@@ -1,0 +1,141 @@
+version: 2
+
+project_name: pingularity
+
+builds:
+  - id: pingularity
+    main: .
+    binary: pingularity
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    # tar.gz everywhere, zip on Windows. README/LICENSE are pulled in by
+    # goreleaser's default (tolerant) file globs, so a missing LICENSE is fine.
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+nfpms:
+  - id: packages
+    package_name: pingularity
+    formats:
+      - deb
+      - rpm
+    maintainer: cansofgrease <github@cansofgrease.com>
+    homepage: https://github.com/pingular/pingularity
+    description: Single-binary internet-connectivity monitor.
+    section: net
+    bindir: /usr/bin
+    contents:
+      - src: packaging/pingularity.service
+        dst: /usr/lib/systemd/system/pingularity.service
+      - src: packaging/pingularity.env
+        dst: /etc/default/pingularity
+        type: config|noreplace
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+
+dockers:
+  - id: amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    use: docker
+    image_templates:
+      - ghcr.io/pingular/pingularity:{{ .Version }}-amd64
+      # Empty template on prerelease tags = tag skipped: an rc must not move
+      # what `docker pull` (latest) serves. Same guard on arm64 + the manifest.
+      - "{{ if not .Prerelease }}ghcr.io/pingular/pingularity:latest-amd64{{ end }}"
+    build_flag_templates:
+      - --platform=linux/amd64
+  - id: arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: docker
+    image_templates:
+      - ghcr.io/pingular/pingularity:{{ .Version }}-arm64
+      - "{{ if not .Prerelease }}ghcr.io/pingular/pingularity:latest-arm64{{ end }}"
+    build_flag_templates:
+      - --platform=linux/arm64
+
+docker_manifests:
+  - name_template: ghcr.io/pingular/pingularity:{{ .Version }}
+    image_templates:
+      - ghcr.io/pingular/pingularity:{{ .Version }}-amd64
+      - ghcr.io/pingular/pingularity:{{ .Version }}-arm64
+  - name_template: "{{ if not .Prerelease }}ghcr.io/pingular/pingularity:latest{{ end }}"
+    image_templates:
+      - "{{ if not .Prerelease }}ghcr.io/pingular/pingularity:latest-amd64{{ end }}"
+      - "{{ if not .Prerelease }}ghcr.io/pingular/pingularity:latest-arm64{{ end }}"
+
+brews:
+  # Same rc guard as winget below: a prerelease tag must not land in the tap,
+  # or every `brew upgrade` user gets the release candidate.
+  - skip_upload: "auto"
+    repository:
+      owner: pingular
+      name: homebrew-tap
+      # Cross-repo push needs the PAT; the default GITHUB_TOKEN is main-repo-only.
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/pingular/pingularity
+    description: Single-binary internet-connectivity monitor.
+    install: |
+      bin.install "pingularity"
+    caveats: |
+      To run pingularity as a background service via launchd, run:
+        sudo pingularity install
+
+winget:
+  # Needs the target repo + a token with push rights at release time.
+  - name: pingularity
+    publisher: pingular
+    package_identifier: pingular.pingularity
+    license: MIT
+    license_url: https://github.com/pingular/pingularity/blob/main/LICENSE
+    homepage: https://github.com/pingular/pingularity
+    short_description: Single-binary internet-connectivity monitor.
+    # Guard: skip pushing the manifest branch to the winget-pkgs fork on
+    # prerelease tags (v*-rc1, -beta) - the maintainer opens the upstream PR by
+    # hand from that branch, see RELEASING.md. An RC tag can exercise the
+    # tap/GHCR/release path for real without staging a winget manifest.
+    skip_upload: "auto"
+    repository:
+      owner: pingular
+      name: winget-pkgs
+      branch: pingularity-{{ .Version }}
+      # Cross-repo push needs the PAT; the default GITHUB_TOKEN is main-repo-only.
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: cansofgrease
+      email: github@cansofgrease.com
+
+release:
+  # RC/prerelease tags (v*-rc1, -beta) are published as GitHub pre-releases.
+  prerelease: auto
+  # The rc tag is re-cut on the same name after every rolling-commit amend, so
+  # the GitHub release already exists with same-named assets; without this the
+  # re-run dies with "422 already_exists" on every upload.
+  replace_existing_artifacts: true
+  github:
+    owner: pingular
+    name: pingularity

@@ -1,0 +1,24 @@
+# Build output
+/pingularity
+/dist/
+
+# Runtime data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Scratch artifacts from local testing - these have been committed by accident
+# before (two copies of /bin/sleep and a saved curl response), so they are
+# named explicitly rather than trusted to discipline.
+busybin*
+r.json
+
+# Local, machine-specific helper scripts
+deploy.sh
+
+# Private engineering notes - the public posture lives in docs/security-model.md
+.notes/
+
+# OS cruft
+.DS_Store
