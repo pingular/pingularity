@@ -1,0 +1,165 @@
+version: 2
+
+project_name: pingularity
+
+builds:
+  - id: pingularity
+    main: .
+    binary: pingularity
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    # tar.gz everywhere, zip on Windows. README/LICENSE are pulled in by
+    # goreleaser's default (tolerant) file globs, so a missing LICENSE is fine.
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+nfpms:
+  - id: packages
+    package_name: pingularity
+    formats:
+      - deb
+      - rpm
+    maintainer: cansofgrease <github@cansofgrease.com>
+    homepage: https://github.com/pingular/pingularity
+    description: Single-binary internet-connectivity monitor.
+    # SPDX identifier; goreleaser stamps it into the deb control file and the rpm
+    # License: tag. Paired with the LICENSE install below it satisfies each format's
+    # policy tooling (lintian/rpmlint), which expects a package to carry both a
+    # declared licence and its copyright text.
+    license: MIT
+    section: net
+    bindir: /usr/bin
+    contents:
+      - src: packaging/pingularity.service
+        dst: /usr/lib/systemd/system/pingularity.service
+      - src: packaging/pingularity.env
+        dst: /etc/default/pingularity
+        type: config|noreplace
+      # Ship the licence at the conventional package doc path.
+      - src: LICENSE
+        dst: /usr/share/doc/pingularity/copyright
+        file_info:
+          mode: 0644
+    # ExecReload=/bin/kill -HUP in the unit needs /bin/kill, which is absent from
+    # some minimal base images. Declare its provider per format: procps on Debian,
+    # util-linux on RPM distros (there procps-ng ships without the kill applet, and
+    # /usr/bin/kill comes from util-linux).
+    overrides:
+      deb:
+        dependencies:
+          - procps
+      rpm:
+        dependencies:
+          - util-linux
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+
+dockers_v2:
+  - id: pingularity
+    ids:
+      - pingularity
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/pingular/pingularity
+    # buildx builds every platform in one pass and assembles a multi-arch manifest
+    # per tag automatically, so the per-arch -amd64/-arm64 image tags and the
+    # separate docker_manifests block the old `dockers:` setup needed are gone.
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - "{{ .Version }}"
+      # Empty template on a prerelease tag drops `latest` entirely: an rc must not
+      # move what `docker pull` (latest) serves.
+      - "{{ if not .Prerelease }}latest{{ end }}"
+
+homebrew_casks:
+  # Same rc guard as winget below: a prerelease tag must not land in the tap, or
+  # every `brew upgrade` user gets the release candidate. Casks are macOS-only (the
+  # old formula's caveats were already launchd-specific); Linux users install via
+  # the deb/rpm packages or the container image.
+  - skip_upload: "auto"
+    repository:
+      owner: pingular
+      name: homebrew-tap
+      # Cross-repo push needs the PAT; the default GITHUB_TOKEN is main-repo-only.
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/pingular/pingularity
+    description: Single-binary internet-connectivity monitor.
+    license: MIT
+    # The binary is unsigned/un-notarized, so Homebrew's cask download carries the
+    # com.apple.quarantine xattr and Gatekeeper blocks the first run. The old
+    # formula never hit this (formulae are not quarantined); strip the xattr on
+    # install so `brew install` stays a single step.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/pingularity"]
+          end
+    caveats: |
+      To run pingularity as a background service via launchd, run:
+        sudo pingularity install
+
+winget:
+  # Needs the target repo + a token with push rights at release time.
+  - name: pingularity
+    publisher: pingular
+    package_identifier: pingular.pingularity
+    license: MIT
+    license_url: https://github.com/pingular/pingularity/blob/main/LICENSE
+    homepage: https://github.com/pingular/pingularity
+    short_description: Single-binary internet-connectivity monitor.
+    # Guard: skip pushing the manifest branch to the winget-pkgs fork on
+    # prerelease tags (v*-rc1, -beta) - the maintainer opens the upstream PR by
+    # hand from that branch, see RELEASING.md. An RC tag can exercise the
+    # tap/GHCR/release path for real without staging a winget manifest.
+    skip_upload: "auto"
+    repository:
+      owner: pingular
+      name: winget-pkgs
+      branch: pingularity-{{ .Version }}
+      # Cross-repo push needs the PAT; the default GITHUB_TOKEN is main-repo-only.
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: cansofgrease
+      email: github@cansofgrease.com
+
+release:
+  # RC/prerelease tags (v*-rc1, -beta) are published as GitHub pre-releases.
+  prerelease: auto
+  # Re-cut policy. The rc tag is re-pushed on the same name after every
+  # rolling-commit amend, so the GitHub pre-release already exists with same-named
+  # assets and the re-run would 422 on upload without this overwrite. A STABLE
+  # release, by contrast, is cut once and must stay immutable: its checksums are
+  # attested in release.yml (C-28), and silently overwriting a published stable
+  # asset would invalidate that provenance. This field is a plain bool (not
+  # templateable), so the prerelease-vs-stable split is enforced upstream in
+  # release.yml - the "Forbid re-cutting a published stable release" guard fails the
+  # run if a stable tag's release already exists, so this overwrite is only ever
+  # exercised by the rc re-cut loop.
+  replace_existing_artifacts: true
+  github:
+    owner: pingular
+    name: pingularity

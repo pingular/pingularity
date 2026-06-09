@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly re-run so govulncheck re-scans the shipped code against newly disclosed
+  # vulnerabilities even when nothing changed - the vuln DB moves, the code doesn't.
+  schedule:
+    - cron: '17 4 * * 1' # Mondays 04:17 UTC
+  # Callable so the release workflow can gate a tag on this exact-SHA CI before it
+  # publishes anything (see .github/workflows/release.yml).
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to run on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        # -race is the gate: three test files only observe the unsynchronized
+        # access they were written to catch when the race detector is on.
+        run: go test ./... -count=1 -race
+
+      - name: ui test
+        run: node --test internal/web/ui/*.test.mjs
+
+      - name: govulncheck
+        # Pin the version for reproducibility: a floating @latest can change the
+        # analyzer (and thus pass/fail) between two runs of the same commit.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # Cheap cross-compile floor: catches platform-specific build regressions.
+  xbuild:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, darwin]
+        goarch: [amd64, arm64]
+        # Two BSD builds keep the stub files honest: freebsd exercises the
+        # !linux/!darwin/!windows stubs (resolver_stub, trace_stub, bytes_other)
+        # plus diskfree_unix's syscall use; openbsd exercises diskfree_other
+        # (its Statfs_t has different field names, which once broke the build).
+        include:
+          - goos: freebsd
+            goarch: amd64
+          - goos: openbsd
+            goarch: amd64
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+  # Native run: macOS + Windows runners EXECUTE the OS-tagged tests (which xbuild
+  # only cross-compiles - trace_darwin/windows, resolver, netstat, disk_free, the
+  # Windows DACL), run the frontend tests, and smoke-boot the binary. The two
+  # privileged paths - raw-socket traceroute and service install - are exercised
+  # by the manually-dispatched deep-test workflow (.github/workflows/deep-test.yml),
+  # not here.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: test
+        run: go test ./... -count=1
+
+      - name: ui test
+        run: node --test internal/web/ui/*.test.mjs
+
+      - name: smoke (boot + serve /metrics)
+        shell: bash
+        run: |
+          exe=$(go env GOEXE)
+          go build -o "pingularity_smoke$exe" .
+          "./pingularity_smoke$exe" -listen 127.0.0.1:9000 -db smoke.db &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/metrics >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          [ -n "$ok" ] || { echo "binary did not serve /metrics within 30s"; exit 1; }
+          echo "smoke OK: booted and served /metrics"
+
+  # Validate the release config so a broken .goreleaser.yaml is caught on a PR
+  # instead of at tag-push time (when it would abort a release mid-flight). Pinned
+  # to the exact goreleaser version release.yml publishes with, so what CI checks is
+  # what the release runs.
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: 'v2.17.0'
+          args: check
