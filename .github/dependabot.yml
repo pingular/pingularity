@@ -1,0 +1,23 @@
+# Actions are pinned to commit SHAs (supply-chain safety); Dependabot keeps
+# those pins current by opening a PR when a new release of each action ships,
+# updating both the SHA and the trailing version comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Go module dependencies (go.mod / go.sum).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Base images in the Dockerfile. The FROM lines are pinned by digest, so this
+  # ecosystem bumps the SHA256 (and the trailing tag) when a new base ships -
+  # picking up debian:12-slim and distroless security updates.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
