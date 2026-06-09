@@ -1,0 +1,24 @@
+[Unit]
+Description=Pingularity internet-connectivity monitor
+After=network-online.target
+Wants=network-online.target
+# Bound the restart loop so a permanently-failing start (unwritable data dir,
+# corrupt DB) reaches the 'failed' state instead of restarting every 5s forever
+# and looking healthy to `systemctl is-failed` and any unit-failure alerting.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# Runs as root: the raw-socket traceroute needs CAP_NET_RAW.
+# De-rooting/sandboxing (User=, ProtectSystem, ...) is deferred - do not add it
+# here or the raw-socket path breaks.
+EnvironmentFile=-/etc/default/pingularity
+ExecStart=/usr/bin/pingularity run $PINGULARITY_OPTS
+# SIGHUP reloads settings live (e.g. after `pingularity reset-auth`), matching
+# the ReloadSignal the self-install unit gets - so `systemctl reload` works here too.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

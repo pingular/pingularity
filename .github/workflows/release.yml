@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Only one release run per tag at a time. Re-cutting a tag (delete + re-push, as the
+# rc loop does) cancels the in-flight run instead of racing it, which otherwise
+# collided on asset uploads (422 already_exists / http2 REFUSED_STREAM).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so goreleaser can build the changelog
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Gate the release on the suite so a tag can't publish untested code.
+      - name: test
+        run: go test ./... -count=1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          # Creates the GitHub Release and pushes the GHCR image.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Publishing the Homebrew tap and winget manifests writes to OTHER
+          # repos, which GITHUB_TOKEN cannot reach. Provide a PAT with access
+          # to the tap/winget repos; goreleaser reads it as its release token.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to run on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        # -race is the gate: three test files only observe the unsynchronized
+        # access they were written to catch when the race detector is on.
+        run: go test ./... -count=1 -race
+
+      - name: ui test
+        run: node --test internal/web/ui/*.test.mjs
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # Cheap cross-compile floor: catches platform-specific build regressions.
+  xbuild:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, darwin]
+        goarch: [amd64, arm64]
+        # Two BSD builds keep the stub files honest: freebsd exercises the
+        # !linux/!darwin/!windows stubs (resolver_stub, trace_stub, bytes_other)
+        # plus diskfree_unix's syscall use; openbsd exercises diskfree_other
+        # (its Statfs_t has different field names, which once broke the build).
+        include:
+          - goos: freebsd
+            goarch: amd64
+          - goos: openbsd
+            goarch: amd64
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+  # Native run: macOS + Windows runners EXECUTE the OS-tagged tests (which xbuild
+  # only cross-compiles - trace_darwin/windows, resolver, netstat, disk_free, the
+  # Windows DACL), run the frontend tests, and smoke-boot the binary. The two
+  # privileged paths - raw-socket traceroute and service install - are exercised
+  # by the manually-dispatched deep-test workflow (.github/workflows/deep-test.yml),
+  # not here.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: test
+        run: go test ./... -count=1
+
+      - name: ui test
+        run: node --test internal/web/ui/*.test.mjs
+
+      - name: smoke (boot + serve /metrics)
+        shell: bash
+        run: |
+          exe=$(go env GOEXE)
+          go build -o "pingularity_smoke$exe" .
+          "./pingularity_smoke$exe" -listen 127.0.0.1:9000 -db smoke.db &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/metrics >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          [ -n "$ok" ] || { echo "binary did not serve /metrics within 30s"; exit 1; }
+          echo "smoke OK: booted and served /metrics"

@@ -1,0 +1,219 @@
+name: Deep test
+
+# Manually-dispatched full-platform validation, beyond what the regular CI job
+# covers: the OS service lifecycle (install -> auto-start -> probes -> stop /
+# restart -> uninstall), data-dir permissions, netinfo/traceroute paths, and the
+# Docker image + the canonical compose flow. Dispatch after platform-sensitive
+# changes; artifacts carry full logs for every leg.
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: full test suite
+        shell: bash
+        run: go test ./... -count=1 2>&1 | tee full-test.log
+
+      - name: build
+        run: go build -o pingularity.exe .
+
+      - name: service lifecycle (install auto-starts, probes, stop, restart, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Probe($what, $url) {
+            try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 $url
+                  "PROBE OK  $what -> $($r.StatusCode)" }
+            catch { "PROBE FAIL $what -> $($_.Exception.Message)" }
+          }
+          "=== install (must register AND start) ===" | Tee-Object svc.log -Append
+          .\pingularity.exe install 2>&1 | Tee-Object svc.log -Append
+          Start-Sleep 8
+          .\pingularity.exe status 2>&1 | Tee-Object svc.log -Append
+          foreach ($i in 1..15) { try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:9000/metrics | Out-Null; break } catch { Start-Sleep 2 } }
+          Probe "metrics"   http://127.0.0.1:9000/metrics    | Tee-Object svc.log -Append
+          Probe "status"    http://127.0.0.1:9000/api/status | Tee-Object svc.log -Append
+          Probe "dashboard" http://127.0.0.1:9000/           | Tee-Object svc.log -Append
+          try { Invoke-WebRequest -UseBasicParsing -Method POST -ContentType 'application/json' -TimeoutSec 10 http://127.0.0.1:9000/api/netinfo | Out-Null } catch {}
+          Start-Sleep 20
+          try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:9000/api/netinfo).Content | Tee-Object svc.log -Append } catch { "netinfo GET failed" | Tee-Object svc.log -Append }
+          .\pingularity.exe stop    2>&1 | Tee-Object svc.log -Append
+          Start-Sleep 3
+          .\pingularity.exe status  2>&1 | Tee-Object svc.log -Append
+          .\pingularity.exe start   2>&1 | Tee-Object svc.log -Append
+          Start-Sleep 5
+          .\pingularity.exe status  2>&1 | Tee-Object svc.log -Append
+          "=== data dir + DACL ===" | Tee-Object svc.log -Append
+          icacls C:\ProgramData\pingularity 2>&1 | Tee-Object svc.log -Append
+          .\pingularity.exe reset-auth 2>&1 | Tee-Object svc.log -Append
+          .\pingularity.exe uninstall -y 2>&1 | Tee-Object svc.log -Append
+          Start-Sleep 3
+          .\pingularity.exe status 2>&1 | Tee-Object svc.log -Append
+          Test-Path C:\ProgramData\pingularity\pingularity.db | ForEach-Object { "db survives uninstall: $_" } | Tee-Object svc.log -Append
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-test-windows
+          path: |
+            full-test.log
+            svc.log
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: full test suite
+        run: go test ./... -count=1 2>&1 | tee full-test.log
+
+      - name: build
+        run: go build -o pingularity .
+
+      - name: service lifecycle (launchd; install auto-starts, probes, stop, restart, uninstall)
+        run: |
+          probe() { code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$2" || echo FAIL); echo "PROBE $1 -> $code"; }
+          {
+            echo "=== install (must register AND start) ==="
+            sudo ./pingularity install
+            sleep 8
+            sudo ./pingularity status
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            probe metrics   http://127.0.0.1:9000/metrics
+            probe status    http://127.0.0.1:9000/api/status
+            probe dashboard http://127.0.0.1:9000/
+            echo "=== netinfo refresh (macOS ICMP-socket traceroute path) ==="
+            curl -fsS -X POST -H 'Content-Type: application/json' --max-time 10 http://127.0.0.1:9000/api/netinfo >/dev/null 2>&1 || true
+            sleep 20
+            curl -fsS --max-time 5 http://127.0.0.1:9000/api/netinfo || echo "netinfo GET failed"
+            echo
+            echo "=== stop / status / start / status ==="
+            sudo ./pingularity stop;  sleep 3; sudo ./pingularity status
+            sudo ./pingularity start; sleep 5; sudo ./pingularity status
+            echo "=== data dir perms (root daemon path, want 700/600) ==="
+            sudo ls -la "/Library/Application Support/pingularity" || true
+            sudo stat -f '%Sp %N' "/Library/Application Support/pingularity" "/Library/Application Support/pingularity/pingularity.db" || true
+            echo "=== reset-auth ==="
+            sudo ./pingularity reset-auth
+            echo "=== uninstall -y ==="
+            sudo ./pingularity uninstall -y
+            sleep 3
+            sudo ./pingularity status
+            sudo test -f "/Library/Application Support/pingularity/pingularity.db" && echo "db survives uninstall: True" || echo "db survives uninstall: False"
+          } 2>&1 | tee svc.log
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-test-macos
+          path: |
+            full-test.log
+            svc.log
+
+  docker-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build static binary + image (same shape goreleaser ships)
+        run: |
+          CGO_ENABLED=0 go build -o pingularity .
+          docker build -t ghcr.io/pingular/pingularity:0.7.0 .
+
+      - name: arm64 image actually runs (the release is multi-arch; only amd64 was ever executed)
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          docker buildx build --platform linux/arm64 -t ping-arm64 --load .
+          # No host networking here: under QEMU we only care that the arm64
+          # binary starts, opens its port and serves - the measurements it takes
+          # inside an emulated container are meaningless either way.
+          docker run -d --name ping-a64 -p 9111:9000 ping-arm64
+          ok=""
+          for i in $(seq 1 30); do
+            curl -fsS --max-time 3 http://127.0.0.1:9111/metrics >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          echo "arm64 metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/metrics)"
+          echo "arm64 status  -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/api/status)"
+          echo "--- arm64 container logs ---"; docker logs ping-a64 2>&1 | tail -15
+          docker rm -f ping-a64
+          [ -n "$ok" ] || { echo "arm64 image never became ready"; exit 1; }
+
+      - name: host-mode docker run (the README command)
+        run: |
+          {
+            docker run -d --name ping-host --network=host --cap-add=NET_RAW \
+              -v pingularity-data:/var/lib/pingularity ghcr.io/pingular/pingularity:0.7.0
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            echo "metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
+            echo "status  -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/api/status)"
+            echo "--- container logs ---"; docker logs ping-host 2>&1 | tail -20
+            docker rm -f ping-host
+          } 2>&1 | tee docker.log
+
+      - name: compose one-shot flow (mirrors install.pingularity.dev/compose.yaml)
+        run: |
+          {
+            # This block mirrors the canonical hosted compose (served by the dl
+            # Worker at dl.pingularity.dev/compose.yaml; template lives in the
+            # pingularity.dev repo, dl/worker.js). Keep shapes in sync.
+            mkdir -p compose-test && cd compose-test
+            cat > compose.yaml <<'EOF'
+          services:
+            pingularity:
+              image: ghcr.io/pingular/pingularity:0.7.0
+              container_name: pingularity
+              network_mode: host
+              cap_add:
+                - NET_RAW
+              volumes:
+                - pingularity-data:/var/lib/pingularity
+              restart: unless-stopped
+
+          volumes:
+            pingularity-data:
+              name: pingularity-data
+          EOF
+            docker compose up -d
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            echo "compose host-mode metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
+            echo "--- volume carries the docker-run data (interchange check) ---"
+            docker run --rm -v pingularity-data:/d alpine ls -la /d
+            docker compose down
+            echo "--- Docker Desktop knob variant (bridge + published port) ---"
+            sed -i 's/^    network_mode: host$/    ports: ["9000:9000"]/' compose.yaml
+            docker compose up -d
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            echo "compose bridge-mode metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
+            docker compose down
+          } 2>&1 | tee -a docker.log
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-test-docker
+          path: docker.log
