@@ -1,0 +1,91 @@
+// Package speedtest measures download/upload throughput and latency. Two engines
+// implement Tester: Ookla (speedtest.net's server network) and iperf3 (a server you
+// run yourself - see iperf.go). The Ookla client parses the server list robustly, so
+// one malformed entry can't crash a run (unlike the legacy Python speedtest-cli).
+package speedtest
+
+import "context"
+
+// Result is a single completed measurement.
+type Result struct {
+	DownloadMbps  float64
+	UploadMbps    float64
+	PingMS        float64
+	JitterMS      *float64 // jitter in ms; nil when unmeasured (iperf3 TCP - needs UDP)
+	Server        string
+	ServerID      string
+	Engine        string   // test backend that produced this run: ookla|iperf3
+	PacketLoss    *float64 // loss percentage (0..100); nil when unmeasurable (iperf3 TCP)
+	DownloadBytes int64    // bytes received during the download test
+	UploadBytes   int64    // bytes delivered during the upload test (sender-side for Ookla)
+
+	// Latency under load (see lul.go): medians of TCP-connect RTTs to a fixed anycast
+	// target - idle just before the transfers, then during each phase. Loaded minus idle
+	// is the bufferbloat. nil when unmeasurable (phase too short, too few samples, target
+	// unreachable). The Max fields are the worst single sample in each phase - the spike
+	// real-time apps actually feel.
+	IdleMS          *float64
+	LoadedDownMS    *float64
+	LoadedUpMS      *float64
+	LoadedDownMaxMS *float64
+	LoadedUpMaxMS   *float64
+}
+
+// Tester runs one measurement. Implemented by Ookla and Iperf.
+type Tester interface {
+	Run(ctx context.Context) (Result, error)
+}
+
+// reasonTester is the optional half of Tester: an engine that wants to know what
+// triggered the run implements it, and the scheduler hands over its closed enum
+// (scheduled|manual|reconnect|startup|degraded). Ookla uses it to gate best-of-3,
+// which is worth 3x the time and data on a scheduled test but not on a reconnect.
+// Engines that don't implement it - iperf3, and every test fake - keep working
+// through plain Run.
+type reasonTester interface {
+	RunReason(ctx context.Context, reason string) (Result, error)
+}
+
+// runTester invokes t, passing the trigger when the engine accepts one.
+func runTester(ctx context.Context, t Tester, reason string) (Result, error) {
+	if rt, ok := t.(reasonTester); ok {
+		return rt.RunReason(ctx, reason)
+	}
+	return t.Run(ctx)
+}
+
+// The engine-agnostic test knobs: both engines resolve direction and retries the
+// same way, so they live here rather than in either engine's file.
+const (
+	speedDefaultRetries = 1 // one retry by default (2 attempts per direction)
+	speedMaxRetries     = 3
+)
+
+// speedDirection resolves which directions to test; anything unrecognized -> "both".
+// "bidir" runs download+upload simultaneously (--bidir, iperf3 only); "both" runs
+// them in sequence.
+func speedDirection(fn func() string) string {
+	if fn != nil {
+		switch v := fn(); v {
+		case "down", "up", "bidir":
+			return v
+		}
+	}
+	return "both"
+}
+
+// speedRetries resolves the per-direction retry count, clamped to [0, speedMaxRetries];
+// nil -> default. 0 means a single attempt (no retry).
+func speedRetries(fn func() int) int {
+	if fn == nil {
+		return speedDefaultRetries
+	}
+	r := fn()
+	if r < 0 {
+		return 0
+	}
+	if r > speedMaxRetries {
+		return speedMaxRetries
+	}
+	return r
+}

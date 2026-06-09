@@ -1,0 +1,67 @@
+# iperf3-enabled image variant. Same prebuilt, CAP_NET_RAW-stamped pingularity
+# binary as the default Dockerfile, but the final stage is debian:12-slim + iperf3
+# so the opt-in iperf3 speedtest engine has a binary to exec. The default image
+# is distroless/static-debian12 with NO package manager, so iperf3 can never be
+# present there; this variant exists only for users who select the iperf3 engine.
+# See Dockerfile for the default (lean, iperf-free) image.
+#
+# Multi-arch works exactly like the default image: goreleaser (dockers_v2) stages
+# the per-platform binaries - linux/amd64/pingularity, linux/arm64/pingularity -
+# in the build context and buildx selects the target-arch one via $TARGETPLATFORM.
+# The difference here is the final stage runs apt for the TARGET arch (under QEMU
+# when cross-building; the release workflow already sets up buildx + QEMU). setcap
+# stays on $BUILDPLATFORM so it still runs natively without emulation.
+#
+# Both FROM lines are pinned by digest (alongside the tag) so Dependabot's docker
+# ecosystem can bump them; the debian:12-slim digest is kept identical to the one
+# in the default Dockerfile so the two bases stay in lock-step.
+
+# --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
+FROM --platform=$BUILDPLATFORM debian:12-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS setcap
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/*
+# TARGETPLATFORM (set by buildx per target arch) selects the matching prebuilt
+# binary; this stage stays pinned to $BUILDPLATFORM above so apt + setcap run
+# natively without QEMU.
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/pingularity /pingularity
+# +ep: effective+permitted, so the cap is raised automatically on exec even for a
+# non-root user. `mkdir /data` seeds the data dir the final stage chowns. BuildKit
+# preserves the security.capability xattr across the COPY into the final image
+# (same guarantee the default Dockerfile relies on), so the final stage needs no
+# libcap2-bin of its own.
+RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data
+
+# --- final image: debian-slim carrying iperf3 + the capped binary ---
+FROM debian:12-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+# iperf3 gives the opt-in engine a binary to exec (pingularity looks it up on PATH
+# via exec.LookPath; the debian package installs /usr/bin/iperf3, pulling libiperf0
+# as a dependency). ca-certificates + tzdata are bundled by the distroless/static
+# base of the default image, so install them here too: without ca-certificates the
+# static Go binary's TLS calls (Ookla, the update feed) fail x509 verification, and
+# tzdata keeps time-zone handling identical to the default image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iperf3 ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
+# debian has no distroless `nonroot` account, so recreate the SAME uid/gid (65532)
+# the default image runs as. This keeps the volume-ownership contract identical: a
+# freshly created named volume inherits 65532 and the unprivileged process can
+# write its database + pingularity.key. Creating the account (not just USER 65532)
+# also restores the /etc/passwd entry distroless `nonroot` provides, so uid->name
+# lookups resolve.
+RUN groupadd --gid 65532 pingularity \
+    && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /var/lib/pingularity --shell /usr/sbin/nologin pingularity
+COPY --from=setcap /pingularity /pingularity
+# The data dir must exist owned by 65532 so a freshly created named volume inherits
+# that ownership and the unprivileged process can write to it.
+COPY --from=setcap --chown=65532:65532 /data /var/lib/pingularity
+EXPOSE 9000
+VOLUME /var/lib/pingularity
+USER pingularity
+# Pin the database onto the volume, exactly as the default image does: without this
+# the path is chosen from the effective uid and a --user override would fall back to
+# a temp dir inside the writable layer, leaving the mounted volume empty so updates
+# silently discard all history plus pingularity.key. The key lives beside the
+# database, so pinning -db pins both.
+ENTRYPOINT ["/pingularity", "run", "-db", "/var/lib/pingularity/pingularity.db"]
