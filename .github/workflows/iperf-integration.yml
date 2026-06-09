@@ -1,0 +1,122 @@
+name: iperf integration
+
+# WHY THIS WORKFLOW EXISTS (audit finding F-12)
+# ------------------------------------------------------------------------------
+# Every committed iperf3 test stubs the child process through the exec seam
+# (internal/speedtest/iperf.go: iperfExec) and feeds back canned -J/--json bodies.
+# That is great for unit logic, but it means the ONE thing that actually breaks in
+# the field - real pingularity <-> real iperf3 interop - is structurally
+# uncatchable by those tests. A stub can never disagree with us about:
+#   * flag ROLES: is --reverse really "server sends" (download)? does --bidir do
+#     what we assume? do -4/-6 / --bind / --port / --dscp behave as coded?
+#   * JSON-SCHEMA drift: a new iperf3 renames/moves a field our parser reads
+#     (bits_per_second, sum_sent/sum_received, lost_percent, min_rtt, error).
+#   * PROTOCOL violations: auth handshake (RSA OAEP vs legacy PKCS#1 padding),
+#     connect-timeout semantics, cancellation/watchdog kill behaviour.
+# Only executing the REAL binary against a REAL server exercises that path, so this
+# job installs a genuine iperf3, stands up a live `iperf3 -s`, and runs the
+# build-tagged integration suite the lead authors against it. It is gated: a real
+# interop regression fails the job.
+#
+# INTEROP MATRIX TO GROW INTO (add legs as dedicated servers/runners appear):
+#   * iperf3 versions : min-supported build + current upstream release (today apt
+#                       gives a single ubuntu-latest version; add a matrix leg that
+#                       builds/pins a second iperf3 once the floor is decided).
+#   * address family  : IPv4 (127.0.0.1) and IPv6 (::1)   [-4 / -6]
+#   * direction       : sequential down-then-up, and --bidir
+#   * protocol        : TCP and UDP (loss / jitter / lost_percent)
+#   * binding         : --bind source address AND source device/interface
+#   * auth            : RSA-OAEP (patched iperf3) vs legacy --use-pkcs1-padding
+# ------------------------------------------------------------------------------
+#
+# NOTE ON SERVERS: the baseline below is ONE default `iperf3 -s` on :5201, which
+# serves sequential connections (down, up, bidir, udp, bind) fine. Cases that need
+# their own listener - IPv6-only bind (`-s -B ::1`), a one-off `-1` single-shot
+# server, an --authorized-users-path/RSA server for the auth leg, or truly
+# concurrent transfers - must start their OWN dedicated `iperf3 -s` instance
+# (extra port / -B / --daemon). Add those server steps here as the matrix grows.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Manual re-run, mirroring deep-test.yml's dispatch-driven heavier validation.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iperf-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # pipefail so `go test ... | tee` fails the step on a test failure (the gate),
+    # instead of tee's exit status masking it.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: install real iperf3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iperf3
+          # Record the exact build the interop run was validated against.
+          iperf3 --version
+
+      - name: start iperf3 server (background, :5201)
+        run: |
+          # Daemonize a single default server; pid + log land in RUNNER_TEMP so the
+          # always()-cleanup step and the log upload can find them. Dedicated
+          # instances for IPv6-only / single-shot / auth / concurrent cases are the
+          # lead's to add here (see the SERVERS note at the top of this file).
+          iperf3 -s -D \
+            --pidfile "$RUNNER_TEMP/iperf3.pid" \
+            --logfile "$RUNNER_TEMP/iperf3-server.log"
+          # Wait until it is actually accepting on 5201 before running the suite.
+          up=
+          for i in $(seq 1 10); do
+            if ss -ltn 2>/dev/null | grep -q ':5201 '; then up=1; break; fi
+            sleep 1
+          done
+          [ -n "$up" ] || { echo "iperf3 server never came up on :5201"; cat "$RUNNER_TEMP/iperf3-server.log" 2>/dev/null || true; exit 1; }
+          echo "iperf3 server up (pid $(cat "$RUNNER_TEMP/iperf3.pid" 2>/dev/null))"
+
+      - name: integration tests (real pingularity -> real iperf3)
+        # THE GATE. The lead's //go:build iperf_integration test file must satisfy
+        # exactly this invocation: build tag iperf_integration, package
+        # ./internal/speedtest/, run pattern Integration. Tests connect to the live
+        # loopback server started above (default iperf3 port 5201); the env vars
+        # below are exposed as a convenience contract for the test to read.
+        env:
+          IPERF3_TEST_HOST: 127.0.0.1
+          IPERF3_TEST_HOST6: ::1
+          IPERF3_TEST_PORT: '5201'
+        run: |
+          go test -tags iperf_integration ./internal/speedtest/ -run Integration -v -count=1 2>&1 | tee iperf-integration.log
+
+      - name: stop iperf3 server
+        if: always()
+        run: |
+          # Unconditional cleanup: kill by recorded pid, then sweep any stray
+          # iperf3 (dedicated-instance servers a future matrix leg may have left).
+          if [ -f "$RUNNER_TEMP/iperf3.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/iperf3.pid")" 2>/dev/null || true
+          fi
+          pkill -x iperf3 2>/dev/null || true
+          echo "iperf3 server(s) stopped"
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: iperf-integration-logs
+          path: |
+            iperf-integration.log
+            ${{ runner.temp }}/iperf3-server.log
+          if-no-files-found: ignore

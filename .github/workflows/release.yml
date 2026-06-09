@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Only one release run per tag at a time. Re-cutting a tag (delete + re-push, as the
+# rc loop does) cancels the in-flight run instead of racing it, which otherwise
+# collided on asset uploads (422 already_exists / http2 REFUSED_STREAM).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; the publish job widens its own grant below.
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      # The trigger glob 'v*' also matches junk like 'v', 'vtest', or 'v1.2' - a
+      # stray or malformed tag must not cut a release. Enforce a proper SemVer
+      # grammar (leading v) before any checkout or token use. This is a regex, not a
+      # full parser, but it is a real SemVer grammar: it rejects the shapes that
+      # actually slip through a naive pattern - leading-zero numeric core/prerelease
+      # identifiers (v01.2.3, v1.2.3-01) and empty dot identifiers (v1.2.3-a..b) -
+      # while GoReleaser stays the authoritative validator downstream.
+      - name: Guard SemVer tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if ! printf '%s' "$tag" | grep -Eq "$semver"; then
+            echo "::error::tag '$tag' is not a valid SemVer tag (vMAJOR.MINOR.PATCH[-prerelease][+build]); refusing to release"
+            exit 1
+          fi
+
+      # Stable releases are immutable: their checksums are attested in the publish
+      # job, so silently overwriting a published stable asset would invalidate that
+      # provenance. .goreleaser.yaml keeps replace_existing_artifacts: true for the
+      # rc re-cut loop (a plain bool there, not templateable per channel), so this
+      # guard confines that overwrite to prerelease tags - it fails the run if a
+      # STABLE tag's GitHub release already exists. Cut a new version instead.
+      - name: Forbid re-cutting a published stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            *-*) echo "prerelease tag ($tag): re-cut permitted"; exit 0 ;;
+          esac
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets. Cut a new version instead."
+            exit 1
+          fi
+          echo "stable tag ($tag): no existing release - ok to publish"
+
+  # Gate the publish on the FULL exact-SHA CI (race, vet, gofmt, UI, govulncheck,
+  # cross-build, native smoke, goreleaser check) so a tag can never publish code the
+  # regular CI would have failed. The reusable workflow checks out this same commit.
+  ci:
+    needs: [guard]
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload assets
+      packages: write # push the GHCR image
+      id-token: write # mint the short-lived OIDC token the attestations are signed with
+      attestations: write # write the build-provenance attestations to the attestation store
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0  # full history so goreleaser can build the changelog
+          # Don't leave the default GITHUB_TOKEN persisted in .git/config: goreleaser
+          # uses its own scoped tokens below, so nothing here needs the credential,
+          # and a persisted one is a needless secret at rest in the workspace.
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          # Pinned to an EXACT version (not '~> v2') so a new goreleaser release
+          # can't silently change tag-push behaviour; bump it deliberately, in step
+          # with the pin in ci.yml's goreleaser-check job.
+          version: 'v2.17.0'
+          args: release --clean
+        env:
+          # Creates the GitHub Release and pushes the GHCR image.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Publishing the Homebrew tap and winget manifests writes to OTHER
+          # repos, which GITHUB_TOKEN cannot reach. Provide a token for that, and
+          # keep it least-privilege: a FINE-GRAINED PAT scoped to ONLY the tap and
+          # winget repos, "Contents: read and write" and nothing else, with the
+          # SHORTEST practical expiry (rotate on expiry). A classic/broadly-scoped
+          # PAT here would let a compromised release step write to every repo the
+          # owner can reach. goreleaser reads it as its release token.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      # Provenance for every downloadable artifact: subject-checksums attests each
+      # file listed in checksums.txt (the .tar.gz/.zip archives and the .deb/.rpm
+      # packages), so a consumer can run `gh attestation verify <file> --repo ...`
+      # and prove it was built by THIS workflow from THIS commit. Signed with the
+      # OIDC id-token above - no long-lived key at rest.
+      #
+      # NOTE: this covers the release-page downloads. The GHCR image is not attested
+      # here (that needs its pushed manifest digest + push-to-registry); dockers_v2
+      # attaches an SBOM to the image, and image provenance can be layered on later
+      # by reading the digest out of dist/artifacts.json.
+      - name: Attest build provenance (release artifacts)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: dist/checksums.txt
