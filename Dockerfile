@@ -21,7 +21,7 @@
 # workflow already sets up buildx.
 
 # --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
-FROM --platform=$BUILDPLATFORM debian:12-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS setcap
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS setcap
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
