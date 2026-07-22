@@ -6,7 +6,7 @@ require (
 	github.com/kardianos/service v1.2.4
 	github.com/showwin/speedtest-go v1.7.10
 	golang.org/x/crypto v0.53.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.52.0
 )
 
