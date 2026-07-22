@@ -1,0 +1,9 @@
+# Actions are pinned to commit SHAs (supply-chain safety); Dependabot keeps
+# those pins current by opening a PR when a new release of each action ships,
+# updating both the SHA and the trailing version comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
