@@ -94,6 +94,37 @@ func TestLoadLegacyPlainText(t *testing.T) {
 	}
 }
 
+// The byte ceiling bounds total retained memory even when the line count is well
+// under cap: a burst of oversized lines is evicted down to the ceiling, but the
+// single newest line is always kept (dropping it would discard what was just
+// appended). Regression for the oversized-Host memory exhaustion (B1).
+func TestRingByteCeiling(t *testing.T) {
+	r := New(1000)            // a generous line cap...
+	r.maxBytes = 4096         // ...but a tight byte ceiling for the test
+	big := make([]byte, 2000) // ~2000 bytes raw+masked ⇒ ~4000 per Append
+	for i := range big {
+		big[i] = 'x'
+	}
+	for i := 0; i < 100; i++ {
+		r.Append(string(big), string(big))
+	}
+	if r.bytes > r.maxBytes {
+		t.Fatalf("retained %d bytes, want <= %d (ceiling)", r.bytes, r.maxBytes)
+	}
+	if got := len(r.Entries()); got == 0 || got > 2 {
+		t.Fatalf("kept %d entries; the ceiling should hold ~1-2 oversized lines", got)
+	}
+
+	// A single line larger than the whole ceiling must still be retained (never
+	// drop the line just recorded).
+	r2 := New(10)
+	r2.maxBytes = 8
+	r2.Append(string(big), string(big))
+	if got := len(r2.Entries()); got != 1 {
+		t.Fatalf("an over-ceiling lone line must be kept, got %d entries", got)
+	}
+}
+
 // Concurrent appends must not race or lose the invariant len(entries) <= cap.
 func TestConcurrent(t *testing.T) {
 	r := New(100)

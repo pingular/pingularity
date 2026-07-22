@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pingular/pingularity/internal/logbuf"
 	"github.com/pingular/pingularity/internal/netinfo"
@@ -140,6 +141,13 @@ type Server struct {
 	// struct-literal Server still gates.
 	importSemOnce sync.Once
 	importSem     chan struct{}
+
+	// exportSem caps concurrent /api/export + /api/speed/runs.csv runs. Each holds a
+	// SQLite read cursor for the whole stream; with a small pool, a few slow clients
+	// could otherwise pin every connection and starve the probe writer. Lazily built
+	// (exportGate) so a struct-literal Server still gates.
+	exportSemOnce sync.Once
+	exportSem     chan struct{}
 
 	// Cached status aggregates: uptime windows scan the outage events table, the
 	// data totals/averages scan the speed table. Recomputed at most once per
@@ -331,7 +339,7 @@ func serveUI(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	body := uiAsset.raw
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+	if acceptsGzip(r) {
 		h.Set("Content-Encoding", "gzip")
 		body = uiAsset.gz
 	}
@@ -339,6 +347,60 @@ func serveUI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodHead {
 		w.Write(body)
 	}
+}
+
+// logCap bounds how much of a request-derived string (Host, username, path) may
+// reach a log line - and thence the in-memory ring and its on-disk snapshot. A
+// header value can be tens of KB; without a cap a request flood could pin large
+// strings in the ring. 256 bytes is plenty to identify a value while logging.
+const logCap = 256
+
+// capForLog truncates s to logCap bytes on a UTF-8 boundary (never mid-rune),
+// appending an ellipsis when it had to cut, so an oversized request-derived value
+// can't bloat the log ring.
+func capForLog(s string) string {
+	if len(s) <= logCap {
+		return s
+	}
+	n := logCap
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
+}
+
+// acceptsGzip reports whether Accept-Encoding positively permits gzip: it must
+// list "gzip" (or a "*" wildcard) with a q-value above zero. A plain substring
+// check is wrong twice over - it matches "gzip;q=0", which explicitly REFUSES
+// gzip, and it can't honour a "*;q=0" that disables every unlisted coding.
+func acceptsGzip(r *http.Request) bool {
+	gzipOK, wildcardOK := false, false
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		tok := strings.TrimSpace(part)
+		if tok == "" {
+			continue
+		}
+		name, q := tok, 1.0
+		if i := strings.IndexByte(tok, ';'); i >= 0 {
+			name = strings.TrimSpace(tok[:i])
+			// Scan the parameters for q=; an unparseable value leaves q at 1 (lenient).
+			for _, param := range strings.Split(tok[i+1:], ";") {
+				if v, ok := strings.CutPrefix(strings.TrimSpace(param), "q="); ok {
+					if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+						q = f
+					}
+				}
+			}
+		}
+		switch {
+		case strings.EqualFold(name, "gzip"):
+			gzipOK = q > 0 // an explicit gzip entry is authoritative, even if q=0
+			return gzipOK
+		case name == "*":
+			wildcardOK = q > 0
+		}
+	}
+	return wildcardOK
 }
 
 // logRequests logs one line per request (method, path, status, duration) at debug.
@@ -353,8 +415,8 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sr, r)
-		s.log.Debug("http", "method", r.Method, "path", r.URL.Path, "status", sr.status,
-			"host", r.Host, "ip", clientIP(r), "dur_ms", util.Round1(util.DurMS(time.Since(start))))
+		s.log.Debug("http", "method", r.Method, "path", capForLog(r.URL.Path), "status", sr.status,
+			"host", capForLog(r.Host), "ip", clientIP(r), "dur_ms", util.Round1(util.DurMS(time.Since(start))))
 	})
 }
 
@@ -391,7 +453,12 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// 32 KiB is ample for this API's headers (no big cookies/tokens ride here).
+		// The stdlib default (1 MiB) let a single request buffer ~1 MiB of header
+		// bytes, and a request-derived value (the Host) then flowed into a warning
+		// and the log ring - a cheap way to pin large strings in memory. Lower the
+		// cap and truncate the logged value (capForLog) as defence in depth.
+		MaxHeaderBytes: 32 * 1024,
 	}
 	// Cancel the shutdown watcher when Serve returns so it can't leak if
 	// ListenAndServe fails immediately (before the parent ctx is cancelled).
@@ -747,24 +814,32 @@ func (s *Server) invalidateAggregates() {
 
 // handleSpeedRunsCSV streams every recorded run as CSV (newest first) for export.
 func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
-	// SpeedHistory returns all rows since the epoch, oldest first.
-	hist, err := s.store.SpeedHistory(r.Context(), time.Unix(0, 0))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	// Cap concurrent exports so a stalled client can't pin a read cursor (see
+	// exportGate); refuse rather than queue when the gate is full.
+	gate := s.exportGate()
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	default:
+		http.Error(w, "another export is already in progress; try again shortly", http.StatusTooManyRequests)
 		return
 	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="pingularity-speed-runs.csv"`)
 	cw := csv.NewWriter(w)
-	defer cw.Flush()
+	// Progress-refreshed write deadline: a client that stops reading must not hold
+	// the DB cursor open for minutes. Rearm on the header and every flushed row.
+	bump := exportDeadlineBumper(w, s.log)
+	bump()
 	cw.Write([]string{"timestamp", "download_mbps", "upload_mbps", "ping_ms", "jitter_ms",
 		"packet_loss_pct", "idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_max_ms", "loaded_up_max_ms", "healthy", "download_bytes", "upload_bytes",
 		"trigger", "engine", "server", "server_id", "isp", "isp_location",
 		"public_ipv4", "public_ipv6", "dns_server", "dns_provider", "dns_location",
 		"cf_colo", "exit_path"})
-	// Emit newest first to match the on-screen table.
-	for i := len(hist) - 1; i >= 0; i-- {
-		sp := hist[i]
+	// Stream newest-first straight from a descending row iterator (no whole-history
+	// slice), flushing per row so back-pressure from a slow client bounds memory and
+	// the write deadline keeps advancing only while bytes actually move.
+	err := s.store.SpeedHistoryDescFunc(r.Context(), func(sp store.SpeedSample) error {
 		cw.Write([]string{
 			time.Unix(sp.TS, 0).UTC().Format(time.RFC3339),
 			strconv.FormatFloat(sp.DownMbps, 'f', 2, 64),
@@ -778,6 +853,16 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			sp.PublicIPv4, sp.PublicIPv6, sp.DNSIP, csvSafe(sp.DNSProvider), csvSafe(sp.DNSLocation),
 			csvSafe(sp.CFColo), csvSafe(sp.ExitSummary),
 		})
+		cw.Flush()
+		bump()
+		return cw.Error()
+	})
+	cw.Flush()
+	if err != nil {
+		// Headers are long since sent, so abort the connection rather than append an
+		// error line into a complete-looking CSV (guard() re-panics this sentinel).
+		s.log.Error("speed-runs CSV export failed", "err", err)
+		panic(http.ErrAbortHandler)
 	}
 }
 
@@ -893,13 +978,27 @@ func (s *Server) handleSpeedtest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "speedtests are disabled", http.StatusServiceUnavailable)
 		return
 	}
-	// Detach from the request's cancellation, keeping its values. A manual run can
-	// take minutes with "best of 3 servers" on, and tying the measurement to the
-	// HTTP request meant a reload, a closed tab or any client-side give-up killed
-	// it mid-transfer - surfacing as "speedtest failed: context canceled" and
-	// storing nothing. The run is still bounded by the engine's own deadline, so
-	// this cannot leak: it just lets a test the user asked for finish.
-	res, err := s.speed.RunOnce(context.WithoutCancel(r.Context()), "manual")
+	// A manual run can take minutes with "best of 3 servers" on. It must outlive the
+	// HTTP request - a reload, a closed tab, or any client-side give-up must not kill
+	// it mid-transfer (that surfaced as "speedtest failed: context canceled" and
+	// stored nothing) - so it does NOT ride r.Context(). But it must NOT outlive the
+	// daemon either: the old context.WithoutCancel fully detached it, so a run in
+	// flight at shutdown kept going and could InsertSpeed into a store main had
+	// already closed. Tie it to the server run context so a shutdown cancels it, and
+	// track it on serveWG so Serve drains it before the store closes.
+	base := s.serveCtx
+	if base == nil {
+		base = context.Background() // not serving (tests): a plain detached ctx
+	}
+	// Refuse once shutdown has started: serveCtx is cancelled, so a new run would
+	// abort immediately and could still race the closing store.
+	if base.Err() != nil {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	s.serveWG.Add(1)
+	defer s.serveWG.Done()
+	res, err := s.speed.RunOnce(base, "manual")
 	if errors.Is(err, speedtest.ErrBusy) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
@@ -1562,6 +1661,20 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "select at least one category", http.StatusBadRequest)
 		return
 	}
+	// Cap concurrent exports so a stalled client can't pin a read cursor across the
+	// whole stream (see exportGate); refuse rather than queue when the gate is full.
+	gate := s.exportGate()
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	default:
+		http.Error(w, "another export is already in progress; try again shortly", http.StatusTooManyRequests)
+		return
+	}
+	// Progress-refreshed write deadline: rearm as rows flush, so a client that stops
+	// reading is reaped within one window instead of holding the cursor for minutes.
+	bump := exportDeadlineBumper(w, s.log)
+	bump()
 	// Stream the envelope row-by-row so a huge table (millions of samples) exports
 	// at O(1) memory instead of buffering every row into a map first. Once bytes
 	// are flushed the status can't change, so a mid-stream error ABORTS the
@@ -1582,7 +1695,18 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 				bw.WriteByte(',')
 			}
 			first = false
-			return enc.Encode(m) // row object + newline (valid JSON whitespace inside the array)
+			if err := enc.Encode(m); err != nil { // row object + newline (valid JSON whitespace inside the array)
+				return err
+			}
+			// Flush and rearm the deadline periodically so back-pressure from a slow
+			// client bounds the buffer and the deadline only advances while bytes move.
+			if bw.Buffered() >= 32<<10 {
+				if err := bw.Flush(); err != nil {
+					return err
+				}
+				bump()
+			}
+			return nil
 		})
 		bw.WriteByte(']')
 		if err != nil {
@@ -1606,6 +1730,35 @@ const maxConcurrentImports = 4
 func (s *Server) importGate() chan struct{} {
 	s.importSemOnce.Do(func() { s.importSem = make(chan struct{}, maxConcurrentImports) })
 	return s.importSem
+}
+
+// maxConcurrentExports caps how many streaming exports (/api/export +
+// /api/speed/runs.csv) run at once. Each holds a SQLite read cursor for the whole
+// stream; the pool is small (4 connections), so a few slow clients could otherwise
+// pin every connection and starve the probe writer. Two leaves headroom.
+const maxConcurrentExports = 2
+
+// exportWriteWindow is how long a streaming export may stall between flushed
+// chunks before its connection is reaped (the progress-refreshed write deadline).
+const exportWriteWindow = 60 * time.Second
+
+// exportGate returns the (lazily built) export concurrency semaphore.
+func (s *Server) exportGate() chan struct{} {
+	s.exportSemOnce.Do(func() { s.exportSem = make(chan struct{}, maxConcurrentExports) })
+	return s.exportSem
+}
+
+// exportDeadlineBumper returns a func that rearms the response write deadline to
+// exportWriteWindow from now, called as each chunk flushes so a client that stops
+// reading is reaped within one window rather than pinning the DB cursor. A writer
+// that doesn't support deadlines (some test recorders) makes it a logged no-op.
+func exportDeadlineBumper(w http.ResponseWriter, log *slog.Logger) func() {
+	rc := http.NewResponseController(w)
+	return func() {
+		if err := rc.SetWriteDeadline(time.Now().Add(exportWriteWindow)); err != nil {
+			log.Debug("export write-deadline extension failed", "err", err)
+		}
+	}
 }
 
 // handleImport merges an uploaded export into the selected categories.

@@ -136,7 +136,7 @@ func Open(path string) (*Store, error) {
 		// db to 0600, closing the same gap from the other direction.
 		for _, sfx := range []string{"", "-wal", "-shm"} {
 			if _, err := os.Stat(path + sfx); err == nil {
-				if err := osperm.SecureFile(path + sfx); err != nil && !securingSkippable(err) {
+				if err := secureDBFile(path + sfx); err != nil {
 					return nil, fmt.Errorf("secure db %s: %w", path+sfx, err)
 				}
 			}
@@ -204,7 +204,7 @@ func Open(path string) (*Store, error) {
 	// securingSkippable).
 	if path != ":memory:" {
 		for _, suffix := range []string{"", "-wal", "-shm"} {
-			if err := osperm.SecureFile(path + suffix); err != nil && !securingSkippable(err) {
+			if err := secureDBFile(path + suffix); err != nil {
 				db.Close()
 				return nil, fmt.Errorf("secure db perms %s: %w", path+suffix, err)
 			}
@@ -297,6 +297,29 @@ func quarantineCorruptDB(path string) (string, error) {
 		}
 	}
 	return moved, nil
+}
+
+// secureDBFile tightens a database file (or WAL/SHM sidecar) to owner-only,
+// tolerating a filesystem that genuinely cannot express perms (vfat/exFAT/CIFS,
+// read-only mounts) - BUT only after verifying the file was not actually left
+// group/world accessible. A permission error that leaves an existing DB readable
+// by other local users (e.g. a root-created DB the daemon now runs too
+// unprivileged to chmod, per the service hardening) must NOT be silently skipped:
+// the DB holds the auth hash and webhook secrets, so an unfixable exposure is
+// fatal and the operator has to correct ownership/perms. A missing sidecar or a
+// mount that reports tight perms passes cleanly.
+func secureDBFile(path string) error {
+	err := osperm.SecureFile(path)
+	if err == nil {
+		return nil
+	}
+	if !securingSkippable(err) {
+		return err
+	}
+	if exposed, known := osperm.GroupOrWorldAccessible(path); known && exposed {
+		return fmt.Errorf("cannot secure %s to owner-only and it is still group/world accessible (holds the auth hash and webhook secrets): %w", path, err)
+	}
+	return nil
 }
 
 // securingSkippable reports whether a permission-securing error just means the
@@ -587,7 +610,14 @@ func (s *Store) newestSampleAt(ctx context.Context, nowU int64) (int64, bool, er
 // sinceU is still caught (its leading 'down' is that boundary event), while pairs
 // wholly before the window - 0 overlap anyway - are skipped. UptimeSince and
 // ResolvedOutagesSince share this so both report the same downtime.
-func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (int64, error) {
+//
+// recovered is the count of gaps whose leading outage PROVABLY ended (a quorum
+// recovery fell between the two 'down' events) and resolved within the window
+// (rec > sinceU). Such a gap is a DISTINCT resolved outage with no closing 'up'
+// event of its own, so ResolvedOutagesSince adds it to the outage count to agree
+// with DowntimeByDay's heatmap tally; a gap with NO recovery between is the same
+// outage re-detected after a restart and is not counted. UptimeSince ignores this.
+func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (downtime int64, recovered int, err error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, next_ts
 		FROM (
@@ -597,7 +627,7 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (int6
 			FROM events WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?))
 		WHERE type='down' AND next_type='down'`, sinceU)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// Collect the pairs before running the per-gap recovery lookups: the pool can
 	// be pinned to one connection (":memory:"), where a query inside an open rows
@@ -607,21 +637,23 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (int6
 		var g [2]int64
 		if err := rows.Scan(&g[0], &g[1]); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
 		gaps = append(gaps, g)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	var downtime int64
 	for _, g := range gaps {
 		end := g[1]
 		if rec, ok, err := s.firstQuorumRecovery(ctx, g[0], g[1]); err != nil {
-			return 0, err
+			return 0, 0, err
 		} else if ok && rec < end {
 			end = rec
+			if rec > sinceU { // the leading outage resolved inside the window: a distinct outage
+				recovered++
+			}
 		}
 		if end > nowU {
 			end = nowU
@@ -634,7 +666,7 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (int6
 			downtime += end - start
 		}
 	}
-	return downtime, nil
+	return downtime, recovered, nil
 }
 
 // UptimeSince returns the fraction of time (0..1) the link was up over
@@ -686,8 +718,9 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time) (float64, erro
 
 	// Orphaned down->down gaps (a restart mid-outage wrote a second 'down' with no
 	// closing 'up') carry no duration_s, so add them explicitly, each bounded at
-	// its first quorum-recovery second. Shared with ResolvedOutagesSince.
-	gap, err := s.orphanGapDowntime(ctx, sinceU, nowU)
+	// its first quorum-recovery second. Shared with ResolvedOutagesSince (which also
+	// uses the recovered-gap count; uptime needs only the downtime).
+	gap, _, err := s.orphanGapDowntime(ctx, sinceU, nowU)
 	if err != nil {
 		return 0, err
 	}
@@ -899,6 +932,15 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 	}
 	ex := append([]string(nil), excludeTargets...)
 	sort.Strings(ex)
+	// Floor the start to its bucket boundary and run the aggregate from THERE, so a
+	// cache miss computes exactly the window the key names. The key already floors
+	// the start (below), so two exact starts in the same bucket share one entry -
+	// but the SQL aggregate keyed off the caller's exact start would build a
+	// different leading (partial) bucket for each, serving whichever raced in first.
+	// Aligning the query to the same boundary makes cached and fresh agree; buckets
+	// are ts/bucket-aligned anyway, so this just completes the leading bucket.
+	sinceBkt := since.Unix() / int64(bucketSec)
+	since = time.Unix(sinceBkt*int64(bucketSec), 0)
 	// The END is keyed EXACTLY, not floored to its bucket like the start. The
 	// start is floored because a rolling window slides every second and flooring
 	// is what makes it cacheable at all; a fixed end never moves, so flooring it
@@ -910,7 +952,7 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 		untilBkt = until.Unix()
 	}
 	key := seriesKey{
-		sinceBkt:  since.Unix() / int64(bucketSec),
+		sinceBkt:  sinceBkt,
 		untilBkt:  untilBkt,
 		bucketSec: bucketSec,
 		exclude:   strings.Join(ex, ","),
@@ -1190,13 +1232,17 @@ func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, d
 	// Add the orphaned down->down gap downtime UptimeSince also books (a restart
 	// mid-outage leaves a dangling 'down' whose pre-restart stretch carries no
 	// duration_s), so the digest's downtime stays consistent with the uptime%
-	// beside it. The gap count is folded into the outage it re-detected, so it
-	// doesn't inflate the resolved-outage count.
-	gap, err := s.orphanGapDowntime(ctx, since, nowU)
+	// beside it. A gap whose leading outage PROVABLY recovered (a quorum recovery
+	// fell between the two downs) is a distinct resolved outage with no closing 'up'
+	// of its own, so add it to the count too - otherwise the digest under-reports
+	// versus the heatmap after a restart interruption (see DowntimeByDay, which
+	// counts that re-detection as its own outage). A gap with no recovery between is
+	// the SAME outage re-detected and is not counted.
+	gap, gapOutages, err := s.orphanGapDowntime(ctx, since, nowU)
 	if err != nil {
 		return 0, 0, err
 	}
-	return int(c.Int64), int(d.Int64) + int(gap), nil
+	return int(c.Int64) + gapOutages, int(d.Int64) + int(gap), nil
 }
 
 // TableCounts reports the row count of each data table.
@@ -1276,6 +1322,28 @@ func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time) (
 		out = append(out, sp)
 	}
 	return out, rows.Err()
+}
+
+// SpeedHistoryDescFunc streams every recorded speedtest newest-first to fn, one
+// row at a time, without materializing the whole table - so the CSV export runs
+// at O(1) memory over a full history instead of building the entire slice. fn is
+// called per row; returning an error stops the scan and propagates it.
+func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) error) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+` FROM speed ORDER BY ts DESC`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		sp, err := scanSpeed(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(sp); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 // SpeedCount returns the total number of recorded speedtests.
@@ -1548,10 +1616,16 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 	if loc == nil {
 		loc = time.Local
 	}
+	// Start the scan from the last event AT/BEFORE the window, not strictly inside
+	// it, exactly as UptimeSince/orphanGapDowntime do - otherwise an outage whose
+	// leading 'down' predates the window (an ongoing or restart-interrupted outage
+	// spanning the boundary) is invisible here and its in-window downtime is lost,
+	// disagreeing with the uptime%. A pre-window boundary event is used only to
+	// anchor proration; it is never counted as an in-window outage (guarded below).
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, type, COALESCE(duration_s, 0)
 		FROM events
-		WHERE ts >= ?
+		WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?)
 		ORDER BY ts`, since.Unix())
 	if err != nil {
 		return nil, err
@@ -1649,7 +1723,10 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 				}
 				prorate(prevDownTS, end)
 			}
-			if newOutage {
+			// Count the outage on the day it began - but only when that 'down' falls
+			// inside the window. A boundary 'down' pulled in from before `since` (to
+			// anchor proration) must not add a phantom outage dot on a pre-window day.
+			if newOutage && e.ts >= sinceU {
 				day(time.Unix(e.ts, 0).In(loc).Format("2006-01-02")).Outages++
 			}
 			prevDownTS = e.ts
@@ -1667,6 +1744,28 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 			prevDownTS = -1
 			prorate(start, start+int64(e.dur))
 		}
+	}
+	// A trailing 'down' with no closing 'up' is an outage still in progress (or one
+	// that recovered while the monitor was off). UptimeSince books its downtime to
+	// now, bounded at the first quorum recovery / last observed sample; mirror that
+	// here so the heatmap's downtime matches the uptime%. The outage's own day was
+	// already counted when the 'down' was processed, so this only credits downtime.
+	if prevDownTS >= 0 {
+		end := nowU
+		if rec, ok, err := s.firstQuorumRecovery(ctx, prevDownTS, nowU); err != nil {
+			return nil, err
+		} else if ok && rec < end {
+			end = rec // quorum recovered here; not still down
+		} else if newest, ok, err := s.newestSampleAt(ctx, nowU); err != nil {
+			return nil, err
+		} else if ok && newest < end && newest > prevDownTS {
+			// No quorum recovery in samples: either still down (newest stays ~now, a
+			// no-op) or monitoring was paused mid-outage - bound at the last observed
+			// sample so an unwatched pause isn't booked as live downtime, matching
+			// UptimeSince and the eventual 'up' event.
+			end = newest
+		}
+		prorate(prevDownTS, end)
 	}
 	// Proration can back-fill days out of order (an 'up' credits earlier days),
 	// so sort; "YYYY-MM-DD" sorts chronologically.
@@ -1995,7 +2094,8 @@ var exportTables = map[string]struct {
 // settingsExportDeny lists settings keys never included in an export - things
 // that must not leak into or be implanted from a backup file.
 var settingsExportDeny = map[string]bool{
-	"auth_hash": true, // the password hash - a restore must not implant a foreign login
+	"auth_hash":          true, // the password hash - a restore must not implant a foreign login
+	"auth_session_epoch": true, // logout revocation counter - session state, not config; a restore must not roll it back and un-revoke tokens
 	// NOTE: webhook_url and heartbeat_url are deliberately NOT denied - a backup
 	// includes them so a restore is complete. They are bearer credentials (the URL
 	// itself is the secret), so an export file must be treated as sensitive: anyone

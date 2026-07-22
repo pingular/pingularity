@@ -7,6 +7,7 @@
 package logbuf
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"strings"
@@ -20,31 +21,60 @@ type Entry struct {
 	Masked string `json:"masked"`
 }
 
-// Ring is a concurrency-safe buffer of the last `cap` log entries.
+// defaultMaxBytes bounds the ring's total in-memory footprint independent of the
+// entry count. The line cap alone bounds memory only if every line is small; a
+// burst of oversized lines (a giant Host header echoed into a warning, a stack
+// trace) could otherwise pin megabytes per line x the whole cap. This ceiling
+// evicts oldest lines until the retained bytes fit, so worst-case memory is
+// bounded whatever the line sizes are.
+const defaultMaxBytes = 8 << 20
+
+// Ring is a concurrency-safe buffer of the last `cap` log entries, additionally
+// bounded to maxBytes of retained line text.
 type Ring struct {
-	mu    sync.Mutex
-	lines []Entry
-	cap   int
+	mu       sync.Mutex
+	lines    []Entry
+	cap      int
+	maxBytes int
+	bytes    int // sum of entrySize over lines (kept in step with the slice)
 }
 
+// entrySize is one entry's contribution to the byte ceiling: both stored forms.
+func entrySize(e Entry) int { return len(e.Raw) + len(e.Masked) }
+
 // New returns a Ring holding at most capacity entries (a non-positive capacity is
-// clamped to 1).
+// clamped to 1) and at most defaultMaxBytes of retained text.
 func New(capacity int) *Ring {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Ring{cap: capacity, lines: make([]Entry, 0, capacity)}
+	return &Ring{cap: capacity, maxBytes: defaultMaxBytes, lines: make([]Entry, 0, capacity)}
 }
 
-// Append records one captured line (raw + masked) and drops the oldest once over
-// capacity.
+// Append records one captured line (raw + masked) and drops the oldest until both
+// the entry-count and total-byte ceilings are satisfied.
 func (r *Ring) Append(raw, masked string) {
+	e := Entry{Raw: raw, Masked: masked}
 	r.mu.Lock()
-	r.lines = append(r.lines, Entry{Raw: raw, Masked: masked})
-	if over := len(r.lines) - r.cap; over > 0 {
-		r.lines = append(r.lines[:0], r.lines[over:]...)
-	}
+	r.lines = append(r.lines, e)
+	r.bytes += entrySize(e)
+	r.trim()
 	r.mu.Unlock()
+}
+
+// trim evicts the oldest lines until the ring is within both ceilings, always
+// keeping at least the newest line (a single line larger than maxBytes still
+// stays - dropping it would discard the very line just recorded). Called with
+// r.mu held.
+func (r *Ring) trim() {
+	drop := 0
+	for drop < len(r.lines)-1 && (len(r.lines)-drop > r.cap || r.bytes > r.maxBytes) {
+		r.bytes -= entrySize(r.lines[drop])
+		drop++
+	}
+	if drop > 0 {
+		r.lines = append(r.lines[:0], r.lines[drop:]...)
+	}
 }
 
 // Entries returns a copy of the buffered entries, oldest first.
@@ -60,6 +90,7 @@ func (r *Ring) Entries() []Entry {
 func (r *Ring) Clear() {
 	r.mu.Lock()
 	r.lines = r.lines[:0]
+	r.bytes = 0
 	r.mu.Unlock()
 }
 
@@ -68,19 +99,34 @@ func (r *Ring) Clear() {
 // a crash mid-write can't leave a torn file. Mode 0600: the raw form holds
 // IPs/hostnames, so the file is owner-only.
 func (r *Ring) SaveFile(path string) error {
+	// Snapshot just the slice header under the lock (cheap - entries are string
+	// headers, not their bytes), then STREAM each entry to the temp file outside
+	// the lock. The old path concatenated the whole ring into one strings.Builder,
+	// transiently doubling the ring's bytes in memory; streaming holds one encoded
+	// line at a time and never blocks the logging path on file I/O.
 	r.mu.Lock()
-	var b strings.Builder
-	for _, e := range r.lines {
-		enc, err := json.Marshal(e)
-		if err != nil {
-			continue
-		}
-		b.Write(enc)
-		b.WriteByte('\n')
-	}
+	snapshot := make([]Entry, len(r.lines))
+	copy(snapshot, r.lines)
 	r.mu.Unlock()
+
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(f)
+	enc := json.NewEncoder(bw) // Encode appends its own '\n' per entry
+	for _, e := range snapshot {
+		if err := enc.Encode(e); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -109,11 +155,13 @@ func (r *Ring) LoadFile(path string) error {
 			r.lines = append(r.lines, e)
 		} else {
 			// Legacy snapshot: a bare formatted line. Keep it as-is either way.
-			r.lines = append(r.lines, Entry{Raw: ln, Masked: ln})
+			e = Entry{Raw: ln, Masked: ln}
+			r.lines = append(r.lines, e)
 		}
+		r.bytes += entrySize(e)
 	}
-	if over := len(r.lines) - r.cap; over > 0 {
-		r.lines = append(r.lines[:0], r.lines[over:]...)
-	}
+	// Enforce both ceilings on a loaded snapshot too: an oversized or tampered
+	// on-disk file must not be able to seed the ring past its memory bound.
+	r.trim()
 	return nil
 }

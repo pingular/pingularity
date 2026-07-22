@@ -8,9 +8,85 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pingular/pingularity/internal/store"
 )
+
+// capLen must cut on a UTF-8 boundary, never mid-codepoint, so a length-capped
+// value (e.g. an oversized username) stays valid UTF-8. Regression for B7.
+func TestCapLenRuneSafe(t *testing.T) {
+	// '€' is 3 bytes; a byte cap that lands inside it must drop the whole rune.
+	s := strings.Repeat("a", 127) + "€" // euro occupies bytes [127,130)
+	got := capLen(s, 128)
+	if !utf8.ValidString(got) {
+		t.Fatalf("capLen produced invalid UTF-8: %q", got)
+	}
+	if len(got) != 127 {
+		t.Fatalf("capLen len = %d, want 127 (partial rune dropped whole)", len(got))
+	}
+	// An exact-fit multi-byte string is untouched.
+	fit := strings.Repeat("é", 64) // 128 bytes
+	if got := capLen(fit, 128); got != fit {
+		t.Fatalf("capLen shortened an exact-fit string")
+	}
+}
+
+// The session-revocation epoch (bumped on logout) must persist across a restart:
+// a controller freshly built from the same store reports the advanced value, so a
+// logged-out token stays revoked instead of revalidating once the in-memory epoch
+// resets. Regression for B12c.
+func TestSessionEpochPersists(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	mk := func() *Controller {
+		c, err := New(context.Background(), st, Values{
+			Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second, DownAfter: 3, UpAfter: 2,
+		})
+		if err != nil {
+			t.Fatalf("new controller: %v", err)
+		}
+		return c
+	}
+	c1 := mk()
+	if got := c1.SessionEpoch(); got != 0 {
+		t.Fatalf("fresh epoch = %d, want 0", got)
+	}
+	if err := c1.BumpSessionEpoch(context.Background()); err != nil {
+		t.Fatalf("BumpSessionEpoch: %v", err)
+	}
+	if got := c1.SessionEpoch(); got != 1 {
+		t.Fatalf("epoch after bump = %d, want 1", got)
+	}
+	// "Restart": a new controller over the same store must load the persisted epoch.
+	if got := mk().SessionEpoch(); got != 1 {
+		t.Fatalf("epoch after restart = %d, want 1 (logout must survive a restart)", got)
+	}
+}
+
+// A username at the byte cap made of multi-byte runes must save and reload intact
+// and valid; normalize must not slice it mid-codepoint. Regression for B7.
+func TestAuthUserUnicodeBoundaryReload(t *testing.T) {
+	c := newController(t)
+	name := strings.Repeat("é", 64) // exactly 128 bytes
+	if err := c.SetAuthUser(context.Background(), name); err != nil {
+		t.Fatalf("SetAuthUser: %v", err)
+	}
+	if got := c.AuthUser(); got != name || !utf8.ValidString(got) {
+		t.Fatalf("AuthUser round-trip = %q (valid=%v), want %q", got, utf8.ValidString(c.AuthUser()), name)
+	}
+	// An over-cap username is truncated at a rune boundary, staying valid UTF-8.
+	over := strings.Repeat("é", 100) // 200 bytes
+	if err := c.SetAuthUser(context.Background(), over); err != nil {
+		t.Fatalf("SetAuthUser over-cap: %v", err)
+	}
+	if got := c.AuthUser(); !utf8.ValidString(got) || len(got) > 128 {
+		t.Fatalf("over-cap username not rune-safe: len=%d valid=%v", len(got), utf8.ValidString(got))
+	}
+}
 
 // pv builds the pointer fields Patch uses (nil = keep current).
 func pv[T any](v T) *T { return &v }

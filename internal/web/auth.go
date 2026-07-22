@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -25,6 +26,11 @@ const (
 	sessionCookie = "ping_session"
 	sessionTTL    = 30 * 24 * time.Hour
 )
+
+// maxUsernameBytes bounds a login username at the persistence boundary. Kept in
+// sync with settings' maxUser (its normalize() caps to the same value); rejecting
+// here surfaces a clear 400 rather than silently truncating.
+const maxUsernameBytes = 128
 
 // Password rate limiting: after maxLoginFails consecutive failures from one
 // IP, further attempts are refused (429) for loginBlockFor.
@@ -54,12 +60,16 @@ type failLimiter struct {
 	proxiedWarn            sync.Once // local-only on, but traffic arrives via a same-host proxy
 	rewriteWarn            sync.Once // proxy detected while no -allow-host is configured
 	containerLocalOnlyWarn sync.Once // local-only on but unenforceable inside a container
-	// epoch is bumped on logout to invalidate every outstanding session token
-	// (it is folded into the token MAC). In-process only: a restart resets it to
-	// 0, so a logged-out token would validate again after a restart - acceptable
-	// for a single-admin tool, and a password change still revokes across
-	// restarts. Guarded by mu.
-	epoch int64
+	// Rate-limiter for the DNS-rebinding Host-rejection warning: a flood of crafted
+	// Hosts would otherwise fill the log ring with a warning per request. Emit at
+	// most once per rejectWarnEvery and report how many were suppressed meanwhile.
+	rejectMu      sync.Mutex
+	rejectLast    time.Time
+	rejectDropped int
+	// The session-revocation epoch (bumped on logout, folded into token MACs) now
+	// lives in the settings store so it survives a restart - a logged-out token
+	// used to revalidate after a restart reset the old in-memory epoch to 0. See
+	// settings.Controller.SessionEpoch / BumpSessionEpoch.
 }
 
 type failState struct {
@@ -69,6 +79,26 @@ type failState struct {
 }
 
 func newFailLimiter() *failLimiter { return &failLimiter{fails: map[string]*failState{}} }
+
+// rejectWarnEvery bounds how often the Host-rejection warning is emitted.
+const rejectWarnEvery = time.Minute
+
+// rejectLog reports whether a Host-rejection warning should be emitted now (at
+// most once per rejectWarnEvery) and how many rejections were suppressed since
+// the last emitted line. This keeps a flood of rejected requests from filling the
+// log ring with one warning each.
+func (l *failLimiter) rejectLog() (emit bool, suppressed int) {
+	l.rejectMu.Lock()
+	defer l.rejectMu.Unlock()
+	if l.rejectLast.IsZero() || time.Since(l.rejectLast) >= rejectWarnEvery {
+		suppressed = l.rejectDropped
+		l.rejectDropped = 0
+		l.rejectLast = time.Now()
+		return true, suppressed
+	}
+	l.rejectDropped++
+	return false, 0
+}
 
 // blocked reports whether ip has exhausted its failure budget and is still in
 // the cool-down window.
@@ -121,20 +151,6 @@ func (l *failLimiter) releaseFail(ip string) {
 	st.last = time.Now()
 }
 
-// tokenEpoch returns the current session-token epoch (folded into token MACs).
-func (l *failLimiter) tokenEpoch() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.epoch
-}
-
-// bumpEpoch invalidates every outstanding session token (see failLimiter.epoch).
-func (l *failLimiter) bumpEpoch() {
-	l.mu.Lock()
-	l.epoch++
-	l.mu.Unlock()
-}
-
 // ok clears ip's failure streak after a successful authentication.
 func (l *failLimiter) ok(ip string) {
 	l.mu.Lock()
@@ -178,9 +194,14 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// fully exposed). A direct/local visit never carries a public FQDN in
 		// Host, so reject those unless allowed via -allow-host (reverse proxies).
 		if !hostAllowed(r.Host, s.AllowedHosts) {
-			s.log.Warn("request rejected: unrecognized Host (DNS-rebinding guard)",
-				"host", r.Host, "ip", clientIP(r), "path", r.URL.Path,
-				"hint", "a public domain needs -allow-host=<domain>")
+			// Truncate the request-derived Host/path (a header can be tens of KB) and
+			// coalesce the warning so a rejection flood can't bloat the log ring.
+			if emit, suppressed := s.logins.rejectLog(); emit {
+				s.log.Warn("request rejected: unrecognized Host (DNS-rebinding guard)",
+					"host", capForLog(r.Host), "ip", clientIP(r), "path", capForLog(r.URL.Path),
+					"suppressed_since_last", suppressed,
+					"hint", "a public domain needs -allow-host=<domain>")
+			}
 			http.Error(w, "unrecognized Host header (DNS-rebinding protection); serving Pingularity under a public domain requires -allow-host=<domain>", http.StatusForbidden)
 			return
 		}
@@ -192,7 +213,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		if len(s.AllowedHosts) == 0 && r.Header.Get("X-Forwarded-For") != "" {
 			s.logins.rewriteWarn.Do(func() {
 				s.log.Warn("reverse proxy detected (X-Forwarded-For present) but no -allow-host is set; if the proxy rewrites Host, the DNS-rebinding guard cannot vet proxied requests",
-					"peer", clientIP(r), "host", r.Host,
+					"peer", clientIP(r), "host", capForLog(r.Host),
 					"hint", "configure the proxy to preserve Host and pass -allow-host=<domain>")
 			})
 		}
@@ -218,7 +239,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				// same-host reverse proxy is forwarding a remote visitor - traffic
 				// local-only cannot block. Tell the operator once.
 				s.logins.proxiedWarn.Do(func() {
-					s.log.Warn("local-only is on, but requests are arriving through a same-host reverse proxy, which local-only cannot block", "host", r.Host)
+					s.log.Warn("local-only is on, but requests are arriving through a same-host reverse proxy, which local-only cannot block", "host", capForLog(r.Host))
 				})
 			}
 		}
@@ -241,7 +262,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				// attempt) - not every cookieless poll from a logged-out browser,
 				// which would flood the log.
 				if u, _, ok := r.BasicAuth(); ok {
-					s.log.Warn("auth failed", "user", u, "ip", clientIP(r), "path", r.URL.Path)
+					s.log.Warn("auth failed", "user", capForLog(u), "ip", clientIP(r), "path", capForLog(r.URL.Path))
 				}
 				// Offer Basic so curl/Prometheus can authenticate; browsers ignore it
 				// and the SPA shows its own login overlay on the 401.
@@ -279,7 +300,7 @@ func (s *Server) authed(r *http.Request) bool {
 	if hash == "" {
 		return false
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil && verifyToken(c.Value, s.settings.AuthUser(), hash, s.logins.tokenEpoch()) {
+	if c, err := r.Cookie(sessionCookie); err == nil && verifyToken(c.Value, s.settings.AuthUser(), hash, s.settings.SessionEpoch()) {
 		return true
 	}
 	if user, pass, ok := r.BasicAuth(); ok {
@@ -554,6 +575,21 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 		if err := decodeJSONBody(w, r, &in); err != nil {
 			return // response already written (415/400)
 		}
+		// Validate the username BEFORE persistence: reject invalid UTF-8 (which would
+		// corrupt the store and every access-status echo) and anything past the
+		// rune-safe cap. normalize() caps it too, but rejecting here gives a clear 400
+		// instead of silently storing a truncated login name the operator can't log in
+		// with. The cap mirrors settings' maxUser (kept in sync intentionally).
+		if u := strings.TrimSpace(in.Username); u != "" {
+			if !utf8.ValidString(u) {
+				http.Error(w, "username must be valid UTF-8", http.StatusBadRequest)
+				return
+			}
+			if len(u) > maxUsernameBytes {
+				http.Error(w, fmt.Sprintf("username too long: at most %d bytes", maxUsernameBytes), http.StatusBadRequest)
+				return
+			}
+		}
 		ctx := r.Context()
 		if in.Password != "" {
 			// bcrypt reads at most 72 bytes and x/crypto rejects longer input
@@ -749,7 +785,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.logins.releaseFail(key)
 		stats.Inc("web.login_fail")
-		s.log.Warn("login failed", "user", user, "ip", clientIP(r))
+		s.log.Warn("login failed", "user", capForLog(user), "ip", clientIP(r))
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
@@ -771,22 +807,40 @@ func (s *Server) secureCookie(r *http.Request) bool {
 	if len(s.AllowedHosts) == 0 {
 		return false
 	}
-	if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
-		// A multi-proxy chain sends a comma-separated list; the leftmost hop is
-		// the original client scheme.
-		if i := strings.IndexByte(xfp, ','); i >= 0 {
-			xfp = xfp[:i]
+	// X-Forwarded-Proto is a spoofable header, so honour it only when the TCP peer
+	// is a declared trusted proxy (the same set the login rate limiter keys on).
+	// From an untrusted peer it is ignored - a direct client must not be able to
+	// steer the cookie's Secure flag with a forged header - and the decision falls
+	// back to the Host below.
+	if s.peerTrusted(r) {
+		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
+			// A multi-proxy chain sends a comma-separated list; the leftmost hop is
+			// the original client scheme.
+			if i := strings.IndexByte(xfp, ','); i >= 0 {
+				xfp = xfp[:i]
+			}
+			return strings.EqualFold(strings.TrimSpace(xfp), "https")
 		}
-		return strings.EqualFold(strings.TrimSpace(xfp), "https")
 	}
 	return !hostAllowed(r.Host, nil)
+}
+
+// peerTrusted reports whether the request's real TCP peer is in the declared
+// trusted-proxy set (see SetTrustedProxies). Used to decide when a forwarded
+// header (X-Forwarded-Proto) may be believed.
+func (s *Server) peerTrusted(r *http.Request) bool {
+	ip, err := netip.ParseAddr(clientIP(r))
+	if err != nil {
+		return false
+	}
+	return s.logins.trustedPeer(ip)
 }
 
 // setSessionCookie issues a fresh session cookie for the current credentials.
 // secure marks it Secure so it never rides a plaintext request; callers pass
 // s.secureCookie(r).
 func (s *Server) setSessionCookie(w http.ResponseWriter, secure bool) {
-	tok := issueToken(s.settings.AuthUser(), s.settings.AuthHash(), s.logins.tokenEpoch(), time.Now())
+	tok := issueToken(s.settings.AuthUser(), s.settings.AuthHash(), s.settings.SessionEpoch(), time.Now())
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/", HttpOnly: true, Secure: secure,
 		SameSite: http.SameSiteStrictMode, MaxAge: int(sessionTTL.Seconds()),
@@ -815,8 +869,13 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// permanently logged out. A request with no (or a stale) cookie has nothing
 	// to revoke; it just gets the clearing cookie.
 	if c, err := r.Cookie(sessionCookie); err == nil &&
-		verifyToken(c.Value, s.settings.AuthUser(), s.settings.AuthHash(), s.logins.tokenEpoch()) {
-		s.logins.bumpEpoch()
+		verifyToken(c.Value, s.settings.AuthUser(), s.settings.AuthHash(), s.settings.SessionEpoch()) {
+		// Persisted so the revocation survives a restart (see BumpSessionEpoch). A
+		// failed persist still revokes the live process; log it - the durability
+		// guarantee is best-effort until the next successful write.
+		if err := s.settings.BumpSessionEpoch(r.Context()); err != nil {
+			s.log.Warn("persist session-revocation epoch failed; logout revoked in-process but may not survive a restart", "err", err)
+		}
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: s.secureCookie(r),

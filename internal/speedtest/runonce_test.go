@@ -69,6 +69,42 @@ func TestRunOnceCancelledDoesNotPersist(t *testing.T) {
 	}
 }
 
+// A run whose result cannot be persisted (the store is closed) must report the
+// failure and must NOT advance the breach streak / adaptive cadence or fire an
+// alert - a restart re-evaluates from durable history and would disagree with an
+// alert sent for a run no row can back.
+func TestRunOnceReportsPersistFailure(t *testing.T) {
+	stats.ResetForTest()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	tester := testerFunc(func(context.Context) (Result, error) {
+		return Result{DownloadMbps: 5, UploadMbps: 1, PingMS: 20, Server: "S", DownloadBytes: 5_000_000, UploadBytes: 1_000_000}, nil
+	})
+	s := NewScheduler(tester, st, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.ThresholdsFn = func() settings.Thresholds { return settings.Thresholds{DownMbps: 100} } // breaches
+	var alerts int
+	s.OnUnhealthy = func(store.SpeedSample, []string) { alerts++ }
+	st.Close() // now every InsertSpeed fails
+
+	_, err = s.RunOnce(context.Background(), "manual")
+	if err == nil {
+		t.Fatal("a run that could not be persisted must return an error")
+	}
+	if alerts != 0 {
+		t.Fatalf("must not alert on a run that was never stored, got %d alerts", alerts)
+	}
+	if s.lastUnhealthy.Load() || s.consecBreach != 0 {
+		t.Fatalf("must not advance breach/adaptive state on a persist failure: unhealthy=%v consec=%d",
+			s.lastUnhealthy.Load(), s.consecBreach)
+	}
+	// The persist failure must not masquerade as a measurement failure.
+	if got := stats.Lifetime().Counters["speed.fail"]; got != 0 {
+		t.Errorf("persist failure must not count as speed.fail, got %d", got)
+	}
+}
+
 // With a consecutive-breach streak of N, a breach must NOT alert until it has
 // persisted for N runs, and a recovered run resets the counter.
 func TestRunOnceDebouncesAlerts(t *testing.T) {

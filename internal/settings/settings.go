@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pingular/pingularity/internal/secret"
 	"github.com/pingular/pingularity/internal/store"
@@ -69,6 +71,7 @@ const (
 	keyAuthEnabled     = "auth_enabled"         // require a login
 	keyAuthUser        = "auth_user"            // login username (default "admin")
 	keyAuthHash        = "auth_hash"            // bcrypt hash of the password ("" = unset)
+	keyAuthSessEpoch   = "auth_session_epoch"   // logout revocation epoch (folded into token MACs; persisted so logout survives a restart)
 	keyUpdateCheck     = "update_check_enabled" // daily background poll for a newer release
 	keyLogLevel        = "log_level"            // logging: "off" (nothing) or any other value = on (full debug). UI sends debug|off
 	keyLogRedactPII    = "log_redact_pii"       // censor PII values (IPs/ISP/hostnames/user) in logs
@@ -354,6 +357,13 @@ type Controller struct {
 	// Reload clears it. Guarded by wmu (set once in New before any concurrency,
 	// read/cleared under the writer lock).
 	initErr bool
+	// sessionEpoch is the persisted session-revocation epoch, folded into every
+	// session-token MAC. Kept in an atomic (not Values) so it's cheap to read on
+	// every authenticated request and never flows through the export/normalize path.
+	// Seeded from the store at load; BumpSessionEpoch advances it AND persists it, so
+	// a logout stays revoked across a restart (an in-memory-only epoch reset to 0 on
+	// restart, letting a logged-out token revalidate).
+	sessionEpoch atomic.Int64
 }
 
 // ErrSettingsUnavailable is returned by settings writes when the initial load
@@ -535,6 +545,7 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	}
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
+	c.seedSessionEpoch(m)
 	c.vals = normalize(overlay(def, m))
 	// Passwords saved before encryption existed are still in the clear on disk: seal
 	// them now, so enabling this doesn't quietly leave the old ones exposed forever.
@@ -764,6 +775,7 @@ func (c *Controller) Reload(ctx context.Context) error {
 	}
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
+	c.seedSessionEpoch(m)
 	v := normalize(overlay(c.defaults, m))
 	// Apply the loaded config to the live process FIRST, before the legacy
 	// re-seal write. Otherwise a transient write failure would discard a
@@ -1149,6 +1161,19 @@ func setIf[T any](dst *T, src *T) {
 // have no Patch field, so a stale form submit can't silently revert a
 // concurrent password change or power toggle.
 func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
+	// Incoming iperf3 passwords are always plaintext (the API is write-only and
+	// never echoes the secret back), so one beginning with the reserved seal prefix
+	// is a real password that Seal would mistake for ciphertext and pass through in
+	// the clear - then fail to Unseal at test time, silently breaking auth. Reject
+	// it up front so the operator learns to pick another password, rather than
+	// having it silently blanked deeper in sanitizeIperfServers.
+	if p.IperfServers != nil {
+		for _, t := range p.IperfServers {
+			if secret.Sealed(strings.TrimSpace(t.Password)) {
+				return Values{}, fmt.Errorf("iperf3 password may not begin with the reserved %q prefix; choose a different password", secret.Prefix)
+			}
+		}
+	}
 	var out Values
 	err := c.mutate(ctx, func(cur *Values) map[string]string {
 		v := *cur
@@ -1303,6 +1328,9 @@ func (c *Controller) SetAuthEnabled(ctx context.Context, on bool) error {
 // SetAuthPassword stores the username and bcrypt hash and enables auth in one
 // step (setting a password is the act of turning auth on).
 func (c *Controller) SetAuthPassword(ctx context.Context, user, hash string) error {
+	// Cap the username rune-safely at the persistence boundary (this setter bypasses
+	// normalize), so an oversized login name can't be stored mid-codepoint.
+	user = capLen(strings.TrimSpace(user), maxUser)
 	if user == "" {
 		user = "admin"
 	}
@@ -1315,6 +1343,9 @@ func (c *Controller) SetAuthPassword(ctx context.Context, user, hash string) err
 // SetAuthUser updates just the login username; the password hash is independent
 // (bcrypt covers only the password), so it's unaffected.
 func (c *Controller) SetAuthUser(ctx context.Context, user string) error {
+	// Cap rune-safely at the persistence boundary (bypasses normalize; see
+	// SetAuthPassword).
+	user = capLen(strings.TrimSpace(user), maxUser)
 	if user == "" {
 		user = "admin"
 	}
@@ -1322,6 +1353,32 @@ func (c *Controller) SetAuthUser(ctx context.Context, user string) error {
 		v.AuthUser = user
 		return map[string]string{keyAuthUser: user}
 	})
+}
+
+// seedSessionEpoch loads the persisted session-revocation epoch into the atomic
+// (0 when absent or unparseable). Called under the writer lock at load/reload.
+func (c *Controller) seedSessionEpoch(m map[string]string) {
+	var n int64
+	if v, ok := m[keyAuthSessEpoch]; ok {
+		n, _ = strconv.ParseInt(v, 10, 64)
+	}
+	c.sessionEpoch.Store(n)
+}
+
+// SessionEpoch returns the current session-revocation epoch, folded into every
+// session-token MAC (see BumpSessionEpoch).
+func (c *Controller) SessionEpoch() int64 { return c.sessionEpoch.Load() }
+
+// BumpSessionEpoch advances the session-revocation epoch and persists it, so a
+// logout invalidates every outstanding token AND the revocation survives a
+// restart (an in-memory-only epoch reset to 0, letting a logged-out token
+// revalidate). The in-memory value advances first so the live process revokes
+// immediately even if the persist write fails; a failed write is returned so the
+// caller can log it (the durability guarantee is then best-effort until the next
+// successful write).
+func (c *Controller) BumpSessionEpoch(ctx context.Context) error {
+	n := c.sessionEpoch.Add(1)
+	return c.store.SetSetting(ctx, keyAuthSessEpoch, strconv.FormatInt(n, 10))
 }
 
 // ClearAuth disables auth and wipes the stored password (the lockout-recovery
@@ -1574,10 +1631,7 @@ func sanitizeIperfServers(ts []IperfTarget) []IperfTarget {
 		if len(addr) > maxAddr {
 			addr = addr[:maxAddr]
 		}
-		label := strings.TrimSpace(t.Label)
-		if len(label) > maxLabel {
-			label = label[:maxLabel]
-		}
+		label := capLen(strings.TrimSpace(t.Label), maxLabel) // rune-safe: labels are free-form text
 		bind := strings.TrimSpace(t.Bind)
 		if strings.HasPrefix(bind, "-") || strings.ContainsAny(bind, " \t\r\n") {
 			bind = "" // can't be a real source address
@@ -1589,11 +1643,8 @@ func sanitizeIperfServers(ts []IperfTarget) []IperfTarget {
 		if ipver != "4" && ipver != "6" {
 			ipver = "auto"
 		}
-		user := strings.TrimSpace(t.Username)
-		if len(user) > maxUser {
-			user = user[:maxUser]
-		}
-		key := strings.TrimSpace(t.RSAKey) // outer whitespace; PEM newlines kept
+		user := capLen(strings.TrimSpace(t.Username), maxUser) // rune-safe (see capLen)
+		key := strings.TrimSpace(t.RSAKey)                     // outer whitespace; PEM newlines kept
 		if len(key) > maxKey {
 			key = key[:maxKey]
 		}
@@ -1728,12 +1779,18 @@ const (
 	maxUser       = 128  // login username
 )
 
-// capLen truncates s to at most n bytes.
+// capLen truncates s to at most n bytes, backing the cut off to a UTF-8 boundary
+// so a multi-byte rune is never split (a mid-codepoint slice would corrupt the
+// stored value and could even truncate to invalid UTF-8 that JSON/SQLite then
+// mangle). The result is therefore <= n bytes and always valid UTF-8 if s was.
 func capLen(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // clampF bounds a float to [lo, hi]. Callers pass sanitizeThresh'd values, so the

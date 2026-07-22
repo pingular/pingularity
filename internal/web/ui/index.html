@@ -191,8 +191,11 @@
   /* First-run coachmark: a one-time non-blocking frosted card under the power +
      settings buttons. No pointer arrows - the association is carried by the
      colour-coded pulses on the buttons themselves and the matching keyword
-     colours in the copy. */
-  .coach{position:absolute;top:calc(100% + 8px);right:16px;z-index:60;width:min(320px,calc(100vw - 32px));
+     colours in the copy. Rendered as a ROOT-LEVEL fixed overlay (appended to
+     <body>, top set from the header's bottom in JS) with an intentionally high
+     z-index, so it can't be trapped behind page content by the sticky header's
+     stacking context - which hid it at narrow widths (~390px). */
+  .coach{position:fixed;right:16px;z-index:150;width:min(320px,calc(100vw - 32px));
     background:color-mix(in srgb,var(--panel) 82%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
     border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line2));border-radius:12px;
     padding:14px 16px 12px;box-shadow:0 10px 30px rgba(0,0,0,.4);color:var(--fg);font-size:13px;line-height:1.45;}
@@ -1705,7 +1708,7 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
               <span class="lbl">Username
                 <span class="info" tabindex="0" data-tip="The login username (default 'admin').
 • Used for HTTP Basic too.">i</span></span>
-              <input type="text" id="authUser" autocomplete="username" placeholder="admin">
+              <input type="text" id="authUser" autocomplete="username" placeholder="admin" maxlength="128">
             </div>
             <div class="afield">
               <span class="lbl">Password <span class="muted" id="pwState" style="font-weight:400"></span>
@@ -1901,7 +1904,7 @@ Applies live and persists.">i</span></span>
   <form class="login-box" id="loginForm">
     <h2>Pingularity</h2>
     <p class="muted">Sign in to continue</p>
-    <input type="text" id="loginUser" autocomplete="username" placeholder="Username" value="admin">
+    <input type="text" id="loginUser" autocomplete="username" placeholder="Username" value="admin" maxlength="128">
     <input type="password" id="loginPass" autocomplete="current-password" placeholder="Password" autofocus>
     <button class="btn" type="submit">Sign in</button>
     <span class="login-err" id="loginErr" role="alert"></span>
@@ -2989,7 +2992,13 @@ $('gearBtn').addEventListener('click', () => {
 // first click/tap anywhere (the popup included) puts it away, as does opening
 // Settings (openDrawer calls dismissCoach). Copy is static, so no esc().
 let coachInstallId='';
+function repositionCoach(){ const c=$('coachmark'); if(!c) return;
+  // Anchor just below the header bar, wherever it sits at this width (the header
+  // height changes when the toolbar wraps on narrow/mobile viewports).
+  const hdr=document.querySelector('header');
+  c.style.top=((hdr?hdr.getBoundingClientRect().bottom:52)+8)+'px'; }
 function dismissCoach(){ const c=$('coachmark'); if(c) c.remove();
+  window.removeEventListener('resize', repositionCoach);
   $('powerBtn').classList.remove('coach-pulse-pwr'); $('gearBtn').classList.remove('coach-pulse-set');
   if(coachInstallId) lsSet('coachSeen:'+coachInstallId,'1'); }
 function showCoach(){
@@ -3001,7 +3010,12 @@ function showCoach(){
   c.innerHTML=
     '<div class="coach-row"><p><b class="k-pwr">Power</b> to pause all monitoring.</p></div>'
     +'<div class="coach-row"><p><b class="k-set">Settings</b> to configure speed tests, intervals, latency, alert, themes, and more.</p></div>';
-  (document.querySelector('.bar')||document.querySelector('header')).appendChild(c);
+  // Append at the document root, not inside the sticky header: as a child of the
+  // header (a z-index stacking context) the card was clipped behind page content
+  // at narrow widths despite its z-index. A body-level fixed overlay escapes that.
+  document.body.appendChild(c);
+  repositionCoach();
+  window.addEventListener('resize', repositionCoach);
   // Any first interaction dismisses it. Capture phase so a click a handler
   // swallows (the power button, a chart) still counts; dismissCoach is
   // idempotent if Settings already dismissed it.

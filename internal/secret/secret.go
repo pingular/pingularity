@@ -32,6 +32,11 @@ import (
 // through, and the caller re-seals it on the next save.
 const prefix = "enc:v1:"
 
+// Prefix is the reserved tag that marks a sealed value. It is exported so callers
+// validating user-supplied secrets can reject a plaintext that begins with it (a
+// collision Seal cannot distinguish from real ciphertext - see Seal's known limit).
+const Prefix = prefix
+
 // keyName is the key file, kept next to the DB so the two travel together for a
 // normal restore but not for a stray copy of the DB alone.
 const keyName = "pingularity.key"

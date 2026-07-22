@@ -55,6 +55,13 @@ func NewClient() *http.Client {
 	dialer.Control = dialGuard
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = dialer.DialContext
+	// Drop the inherited ProxyFromEnvironment: an HTTP(S)_PROXY in the daemon's
+	// environment would route the POST through a CONNECT/absolute-URI to the proxy,
+	// so the connection dialGuard actually inspects is the proxy's address - not the
+	// webhook's resolved IP. That lets an attacker-influenced webhook host reach a
+	// link-local/metadata target the guard is meant to block. No proxy => dialGuard
+	// vets the real destination every dial.
+	tr.Proxy = nil
 	return &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: tr,
@@ -74,6 +81,11 @@ func NewHeartbeatClient() *http.Client {
 	dialer.Control = dialGuard
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = dialer.DialContext
+	// No env proxy: a proxied request would be dialed to the proxy's address, so
+	// dialGuard would vet the proxy instead of the heartbeat's real destination -
+	// letting a crafted host slip a link-local/metadata target past the guard (see
+	// NewClient). ssrfBlocked still covers redirect hops.
+	tr.Proxy = nil
 	return &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: tr,

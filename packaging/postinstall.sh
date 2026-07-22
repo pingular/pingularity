@@ -1,6 +1,23 @@
 #!/bin/sh
 set -e
 
+# Dedicated unprivileged service account (the unit runs as User=pingularity with
+# only an ambient CAP_NET_RAW). Idempotent - a reinstall/upgrade must not fail if
+# it already exists. Created even when systemd is absent so the account is present
+# for any manual run.
+if ! getent passwd pingularity >/dev/null 2>&1; then
+	useradd --system --no-create-home --home-dir /var/lib/pingularity \
+		--shell /usr/sbin/nologin pingularity >/dev/null 2>&1 \
+		|| useradd --system --no-create-home pingularity >/dev/null 2>&1 \
+		|| true
+fi
+# On upgrade from an older (root-run) install, the existing data dir and DB are
+# owned by root and 0600, so the unprivileged service could not read them. Hand
+# them to the service account. systemd's StateDirectory owns a fresh install.
+if [ -d /var/lib/pingularity ] && getent passwd pingularity >/dev/null 2>&1; then
+	chown -R pingularity:pingularity /var/lib/pingularity >/dev/null 2>&1 || true
+fi
+
 # Skip gracefully when systemd is unavailable (e.g. container image builds).
 if ! command -v systemctl >/dev/null 2>&1; then
 	exit 0

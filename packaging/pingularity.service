@@ -9,11 +9,35 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-# Runs as root: the raw-socket traceroute needs CAP_NET_RAW.
-# De-rooting/sandboxing (User=, ProtectSystem, ...) is deferred - do not add it
-# here or the raw-socket path breaks.
+# Runs as a dedicated unprivileged account (created by the package postinstall),
+# NOT root. The raw-socket traceroute needs CAP_NET_RAW, so grant JUST that one
+# capability ambiently - which, unlike a plain --cap-add, an unprivileged process
+# actually keeps effective - and bound the set to it. NoNewPrivileges then forbids
+# regaining anything more. This is the de-rooting the old comment deferred, done
+# without losing the raw-socket path.
+User=pingularity
+Group=pingularity
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=true
+# systemd creates/owns /var/lib/pingularity as the service user (0700). The DB path
+# is normally chosen from the effective uid (root -> /var/lib/pingularity); running
+# unprivileged it would fall back elsewhere, so pin it explicitly onto the state dir
+# (the pingularity.key lives beside it, so this pins both).
+StateDirectory=pingularity
+StateDirectoryMode=0700
+# Defence-in-depth sandboxing that does not interfere with a network monitor:
+# read-only system tree (state dir stays writable), no access to home dirs, a
+# private /tmp, and a few kernel/privilege restrictions.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 EnvironmentFile=-/etc/default/pingularity
-ExecStart=/usr/bin/pingularity run $PINGULARITY_OPTS
+ExecStart=/usr/bin/pingularity run -db /var/lib/pingularity/pingularity.db $PINGULARITY_OPTS
 # SIGHUP reloads settings live (e.g. after `pingularity reset-auth`), matching
 # the ReloadSignal the self-install unit gets - so `systemctl reload` works here too.
 ExecReload=/bin/kill -HUP $MAINPID

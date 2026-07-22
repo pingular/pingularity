@@ -5,9 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/pingular/pingularity/internal/osperm"
 	"github.com/pingular/pingularity/internal/stats"
 )
 
@@ -114,6 +116,33 @@ func TestSecuringSkippable(t *testing.T) {
 	}
 	if securingSkippable(errors.New("input/output error")) {
 		t.Error("securingSkippable(I/O error) = true, want false (a real fault must still fail)")
+	}
+}
+
+// B12a: securing a world-readable DB must actually tighten it (and the verify
+// step must then confirm it is no longer group/world accessible). A skippable
+// securing error that LEFT the file exposed must be fatal, not silently ignored.
+func TestSecureDBFileTightensAndVerifies(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("owner-only is a DACL on Windows, not Unix mode bits")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ping.db")
+	if err := os.WriteFile(path, []byte("x"), 0o666); err != nil { // world-readable
+		t.Fatal(err)
+	}
+	if exposed, known := osperm.GroupOrWorldAccessible(path); !known || !exposed {
+		t.Fatalf("setup: fresh 0666 file should read as exposed (known=%v exposed=%v)", known, exposed)
+	}
+	if err := secureDBFile(path); err != nil {
+		t.Fatalf("secureDBFile on a chmod-able file: %v", err)
+	}
+	if exposed, known := osperm.GroupOrWorldAccessible(path); !known || exposed {
+		t.Fatalf("after secureDBFile the DB is still exposed (known=%v exposed=%v)", known, exposed)
+	}
+	// A missing sidecar reads as unknown, so securing it is a clean no-op.
+	if err := secureDBFile(path + "-wal"); err != nil {
+		t.Fatalf("securing a missing sidecar should be a no-op, got %v", err)
 	}
 }
 
@@ -323,6 +352,154 @@ func TestDowntimeByDayCountsRecoveredOrphanSeparately(t *testing.T) {
 	}
 	if totalOut != 2 {
 		t.Fatalf("a recovered-while-off orphan is a distinct outage: got %d outages, want 2", totalOut)
+	}
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// sumDowntimeDays totals the per-day downtime and outage counts.
+func sumDowntimeDays(rows []DowntimeDay) (downS, outages int) {
+	for _, r := range rows {
+		downS += r.DowntimeS
+		outages += r.Outages
+	}
+	return
+}
+
+// impliedDowntime is the downtime (seconds) UptimeSince attributes over a window.
+func impliedDowntime(t *testing.T, st *Store, since time.Time, windowS float64) int {
+	t.Helper()
+	up, err := st.UptimeSince(context.Background(), since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int(((1 - up) * windowS) + 0.5)
+}
+
+// B4: an ACTIVE outage (a trailing 'down' with no closing 'up', still writing
+// failed samples) must be booked by DowntimeByDay to the last observed sample,
+// matching UptimeSince. Before the fix DowntimeByDay ignored the trailing 'down'
+// entirely and reported zero downtime for an ongoing outage.
+func TestDowntimeByDayActiveOutageMatchesUptime(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	sampleAt(t, st, now, 1000, "cf", "ipv4", true) // window anchor
+	eventAt(t, st, now, 500, "down", -1)           // outage begins, never closed
+	for _, ago := range []int{480, 300, 100, 2} {  // failed samples up to ~now (still down)
+		sampleAt(t, st, now, ago, "cf", "ipv4", false)
+	}
+	rows, err := st.DowntimeByDay(ctx, now.Add(-1000*time.Second), time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, out := sumDowntimeDays(rows)
+	implied := impliedDowntime(t, st, now.Add(-1000*time.Second), 1000)
+	if abs(down-implied) > 3 {
+		t.Fatalf("DowntimeByDay active-outage downtime = %ds, want ~%ds (UptimeSince)", down, implied)
+	}
+	if out != 1 {
+		t.Fatalf("active outage should count as 1 outage, got %d", out)
+	}
+}
+
+// B4: an outage whose leading 'down' predates the window (a boundary-spanning
+// restart interruption) must still contribute its in-window downtime. Fetching
+// only events strictly inside the window missed the leading 'down', so the
+// orphan-gap stretch went unbooked and DowntimeByDay disagreed with UptimeSince.
+func TestDowntimeByDayBoundarySpanningOutageMatchesUptime(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	sampleAt(t, st, now, 2000, "cf", "ipv4", true) // monitoring anchor (pre-window)
+	eventAt(t, st, now, 1000, "down", -1)          // D1: BEFORE the window
+	eventAt(t, st, now, 500, "down", -1)           // D2: in window, restart re-detect (no recovery between)
+	eventAt(t, st, now, 300, "up", 200)            // closes: [now-500, now-300]
+
+	since := now.Add(-800 * time.Second) // window starts AFTER D1
+	rows, err := st.DowntimeByDay(ctx, since, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, _ := sumDowntimeDays(rows)
+	implied := impliedDowntime(t, st, since, 800)
+	// In-window downtime = orphan gap [since, D2]=300s + closed [D2, up]=200s = 500s.
+	if abs(down-implied) > 3 || abs(down-500) > 3 {
+		t.Fatalf("boundary-spanning downtime = %ds, want ~500s and == UptimeSince ~%ds", down, implied)
+	}
+}
+
+// B4: a monitoring pause mid-outage (failed samples then silence, no closing
+// 'up') must bound the active outage at the last observed sample in DowntimeByDay
+// too, so an unwatched pause is not booked as live downtime - matching
+// TestUptimePausedMidOutageNotCounted's UptimeSince behaviour.
+func TestDowntimeByDayPausedMidOutageMatchesUptime(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	sampleAt(t, st, now, 1000, "cf", "ipv4", true)
+	eventAt(t, st, now, 600, "down", -1)
+	sampleAt(t, st, now, 580, "cf", "ipv4", false)
+	sampleAt(t, st, now, 560, "cf", "ipv4", false) // last observation before the pause
+	rows, err := st.DowntimeByDay(ctx, now.Add(-1000*time.Second), time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, out := sumDowntimeDays(rows)
+	implied := impliedDowntime(t, st, now.Add(-1000*time.Second), 1000)
+	// Only [now-600, now-560] = 40s, not the whole [now-600, now].
+	if abs(down-40) > 3 || abs(down-implied) > 3 {
+		t.Fatalf("paused-mid-outage downtime = %ds, want ~40s and == UptimeSince ~%ds", down, implied)
+	}
+	if out != 1 {
+		t.Fatalf("paused outage should count as 1 outage, got %d", out)
+	}
+}
+
+// B5 reconciliation fixture: after a restart interruption where the leading
+// outage recovered while the monitor was off (a quorum recovery falls between the
+// two 'down' events), the digest's resolved-outage COUNT must match the heatmap's
+// - both count TWO distinct outages, even though only the second carries a closing
+// 'up' event. Before the fix ResolvedOutagesSince counted only the 'up' (one).
+func TestDigestOutageCountMatchesHeatmapAfterRestart(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	sampleAt(t, st, now, 10000, "cf", "ipv4", true) // anchor
+	eventAt(t, st, now, 5000, "down", -1)           // outage 1: recovered while the monitor was off
+	sampleAt(t, st, now, 4800, "a", "ipv4", true)   // quorum recovery (2 of 3 up)
+	sampleAt(t, st, now, 4800, "b", "ipv4", true)
+	sampleAt(t, st, now, 4800, "c", "ipv4", false)
+	eventAt(t, st, now, 1000, "down", -1) // outage 2: separate, closed by an 'up'
+	eventAt(t, st, now, 800, "up", 200)
+
+	since := now.Add(-10000 * time.Second)
+	c, dgDown, err := st.ResolvedOutagesSince(ctx, since.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.DowntimeByDay(ctx, since, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hmDown, hmOut := sumDowntimeDays(rows)
+	if c != 2 {
+		t.Fatalf("digest resolved-outage count = %d, want 2 (recovered orphan is a distinct outage)", c)
+	}
+	if hmOut != 2 {
+		t.Fatalf("heatmap outage count = %d, want 2", hmOut)
+	}
+	if c != hmOut {
+		t.Fatalf("digest count %d disagrees with heatmap count %d after a restart interruption", c, hmOut)
+	}
+	// Downtime agrees too: [now-5000, now-4800]=200s + [now-1000, now-800]=200s = 400s.
+	if abs(dgDown-400) > 3 || abs(hmDown-400) > 3 || abs(dgDown-hmDown) > 3 {
+		t.Fatalf("downtime disagrees: digest=%ds heatmap=%ds, want ~400s each", dgDown, hmDown)
 	}
 }
 

@@ -19,9 +19,26 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # The trigger glob 'v*' also matches junk like 'v', 'vtest', or 'v1.2' - a
+      # stray or malformed tag must not cut a release. Refuse anything that is not
+      # an exact vMAJOR.MINOR.PATCH SemVer (optional -prerelease / +build), before
+      # any checkout or token use.
+      - name: Guard exact SemVer tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! printf '%s' "$tag" | grep -Eq "$semver"; then
+            echo "::error::tag '$tag' is not an exact vMAJOR.MINOR.PATCH SemVer tag; refusing to release"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # full history so goreleaser can build the changelog
+          # Don't leave the default GITHUB_TOKEN persisted in .git/config: goreleaser
+          # uses its own scoped tokens below, so nothing here needs the credential,
+          # and a persisted one is a needless secret at rest in the workspace.
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
@@ -53,6 +70,10 @@ jobs:
           # Creates the GitHub Release and pushes the GHCR image.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Publishing the Homebrew tap and winget manifests writes to OTHER
-          # repos, which GITHUB_TOKEN cannot reach. Provide a PAT with access
-          # to the tap/winget repos; goreleaser reads it as its release token.
+          # repos, which GITHUB_TOKEN cannot reach. Provide a token for that, and
+          # keep it least-privilege: a FINE-GRAINED PAT scoped to ONLY the tap and
+          # winget repos, "Contents: read and write" and nothing else, with the
+          # SHORTEST practical expiry (rotate on expiry). A classic/broadly-scoped
+          # PAT here would let a compromised release step write to every repo the
+          # owner can reach. goreleaser reads it as its release token.
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

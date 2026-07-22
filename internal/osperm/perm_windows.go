@@ -24,6 +24,11 @@ const ownerOnlySDDLFmt = "D:PAI(A;;FA;;;%s)(A;;FA;;;SY)(A;;FA;;;BA)"
 // SecureFile applies the owner-only DACL to a single file.
 func SecureFile(path string) error { return secure(path) }
 
+// GroupOrWorldAccessible can't be judged from Unix mode bits on Windows: access
+// is governed by the DACL SecureFile sets, not by the synthetic perms os.Stat
+// reports. Report "unknown" so the caller's verify step is a no-op here.
+func GroupOrWorldAccessible(path string) (accessible, known bool) { return false, false }
+
 // SecureDir applies the owner-only DACL to a directory. New children inherit
 // nothing (inheritance is off), so each secured file also sets its own DACL.
 func SecureDir(path string) error { return secure(path) }

@@ -175,7 +175,7 @@ func TestAccessStatusHidesDetailsWhenUnauthenticated(t *testing.T) {
 	r = httptest.NewRequest("GET", "/api/access", nil)
 	r.Host = "127.0.0.1:9000"
 	r.AddCookie(&http.Cookie{Name: sessionCookie,
-		Value: issueToken("admin", s.settings.AuthHash(), s.logins.tokenEpoch(), time.Now())})
+		Value: issueToken("admin", s.settings.AuthHash(), s.settings.SessionEpoch(), time.Now())})
 	out = s.accessStatus(r)
 	if out["authed"] != true {
 		t.Fatalf("session cookie not accepted: %v", out)
@@ -536,12 +536,19 @@ func TestSecureCookiePerRequest(t *testing.T) {
 	s := newTestServer(t)
 	setPassword(t, s, "admin", "secret")
 	s.AllowedHosts = []string{"ping.example.com"}
+	// The reverse proxy sits on loopback; declare it trusted so its forwarded
+	// scheme is believed. A peer outside this set is untrusted (see below).
+	const trustedPeer = "127.0.0.1:5555"
+	if err := s.SetTrustedProxies([]string{"127.0.0.1/32"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
 
-	login := func(host, xfp string) *http.Cookie {
+	login := func(peer, host, xfp string) *http.Cookie {
 		t.Helper()
 		r := httptest.NewRequest("POST", "/api/auth/login",
 			strings.NewReader(`{"username":"admin","password":"secret"}`))
 		r.Header.Set("Content-Type", "application/json")
+		r.RemoteAddr = peer
 		r.Host = host
 		if xfp != "" {
 			r.Header.Set("X-Forwarded-Proto", xfp)
@@ -560,7 +567,7 @@ func TestSecureCookiePerRequest(t *testing.T) {
 		return nil
 	}
 
-	if c := login("ping.example.com", ""); !c.Secure {
+	if c := login(trustedPeer, "ping.example.com", ""); !c.Secure {
 		t.Error("public-domain login must set a Secure cookie")
 	} else {
 		// The rest of the hardening flags are fixed regardless of scheme.
@@ -577,21 +584,28 @@ func TestSecureCookiePerRequest(t *testing.T) {
 			t.Errorf("session cookie MaxAge = %d, want %d", c.MaxAge, int(sessionTTL.Seconds()))
 		}
 	}
-	if c := login("192.168.1.5:9000", ""); c.Secure {
+	if c := login(trustedPeer, "192.168.1.5:9000", ""); c.Secure {
 		t.Error("LAN-IP login must not set a Secure cookie (browsers drop it over http)")
 	}
-	// Proxy that rewrote Host to a loopback literal but set X-Forwarded-Proto:
-	// the request is really HTTPS, so the cookie must be Secure (regression).
-	if c := login("127.0.0.1:9000", "https"); !c.Secure {
-		t.Error("proxied https (X-Forwarded-Proto) must set a Secure cookie despite a rewritten Host")
+	// Trusted proxy that rewrote Host to a loopback literal but set
+	// X-Forwarded-Proto: the request is really HTTPS, so the cookie must be Secure.
+	if c := login(trustedPeer, "127.0.0.1:9000", "https"); !c.Secure {
+		t.Error("proxied https (X-Forwarded-Proto) from a trusted proxy must set a Secure cookie despite a rewritten Host")
 	}
 	// Genuine LAN access reporting http must stay non-Secure so login works.
-	if c := login("192.168.1.5:9000", "http"); c.Secure {
+	if c := login(trustedPeer, "192.168.1.5:9000", "http"); c.Secure {
 		t.Error("plain-http LAN access must not set a Secure cookie")
 	}
 	// A multi-proxy chain sends a list; the leftmost (client) scheme decides.
-	if c := login("127.0.0.1:9000", "https, https"); !c.Secure {
+	if c := login(trustedPeer, "127.0.0.1:9000", "https, https"); !c.Secure {
 		t.Error("multi-hop https X-Forwarded-Proto must set a Secure cookie")
+	}
+	// B10: X-Forwarded-Proto from an UNTRUSTED peer must be ignored - a direct
+	// client must not be able to force a Secure cookie with a forged header. With
+	// the Host rewritten to loopback and no trusted proxy vouching, the cookie
+	// falls back to the Host decision (non-Secure).
+	if c := login("203.0.113.7:44321", "127.0.0.1:9000", "https"); c.Secure {
+		t.Error("X-Forwarded-Proto from an untrusted peer must not set a Secure cookie")
 	}
 }
 
@@ -656,7 +670,7 @@ func TestHandlerEnforcesAuth(t *testing.T) {
 	r = httptest.NewRequest("GET", "/api/settings", nil)
 	r.Host = "127.0.0.1:9000"
 	r.AddCookie(&http.Cookie{Name: sessionCookie,
-		Value: issueToken("admin", s.settings.AuthHash(), s.logins.tokenEpoch(), time.Now())})
+		Value: issueToken("admin", s.settings.AuthHash(), s.settings.SessionEpoch(), time.Now())})
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -885,7 +899,7 @@ func doSession(t *testing.T, s *Server, h http.Handler, method, path, body strin
 	}
 	r.Host = "127.0.0.1:9000"
 	r.AddCookie(&http.Cookie{Name: sessionCookie,
-		Value: issueToken(s.settings.AuthUser(), s.settings.AuthHash(), s.logins.tokenEpoch(), time.Now())})
+		Value: issueToken(s.settings.AuthUser(), s.settings.AuthHash(), s.settings.SessionEpoch(), time.Now())})
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w

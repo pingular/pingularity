@@ -334,7 +334,13 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		return sp, err
 	}
 	if err := s.store.InsertSpeed(ctx, sp); err != nil {
+		// The result is not durable. Do NOT advance the breach streak, the adaptive
+		// cadence (lastUnhealthy), or fire an alert on a run that was never recorded -
+		// a restart would then re-evaluate from persisted history and disagree with an
+		// alert already sent, or pin the fast cadence off a run no one can see. Report
+		// the persistence failure so the caller (a manual run) learns it didn't store.
 		s.log.Error("speedtest store", "err", err)
+		return sp, fmt.Errorf("speedtest: persist result: %w", err)
 	}
 	// Debounced alerting: fire only once a breach has persisted for the configured
 	// number of consecutive runs, so a single blip doesn't page. The counter only
