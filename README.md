@@ -423,9 +423,12 @@ and persist across restarts:
   server plus the two fastest by ping *near it* - the search is centred on the
   server you picked, not on your exit, so the round stays in the area you asked
   for (with nothing pinned, they come from the auto location instead). It keeps
-  only the fastest result - handy when one server has a bad day and you'd rather
-  it didn't define your history. The best result is the highest download + upload, breaking ties on
-  ping, then jitter, then bufferbloat; the other two runs are discarded (their
+  only the best result - handy when one server has a bad day and you'd rather
+  it didn't define your history. The best result is the highest *score*:
+  download + upload discounted by ping (roughly 1% of throughput per
+  millisecond, topping out at 20ms), so a near-tie on speed goes to the
+  lower-ping server while a clearly faster one still wins. Ties break on ping, then jitter, then
+  bufferbloat; the other two runs are discarded (their
   data volume is still counted, since it was really spent). Each server gets 90
   seconds before it is dropped and the next is tried, so a stalled server can't
   hold up the round; a whole round is capped at 7 minutes. It costs roughly **3x

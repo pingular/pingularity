@@ -14,21 +14,124 @@ func res(name string, down, up, ping float64) Result {
 }
 
 func TestBestResultRanksOnTotalThroughput(t *testing.T) {
-	// Middle entry wins on down+up even though another has the best download
-	// alone - the user's rule is the SUM, not either direction.
+	// At equal ping, the middle entry wins on down+up even though another has
+	// the best download alone - the throughput half of the score is the SUM,
+	// not either direction.
 	rs := []Result{
 		res("a", 900, 10, 5),  // 910
-		res("b", 500, 500, 9), // 1000
-		res("c", 950, 20, 4),  // 970
+		res("b", 500, 500, 5), // 1000
+		res("c", 950, 20, 5),  // 970
 	}
 	if got := bestResult(rs).Server; got != "b" {
 		t.Fatalf("got %q want b (highest down+up)", got)
 	}
 }
 
+func TestBestResultNearTieOnThroughputGoesToLowerPing(t *testing.T) {
+	// The user's rule: a hair more throughput must not beat a meaningfully
+	// lower ping. 500/450 at 10ms loses to 500/440 at 6ms - 1% extra speed is
+	// not worth 4ms of latency.
+	rs := []Result{
+		res("hair-faster", 500, 450, 10),
+		res("snappier", 500, 440, 6),
+	}
+	if got := bestResult(rs).Server; got != "snappier" {
+		t.Fatalf("got %q want snappier (1%% more throughput must not beat 40%% less ping)", got)
+	}
+}
+
+func TestBestResultRealThroughputLeadStillWins(t *testing.T) {
+	// The ping discount is a weight, not a takeover: a genuinely faster server
+	// wins even against half the ping, or best-of would quietly turn the
+	// speedtest into a ping contest.
+	rs := []Result{
+		res("snappy", 250, 250, 5), // 500 total
+		res("fast", 500, 400, 10),  // 900 total
+	}
+	if got := bestResult(rs).Server; got != "fast" {
+		t.Fatalf("got %q want fast (an 80%% throughput lead beats 5ms of ping)", got)
+	}
+
+	// Same at a wider spread: this case binds pingWeightMS from below (at a
+	// weight of ~14 or less the ping side takes over and snappy wins), where
+	// the 5-vs-10ms case above only binds it above ~1.
+	rs = []Result{
+		res("snappy", 250, 250, 5), // 500 total
+		res("fast", 500, 400, 20),  // 900 total
+	}
+	if got := bestResult(rs).Server; got != "fast" {
+		t.Fatalf("got %q want fast (an 80%% throughput lead beats 15ms of ping)", got)
+	}
+}
+
+func TestBestResultPingDiscountIsCapped(t *testing.T) {
+	// The discount settles near-ties; it must not bury a demonstrated line
+	// speed. Uncapped, this round's 20ms spread let the server that measured
+	// 17% MORE throughput lose (734 vs 741) - and the stored run would then
+	// understate the connection the round just demonstrated.
+	rs := []Result{
+		res("slow-near", 500, 300, 8), // 800 total
+		res("fast-far", 540, 400, 28), // 940 total
+	}
+	if got := bestResult(rs).Server; got != "fast-far" {
+		t.Fatalf("got %q want fast-far (17%% more throughput must survive a 20ms ping deficit)", got)
+	}
+
+	// Past the cap entirely (satellite-scale pings) servers compare on
+	// throughput alone; uncapped, the faster server lost 4:1 here.
+	rs = []Result{
+		res("sat-fast", 60, 40, 600), // 100 total
+		res("sat-slow", 50, 30, 40),  // 80 total
+	}
+	if got := bestResult(rs).Server; got != "sat-fast" {
+		t.Fatalf("got %q want sat-fast (past the cap, throughput decides)", got)
+	}
+}
+
+func TestBestResultExactScoreTieBreaksOnPing(t *testing.T) {
+	// Distinct throughput/ping pairs can land on the exact same score in
+	// float64: 110 total @10ms and 105 total @5ms are both exactly 100. The
+	// ping key behind the score must then prefer the snappier server.
+	a, b := res("tenms", 110, 0, 10), res("fivems", 105, 0, 5)
+	if sa, sb := resultScore(a), resultScore(b); sa != sb {
+		t.Fatalf("premise broke: scores %v vs %v are meant to tie exactly", sa, sb)
+	}
+	if got := bestResult([]Result{a, b}).Server; got != "fivems" {
+		t.Fatalf("got %q want fivems (exact score tie goes to the lower ping)", got)
+	}
+
+	// A run with no ping can tie too (1100 total at the substituted 1000ms is
+	// also exactly 100); the measured run must win the tie, not the absent one.
+	c := res("noping", 1100, 0, 0)
+	if sc := resultScore(c); sc != resultScore(a) {
+		t.Fatalf("premise broke: scores %v vs %v are meant to tie exactly", sc, resultScore(a))
+	}
+	if got := bestResult([]Result{c, a}).Server; got != "tenms" {
+		t.Fatalf("got %q want tenms (a measured ping beats an unmeasured one on a tie)", got)
+	}
+}
+
+func TestBestResultUnmeasuredPingIsPunishedNotFatal(t *testing.T) {
+	// A run that never measured ping is scored as if its ping were terrible:
+	// it can't beat a measured run of comparable speed by absence...
+	a, b := res("noping", 500, 450, 0), res("measured", 300, 0, 20)
+	if got := bestResult([]Result{a, b}).Server; got != "measured" {
+		t.Fatalf("got %q want measured (absence must not win)", got)
+	}
+	// ...but its throughput still counts, so it beats a genuinely slow run.
+	// 80 total at 20ms scores ~67 against noping's ~86 - close enough that the
+	// substituted ping can't drift much past 1000 without flipping this case,
+	// keeping the constant a tested decision on both sides.
+	a, b = res("noping", 500, 450, 0), res("slowpoke", 80, 0, 20)
+	if got := bestResult([]Result{a, b}).Server; got != "noping" {
+		t.Fatalf("got %q want noping (throughput is punished, not zeroed)", got)
+	}
+}
+
 func TestBestResultTieBreaksOnPingThenJitterThenBloat(t *testing.T) {
-	// Identical throughput -> ping decides.
-	a, b := res("a", 500, 500, 30), res("b", 500, 500, 12)
+	// Both pings past the score cap -> identical scores -> the ping KEY (not
+	// the score) must pick the lower one.
+	a, b := res("a", 500, 500, 30), res("b", 500, 500, 25)
 	if got := bestResult([]Result{a, b}).Server; got != "b" {
 		t.Fatalf("ping tie-break: got %q want b", got)
 	}

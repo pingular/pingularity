@@ -242,9 +242,9 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	//   - nothing pinned: the auto location (a searched city, else the exit router).
 	//   - pinned + best-of: the PINNED server, so the extras are its neighbours.
 	//     Centring those on the exit instead made a pin nearly pointless - the
-	//     winner is chosen on throughput alone (see bestIndex), so exit-local
-	//     servers would out-run the pin on most rounds and get stored in its place,
-	//     which is just Auto with one extra racer.
+	//     winner is chosen on ping-weighted throughput (see bestIndex), so
+	//     exit-local servers would out-score the pin on most rounds and get
+	//     stored in its place, which is just Auto with one extra racer.
 	//   - pinned, no best-of: nothing to centre; the pin is the only target.
 	var pinned *ookla.Server
 	if id != "" && want > 1 {
@@ -308,7 +308,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			o.logf("best-of server measured", "server", res.Server, "server_id", res.ServerID,
 				"down_mbps", res.DownloadMbps, "up_mbps", res.UploadMbps,
 				"ping_ms", res.PingMS, "jitter_ms", f64v(res.JitterMS),
-				"bufferbloat_ms", f64v(bufferbloatMS(res)))
+				"bufferbloat_ms", f64v(bufferbloatMS(res)), "score", resultScore(res))
 		}
 		results = append(results, res)
 	}
@@ -330,7 +330,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		}
 		o.logf("best-of run finished", "servers", len(results), "winner", best.Server,
 			"down_mbps", best.DownloadMbps, "up_mbps", best.UploadMbps,
-			"discarded", strings.Join(discarded, " | "))
+			"score", resultScore(best), "discarded", strings.Join(discarded, " | "))
 	}
 	best.DownloadBytes, best.UploadBytes = totalBytes(results)
 	// Always name the server whose numbers are being returned. Without this a run
@@ -816,16 +816,55 @@ func serverLabel(s *ookla.Server) string {
 	return fmt.Sprintf("%s, %s", s.Sponsor, s.Name)
 }
 
-// bestResult picks the winner of a best-of-N run, by the user's stated order:
-// total throughput first, then latency, then jitter, then bufferbloat. Every
-// tie-break is a strict improvement test, so an exact tie keeps the earlier
-// result - and the earlier result is the higher-ranked server (the pinned one,
-// or the lowest ping), which is the right thing to fall back on.
+// bestResult picks the winner of a best-of-N run, by the user's stated rule:
+// total throughput discounted by ping (see resultScore) first, then latency,
+// then jitter, then bufferbloat. Every tie-break is a strict improvement test,
+// so an exact tie keeps the earlier result - and the earlier result is the
+// higher-ranked server (the pinned one, or the lowest ping), which is the
+// right thing to fall back on.
 //
 // Later keys are near-impossible to reach in practice: two separate runs would
 // have to agree to the full float precision. They exist so the choice is
 // deterministic rather than accidental.
 func bestResult(rs []Result) Result { return rs[bestIndex(rs)] }
+
+// pingWeightMS sets how much latency discounts throughput in resultScore: a
+// result's down+up is multiplied by pingWeightMS/(pingWeightMS+ping). At 100,
+// one millisecond of ping is worth about 1% of throughput at typical last-mile
+// pings, so a near-tie on speed (950 total at 10ms vs 940 at 6ms) goes to the
+// snappier server, while a genuinely faster server still wins through - the
+// weight must never turn a speedtest into a ping contest.
+const pingWeightMS = 100
+
+// maxScorePingMS caps the ping the score charges for. The discount exists to
+// settle near-ties, not to bury a demonstrated line speed: uncapped, a 20ms+
+// spread inside one round (a pinned far server, a latency blip on one target)
+// let a measurement 15%+ slower win and understate the connection. Past the
+// cap the discount tops out (~17%), so widely-spread servers compare on
+// throughput alone.
+const maxScorePingMS = 20
+
+// unmeasuredPingMS stands in for a run whose ping was never measured, scoring
+// it as worse than any real-world path (geostationary satellite is ~600ms).
+// Absence can't win - the same philosophy as the tie-breaks below - but the
+// run's throughput still counts, rather than being zeroed outright. It
+// deliberately bypasses maxScorePingMS: the cap protects measured pings, not
+// missing ones.
+const unmeasuredPingMS = 1000
+
+// resultScore is the primary ranking key of a best-of-N run: total throughput
+// discounted by ping (see pingWeightMS, maxScorePingMS). Higher is better. A
+// skipped direction contributes 0 for every run in the round, so down-only or
+// up-only configurations still compare fairly.
+func resultScore(r Result) float64 {
+	ping := r.PingMS
+	if !validMS(ping) {
+		ping = unmeasuredPingMS
+	} else if ping > maxScorePingMS {
+		ping = maxScorePingMS
+	}
+	return (r.DownloadMbps + r.UploadMbps) * pingWeightMS / (pingWeightMS + ping)
+}
 
 // f64v renders an optional measurement for a log line: the value, or NaN when it
 // was never measured. Keeps a nil jitter from printing as a pointer address.
@@ -866,11 +905,9 @@ func bestIndex(rs []Result) int {
 // being absent - a run that could not measure jitter has not proved it is
 // steadier than one that did.
 func betterResult(a, b Result) bool {
-	// 1. Throughput: download + upload. A skipped direction is 0 for both runs,
-	//    so a down-only or up-only configuration still compares fairly.
-	at, bt := a.DownloadMbps+a.UploadMbps, b.DownloadMbps+b.UploadMbps
-	if at != bt {
-		return at > bt
+	// 1. Score: throughput discounted by ping (see resultScore).
+	if as, bs := resultScore(a), resultScore(b); as != bs {
+		return as > bs
 	}
 	// 2. Latency (lower wins). A run with no ping figure can't win here.
 	if a.PingMS != b.PingMS {

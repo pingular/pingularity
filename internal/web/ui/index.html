@@ -1505,9 +1505,9 @@
 • It also reads off when you pin a server, because the search then centres on that server rather than on your exit.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setAutoLoc"><span class="unit"></span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Best of 3 servers
-          <span class="info" tabindex="0" data-tip="Runs the test against your chosen server AND two more picked by ping, then keeps only the fastest result. The other two are thrown away.
+          <span class="info" tabindex="0" data-tip="Runs the test against your chosen server AND two more picked by ping, then keeps only the best result. The other two are thrown away.
 • The two extra servers are picked near the server you chose - or near your auto location when you have not chosen one - so the round always stays in the area you asked for.
-• Best result = highest download + upload. Ties break on ping, then jitter, then bufferbloat.
+• Best result = highest score: download + upload, discounted by ping (about 1% of throughput per millisecond, topping out at 20ms). A near-tie on speed goes to the lower-ping server; a clearly faster server still wins. Ties break on ping, then jitter, then bufferbloat.
 • Useful when one server is having a bad day and you'd rather not have it define your history.
 • Costs about 3x the time and 3x the data of a normal test.
 • A server that hasn't finished within 90 seconds is dropped and the next one is tried, so one stalled server can't hold up the round.
