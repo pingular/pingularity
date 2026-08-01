@@ -21,8 +21,8 @@ func TestLatestConnInfo(t *testing.T) {
 	}
 	// a run WITH conn info
 	if err := st.InsertSpeed(ctx, SpeedSample{TS: 200, DownMbps: 412, Server: "Bell, Toronto",
-		ISP: "AS64500 CalNect", ISPLocation: "San Junipero, California, US", PublicIPv4: "86.75.30.9",
-		DNSIP: "198.51.100.53", DNSProvider: "AS64510 Delos DNS"}); err != nil {
+		ISP: "AS1403 EBOX", ISPLocation: "Oldtown, XX", PublicIPv4: "203.0.113.226",
+		DNSIP: "198.51.100.135", DNSProvider: "AS64497 Example DNS"}); err != nil {
 		t.Fatal(err)
 	}
 	// a newer run withOUT conn info must NOT shadow the good one
@@ -33,7 +33,7 @@ func TestLatestConnInfo(t *testing.T) {
 	if err != nil || sp == nil {
 		t.Fatalf("got (%v,%v), want the good run", sp, err)
 	}
-	if sp.ISP != "AS64500 CalNect" || sp.PublicIPv4 != "86.75.30.9" || sp.DNSProvider == "" {
+	if sp.ISP != "AS1403 EBOX" || sp.PublicIPv4 != "203.0.113.226" || sp.DNSProvider == "" {
 		t.Fatalf("wrong run: isp=%q ip=%q dns=%q", sp.ISP, sp.PublicIPv4, sp.DNSProvider)
 	}
 }

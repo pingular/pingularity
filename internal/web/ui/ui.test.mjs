@@ -4,12 +4,16 @@
 // changes behavior.  Run:  node --test internal/web/ui/
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const script = readFileSync(join(here, 'index.html'), 'utf8').match(/<script>([\s\S]*)<\/script>/)[1];
+// The whole page, for the few assertions that are about markup or CSS rather than
+// about the script; `script` is what everything else works from.
+const html = readFileSync(join(here, 'index.html'), 'utf8');
+const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // Extract a `function NAME` / `const NAME =` definition with balanced braces,
 // skipping strings, template literals and line comments so their contents can't
@@ -44,15 +48,68 @@ const DEFS = {
   covGrid: 'function covGrid', covStats: 'function covStats',
   parseRange: 'function parseRange', fmtRangeEcho: 'function fmtRangeEcho',
   rangeLoad: 'function rangeLoad', speedTileMbps: 'function speedTileMbps',
+  mbpsText: 'function mbpsText', pingText: 'function pingText',
+  spMeasured: 'function spMeasured', spdAverages: 'function spdAverages',
+  speedtestBusy: 'function speedtestBusy',
+  speedtestAbortable: 'function speedtestAbortable',
+  autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
+  bloatBins: 'function bloatBins', bloatCeiling: 'function bloatCeiling',
+  bloatDataMax: 'function bloatDataMax', cursorSpan: 'const cursorSpan',
+  drawCursor: 'function drawCursor',
+  logPostAction: 'function logPostAction', spdAvgNote: 'function spdAvgNote',
+  pingAvgText: 'function pingAvgText',
+  setSpdAvg: 'function setSpdAvg', upCovNote: 'function upCovNote',
+  upCovFoot: 'function upCovFoot', logTruncNote: 'function logTruncNote',
+  outageDeletable: 'function outageDeletable',
+  isReconcile503: 'function isReconcile503', retryAfterMs: 'function retryAfterMs',
 };
 const NAMES = Object.keys(DEFS);
 const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
 // DAYN is a plain array const (no braces), which extract() can't lift - pass it in.
-const factory = new Function('document', 'TC', 'DAYN', defs + '\nreturn {' + NAMES.join(',') + '};');
+// isNum is the same shape (a one-line arrow const) and spMeasured/spdAverages call
+// it, so it is injected the same way rather than copied as a literal here.
+// `$` is injected so setSpdAvg can be driven against a fake element: the pill's
+// visible text and its accessible name are set on different lines, and whether the
+// second one is reached is exactly what is under test.
+const factory = new Function('document', 'TC', 'DAYN', 'isNum', '$', 'esc', 'AX_PAD', defs + '\nreturn {' + NAMES.join(',') + '};');
 const TC = { hm0: '#000000', down: '#ffffff' };
 const fakeCtx = { _v: '#000000', set fillStyle(x) { this._v = x; }, get fillStyle() { return this._v; } };
 const fakeDoc = { createElement: () => ({ getContext: () => fakeCtx }) };
-const F = factory(fakeDoc, TC, ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
+let fakePill = null;
+// The pill holds a static SVG icon and the number in separate elements, so the
+// only thing setSpdAvg writes is the number - the icon is markup, not text.
+// `textContent` therefore reports the value alone.
+const fakeEl = () => ({
+  val: { textContent: '' },
+  attrs: {},
+  classList: { toggle() {} },
+  querySelector() { return this.val; },
+  get textContent() { return this.val.textContent; },
+  setAttribute(k, v) { this.attrs[k] = v; },
+  getAttribute(k) { return this.attrs[k]; },
+});
+// AX_PAD is a brace-less const built from another one, so it is evaluated out of
+// the page rather than copied here - a literal would silently drift.
+const AX_PAD_VAL = new Function(script.match(/const AX_GAP = [^;]*;/)[0] + '\n'
+  + script.match(/const AX_PAD = [^;]*;/)[0] + '\nreturn AX_PAD;')();
+const F = factory(fakeDoc, TC, ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], v => typeof v === 'number',
+  () => fakePill,
+  // esc is a one-line arrow in the page, so it is injected rather than extracted;
+  // the panel strings below interpolate daemon-supplied place names through it.
+  s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+  AX_PAD_VAL);
+
+// Everything below picks single definitions out of the script and compiles those,
+// so a syntax error anywhere in the other ~6800 lines passes every test here AND
+// the Go build (index.html is embedded, never parsed) - and then blanks the whole
+// dashboard, because one bad token stops the browser loading the entire file.
+// So compile the WHOLE script once, without running it: no DOM or window stubs are
+// needed since nothing executes. vm.Script rather than new Function because it
+// compiles with the browser's parse goal - a classic top-level script - and so
+// rejects things a function body would happily accept (a stray top-level return).
+test('the whole inline script parses', () => {
+  new vm.Script(script, { filename: 'index.html <script>' });
+});
 
 test('withAlpha: hex -> rgba at the given alpha', () => {
   assert.equal(F.withAlpha('#5b9dff', 0.16), 'rgba(91,157,255,0.16)');
@@ -330,17 +387,81 @@ test('covStats: exact minute count rides along (rounded pct lies at the edges)',
   assert.equal(near.gap.to, 'Sat 00:50');
 });
 
-// --- log viewer change-detection signature ---
-const LG = new Function(extract('function logSig') + '\nreturn { logSig };')();
+// --- log viewer cursor merge rule ---
+const LG = new Function(extract('function logMerge') + '\nreturn { logMerge };')();
 
-test('logSig: stable when unchanged, differs on a new/changed last line', () => {
-  assert.equal(LG.logSig([]), '0|0:');
-  assert.equal(LG.logSig(null), '0|0:');
-  assert.equal(LG.logSig(['a', 'b']), LG.logSig(['a', 'b'])); // same content -> same sig (poll no-ops)
-  assert.notEqual(LG.logSig(['a', 'b']), LG.logSig(['a', 'b', 'c'])); // new line appended
-  assert.notEqual(LG.logSig(['a', 'b']), LG.logSig(['a', 'x'])); // last line changed
-  assert.notEqual(LG.logSig(['a', 'b']), LG.logSig(['a', 'bb'])); // last line length changed
-  assert.notEqual(LG.logSig(['a', 'b']), LG.logSig([])); // cleared
+test('logMerge: a delta appends, an empty delta skips, anything else replaces', () => {
+  const E = 'r1';
+  // The steady state: cursor sent, nothing new since. No repaint at all.
+  assert.equal(LG.logMerge({ epoch: E, lines: [] }, true, E, true), 'skip');
+  assert.equal(LG.logMerge({ epoch: E, lines: [], dropped: 0 }, true, E, true), 'skip');
+  // New lines, or an eviction to mark, append onto what is already rendered.
+  assert.equal(LG.logMerge({ epoch: E, lines: [{ raw: 'a' }] }, true, E, true), 'append');
+  assert.equal(LG.logMerge({ epoch: E, lines: [], dropped: 12 }, true, E, true), 'append');
+  // No cursor was sent (first load, or a POST): full window.
+  assert.equal(LG.logMerge({ epoch: E, lines: [{ raw: 'a' }] }, false, E, true), 'replace');
+  // Nothing has been painted yet (first load, or a view emptied by Clear that is
+  // showing the placeholder): there is nothing to append to.
+  assert.equal(LG.logMerge({ epoch: E, lines: [{ raw: 'a' }] }, true, E, false), 'replace');
+  assert.equal(LG.logMerge({ epoch: E, lines: [], dropped: 3 }, true, E, false), 'replace');
+  // The daemon restarted: sequences restart at 0, so this response is a tail from
+  // a different ring and must NOT be spliced onto the lines already on screen.
+  assert.equal(LG.logMerge({ epoch: 'r2', lines: [{ raw: 'a' }] }, true, E, true), 'replace');
+  assert.equal(LG.logMerge({ epoch: 'r2', lines: [] }, true, E, true), 'replace');
+  // A server with no ring wired up reports no epoch; never append to that either.
+  assert.equal(LG.logMerge({ lines: [{ raw: 'a' }] }, true, E, true), 'replace');
+});
+
+// --- downtime heatmap: the grid must not outrun the data it fetched ----------
+// refreshHeatmap asks for days=366 - the cap web.go enforces - so the oldest
+// answerable local date is today-366. The grid starts at the Sunday on or
+// before today-365 to keep the week columns aligned, which reaches up to 5
+// days further back: cells no response can ever describe. With no row, a cell
+// drew as the identical clean fully-observed square - the exact false-clean
+// disclosure failure the observation tooltip exists to prevent. This drives
+// the REAL drawHeatmap with a frozen clock and stub DOM.
+function driveHeatmap(rows, todayMs) {
+  const defs = extract('function _rgb') + '\n' + extract('function hmShade') + '\n'
+    + extract('const fmtDur') + '\n'
+    + script.match(/const fmtLocalDate = [^;]*;/)[0] + '\n'
+    + script.match(/const hmLevel = [^;]*;/)[0] + '\n'
+    + script.match(/const HM_W=[^;]*;/)[0] + '\n'
+    + extract('function drawHeatmap');
+  const cells = [];
+  const grid = { innerHTML: '', style: {}, appendChild: c => cells.push(c) };
+  const doc = { createElement: () => ({ className: '', style: {}, dataset: {}, attrs: {},
+    classList: { add() {} }, setAttribute(k, v) { this.attrs[k] = v; } }) };
+  class FrozenDate extends Date { constructor(...a) { a.length ? super(...a) : super(todayMs); } }
+  new Function('ROWS', '$', 'document', 'Date', 'TC',
+    'let hmData = ROWS, outageSelDay = null;\n' + defs + '\ndrawHeatmap();')(
+    rows, () => grid, doc, FrozenDate, { hm0: '#000000', down: '#ffffff' });
+  return cells;
+}
+
+test('heatmap: cells older than the API window are padding, not clean days', () => {
+  // 2 Aug 2026 is a Sunday: today-365 lands on a Saturday, so the Sunday
+  // alignment reaches 5 days - the worst case - past the oldest fetchable day.
+  const cells = driveHeatmap(
+    [{ date: '2026-07-15', outages: 1, downtime_s: 60, window_s: 86400, observed_s: 86400 }],
+    new Date(2026, 7, 2, 12, 0).getTime());
+  assert.equal(cells.length, 372); // Sun 27 Jul 2025 .. Sun 2 Aug 2026
+  for (let i = 0; i < 5; i++) {
+    assert.equal(cells[i].style.visibility, 'hidden',
+      `cell ${i} predates the fetched window: with no row it draws as a clean fully-observed day`);
+  }
+  // The oldest day the API can answer for, and everything after it, draws.
+  assert.notEqual(cells[5].style.visibility, 'hidden');
+  // Sanity for the harness itself: a real day still renders its disclosure.
+  assert.ok(cells.some(c => /2026-07-15: 1 outage/.test(c.dataset.tip || '')),
+    'the outage day lost its tooltip - the drive is not rendering real cells');
+});
+
+test('heatmap: a Sunday-aligned year needs no padding at all', () => {
+  // 27 Jul 2026 is a Monday: today-365 is a Sunday, the grid starts exactly
+  // there, and every cell is inside the fetched window.
+  const cells = driveHeatmap([], new Date(2026, 6, 27, 12, 0).getTime());
+  assert.equal(cells.length, 366);
+  assert.ok(cells.every(c => c.style.visibility !== 'hidden'));
 });
 
 // --- single-run graph: spanOne duplicates a lone point so it draws a flat line ---
@@ -362,6 +483,62 @@ test('speedTileMbps: "-" when the direction was not measured, else rounded Mbps'
   assert.equal(F.speedTileMbps(0, 0), '0 Mbps');          // 0 bytes is still a measurement of a very slow run
   assert.equal(F.speedTileMbps(0, null), '-');            // no upload phase ran -> absent, not "0 Mbps"
   assert.equal(F.speedTileMbps(500, undefined), '-');     // omitempty drops the field entirely
+});
+
+// --- Range averages: the three readout pills on the speed panel's runs bar ------
+// They describe spdData, i.e. exactly the rows the charts beside them are drawing.
+// A row as /api/speed sends it. The byte counts are the "this direction actually
+// ran" evidence spMeasured gates on, so dropping one is how a run says it measured
+// only the other direction; ping_ms 0 is the "not probed" sentinel.
+const run = (o = {}) => ({ ts: 1, down_mbps: 0, up_mbps: 0, ping_ms: 0,
+  download_bytes: null, upload_bytes: null, ...o });
+
+test('spdAverages: ping_ms 0 is "not probed" - excluded from the mean, not averaged in as zero', () => {
+  const rows = [run({ ping_ms: 10 }), run({ ping_ms: 0 }), run({ ping_ms: 30 })];
+  // The mean of the two runs that actually probed. Counting the sentinel as a
+  // sample gives 13.3 ms and advertises a link far faster than it is.
+  assert.equal(F.spdAverages(rows).ping, 20);
+  assert.equal(F.pingText(F.spdAverages(rows).ping), '20.0 ms');
+  // Nothing probed at all -> no sample, which is a dash and never "0.0 ms".
+  assert.equal(F.spdAverages([run(), run()]).ping, null);
+  assert.equal(F.pingText(F.spdAverages([run(), run()]).ping), '-');
+});
+
+test('spdAverages: a row missing one direction is skipped per metric, not dropped whole', () => {
+  const rows = [
+    run({ down_mbps: 100, download_bytes: 5000 }),                                  // download only
+    run({ up_mbps: 20, upload_bytes: 4000 }),                                       // upload only
+    run({ down_mbps: 200, download_bytes: 5000, up_mbps: 40, upload_bytes: 4000 }), // both
+  ];
+  const a = F.spdAverages(rows);
+  // Dropping any row that lacks a direction would leave only the third run (200/40);
+  // averaging its absent direction in as 0 Mbps would give 100/20. Both are wrong.
+  assert.equal(a.down, 150);
+  assert.equal(a.up, 30);
+  assert.equal(F.mbpsText(a.down), '150 Mbps'); // same units/decimals as the tile above
+});
+
+test('spdAverages: an empty range yields no mean at all, which renders as the house dash', () => {
+  const a = F.spdAverages([]);
+  assert.deepEqual(a, { down: null, up: null, ping: null });
+  // The concrete failure guarded here: a sum/count of 0/0 is NaN, and a pill reading
+  // "NaN Mbps" beside an empty chart.
+  assert.equal(F.mbpsText(a.down), '-');
+  assert.equal(F.mbpsText(a.up), '-');
+  assert.equal(F.pingText(a.ping), '-');
+  assert.deepEqual(F.spdAverages(undefined), { down: null, up: null, ping: null });
+});
+
+test('spdAverages: every plotted point counts once - /api/speed decimates, it does not aggregate', () => {
+  // A wide window is thinned with `ts IN (SELECT MAX(ts) FROM speed .. GROUP BY ts/bucket)`,
+  // which keeps the newest REAL run per bucket and re-reads that row whole. So every
+  // row here is one genuine speedtest and none carries a sample count: the mean is
+  // unweighted, and must stay unweighted even if a row shows up wearing a
+  // count-shaped field, because weighting by one would claim an accuracy the payload
+  // does not actually carry.
+  const rows = [run({ down_mbps: 100, download_bytes: 1 }), run({ down_mbps: 200, download_bytes: 1 })];
+  rows[0].count = 500; rows[0].n = 500; rows[0].samples = 500;
+  assert.equal(F.spdAverages(rows).down, 150);
 });
 
 // --- bufferbloat helpers: latency added under load ---
@@ -694,4 +871,1179 @@ test('parseRange: from X to Y is a span, since X stays open-ended', () => {
 test('parseRange: nothing predates the epoch, since rangeLoad would drop it on reload', () => {
   for (const s of ['until 1920', 'before 1950-01-01', '1 jan 1900 to 1 jan 1901'])
     assert.equal(PR(s), null, s);
+});
+
+// ---------------------------------------------------------------------------
+// Chart x-axis + speed-panel poll guard.
+//
+// drawXAxis only needs a 2D context that can measure and place text, so it runs
+// here against a stub that RECORDS every fillText instead of painting it. The
+// recorded x is the tick position (the end labels are edge-aligned, the interior
+// ones centred, and in both cases fillText is passed the tick x), so a test can
+// ask the one question that matters: does the label at this x name the time that
+// the chart actually plotted at this x?
+// ---------------------------------------------------------------------------
+const CHART_DEFS = {
+  drawXAxis: 'function drawXAxis', axFmtLadder: 'function axFmtLadder',
+  fmtAxisTime: 'function fmtAxisTime', AXF: 'const AXF',
+  spdSyncPlan: 'function spdSyncPlan', xMap: 'function xMap',
+};
+const CNAMES = Object.keys(CHART_DEFS);
+const cdefs = CNAMES.map(n => extract(CHART_DEFS[n])).join('\n');
+// AXMON and AX_GAP are brace-less consts that extract() can't lift - pass them in,
+// same as DAYN above.
+const chartFactory = new Function('TC', 'AXMON', 'AX_GAP',
+  cdefs + '\nreturn {' + CNAMES.join(',') + '};');
+const AXMON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const C = chartFactory({ xLab: true, axis: '#888' }, AXMON, 10);
+
+// 11px ui-monospace: every glyph the same width, which is what the real cull
+// measures against. 6.6px is close enough that label widths - and therefore which
+// labels the cull drops - match a browser within a pixel or two.
+const CHW = 6.6;
+function recCtx() {
+  const calls = [];
+  return {
+    calls, font: '', fillStyle: '', textBaseline: '', textAlign: 'left',
+    save() {}, restore() {},
+    measureText(s) { return { width: s.length * CHW }; },
+    fillText(t, x) { calls.push({ text: t, x, align: this.textAlign }); },
+  };
+}
+
+// A desktop-width latency chart: floor(846/105) = 8, so the tick count is capped
+// by the 6 ceiling and 7 labels are asked for - the shape all three defects showed up in.
+const CW = 900, PADL = 44, PADR = 10, PLOT = CW - PADL - PADR;
+const at = (y, mo, d, h, mi, s = 0) => Math.floor(new Date(y, mo, d, h, mi, s).getTime() / 1000);
+
+// labelToTs reads an axis label back into the instant it names, resolving the
+// day from the time the label sits next to (a bare clock label can belong to
+// either side of a midnight). Throws on anything it can't parse, so a format
+// change can't quietly weaken these tests into passing.
+function labelToTs(label, nearTs) {
+  const m = label.match(/^(?:(\d{1,2}) ([A-Za-z]{3}) )?(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) throw new Error('unparsable axis label: ' + JSON.stringify(label));
+  const [, dd, mon, hh, mi, ss] = m;
+  const near = new Date(nearTs * 1000);
+  let best = null;
+  for (let off = -1; off <= 1; off++) {
+    const d = new Date(near.getFullYear(), near.getMonth(), near.getDate() + off,
+      +hh, +mi, ss ? +ss : 0);
+    if (dd) { d.setMonth(AXMON.indexOf(mon)); d.setDate(+dd); }
+    const ts = Math.round(d.getTime() / 1000);
+    if (best === null || Math.abs(ts - nearTs) < Math.abs(best - nearTs)) best = ts;
+  }
+  return best;
+}
+
+// The shape that broke the latency axis: a 1 day window whose middle 18 hours
+// have no samples at all (the monitor was off), sampled once a minute either side.
+function gappedSeries() {
+  const pts = [];
+  const push = t => pts.push({ t, ts: t, lat: 20, online: true });
+  for (let i = 0; i < 118; i++) push(at(2026, 6, 25, 8, 36) + i * 60);   // 08:36 -> 10:33
+  for (let i = 0; i < 242; i++) push(at(2026, 6, 26, 4, 34) + i * 60);   // 04:34 -> 08:35
+  return pts;
+}
+
+test('drawXAxis: over a hole, every label names the time actually plotted at its x', () => {
+  const pts = gappedSeries();
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  // Exactly the mapping drawChart plots with: x linear in TIME.
+  const X = t => PADL + (t - t0) / (t1 - t0) * PLOT;
+  const x = recCtx();
+  C.drawXAxis(x, pts, 't', X, CW, 300, PADL, PADR, 'time');
+
+  assert.ok(x.calls.length >= 5, 'expected a full axis, got ' + x.calls.length + ' labels');
+  for (const c of x.calls) {
+    // The time this chart really draws at this x, inverted from the same X().
+    const want = t0 + (c.x - PADL) / PLOT * (t1 - t0);
+    const got = labelToTs(c.text, want);
+    // Tolerance is 60s: the label is truncated to the minute, so that is the
+    // finest it can be right to. The defect was 8.2 HOURS.
+    assert.ok(Math.abs(got - want) <= 60,
+      `label ${JSON.stringify(c.text)} at x=${c.x.toFixed(1)} names ` +
+      `${new Date(got * 1000).toLocaleString()} but that x plots ` +
+      `${new Date(want * 1000).toLocaleString()} - off by ` +
+      `${((got - want) / 3600).toFixed(2)}h`);
+  }
+  const seen = x.calls.map(c => c.text);
+  assert.equal(new Set(seen).size, seen.length, 'duplicate labels on the axis: ' + seen.join(' | '));
+
+  // Control: the SAME gapped array through the index-based mapping the speed
+  // charts use. There every label must be the time of a real sample, and that
+  // sample must plot within half a sample step of the tick.
+  const xi = recCtx();
+  const XI = C.xMap(pts, PADL, PADR, CW);
+  C.drawXAxis(xi, pts, 'ts', XI, CW, 300, PADL, PADR);
+  for (const c of xi.calls) {
+    // Invert the INDEX mapping (not the time one): the sample that sits at this x.
+    const want = pts[Math.round((c.x - PADL) / PLOT * (pts.length - 1))];
+    const got = labelToTs(c.text, want.ts);
+    assert.ok(Math.abs(got - want.ts) <= 60,
+      `index-mode label ${JSON.stringify(c.text)} at x=${c.x.toFixed(1)} names ` +
+      `${new Date(got * 1000).toLocaleString()}, but the sample at that x is ` +
+      `${new Date(want.ts * 1000).toLocaleString()}`);
+  }
+
+  // And the latency chart must actually ask for time mode - the fix is only live
+  // if the call site passes it.
+  const call = script.match(/drawXAxis\(x, points, 't',[^\n]*/);
+  assert.ok(call && /'time'/.test(call[0]),
+    'drawChart must pass tMode=time to drawXAxis, got: ' + (call && call[0]));
+});
+
+test('drawXAxis: never draws more ticks than the series has distinct times', () => {
+  // Four runs, the sparse series the 1y preset produced - it asked for 7 ticks
+  // and several resolved to the same sample, so the axis read 21:21 three times.
+  const base = at(2026, 6, 25, 21, 21);
+  const pts = [0, 7 * 3600, 14 * 3600, 22 * 3600].map(o => ({ ts: base + o }));
+  const x = recCtx();
+  C.drawXAxis(x, pts, 'ts', C.xMap(pts, PADL, PADR, CW), CW, 300, PADL, PADR);
+  const seen = x.calls.map(c => c.text);
+  assert.ok(seen.length <= pts.length,
+    `4 samples but ${seen.length} ticks: ` + seen.join(' | '));
+  assert.equal(new Set(seen).size, seen.length, 'duplicate labels: ' + seen.join(' | '));
+
+  // Two samples is two ticks, not seven.
+  const two = [{ ts: base }, { ts: base + 3600 }];
+  const x2 = recCtx();
+  C.drawXAxis(x2, two, 'ts', C.xMap(two, PADL, PADR, CW), CW, 300, PADL, PADR);
+  assert.equal(x2.calls.length, 2, 'two samples: ' + x2.calls.map(c => c.text).join(' | '));
+
+  // A series with one instant repeated has no range to describe and draws nothing.
+  const same = [{ ts: base }, { ts: base }, { ts: base }];
+  const x3 = recCtx();
+  C.drawXAxis(x3, same, 'ts', C.xMap(same, PADL, PADR, CW), CW, 300, PADL, PADR);
+  assert.equal(x3.calls.length, 0);
+});
+
+test('drawXAxis: the label format is fine enough that neighbouring ticks differ', () => {
+  // A 3 day window is past the 36h clock-time cutoff, so labels went date-only -
+  // but 7 ticks across 3 days sit 12 hours apart, so the same date printed twice
+  // in a row. Dense samples, so the tick cap is not what saves this.
+  const start = at(2026, 6, 25, 0, 0);
+  const pts = [];
+  for (let i = 0; i <= 3 * 24 * 6; i++) pts.push({ ts: start + i * 600 });
+  const x = recCtx();
+  C.drawXAxis(x, pts, 'ts', C.xMap(pts, PADL, PADR, CW), CW, 300, PADL, PADR);
+  const seen = x.calls.map(c => c.text);
+  assert.ok(seen.length >= 5, 'expected a full axis, got ' + seen.join(' | '));
+  for (let i = 1; i < seen.length; i++)
+    assert.notEqual(seen[i], seen[i - 1],
+      'neighbouring ticks read the same: ' + seen.join(' | '));
+
+  // The ladder is what makes that possible: each span offers a finer fallback,
+  // and every rung is strictly more detailed than the one above it.
+  for (const span of [3 * 86400, 400 * 86400]) {
+    const ladder = C.axFmtLadder(span);
+    assert.ok(ladder.length > 1, 'span ' + span + ' has no finer format to fall back on');
+    const d = new Date(2026, 6, 25, 9, 30, 15);
+    const rendered = ladder.map(f => f(d));
+    assert.equal(new Set(rendered).size, rendered.length, 'ladder rungs are not distinct');
+  }
+  // The top of each ladder is still what the span picked before - unchanged.
+  const d = new Date(2026, 6, 25, 9, 30, 15), s = Math.floor(d.getTime() / 1000);
+  assert.equal(C.fmtAxisTime(s, 10 * 60), '09:30:15');
+  assert.equal(C.fmtAxisTime(s, 6 * 3600), '09:30');
+  assert.equal(C.fmtAxisTime(s, 10 * 86400), '25 Jul');
+  assert.equal(C.fmtAxisTime(s, 400 * 86400), 'Jul 26');
+});
+
+test('spdSyncPlan: a status poll cannot repaint a span selected after it left', () => {
+  // The race: the poll leaves under range A, the user picks range B (which bumps
+  // speedSeq and leaves speedLoadedFor still on A), then the poll lands.
+  const seqAtSend = 4;
+  assert.equal(C.spdSyncPlan(seqAtSend, 5, 'from=1&to=2', 'from=3&to=4'), 'skip');
+
+  // Nothing moved: the poll owns the panel and spdData really is this range.
+  assert.equal(C.spdSyncPlan(4, 4, 'from=3&to=4', 'from=3&to=4'), 'sync');
+
+  // The sequence settled but the fetch for B FAILED, so spdData is still A. A
+  // sequence check alone would call this fresh and paint A over B.
+  assert.equal(C.spdSyncPlan(4, 4, 'from=1&to=2', 'from=3&to=4'), 'stale');
+
+  // The call site must translate that into syncSpeedPanel(fresh) correctly:
+  // skip paints nothing, stale paints the loading state, sync paints the data.
+  const painted = [];
+  const callSite = (seq, curSeq, loadedFor, wantQ) => {
+    const plan = C.spdSyncPlan(seq, curSeq, loadedFor, wantQ);
+    if (plan !== 'skip') painted.push(plan === 'sync');
+  };
+  callSite(4, 5, 'from=1&to=2', 'from=3&to=4');
+  assert.deepEqual(painted, [], 'a superseded poll must not paint the panel at all');
+  callSite(4, 4, 'from=1&to=2', 'from=3&to=4');
+  assert.deepEqual(painted, [false], 'stale data must never be painted as fresh');
+  callSite(4, 4, 'from=3&to=4', 'from=3&to=4');
+  assert.deepEqual(painted, [false, true]);
+
+  // And refreshStatus must actually route through it. The guard is only worth
+  // anything at the call site, so assert the poll no longer re-asserts the old
+  // window unconditionally and that it compares the sequence it LEFT under.
+  assert.equal(script.match(/if\(speedFrozen\(\)\)\s*syncSpeedPanel\(true\);/), null,
+    'refreshStatus still calls syncSpeedPanel(true) unconditionally when frozen');
+  assert.ok(/const mySpeed=speedSeq;/.test(script),
+    'refreshStatus must capture speedSeq before it awaits');
+  assert.ok(/spdSyncPlan\(mySpeed, speedSeq, speedLoadedFor, speedWindowQuery\(\)\.q\)/.test(script),
+    'refreshStatus must consult spdSyncPlan before painting the pinned panel');
+});
+
+// The RUN button offers "click to stop" for ANY running speedtest - the poll
+// drives that from the backend's speedtest_running, so a scheduled run, a
+// reconnect-triggered run, or one started in another tab all show it. The abort
+// path must therefore cover the same set. It used to test only speedtestPending,
+// a flag this tab sets when IT posts a run, so clicking the stop button on
+// anything else started a second test, got the backend's already-running
+// rejection, and left the original running.
+test('speedtestAbortable: the stop path covers every run the button offers to stop', () => {
+  // This tab's own run, once the poll has delivered its id: abortable.
+  assert.equal(F.speedtestAbortable(true, false, 7), true);
+  // A backend-originated run - the case that was broken.
+  assert.equal(F.speedtestAbortable(false, true, 7), true);
+  // Both, mid-handover between the POST and the poll.
+  assert.equal(F.speedtestAbortable(true, true, 7), true);
+  // Nothing running: a click means START, not stop.
+  assert.equal(F.speedtestAbortable(false, false, 0), false);
+  // A run whose id is not known yet - the optimistic paint before the poll
+  // catches up - must NOT offer a stop: with no id the abort could only be the
+  // id-less kind, which stops "whatever is running now" and can kill the NEXT
+  // run if the one the operator meant ends while the confirm dialog is open.
+  assert.equal(F.speedtestAbortable(true, false, 0), false);
+  assert.equal(F.speedtestAbortable(false, true, 0), false);
+  assert.equal(F.speedtestAbortable(true, true, 0), false);
+});
+
+test('speedtestBusy: any in-flight run is busy, id known or not', () => {
+  assert.equal(F.speedtestBusy(true, false), true);
+  assert.equal(F.speedtestBusy(false, true), true);
+  assert.equal(F.speedtestBusy(false, false), false);
+});
+
+// The affordance and the abort read the same predicate, so the sub-poll window
+// in which the id is unknown must LOOK different too: a button that says
+// "click to stop" while a click can stop nothing (or worse, the wrong run) is
+// the same lie the predicate was built to prevent. This drives the REAL
+// setSpeedtestRunning against a fake button.
+test('the RUN button does not offer to stop a run whose id it does not know', () => {
+  const btn = { title: '', attrs: {}, classList: { toggle() {} },
+    setAttribute(k, v) { this.attrs[k] = v; } };
+  const when = { innerHTML: '', classList: { remove() {} } };
+  const els = { runSpeed: btn, speedWhen: when };
+  const defs = extract('function speedtestRunText') + '\n'
+    + (script.includes('function speedtestBusy') ? extract('function speedtestBusy') + '\n' : '')
+    + extract('function speedtestAbortable') + '\n'
+    + extract('function setSpeedtestRunning');
+  const set = new Function('$', 'esc', 'speedtestPending',
+    'let speedtestRunningNow=false, speedtestRunId=0;\n' + defs + '\nreturn setSpeedtestRunning;')(
+    id => els[id], s => String(s), false);
+  set(true, '', false, '', 0);      // the optimistic paint: running, id unknown
+  assert.ok(!/click to stop/.test(btn.title),
+    'the button offers a stop it cannot deliver: with no id the click would send an id-less abort');
+  assert.match(btn.title, /starting/i, 'the id-less window should read as a starting state');
+  set(true, 'srv', false, '', 42);  // the poll delivered the id
+  assert.match(btn.title, /click to stop/);
+  set(false, '', false, '', 0);
+  assert.match(btn.title, /Run a speedtest now/);
+});
+
+// The affordance and the action must be driven by the same state, not by two
+// variables that happen to agree today.
+test('the RUN click handler consults speedtestAbortable, not the local flag alone', () => {
+  assert.ok(/if\(speedtestAbortable\(speedtestPending, speedtestRunningNow, speedtestRunId\)\)/.test(script),
+    'the click handler must branch on speedtestAbortable(pending, running, runId)');
+  assert.equal(/if\(speedtestPending\)\{\s*\n\s*if\(!confirm\('Stop the running speedtest/.test(script), false,
+    'the old pending-only abort guard is still there');
+  // setSpeedtestRunning is the single place that learns the backend state, so it
+  // must be what records it.
+  assert.ok(/function setSpeedtestRunning\(running,[^)]*\)\{\s*\n\s*speedtestRunningNow=!!running;/.test(script),
+    'setSpeedtestRunning must record the backend running state it was handed');
+  // The stop request must name the run the operator decided about, captured
+  // BEFORE confirm() blocks the tab - by the time they answer, that run may have
+  // finished and another started. Matching on the parameter list rather than this
+  // invariant is what made the assertion above break when runId was added.
+  assert.ok(/const target=speedtestRunId;\s*\n\s*if\(!confirm\('Stop the running speedtest/.test(script),
+    'the run id must be captured before the confirm dialog, not after it');
+  // The abort always names its run. The id-less form asked the daemon to stop
+  // "whatever is running now" - Abort(0) - which bypasses the identity check the
+  // id exists for, so the fallback must be gone, not merely rarely taken.
+  assert.ok(/const q='\?run='\+encodeURIComponent\(target\);/.test(script),
+    'the abort request must always carry the run id');
+  assert.equal(/target\?\('\?run='/.test(script), false,
+    'the id-less abort fallback is still there');
+  // A busy click with no id yet must do NOTHING: not abort (no id to name), and
+  // not fall through to the start path, where the POST would only collect the
+  // daemon’s already-running rejection.
+  assert.ok(/if\(speedtestBusy\(speedtestPending, speedtestRunningNow\)\) return;/.test(script),
+    'a busy-but-id-less click must be swallowed, not turned into a second run');
+});
+
+// A POST to /api/logs answers with a fresh 500-line WINDOW, never a delta. The
+// pane meanwhile accumulates well past that from the 2.5s delta polls, up to the
+// ring's 4000 lines. Repainting from every POST therefore discarded the operator's
+// scrollback - and the worst trigger was the Redact-PII switch, a pure display
+// flip that had already been applied locally with no round-trip.
+test('logPostAction: only a clear repaints the pane, and a clear is what rotates the epoch', () => {
+  // Same epoch = the ring is unchanged; a level or redact flip must not repaint.
+  assert.equal(F.logPostAction('ep-1', 'ep-1'), 'settings');
+  // A clear rotates the epoch, so the pane must be replaced.
+  assert.equal(F.logPostAction('ep-2', 'ep-1'), 'replace');
+  // First load, nothing held yet.
+  assert.equal(F.logPostAction('ep-1', null), 'replace');
+});
+
+test('postLogs consults logPostAction instead of repainting on every POST', () => {
+  assert.ok(/if\(logPostAction\(d\.epoch, logEpoch\)==='replace'\)/.test(script),
+    'postLogs must branch on logPostAction');
+  assert.equal(/if\(my===logsSeq\)\{ setLogStall\(false\); renderLogs\(d, false\); \}/.test(script), false,
+    'the unconditional repaint is still there, so a Redact flip still wipes scrollback');
+});
+
+// The server discloses thinning in X-Sampled / X-Total-Count. The dashboard threw
+// those away, so the chart, the stat tiles and the three average pills all
+// described a ~1500-run sample while the pills were labelled averages "across the
+// range". A mean over a positional stride is not the range's mean - the stride
+// keeps every Nth run, so periodic data aliases.
+test('spdAvgNote: the pills admit when they describe a sample', () => {
+  assert.equal(F.spdAvgNote(false, 900, 900), '', 'a complete window needs no caveat');
+  const note = F.spdAvgNote(true, 40000, 1500);
+  assert.match(note, /1500/, 'must say how many runs were actually averaged');
+  assert.match(note, /40000/, 'must say how many are in the range');
+});
+
+test('the speed chart reads the thinning headers it is sent', () => {
+  assert.ok(/r\.headers\.get\('X-Sampled'\)/.test(script),
+    'refreshSpeedChart must read X-Sampled');
+  assert.ok(/r\.headers\.get\('X-Total-Count'\)/.test(script),
+    'refreshSpeedChart must read X-Total-Count');
+  assert.ok(/spdAvgNote\(spdSampled,\s*spdTotal,\s*spdData\.length\)/.test(script),
+    'paintSpdAvgs must pass the sampling state into the pill labels');
+});
+
+// The average pill rounds to whole milliseconds. A mean over a window of runs does
+// not have tenth-of-a-millisecond resolution, so printing one implies precision
+// the figure does not have. pingText - which renders a SINGLE run in the tile
+// beside it - deliberately keeps its decimal.
+test('pingAvgText: the average pill shows whole milliseconds', () => {
+  assert.equal(F.pingAvgText(22.1), '22 ms');
+  assert.equal(F.pingAvgText(22.5), '23 ms', 'rounds, not truncates');
+  assert.equal(F.pingAvgText(22.4), '22 ms');
+  assert.equal(F.pingAvgText(9.6), '10 ms');
+  // 0 means "not probed", the same rule pingText follows and /metrics gates on.
+  assert.equal(F.pingAvgText(0), '-');
+  assert.equal(F.pingAvgText(null), '-');
+  assert.equal(F.pingAvgText(undefined), '-');
+});
+
+test('the single-run ping tile keeps its decimal', () => {
+  assert.equal(F.pingText(22.1), '22.1 ms', 'one measurement does resolve to a tenth');
+  assert.ok(/\$\('sp_ping'\)\.textContent = pingText\(/.test(script),
+    'the tile must still use pingText');
+  // Pinned by which formatter each consumer calls, not by the whole argument list -
+  // an argument-shape regex breaks on unrelated refactors and teaches people to
+  // "fix" the test rather than read it.
+  assert.ok(/setSpdAvg\('spdAvgPing'[^)]*pingAvgText\(/.test(script),
+    'the average pill must use pingAvgText');
+});
+
+// The sampling caveat rides in the pill's ACCESSIBLE NAME, but setSpdAvg returns
+// early when the VISIBLE text is unchanged - and the visible text is a rounded
+// number. So when a window becomes sampled without the rounded average moving, the
+// caveat is never written at all: the pill silently keeps describing a ~1500-run
+// sample as the average across the whole range.
+//
+// The in-code comment on that early return says the accessible name "is derived
+// from the same txt as the content, so it can never be left behind by this guard".
+// That stopped being true the moment the name gained a note the text does not
+// carry.
+test('setSpdAvg: the sampling caveat lands even when the rounded value does not move', () => {
+  fakePill = fakeEl();
+  // Complete window first.
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps');
+  assert.equal(fakePill.textContent, '50 Mbps');
+  assert.equal(fakePill.getAttribute('aria-label'), 'average download 50 Mbps');
+
+  // Now the same rounded figure, but the window is a SAMPLE - the caveat is in the
+  // name only, so the visible text is byte-identical.
+  const note = F.spdAvgNote(true, 40000, 1500);
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps', true, note);
+  assert.match(fakePill.getAttribute('aria-label'), /1500/,
+    'the caveat never reached the pill: the early return is gated on the rounded ' +
+    'visible text, which did not change');
+  assert.match(fakePill.getAttribute('aria-label'), /40000/);
+});
+
+// ...and leaving the sampled state must clear it again.
+test('setSpdAvg: the caveat is removed when the window is complete again', () => {
+  fakePill = fakeEl();
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps', true, F.spdAvgNote(true, 40000, 1500));
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps', false, '');
+  assert.equal(fakePill.getAttribute('aria-label'), 'average download 50 Mbps',
+    'a stale caveat survived the window becoming complete');
+});
+
+// The guard still has to do its job: paintSpdAvgs runs once per animation frame
+// while the pointer is over a chart, so an unchanged pill must not be rewritten.
+test('setSpdAvg: an entirely unchanged pill is still not rewritten', () => {
+  // Count writes rather than mutating the node: overwriting textContent would make
+  // it genuinely differ, so the guard would be right to write again and the test
+  // would be measuring its own tampering.
+  let textWrites = 0, attrWrites = 0;
+  const counted = () => { let t = ''; return { get textContent() { return t; }, set textContent(v) { textWrites++; t = v; } }; };
+  fakePill = {
+    val: counted(), attrs: {}, classList: { toggle() {} },
+    querySelector() { return this.val; },
+    setAttribute(k, v) { attrWrites++; this.attrs[k] = v; },
+    getAttribute(k) { return this.attrs[k]; },
+  };
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps');
+  const t0 = textWrites, a0 = attrWrites;
+  F.setSpdAvg('spdAvgDn', 'average download', '50 Mbps');
+  assert.equal(textWrites, t0, 'rewrote identical visible text');
+  assert.equal(attrWrites, a0, 'rewrote an identical accessible name');
+});
+
+// The coverage note is shown when a window was not watched end to end. It treats
+// anything under 99.9% as partial but printed the percentage with no decimals, so
+// coverage between 99.5% and 99.9% rounded up to "100%" and the sentence
+// contradicted itself: "monitored 100% of this window; the rest was not
+// monitored". The reader is left unable to tell whether they are looking at a
+// rounding artefact or a real gap.
+test('upCovNote: a partial window never claims to be complete', () => {
+  for (const cv of [0.995, 0.996, 0.998, 0.9989]) {
+    const s = F.upCovNote(cv);
+    assert.notEqual(s, '', `coverage ${cv} is partial and must say something`);
+    assert.ok(!/monitored 100% of this window/.test(s),
+      `coverage ${cv} rendered as "${s}" - it says 100% and then says the rest was not monitored`);
+  }
+});
+
+test('upCovNote: the ordinary cases are unchanged', () => {
+  assert.equal(F.upCovNote(null), '');
+  assert.equal(F.upCovNote(1), '', 'full coverage says nothing');
+  assert.equal(F.upCovNote(0.9995), '', 'above the threshold says nothing');
+  assert.match(F.upCovNote(0), /nothing was monitored/);
+  assert.match(F.upCovNote(0.5), /monitored 50% of this window/, 'a clear figure keeps its round form');
+  assert.match(F.upCovNote(0.62), /monitored 62% of this window/);
+  // Flooring must not turn "a little was watched" into "none was", which is the
+  // same error the other way round; real zero has its own sentence.
+  assert.match(F.upCovNote(0.004), /monitored <1% of this window/);
+  assert.match(F.upCovNote(0), /nothing was monitored/);
+});
+
+// The whole-percent arm used toFixed(0), which rounds to NEAREST: every x.5-x.9
+// coverage displayed one percent higher than measured (98.5% read "monitored
+// 99%"), violating the floor guarantee the comment above the code promises. The
+// cases above all sit where round==floor, so they never caught it.
+test('upCovNote: a half-way figure floors, it never rounds coverage up', () => {
+  assert.match(F.upCovNote(0.985), /monitored 98% of this window/);
+  assert.match(F.upCovNote(0.989), /monitored 98% of this window/);
+  assert.match(F.upCovNote(0.645), /monitored 64% of this window/);
+  assert.match(F.upCovNote(0.115), /monitored 11% of this window/);
+  assert.match(F.upCovNote(0.015), /monitored 1% of this window/);
+  // The bands either side are untouched: >=99 keeps its floored decimal, and
+  // below 1% the "<1" wording still owns it.
+  assert.match(F.upCovNote(0.9905), /monitored 99\.0% of this window/);
+  assert.match(F.upCovNote(0.009), /monitored <1% of this window/);
+});
+
+// Until now the coverage caveat reached the eye through a title attribute only.
+// Phones do not show those at all and keyboard focus does not reliably surface one
+// either, so a window that was half monitored but flawless while watched rendered
+// as a bare 100.000% with nothing to say otherwise. (A screen reader did get it,
+// out of the pill's accessible name.) The popover is the one place already reachable
+// by tap and by keyboard, so the note goes there in visible text.
+test('upCovFoot: the popover says out loud that a window is only partly covered', () => {
+  const foot = F.upCovFoot(0.5, '7d');
+  // The wording is upCovNote's alone - the footer must not paraphrase it, or the pill,
+  // its accessible name and the popover start telling slightly different stories.
+  assert.ok(foot.includes(F.upCovNote(0.5)), 'the note is not carried verbatim: ' + foot);
+  // It names the window, because the popover lists several and the note itself says
+  // only "this window".
+  assert.ok(foot.includes('7d'), foot);
+  assert.match(F.upCovFoot(0, '1d'), /nothing was monitored/);
+  // Nothing to disclose, nothing rendered - no empty box at the foot of the popover.
+  assert.equal(F.upCovFoot(1, '7d'), '', 'a fully covered window has no caveat');
+  assert.equal(F.upCovFoot(null, '7d'), '', 'nor has one the server said nothing about');
+  assert.equal(F.upCovFoot(undefined, '7d'), '');
+  // And the popover actually renders it - a function nothing calls discloses nothing.
+  assert.match(extract('function showUptimePop'), /upCovFoot\(/,
+    'the popover does not put the note on screen');
+});
+
+// ...but the PILL is deliberately not outlined for it. The dashed marker the
+// sampled speed averages carry says "this figure does not describe the whole of
+// what it names", which is true of a partly-covered uptime too - except that
+// coverage drops below 99.9% on any restart, pause or power-button toggle, so the
+// marker would be lit more often than not and would stop reading as a caveat.
+// The note itself is not dropped: it still reaches the title, the accessible name
+// and the popover, where it can be stated in words instead of hinted at.
+//
+// Pinned at the source because the pill is a markup string built deep inside
+// refreshStatus, which cannot be driven from here.
+test('the uptime pill carries its coverage note without being outlined', () => {
+  // The interactive pill, not the `upv==null` dash fallback beside it.
+  const pill = script.match(/`<span class="pill stat-up"[^`]*role="button"[^`]*`/);
+  assert.ok(pill, 'could not find the interactive uptime pill markup');
+  assert.ok(!/sampled/.test(pill[0]),
+    'the uptime pill is marked sampled again; that outline is on more often than off');
+  assert.ok(!/\.stat-up\.sampled/.test(html),
+    'the stylesheet still gives the uptime pill a dashed outline');
+  // The caveat must survive losing its visual marker, in all three places.
+  assert.match(pill[0], /title="\$\{upTitle\}"/, 'the note no longer reaches the title');
+  assert.match(script, /upTitle = upNote \|\|/, 'upTitle no longer carries the note');
+  assert.match(script, /upAria[\s\S]{0,200}upNote/, 'the accessible name no longer carries the note');
+  assert.match(extract('function showUptimePop'), /upCovFoot\(/,
+    'the popover no longer states the note');
+  // The speed averages keep theirs - they are a different case, sampled only when
+  // the range genuinely exceeds what the chart drew.
+  assert.match(html, /\.chart-stat\.sampled\{border-style:dashed/,
+    'the speed averages lost their marker too');
+});
+
+// The server caps a bare log read at 500 lines while retaining up to 4000, and
+// reports both in the response. The viewer discarded them, so the pane - and the
+// Copy button, which serialises what the pane holds - presented the newest slice as
+// though it were the whole retained log.
+test('logTruncNote: says so when the pane holds only part of the retained log', () => {
+  assert.match(F.logTruncNote(500, 4000), /newest 500 of 4000/);
+  assert.match(F.logTruncNote(500, 4000), /Download/, 'must point at the way to get all of it');
+  // Nothing to say when the pane already has everything.
+  assert.equal(F.logTruncNote(4000, 4000), '');
+  assert.equal(F.logTruncNote(120, 120), '');
+  // A pane that has grown past the initial tail via delta polls is complete too.
+  assert.equal(F.logTruncNote(4000, 3999), '');
+});
+
+// logShownCount is the "shown" figure the truncation note discloses: what the
+// pane holds once this response is applied. Only an append adds this response's
+// lines to what is rendered; a skip leaves the pane exactly as it is, and using
+// the response's (empty) line count there is what wrote "the newest 0 of N".
+test('logShownCount: skip keeps the rendered count, replace takes the response, append adds', () => {
+  const LS = new Function(extract('function logShownCount') + '\nreturn logShownCount;')();
+  assert.equal(LS('skip', 500, 0), 500);
+  assert.equal(LS('replace', 500, 120), 120);
+  assert.equal(LS('append', 500, 2), 502);
+});
+
+// The note block's own comment says it is "driven off the entries actually
+// rendered rather than off this response" - but the shown count was taken from
+// the response's lines for every non-append mode. An idle delta poll (mode
+// 'skip', the pane's steady state at the 2.5s cadence) carries zero lines, so
+// 2.5s after the About tab opened a correct "newest 500 of 4000" was rewritten
+// to "newest 0 of 4000" - and a COMPLETE 300-of-300 pane gained a fabricated
+// truncation banner. This drives the REAL renderLogs with stub DOM, so it pins
+// the wiring and not just the helper above.
+function driveLogPane() {
+  const parts = ['function logMerge', 'function logTruncNote'];
+  if (script.includes('function logShownCount')) parts.push('function logShownCount');
+  parts.push('function renderLogs');
+  const defs = parts.map(extract).join('\n');
+  const els = {
+    logWindow: { contains: () => false },
+    logTrunc: { textContent: '', hidden: true },
+  };
+  const state = 'let logMaskInit = true, logMasked = false, logEpoch = null, logCursor = null;\n'
+    + 'let logPainted = false, logEntries = [];\nconst LOG_VIEW_MAX = 4000;\n'
+    + 'const paintLogs = () => { logPainted = true; };\n'
+    + 'const appendLogs = () => {};\nconst updateLogDownload = () => {};\n';
+  const render = new Function('$', 'window', state + defs + '\nreturn renderLogs;')(
+    id => els[id], { getSelection: () => null });
+  return { render, note: () => ({ text: els.logTrunc.textContent, hidden: els.logTrunc.hidden }) };
+}
+const logLines = n => Array.from({ length: n }, (_, i) => ({ raw: 'l' + i, masked: 'l' + i }));
+
+test('log truncation note: an idle delta poll does not rewrite the shown count', () => {
+  const { render, note } = driveLogPane();
+  // First load: the newest 500 of a 4000-line ring.
+  render({ epoch: 'r1', lines: logLines(500), next_seq: 4000, dropped: 0, buffered: 4000 }, false);
+  assert.match(note().text, /newest 500 of 4000/);
+  // The steady state: a quiet 2.5s delta ('skip'). The pane still shows 500 lines.
+  render({ epoch: 'r1', lines: [], next_seq: 4000, dropped: 0, buffered: 4000 }, true);
+  assert.match(note().text, /newest 500 of 4000/,
+    'an empty delta rewrote the note from the response instead of the rendered pane');
+  assert.equal(note().hidden, false);
+  // New lines still advance the count - the append arm was always right.
+  render({ epoch: 'r1', lines: logLines(2), next_seq: 4002, dropped: 0, buffered: 4000 }, true);
+  assert.match(note().text, /newest 502 of 4000/);
+});
+
+test('log truncation note: a complete pane stays unbannered across idle polls', () => {
+  const { render, note } = driveLogPane();
+  render({ epoch: 'r1', lines: logLines(300), next_seq: 300, dropped: 0, buffered: 300 }, false);
+  assert.equal(note().hidden, true, 'the whole ring is on screen; there is nothing to disclose');
+  render({ epoch: 'r1', lines: [], next_seq: 300, dropped: 0, buffered: 300 }, true);
+  assert.equal(note().hidden, true, 'an idle poll fabricated a truncation banner for a complete pane');
+  assert.equal(note().text, '');
+});
+
+// The 2.5s poll must not be gated on the log-level switch. That switch decides
+// whether the daemon produces lines; a tab with logging off still has to notice a
+// Clear performed in another tab, which is signalled by the epoch changing.
+test('the log poll is not gated on the logging switch', () => {
+  assert.equal(/setInterval\(\(\)=>\{ if\(!document\.hidden && \$\('setLogOn'\) && \$\('setLogOn'\)\.checked/.test(script), false,
+    'the poll still requires logging to be on, so a tab with it off never sees a clear');
+  assert.ok(/setInterval\(\(\)=>\{ if\(!document\.hidden\s*\n\s*&& \$\('drawer'\)\.classList\.contains\('open'\)/.test(script),
+    'the poll should run whenever the About tab is open and visible');
+});
+
+// --- the Connection panel when no lookup is coming -------------------------
+//
+// Automatic connection lookups are gated on BOTH the connection-info setting and
+// the monitoring power button (main.go: EnabledFn = Monitoring() && NetinfoEnabled()).
+// With no cached snapshot and neither of those on, nothing will ever fetch one, so
+// the panel must say so and stop asking. Saying "gathering…" and re-polling every
+// 3s forever promises work that is not happening.
+//
+// This drives the REAL refreshNetinfo out of index.html with stubs, so it fails if
+// the shipped early-return logic changes.
+function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {} } = {}) {
+  const body = extract('async function refreshNetinfo');
+  const panel = { innerHTML: '' };
+  const warn = { innerHTML: '', classList: { add() {}, remove() {} } };
+  const refreshBtn = { classList: { contains: () => false } };
+  const els = { netinfo: panel, netinfoWarn: warn, netinfoRefresh: refreshBtn };
+  const scheduled = [];
+  const $ = id => els[id] || { innerHTML: '', classList: { add() {}, remove() {}, contains: () => false },
+    setAttribute() {}, getAttribute() {}, hidden: false };
+  // netinfoIdleReason is pulled from the same source, not restated here: the
+  // whole point of the fix is that one answer drives both call sites.
+  const idle = script.includes('function netinfoIdleReason') ? extract('function netinfoIdleReason') : '';
+  const make = new Function(
+    '$', 'fget', 'syncNetinfoOffMark', 'netinfoOff', 'monitoring', 'setTimeout', 'clearTimeout',
+    'labelInfoBubbles', 'esc',
+    idle + '\nlet netinfoSeq = 0, netinfoRetry = null;\n' + body + '\nreturn refreshNetinfo;');
+  const fn = make(
+    $,
+    async () => ({ json: async () => snapshot }),
+    () => {},
+    netinfoOff, monitoring,
+    (f, ms) => { scheduled.push(ms); return 1; },
+    () => {},
+    () => {},
+    s => String(s),
+  );
+  return fn().then(() => ({ html: panel.innerHTML, polls: scheduled.length }));
+}
+
+test('connection panel: nothing cached and monitoring paused -> says so, stops polling', async () => {
+  const { html, polls } = await driveNetinfo({ monitoring: false, snapshot: {} });
+  assert.ok(!/gathering/.test(html),
+    'the panel says "gathering…" while the monitor is paused, so no lookup is coming and none ' +
+    'will: automatic lookups need the power button on. It is describing work that is not ' +
+    'happening. Got: ' + html);
+  assert.equal(polls, 0,
+    'it also re-polls every 3s forever waiting for a snapshot nothing will ever fetch');
+});
+
+test('connection panel: nothing cached and connection info off -> unchanged behaviour', async () => {
+  const { html, polls } = await driveNetinfo({ netinfoOff: true, snapshot: {} });
+  assert.match(html, /not looked up yet/);
+  assert.equal(polls, 0);
+});
+
+test('connection panel: nothing cached but monitoring on -> still gathers and polls', async () => {
+  const { html, polls } = await driveNetinfo({ monitoring: true, snapshot: {} });
+  assert.match(html, /gathering/, 'a healthy first run must still show progress');
+  assert.equal(polls, 1, 'and keep polling until the first snapshot lands');
+});
+
+// Stopping the poll when nothing is coming (above) means something has to start it
+// again. Turning monitoring back on is that something: the panel is sitting on
+// "not looked up yet" with no timer pending, so unless the resume triggers a
+// render the panel stays stuck on a message that is no longer true.
+//
+// setPowerUI runs on EVERY status poll, so it must fire only on the transition -
+// a refresh per poll would hammer the endpoint the panel just stopped calling.
+function drivePower(sequence) {
+  const body = extract('function setPowerUI');
+  const btn = { classList: { toggle() {} }, setAttribute() {}, title: '' };
+  const calls = [];
+  const make = new Function('$', 'syncNetinfoOffMark', 'refreshNetinfo', 'monitoring',
+    body + '\nreturn { setPowerUI, state: () => monitoring };');
+  const api = make(() => btn, () => {}, () => calls.push(1), sequence.shift());
+  for (const on of sequence) api.setPowerUI(on);
+  return calls.length;
+}
+
+test('turning monitoring back on releases the connection panel, once', () => {
+  assert.equal(drivePower([false, true]), 1,
+    'resuming must re-render the Connection panel: the poll stopped while paused, so nothing ' +
+    'else will clear "not looked up yet"');
+  assert.equal(drivePower([true, true, true]), 0,
+    'an unchanged power state must not refresh - setPowerUI runs on every status poll');
+  assert.equal(drivePower([true, false]), 0,
+    'pausing must not trigger a lookup that the pause exists to stop');
+});
+
+// --- the Import button's upload ---------------------------------------------
+//
+// The server streams an import in and imposes no ceiling on the body, and a
+// default export of a year's monitoring runs to hundreds of megabytes. Reading
+// the file with f.text() first defeats all of that in the browser: the whole
+// backup becomes a JS string, and fetch then makes a second copy of it as UTF-8
+// bytes. Handing fetch the File instead lets the browser stream it off disk.
+//
+// This drives the REAL click handler out of index.html against stubs, so it fails
+// if the shipped upload changes shape.
+function driveImport({ ok = true, resp = {}, fetchFails = false } = {}) {
+  let handler = null;
+  const file = { name: 'backup.json', size: 290 * 1024 * 1024, reads: 0,
+    async text() { this.reads++; return '{}'; } };
+  const btn = { disabled: false, addEventListener: (_ev, fn) => { handler = fn; } };
+  const msg = { textContent: '' };
+  const els = { importBtn: btn, importFile: { files: [file] }, importMsg: msg,
+    outagesSection: { style: { display: 'none' } } };
+  const sent = { body: undefined, headers: null, disabledMidUpload: null };
+  const fetchStub = async (_url, opt) => {
+    sent.body = opt.body; sent.headers = opt.headers;
+    sent.disabledMidUpload = btn.disabled; // a second click here would upload twice
+    if (fetchFails) throw new Error('network went away');
+    return { ok, status: ok ? 200 : 500, json: async () => resp,
+      text: async () => JSON.stringify(resp) };
+  };
+  const noop = async () => {};
+  const register = new Function('$', 'getCats', 'fetch', 'confirm', 'loadSettings',
+    'loadAccess', 'formSnapshot', 'refreshStatus', 'refreshChart', 'refreshSpeedChart',
+    'refreshHeatmap', 'loadOutages',
+    'let savedBody = null;\n' + extract("$('importBtn').addEventListener('click'") + ');');
+  register(id => els[id], () => ['pings'], fetchStub, () => true, noop, noop,
+    () => '', () => {}, () => {}, () => {}, () => {}, noop);
+  return handler().then(() => ({ file, btn, msg, sent }));
+}
+
+test('import hands the file to fetch instead of reading it into memory', async () => {
+  const { file, sent } = await driveImport();
+  assert.equal(file.reads, 0,
+    'the whole backup was read into a JS string first - a 290 MB export becomes ~580 MB ' +
+    'of browser memory once fetch encodes it, which is how a phone runs out');
+  assert.equal(sent.body, file,
+    'fetch must be given the File itself so the browser streams it from disk');
+  // Load-bearing, not decoration: a File picked with no MIME type sends no
+  // Content-Type at all, and the import handler answers that with a 415.
+  assert.equal(sent.headers['Content-Type'], 'application/json',
+    'the explicit Content-Type must survive - the File cannot be relied on to carry one');
+});
+
+test('import will not take a second click while the first is still uploading', async () => {
+  const done = await driveImport();
+  assert.equal(done.sent.disabledMidUpload, true,
+    'the button stays live during a multi-minute upload, so an impatient second click ' +
+    'imports the same file twice');
+  assert.equal(done.btn.disabled, false, 'and it must come back after a success');
+  const refused = await driveImport({ ok: false, resp: { error: 'nope' } });
+  assert.equal(refused.btn.disabled, false, 'a refused import must not leave it stuck');
+  const broken = await driveImport({ fetchFails: true });
+  assert.equal(broken.btn.disabled, false, 'nor must a connection that dies mid-upload');
+});
+
+// B1: the per-outage delete button gates on outageDeletable, which must match the
+// server's guard (ts=? AND type='up') - including a repair-nulled 'up' row whose
+// duration is gone (has_duration:false). Gating on has_duration hid the button for
+// exactly the rows the server still accepts for deletion.
+test('outageDeletable: every closing up event is deletable, even a repair-nulled one', () => {
+  assert.equal(F.outageDeletable({ type: 'up', has_duration: true, duration_s: 180 }), true);
+  assert.equal(F.outageDeletable({ type: 'up', has_duration: false }), true); // repair nulled the duration - server still deletes it
+  assert.equal(F.outageDeletable({ type: 'down' }), false);                   // an in-progress outage can't be deleted
+  assert.equal(F.outageDeletable(null), false);
+});
+
+// A5: the background chart pollers must recognise the restore-reconcile 503 (an
+// expected, self-clearing pause) so they suppress the failure toast and back off
+// Retry-After instead of treating it as a load failure.
+test('isReconcile503: matches the reconcile 503 by Retry-After or body, nothing else', () => {
+  const hdr = v => ({ get: k => (k === 'Retry-After' ? v : null) });
+  assert.equal(F.isReconcile503({ status: 503, headers: hdr('2') }), true);   // Retry-After signal
+  assert.equal(F.isReconcile503({ status: 503, headers: hdr(null) }, 'restoring a backup; try again shortly'), true); // body fallback
+  assert.equal(F.isReconcile503({ status: 503, headers: hdr(null) }, ''), false); // a plain 503 with neither signal is a real failure
+  assert.equal(F.isReconcile503({ status: 500, headers: hdr('2') }), false);  // wrong status
+  assert.equal(F.isReconcile503(null), false);
+  assert.equal(F.retryAfterMs('2'), 2000);
+  assert.equal(F.retryAfterMs(null), 2000);   // absent -> the server's default
+  assert.equal(F.retryAfterMs('99999'), 60000); // clamped so a hostile header can't wedge the loop
+});
+
+// ONLY A SEARCHED CITY MAY BE NAMED AS AUTO'S CENTRE. The dropdown used to read
+// "Auto - fastest near Miami" from the BROWSING list's centre, which live auto
+// does not use - and on the measured link that centre was a Cloudflare PoP a
+// country from every city auto races. With no searched city there is no place
+// to name at all: the centre is raced fresh on every test.
+test('autoOptionText names a searched city, never the browse centre', () => {
+  assert.equal(F.autoOptionText('Montreal'), 'Auto - fastest in Montreal');
+  assert.equal(F.autoOptionText(''), 'Auto - fastest near you');
+  // "near you" describes the candidates - every city the race considers is an
+  // attempt to locate US - so it stays true whichever one wins. What must never
+  // come back is a NAMED city that auto did not choose: the browse centre.
+  assert.ok(!/Miami|Montreal/.test(F.autoOptionText('')));
+});
+
+test('the scope note never credits the browse centre to auto', () => {
+  const t = F.autoScopeText('the fastest server', '', 'Miami', '');
+  assert.ok(/races the cities/.test(t), t);
+  assert.ok(/for browsing/.test(t), t);
+  // The two claims the old string made, both false: that auto picks near this
+  // place, and that the place is the ISP's exit.
+  assert.ok(!/picks .* near/.test(t), t);
+  assert.ok(!/exit/.test(t), t);
+});
+
+test('a searched city wins outright and the browse centre goes unmentioned', () => {
+  assert.equal(F.autoScopeText('the 3 fastest servers', 'Montreal', 'Miami', 'Example ISP, Oldtown'),
+    'Auto picks the 3 fastest servers in <b>Montreal</b>.');
+});
+
+test('with no browse centre the sentence is still true', () => {
+  const t = F.autoScopeText('the fastest server', '', '', '');
+  assert.ok(/for browsing/.test(t), t);
+  assert.ok(!/<b>/.test(t), t);
+});
+
+// Reports what the last run MEASURED, in the past tense, so it stays true
+// however that server was chosen - and it is the honest answer to "which city
+// did auto use?" without the daemon remembering a race.
+test('the last measured server is reported, and only when there is one', () => {
+  assert.ok(/last test measured <b>Example ISP, Oldtown<\/b>/.test(
+    F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Oldtown')));
+  assert.ok(!/last test measured/.test(F.autoScopeText('the fastest server', '', 'Oldtown', '')));
+});
+
+test('the panel escapes place names the daemon supplies', () => {
+  assert.ok(F.autoScopeText('x', '', '<img src=x>', '').includes('&lt;img'));
+  assert.ok(F.autoScopeText('x', '<img src=y>', '', '').includes('&lt;img'));
+});
+
+// A 30-day window returns hundreds of runs into ~900px. Below one bar per ~2px
+// the bars touch and the strip shows density instead of level, so columns are
+// binned - but only then: a short window must keep every run's own bar.
+test('bloatBins leaves a sparse window alone', () => {
+  const f = { dDn: p => p.dn, dUp: p => p.up, dDnX: p => p.dnX, dUpX: p => p.upX };
+  const pts = [0, 1, 2, 3].map(i => ({ ts: i, dn: 5 + i, up: 6, dnX: 40, upX: 40 }));
+  const X = t => 100.4 + t * 200;             // 200px apart: nothing collides
+  const out = F.bloatBins(pts, f, X, 1.6);
+  assert.equal(out.length, 4);
+  assert.equal(out[0].dn, 5);
+  assert.equal(out[3].dn, 8);
+  // Positions stay EXACT when nothing needed binning. A binned bar sits on a
+  // rounded pixel column, but the hover cursor is drawn at the unrounded X, so
+  // rounding a window that did not need it would walk the bar off its own cursor.
+  assert.equal(out[0].px, 100.4);
+  assert.equal(out[3].px, 700.4);
+});
+
+test('bloatBins collapses a dense window to one bar per pixel column', () => {
+  const f = { dDn: p => p.dn, dUp: p => p.up, dDnX: p => p.dnX, dUpX: p => p.upX };
+  // 400 runs across 100px - far past the point where 1.6px bars overlap.
+  const pts = Array.from({ length: 400 }, (_, i) => ({ ts: i, dn: 5, up: 6, dnX: 40, upX: 40 }));
+  const X = t => 10 + t * (100 / 399);
+  const out = F.bloatBins(pts, f, X, 1.6);
+  assert.ok(out.length < 120, `binned to ${out.length} bars, want about one per pixel column`);
+  assert.ok(out.length > 50, `binned to ${out.length} - collapsed too far`);
+});
+
+// The two marks mean different things, so they reduce differently. The solid bar
+// is a LEVEL: a column takes the median so the trend sits where the runs sat. The
+// pale tail is a SPIKE: a column takes the maximum, because one bad run inside a
+// busy column must not be averaged out of existence by its neighbours.
+test('bloatBins takes the median level but the peak tail', () => {
+  const f = { dDn: p => p.dn, dUp: p => p.up, dDnX: p => p.dnX, dUpX: p => p.upX };
+  const pts = [
+    { ts: 0, dn: 5, up: 5, dnX: 20, upX: 20 },
+    { ts: 1, dn: 7, up: 7, dnX: 900, upX: 900 },   // the spike
+    { ts: 2, dn: 9, up: 9, dnX: 30, upX: 30 },
+  ];
+  const X = t => 50 + t * 0.2;                     // sub-pixel apart: one column
+  const out = F.bloatBins(pts, f, X, 1.6);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].dn, 7, 'level should be the median of 5/7/9');
+  assert.equal(out[0].dnX, 900, 'the spike must survive binning');
+});
+
+// A threshold far above what the link does must not own the axis. Set a 200ms
+// bufferbloat limit on a line that bloats 5-15ms and the old ceiling scaled to
+// the limit, flattening every bar into the baseline - the chart went blank to
+// make room for a line that was never going to be crossed.
+test('bloatCeiling ignores a threshold that is nowhere near the data', () => {
+  const far = F.bloatCeiling(15, 200);
+  assert.ok(far <= 20, `ceiling ${far} was stretched to a distant 200ms limit`);
+  // A limit close to the data still belongs in scale - that is what makes it
+  // useful to see.
+  assert.ok(F.bloatCeiling(100, 150) >= 150, 'a nearby limit must stay visible');
+});
+
+// Rounded to a stable step, so the axis number stops drifting between refreshes
+// while the underlying data wanders a few ms.
+test('bloatCeiling rounds to a stable step', () => {
+  const a = F.bloatCeiling(23.4, 0), b = F.bloatCeiling(24.1, 0);
+  assert.equal(a, b, `ceiling moved from ${a} to ${b} on a 0.7ms change in the data`);
+  assert.ok([1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].includes(a), `ceiling ${a} is not a round step`);
+});
+
+// THE THREE ICONS HAVE TO SHARE A CAP HEIGHT. As characters they could not: the
+// sine is U+223F SINE WAVE, a math operator drawn about the math axis, so it
+// occupies roughly x-height while the arrows span nearly the full ascender - it
+// read as crushed beside them at any shared font-size. All three also fell out
+// of the page font's Latin subset to whatever system-ui resolved to, so their
+// relative sizes were the OS's choice. Drawn as SVG they share one height and
+// one stroke weight by construction.
+test('the average pills draw their icons instead of typing them', () => {
+  for (const id of ['spdAvgDn', 'spdAvgUp', 'spdAvgPing']) {
+    assert.ok(new RegExp(`id="${id}"[^>]*><i class="stat-face"><svg`).test(html),
+      `${id} does not draw its icon; a text glyph cannot be matched to the others`);
+  }
+  // One rule pins HEIGHT for all three and lets width follow each viewBox, which
+  // is what makes a wide wave and a narrow arrow the same size to the eye.
+  assert.ok(/\.chart-stat \.stat-face svg\{height:[^;]+;width:auto/.test(html),
+    'the icons are not height-matched with free width');
+  // Decorative: the pill carries role="img" and the accessible name.
+  const icons = html.match(/<i class="stat-face"><svg[^>]*>/g) || [];
+  assert.equal(icons.length, 3);
+  for (const i of icons) assert.ok(/aria-hidden="true"/.test(i), 'an icon is exposed to assistive tech');
+  for (const i of icons) assert.ok(/stroke="currentColor"/.test(i), 'an icon does not follow the pill colour');
+  // The number still needs separating from the icon now that no space joins them.
+  assert.ok(/\.chart-stat\{[^}]*gap:/.test(html),
+    'nothing separates the icon from the value');
+});
+
+// THE HEATMAP TINTS BY OUTAGE COUNT, NOT BY DOWNTIME. The README described the
+// cells as "per-day outage time", "tinted by how much outage time it saw" - the
+// one thing the fill does not encode. A day with a single 23-hour outage is
+// level 1, exactly like a day with a single one-second blip; three trivial blips
+// outrank both.
+//
+// This pins the semantics the README now states. If the fill is ever changed to
+// encode duration (a reasonable thing to want), this test fails and whoever
+// changes it is told to go fix the prose too.
+test('heatmap level counts outages and ignores how long they lasted', () => {
+  // Lifted the same way driveHeatmap lifts it: a one-line arrow const, which
+  // extract() cannot brace-match.
+  const hmLevel = new Function(
+    script.match(/const hmLevel = [^;]*;/)[0] + '\nreturn hmLevel;')();
+  assert.equal(hmLevel(0), 0, 'a clean day is empty');
+  assert.equal(hmLevel(1), 1);
+  assert.equal(hmLevel(2), 2);
+  assert.equal(hmLevel(3), 3);
+  assert.equal(hmLevel(99), 3, 'the ramp saturates at 3');
+
+  // The claim in prose form: one outage is one outage, whatever it cost.
+  const dayWithOneLongOutage = hmLevel(1);   // 23h down
+  const dayWithOneBlip = hmLevel(1);         // 1s down
+  const dayWithThreeBlips = hmLevel(3);      // 3s down total
+  assert.equal(dayWithOneLongOutage, dayWithOneBlip,
+    'duration must not affect the level - that is the documented behaviour');
+  assert.ok(dayWithThreeBlips > dayWithOneLongOutage,
+    'three brief outages outrank one long one; the README must not claim otherwise');
+});
+
+// ONE BAD MOMENT MUST NOT OWN THE AXIS. The bufferbloat chart reduced its p95
+// tails with a median (robust) but its TYPICAL values with a plain max, so a
+// single run whose upload median hit 256ms set the ceiling to 500 while every
+// other bar in the window sat around 8ms. The chart went flat to make room for
+// one spike the overflow caret was going to mark anyway.
+test('bloatDataMax: a single spike does not set the scale', () => {
+  // 41 ordinary runs around 8ms and one catastrophic one, both directions.
+  const typical = Array(82).fill(8.4).concat([256.1, 30.0]);
+  const tails = Array(82).fill(13.5).concat([1014.7, 95.1]);
+
+  const dm = F.bloatDataMax(typical, tails);
+  assert.ok(dm < 60, `ceiling input ${dm} is still being dragged up by the outlier`);
+  assert.ok(dm >= 13.5, 'the typical tail level must still fit under the ceiling');
+
+  // The whole point, stated as the user sees it: the axis stays within a small
+  // multiple of the level the bars actually occupy.
+  assert.ok(F.bloatCeiling(dm, 0) <= 8.4 * 12,
+    'the axis is more than 12x the typical bar - the chart reads as flat');
+});
+
+// The clamp must not become a lie in the other direction: a link that really is
+// this bad has to scale up, or the chart would clip everything and say nothing.
+test('bloatDataMax: a genuinely bad link still gets a big axis', () => {
+  const typical = Array(40).fill(300);
+  const tails = Array(40).fill(420);
+  const dm = F.bloatDataMax(typical, tails);
+  assert.ok(dm >= 300, `sustained 300ms bloat must raise the ceiling, got ${dm}`);
+});
+
+test('bloatDataMax: floors a quiet link and survives empty input', () => {
+  assert.equal(F.bloatDataMax([], []), 20, 'no data still needs a sane axis');
+  assert.equal(F.bloatDataMax([0.2, 0.4, 0.1], [0.5]), 20,
+    'a link with no bloat should not magnify sub-millisecond noise');
+  // The tail median counts even when the typical values are tiny.
+  assert.ok(F.bloatDataMax(Array(20).fill(1), Array(20).fill(75)) >= 75,
+    'a sustained tail level must fit under the ceiling');
+});
+
+// ONE SELECTION, THREE CHARTS, ONE LINE. The selection cursor marks the same run
+// down a stack of three charts, so it has to read as a single continuous line.
+// Each chart used to anchor it to its own plot box, and those boxes reserve
+// padding for their own data: the speed chart keeps 10px at the top so a line at
+// the ceiling is not clipped, the bufferbloat chart keeps 8px at the bottom for
+// the caret its downward bars clip into. The result was three different lengths,
+// the bufferbloat one visibly stopping short of the floor.
+test('cursorSpan: the selection cursor is the same height on every chart', () => {
+  const h = 150;
+  // Whatever each chart reserves internally, the cursor spans the canvas.
+  assert.deepEqual(F.cursorSpan(h, false), { top: 0, bot: h });
+  // Three charts, same canvas height, no axis: identical spans.
+  const spans = [false, false, false].map(() => F.cursorSpan(h, false));
+  assert.deepEqual(spans[0], spans[1]);
+  assert.deepEqual(spans[1], spans[2]);
+});
+
+test('cursorSpan: only the x-axis label strip is excluded', () => {
+  const h = 150;
+  const plain = F.cursorSpan(h, false), axis = F.cursorSpan(h, true);
+  assert.equal(axis.top, 0, 'the cursor always starts at the canvas top');
+  assert.ok(axis.bot < plain.bot,
+    'the chart drawing the timestamps must stop above them, not run dashes through');
+  assert.ok(axis.bot > h * 0.5, 'but it must still cross the great majority of the chart');
+});
+
+// The rule is worth nothing if a chart goes back to using its own padding, and
+// that is exactly how the three drifted apart in the first place - each was
+// edited for its own reasons and nothing tied them together.
+test('every speed chart takes its cursor span from the shared rule', () => {
+  const calls = script.split('\n')
+    .filter(l => l.includes('drawCursor(') && !l.includes('function drawCursor'));
+  assert.ok(calls.length >= 6, `expected the three charts' six cursor draws, found ${calls.length}`);
+  for (const l of calls) {
+    assert.ok(/cs\.top,\s*cs\.bot/.test(l),
+      `a cursor is drawn from something other than cursorSpan: ${l.trim()}`);
+    assert.ok(/,\s*sy\)/.test(l),
+      `a cursor is drawn without its stack offset, so its dashes restart: ${l.trim()}`);
+  }
+  // And all three ask for it the same way.
+  assert.equal((script.match(/cursorSpan\(h,\s*mine\)/g) || []).length, 3,
+    'each of the three speed charts must derive its cursor span from cursorSpan(h, mine)');
+});
+
+// A recording 2d context: enough for drawCursor, and it REMEMBERS the state it
+// was handed so a test can prove the function does not inherit it.
+const penCtx = (pre = {}) => ({
+  lineWidth: 2, globalAlpha: 1, strokeStyle: '', lineDashOffset: 0, dash: null,
+  ops: [], ...pre,
+  save() { this.ops.push('save'); }, restore() { this.ops.push('restore'); },
+  setLineDash(d) { this.dash = d; }, beginPath() {}, moveTo() {}, lineTo() {},
+  stroke() { this.ops.push({ lw: this.lineWidth, alpha: this.globalAlpha, off: this.lineDashOffset }); },
+});
+
+// THE CURSOR MUST NOT INHERIT THE CHART'S PEN. Every stroke property in
+// drawCursor was set explicitly except lineWidth, so the one shared selection
+// marker came out at two thicknesses: the speed and quality charts set
+// lineWidth to TC.lw (appearance slider, default 2) drawing their data lines,
+// while the bufferbloat chart draws bars with fillRect and its caret with
+// fill(), touching lineWidth not at all and leaving the canvas reset value of 1.
+// It also moved with settings - threshLine drops lineWidth to 1, so enabling a
+// threshold thinned that chart's cursor.
+test('drawCursor: the same width whatever the chart was drawing with', () => {
+  // Two contexts left in the states the real charts leave them in.
+  const afterLines = penCtx({ lineWidth: 2 });   // speed/quality: TC.lw
+  const afterBars = penCtx({ lineWidth: 1 });    // bufferbloat: never set
+  const afterThresh = penCtx({ lineWidth: 4 });  // and an arbitrary third
+
+  for (const c of [afterLines, afterBars, afterThresh]) F.drawCursor(c, 10, 0, 100, true, 0);
+
+  const widths = [afterLines, afterBars, afterThresh].map(c => c.ops.find(o => o.lw !== undefined).lw);
+  assert.deepEqual(widths, [1, 1, 1],
+    `the cursor drew at ${widths.join('/')} px depending on what the chart drew last`);
+});
+
+test('drawCursor: still dashed, still phase-shifted, still dimmer when not selected', () => {
+  const a = penCtx(), b = penCtx();
+  F.drawCursor(a, 10, 0, 100, true, 14);
+  F.drawCursor(b, 10, 0, 100, false, 0);
+  assert.deepEqual(a.dash, [3, 3], 'the cursor must stay dashed');
+  assert.equal(a.ops.find(o => o.off !== undefined).off, 14 % 6,
+    'the stack offset must still shift the dash phase');
+  const alphaSel = a.ops.find(o => o.alpha !== undefined).alpha;
+  const alphaHover = b.ops.find(o => o.alpha !== undefined).alpha;
+  assert.ok(alphaSel > alphaHover, 'the pinned selection stays stronger than a hover');
+  // and it must not leak its pen back to the caller
+  assert.equal(a.ops[0], 'save');
+  assert.equal(a.ops[a.ops.length - 1], 'restore');
+});
+
+// THE GAPS BETWEEN THE THREE CHARTS CARRY MEANING. Speed and quality are two
+// line charts sharing one x axis and read as a pair, so they sit tight together.
+// Bufferbloat is a different kind of chart - diverging about a centre zero, with
+// its own scale - and the wider gap is what says so.
+//
+// This exists because that grouping was once flattened to a uniform 2px while
+// chasing an unrelated goal (making the selection cursor read as one continuous
+// line down the stack). Uniformity looked like an improvement in the diff and
+// was a regression on screen. The cursor's continuity is handled by dash PHASE
+// (drawCursor's stackY), which is independent of the gap - so spacing is free to
+// express grouping, and no future tidy-up should trade it away again.
+test('the chart stack spaces bufferbloat apart from the speed/quality pair', () => {
+  const gap = id => {
+    const tag = html.match(new RegExp(`<canvas id="${id}"[^>]*>`))[0];
+    const m = tag.match(/margin-top:(\d+)px/);
+    assert.ok(m, `${id} has no explicit margin-top; the stack spacing is deliberate`);
+    return Number(m[1]);
+  };
+  const quality = gap('qualityChart'), bloat = gap('bloatChart');
+  assert.ok(quality <= 4,
+    `quality sits ${quality}px under speed; the pair must stay visually joined`);
+  assert.ok(bloat >= 12,
+    `bufferbloat sits only ${bloat}px under quality - it reads as part of the pair above it`);
+  assert.ok(bloat > quality * 3,
+    'the break before bufferbloat must be clearly larger than the one inside the pair');
+});
+
+// WCAG AA WANTS 4.5:1 FOR NORMAL-SIZE TEXT, AND THESE TOKENS ARE NORMAL-SIZE
+// TEXT. --muted/--up/--down/--warn colour 11-13px headings, log lines, badges
+// and status readouts on .panel and .card, whose backgrounds are gradients
+// between --panel and --panel2 - so a token has to clear the bar against BOTH
+// ends, not just the one that flatters it.
+//
+// Five of the eight built-in themes shipped below the bar (twelve token/surface
+// pairs, worst 2.38:1). Eyeballing colour is exactly the thing people cannot do,
+// so this computes it: any theme added or retuned later is measured the same way
+// rather than trusted.
+const srgb = h => {
+  let x = h.replace('#', '');
+  if (x.length === 3) x = [...x].map(c => c + c).join('');
+  return [0, 2, 4].map(i => parseInt(x.slice(i, i + 2), 16) / 255);
+};
+const relLuminance = h => {
+  const [r, g, b] = srgb(h).map(c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const contrast = (a, b) => {
+  const [hi, lo] = [relLuminance(a), relLuminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+};
+
+test('contrast: relLuminance/contrast agree with the WCAG reference points', () => {
+  // Anchors from the spec itself, so a broken formula cannot quietly pass the
+  // theme sweep below by rating everything as fine.
+  assert.equal(Math.round(contrast('#ffffff', '#000000')), 21);
+  assert.equal(Math.round(contrast('#ffffff', '#ffffff')), 1);
+  assert.ok(Math.abs(contrast('#767676', '#ffffff') - 4.54) < 0.02,
+    '#767676 on white is the canonical "just passes AA" grey');
+});
+
+test('every built-in theme meets WCAG AA for its normal-size text tokens', () => {
+  const readVars = block => Object.fromEntries(
+    [...block.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-fA-F]{3,6})/g)].map(m => [m[1], m[2]]));
+  const base = readVars(html.match(/:root\{([\s\S]*?)\n {2}\}/)[1]);
+  const themes = {};
+  for (const m of html.matchAll(/html\[data-theme="([a-z]+)"\]\{([^}]*)\}/g)) {
+    const v = readVars(m[2]);
+    if (Object.keys(v).length) themes[m[1]] = { ...(themes[m[1]] || {}), ...v };
+  }
+  assert.ok(Object.keys(themes).length >= 5, 'no themes parsed - the selector shape changed');
+
+  const failures = [];
+  for (const [name, over] of Object.entries(themes)) {
+    const t = { ...base, ...over };
+    if (!t.panel || !t.panel2) continue;
+    for (const tok of ['muted', 'up', 'down', 'warn']) {
+      if (!t[tok]) continue;
+      for (const surface of ['panel', 'panel2']) {
+        const r = contrast(t[tok], t[surface]);
+        if (r < 4.5) failures.push(`${name} --${tok} on --${surface}: ${r.toFixed(2)}:1`);
+      }
+    }
+  }
+  assert.deepEqual(failures, [],
+    `theme text below WCAG AA 4.5:1:\n  ${failures.join('\n  ')}`);
 });

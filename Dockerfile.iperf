@@ -55,7 +55,11 @@ RUN groupadd --gid 65532 pingularity \
 COPY --from=setcap /pingularity /pingularity
 # The data dir must exist owned by 65532 so a freshly created named volume inherits
 # that ownership and the unprivileged process can write to it.
-COPY --from=setcap --chown=65532:65532 /data /var/lib/pingularity
+# --chmod=0700 to match the mode pingularity gives a data directory it creates
+# itself; see the same COPY in Dockerfile. Without it the destination directory is
+# 0755 (COPY does not carry the source mode across) and the daemon spends every
+# start warning that its own data directory is readable by others.
+COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity
 USER pingularity

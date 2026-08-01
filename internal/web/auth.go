@@ -170,16 +170,46 @@ func (l *failLimiter) prune() {
 	}
 }
 
+// recoverPanics turns a panicking handler into a 500 instead of a killed
+// connection: recover, log with a stack, and write the error (a post-headers
+// write just no-ops). http.ErrAbortHandler is re-panicked so the server's abort
+// path runs.
+//
+// WHERE this sits is the whole point, not a detail. Deferred functions unwind
+// innermost-first, so any middleware that finalizes a response in a defer -
+// compressResponses closing its gzip stream - runs BEFORE a recover that is
+// further out, and commits its own status first. With recovery only in guard
+// (outside compression), a route that panicked before writing produced a clean
+// 500 to a plain client and a 200 carrying "internal server error" to a client
+// that sent Accept-Encoding: gzip, which is nearly all of them. So recovery is
+// mounted INSIDE compression, nearest the routes: it writes the 500 first, and
+// the compressor then finalizes around a status that is already correct.
+func (s *Server) recoverPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
+				s.log.Error("panic serving request", "method", r.Method, "path", r.URL.Path, "recovered", rec, "stack", string(debug.Stack()))
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // guard wraps the mux with three access controls, in order: a DNS-rebinding
 // Host-header check, a loopback-only filter, and authentication. The filter and
 // auth read live settings (toggling either applies without a restart); the
-// allowed-host set is fixed at startup.
+// allowed-host set is fixed at startup. Ahead of all three, a restore's reconcile
+// window is refused wholesale - those settings are the backup's, not this box's.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Every route passes through here, so this is the one place to stop a
-		// panicking handler from silently killing the connection: recover, log
-		// with a stack, and return a 500 (a post-headers write just no-ops).
-		// http.ErrAbortHandler is re-panicked so the server's abort path runs.
+		// Retained as the OUTER net so a panic in guard's own work (the host check,
+		// the local-only filter, auth) is still caught - recoverPanics only covers
+		// what it wraps. Route panics are handled further in, before the compressor
+		// finalizes; see recoverPanics.
 		defer func() {
 			if rec := recover(); rec != nil {
 				if rec == http.ErrAbortHandler {
@@ -195,6 +225,24 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// panic-recover defer above and the securityHeaders/writeDeadline wrappers.
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			next.ServeHTTP(w, r)
+			return
+		}
+		// A restore publishes the backup's settings before its safety repair runs, so
+		// for that window the box is configured by whatever the backup said - possibly
+		// "no login, reachable from the network". Refuse everything rather than judge
+		// the request against settings nobody on this machine chose: loopback cannot
+		// tell a local browser from a same-host reverse proxy, so no narrower test
+		// closes the window (a proxy that rewrites Host to loopback and drops
+		// X-Forwarded-For is indistinguishable from the operator's own browser). The
+		// import itself is admitted before the handler raises this flag, so an
+		// in-flight restore never locks itself out.
+		//
+		// 503 with a short Retry-After, not 403: the window is seconds wide, and this
+		// tells the dashboard (and a load balancer) to come back rather than to report
+		// the box as forbidden. /healthz and /readyz answer throughout, above.
+		if s.reconciling.Load() {
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "restoring a backup; try again shortly", http.StatusServiceUnavailable)
 			return
 		}
 		// DNS-rebinding protection: a malicious page can re-point its own DNS
@@ -228,7 +276,8 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		}
 		// Local-only: judged on the real TCP peer, never the spoofable
 		// X-Forwarded-For. A same-host reverse proxy still passes - detected and
-		// warned about below.
+		// warned about below. Restores need no special case here: the reconcile
+		// window is refused outright above, before any setting is consulted.
 		if s.settings.AccessLocalOnly() {
 			switch {
 			case s.InContainer:
@@ -251,6 +300,31 @@ func (s *Server) guard(next http.Handler) http.Handler {
 					s.log.Warn("local-only is on, but requests are arriving through a same-host reverse proxy, which local-only cannot block", "host", capForLog(r.Host))
 				})
 			}
+		}
+		// FAIL CLOSED WHEN THE CONFIGURATION NEVER LOADED. If the initial settings
+		// read failed, the controller holds compiled-in defaults, and those have no
+		// password - so AuthActive() below answers "no login here" whether the
+		// operator never set one or the daemon simply could not read the one they
+		// did. Serving on that answer silently discards a configured login: every
+		// route, including data deletion and import, then answers with no
+		// credentials while the password sits intact on disk.
+		//
+		// The ambiguity cannot be resolved from here, so it is refused instead of
+		// guessed. That is the call the import reconcile path already makes for the
+		// same ambiguity ("fail CLOSED", handleImport), and the same bargain the
+		// store's prune guard makes about an untrusted clock: declining costs a
+		// restart, acting costs the thing being protected.
+		//
+		// /healthz and /readyz are already past us (they return above), so liveness
+		// stays answerable and readiness can report NOT ready - which is how a
+		// supervisor learns to keep traffic away. Everything else - UI, API and
+		// metrics alike - gets 503 until a reload succeeds.
+		if !s.settings.Loaded() {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "settings could not be loaded, so access control cannot be applied; "+
+				"refusing to serve. check the log, then restart or SIGHUP once the database is readable.",
+				http.StatusServiceUnavailable)
+			return
 		}
 		if s.settings.AuthActive() && !authExempt(r) {
 			// A configured read-only metrics token is an ALTERNATIVE credential for
@@ -653,6 +727,13 @@ func isLoopbackAddr(remoteAddr string) bool {
 // is reachable unauthenticated so the UI can decide whether to prompt for login;
 // POST is gated by the guard once auth is active.
 func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
+	// Same lock the import's reconcile holds. A credential change landing in the
+	// middle of a restore used to leave the reconcile guessing which username was
+	// the operator's, and it guessed wrong whenever only the password had changed -
+	// a password-only update keeps the username, so the hash moved and the name did
+	// not. Serializing removes the guess: one of the two goes first, whole.
+	s.importMu.Lock()
+	defer s.importMu.Unlock()
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, s.accessStatus(r))
@@ -762,10 +843,36 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 					"allowed_hosts", strings.Join(s.AllowedHosts, ","))
 			}
 		}
-		writeJSON(w, s.accessStatus(r))
+		status := s.accessStatus(r)
+		// Surface the same proxy caveat the log records above to the CALLER, not only
+		// the server log: setting local-only while a same-host proxy is declared does
+		// NOT keep proxied visitors out, and the operator saving this needs to know.
+		if in.LocalOnly != nil && *in.LocalOnly {
+			if c := proxyLocalOnlyCaveat(s.AllowedHosts); c != "" {
+				status["warnings"] = []string{"Access is now limited to this machine, but " + c}
+			}
+		}
+		writeJSON(w, status)
 	default:
 		http.Error(w, "use GET or POST", http.StatusMethodNotAllowed)
 	}
+}
+
+// proxyLocalOnlyCaveat returns the sentence to append when access is (or is being)
+// limited to the local machine but -allow-host declares a same-host reverse proxy.
+// Proxied visitors reach the box as loopback connections the local-only filter
+// cannot tell from a real local user, so local-only CANNOT block them; the honest
+// remedy is a login password. It returns "" when no proxy is declared - there
+// local-only is a real restriction and the caller's truthful no-proxy wording
+// stands. One predicate, read by both the import repair (web.go) and the
+// access-settings action, so the affordance and the action cannot disagree.
+func proxyLocalOnlyCaveat(allowedHosts []string) string {
+	if len(allowedHosts) == 0 {
+		return ""
+	}
+	return "a reverse proxy is declared (-allow-host), and local-only access CANNOT block visitors " +
+		"arriving through it - proxied visitors still reach the dashboard. Set a login password in the " +
+		"Access tab to protect it."
 }
 
 func (s *Server) accessStatus(r *http.Request) map[string]any {

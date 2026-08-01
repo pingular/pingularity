@@ -26,6 +26,8 @@ func (d *disconnectSpy) RunOnce(ctx context.Context, reason string) (store.Speed
 	return store.SpeedSample{TS: time.Now().Unix(), DownMbps: 1}, nil
 }
 func (d *disconnectSpy) Running() bool         { return false }
+func (d *disconnectSpy) RunID() uint64         { return 0 }
+func (d *disconnectSpy) Abort(uint64) bool     { return false }
 func (d *disconnectSpy) CurrentServer() string { return "" }
 func (d *disconnectSpy) NextRun() time.Time    { return time.Time{} }
 

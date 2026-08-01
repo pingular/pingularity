@@ -1,22 +1,26 @@
-# Actions are pinned to commit SHAs (supply-chain safety); Dependabot keeps
-# those pins current by opening a PR when a new release of each action ships,
-# updating both the SHA and the trailing version comment.
+# Base images only.
+#
+# The FROM lines in Dockerfile and Dockerfile.iperf are pinned by DIGEST, and a
+# digest is immutable: when Debian or distroless ship a rebuild for a CVE the tag
+# moves and our pin does not. Nothing in the build reports that, and these images
+# are published to ghcr.io - so with nothing watching, a stale base layer ships
+# to whoever pulls them, silently and indefinitely. Verified: no CI job inspects
+# a base manifest, so this file is the only thing covering it.
+#
+# The other two ecosystems were dropped deliberately, and the asymmetry is the
+# reason:
+#
+#   gomod          - already covered. ci.yml runs govulncheck, including on a
+#                    weekly schedule specifically to re-scan the shipped code
+#                    against newly disclosed vulnerabilities. A Go CVE surfaces
+#                    as a failing gate rather than an unread PR.
+#   github-actions - NOT covered by anything, and that is an accepted cost. The
+#                    action SHAs can go stale without notice. It is the smaller
+#                    exposure (build-time, not shipped to users) and it produced
+#                    most of the PR volume. Re-add it if that trade stops looking
+#                    right.
 version: 2
 updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-
-  # Go module dependencies (go.mod / go.sum).
-  - package-ecosystem: gomod
-    directory: /
-    schedule:
-      interval: weekly
-
-  # Base images in the Dockerfile. The FROM lines are pinned by digest, so this
-  # ecosystem bumps the SHA256 (and the trailing tag) when a new base ships -
-  # picking up debian:12-slim and distroless security updates.
   - package-ecosystem: docker
     directory: /
     schedule:

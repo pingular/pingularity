@@ -42,7 +42,7 @@ raw-socket capability. Where each one lands:
 | Channel | Runs as | Raw-socket privilege | Sandbox |
 | --- | --- | --- | --- |
 | **deb / rpm** (`apt` / `dnf` / `zypper`) | dedicated unprivileged `pingularity` user | ambient `CAP_NET_RAW`, bounded to just that | full systemd sandbox |
-| **`sudo pingularity install`** (Linux self-install) | root | inherent | none yet |
+| **`sudo pingularity install`** (Linux self-install) | root | inherent | partial - no `User=`/`StateDirectory`, but `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, `PrivateTmp`, `ProtectKernelTunables`, `RestrictSUIDSGID`, `LockPersonality` |
 | **macOS** (`sudo pingularity install`, launchd) | root | inherent | none |
 | **Windows** (`pingularity install`, SCM) | `LocalSystem` | inherent | none |
 | **Docker** | non-root, uid 65532 (distroless `nonroot`) | `cap_net_raw+ep` file capability on the binary | container isolation |
@@ -61,13 +61,18 @@ The rows in detail:
   `StateDirectory=pingularity` (mode `0700`) keeps the data dir writable through
   the read-only system tree. So a package install keeps the full traceroute
   without ever being root.
-- **`sudo pingularity install` (Linux) — still root.** The self-install path
-  registers a root systemd service with no `User=` and none of the sandbox
-  directives above. It matches the packaged unit in every other respect
+- **`sudo pingularity install` (Linux) — root, but not unsandboxed.** The
+  self-install path registers a systemd service with no `User=`, so it runs as
+  root and keeps neither the de-rooting nor `StateDirectory`. It does carry the
+  directives that still bite under root: `NoNewPrivileges=yes`,
+  `ProtectSystem=full` (not `=strict`, which would make the DB's own directory
+  read-only for a root daemon writing under `/var`), `ProtectHome=yes`,
+  `PrivateTmp=yes`, `ProtectKernelTunables=yes`, `RestrictSUIDSGID=yes` and
+  `LockPersonality=yes` (svcopts_other.go). It matches the packaged unit in every other respect
   (`$PINGULARITY_OPTS` from `/etc/default/pingularity`, a 5s restart, a bounded
   restart loop, `ExecReload` for the SIGHUP settings reload) but not the
   de-rooting — aligning it with the packaged unit is planned but not yet
-  shipped, so today treat a self-install as root-and-unsandboxed. If you want
+  shipped, so today treat a self-install as root, though not unprotected. If you want
   the hardening now, a systemd drop-in that adds the `User=` / capability /
   sandbox lines above is the right place, and nothing in the app depends on
   running as root beyond the two items above.
@@ -155,8 +160,11 @@ TLS is terminated upstream. Instead:
 - With no `-allow-host` set, the cookie is not `Secure`. That is the plain
   local or LAN case, where the traffic is plain HTTP and marking it `Secure`
   would stop the cookie working at all.
-- With `-allow-host` set, an `X-Forwarded-Proto` header decides it, using the
-  leftmost value so a multi-proxy chain reports the original client scheme.
+- With `-allow-host` set, an `X-Forwarded-Proto` header decides it — but only
+  when the TCP peer is in the `-trusted-proxy` set. The header is spoofable, so
+  from an untrusted peer it is ignored entirely and the Host decides instead; a
+  direct client cannot steer the cookie's Secure flag with a forged header. The
+  leftmost value is used, so a multi-proxy chain reports the original client scheme.
 - With `-allow-host` set and no such header, it infers from the `Host`: a host
   that needed allow-listing is a real public domain, so the cookie is marked
   `Secure`.
@@ -185,8 +193,12 @@ needs `-allow-host`.
 When a password is set:
 
 - Every `/api/*` endpoint requires it, **including `/metrics`**.
-- Three things are exempt: login, logout, and a `GET /api/access` so the UI can
-  tell you what state it is in before you have signed in.
+- Three things are exempt from auth: login, logout, and a `GET /api/access` so
+  the UI can tell you what state it is in before you have signed in.
+- `/healthz` and `/readyz` are exempt from more than auth: they answer before
+  the DNS-rebinding check and the local-only filter as well, so a load balancer
+  hitting a bare IP gets an answer. They expose no data — an ok/not-ready
+  verdict and nothing else.
 - Static assets are exempt: the HTML shell, the font, the favicon. They contain
   no data.
 
@@ -202,13 +214,20 @@ boundary as the data itself.
 - **History** lives in one SQLite file in the data directory. It is not
   encrypted. The protection is filesystem permissions: the data directory is
   `0700` and the database `0600`, owner only, and on Windows a protected ACL
-  granting SYSTEM and Administrators. These are applied on every start rather
-  than only at creation, so a database restored or copied in from elsewhere is
-  tightened too. Keep it that way if you relocate the database with `-db`.
+  granting SYSTEM and Administrators. The database and its `-wal`/`-shm`
+  sidecars are re-tightened on every start, so a file restored or copied in from
+  elsewhere is fixed up; the directory's mode is set when Pingularity creates it,
+  and an existing directory is left as it is (a warning is logged if it is
+  group- or world-readable). Keep it that way if you relocate the database with `-db`.
 - **Secrets** you enter, such as iperf3 passwords, are sealed with a key stored
   as `pingularity.key` beside the database. That protects a settings export or
   a database copy, not someone who already has both files and the ability to
   read them.
+- **The saved log snapshot** (`logs.txt`, beside the database) holds the raw
+  log lines — unmasked IPs and hostnames — so it gets the same owner-only
+  treatment as the database and key: `0600`, and on Windows a protected ACL of
+  its own rather than the ACEs it would inherit from its directory, applied
+  before the file ever appears under its final name.
 - **Webhook URLs are bearer secrets.** A Discord or Slack webhook URL is enough
   to post as you, so treat it like a password. Delivery errors have the URL
   path and token stripped before they are logged. Be aware the wrapped cause
@@ -219,18 +238,21 @@ boundary as the data itself.
 
 Collected here so you do not have to work them out from the source.
 
-- **Import accepts opaque event types.** `/api/import` is behind the auth
-  guard, and what you are importing is a file this same tool exported. It is
-  operator input, not attacker input.
+- **Import validates what it can, and trusts the operator for the rest.**
+  `/api/import` is behind the auth guard, and what you are importing is a file
+  this same tool exported — operator input, not attacker input. Even so, the
+  rows a bad file can carry are checked for meaning rather than only for type:
+  an outage's `type` must be the string `down` or `up`, an integer column must
+  hold an integer, a pause span must be positive, start after the project
+  existed and not run longer than the retention ceiling, and a `ts + duration`
+  must not overflow. Those exist because a hand-edited or corrupt backup could
+  otherwise rewrite every uptime figure, not because the endpoint is exposed.
 - **The iperf3 congestion-algorithm setting is not checked against a list of
   valid values.** It cannot be. `-C` applies on the sending side, so for a
   download the valid set belongs to the remote server's kernel, which this host
   cannot enumerate. The setting is sanitised for shape, which is the only
   boundary that can be enforced honestly. A wrong value fails that test and
   nothing else.
-- **A saved log snapshot relies on its directory's permissions on Windows,**
-  not on its own ACL. The snapshot is always written into the data directory,
-  which is secured before the snapshot goroutine starts.
 - **Two things can leave the machine without you asking, and both can be turned
   off.**
   - **Connection info.** Fills the Connection panel (public IP, ISP, geo, DNS

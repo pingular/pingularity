@@ -11,12 +11,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/pingular/pingularity/internal/osperm"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Entry is one captured log line in both forms. Both are produced at capture
@@ -34,6 +38,20 @@ type Entry struct {
 // bounded whatever the line sizes are.
 const defaultMaxBytes = 8 << 20
 
+// ringSeq separates two Rings built in the same nanosecond; see newEpoch.
+var ringSeq atomic.Uint64
+
+// newEpoch names one Ring instance. A viewer's cursor is only meaningful against
+// the ring that issued it: LoadFile reseeds a fresh ring from logs.txt with no
+// persisted sequence, so after a restart sequence 3000 names a DIFFERENT line
+// than the one an already-open tab is holding at 3000. Handing the epoch out
+// with every response lets a client notice that and resync instead of silently
+// rendering the wrong window. It is a string because a nanosecond timestamp is
+// past JavaScript's exact-integer range.
+func newEpoch() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatUint(ringSeq.Add(1), 36)
+}
+
 // Ring is a concurrency-safe buffer of the last `cap` log entries, additionally
 // bounded to maxBytes of retained line text.
 type Ring struct {
@@ -42,6 +60,14 @@ type Ring struct {
 	cap      int
 	maxBytes int
 	bytes    int // sum of entrySize over lines (kept in step with the slice)
+	// dropped counts the entries this ring has evicted since it was built, and so
+	// doubles as the sequence number of lines[0]: the entry at lines[i] is
+	// sequence dropped+i. Deriving the sequence from a monotonically increasing
+	// evicted-count rather than from a slice index is what makes a reader's cursor
+	// survive both eviction paths (the entry cap and the byte ceiling) and trim's
+	// compaction, which do move every surviving entry's index.
+	dropped uint64
+	epoch   string // rotated by Clear (and per Ring); read under mu. See newEpoch
 	// saveMu serializes SaveFile calls with each other (NOT with mu, which guards
 	// the in-memory ring and must never be held across file I/O). Two concurrent
 	// SaveFiles - a periodic checkpoint racing a shutdown save - otherwise share the
@@ -59,7 +85,23 @@ func New(capacity int) *Ring {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Ring{cap: capacity, maxBytes: defaultMaxBytes, lines: make([]Entry, 0, capacity)}
+	return &Ring{cap: capacity, maxBytes: defaultMaxBytes, lines: make([]Entry, 0, capacity), epoch: newEpoch()}
+}
+
+// Epoch identifies this Ring instance; see newEpoch.
+func (r *Ring) Epoch() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.epoch
+}
+
+// Len reports how many entries the ring currently holds. Callers use it to tell a
+// truncated read from a complete one: a response of 500 lines means nothing on its
+// own, since it could be the whole buffer or the newest tenth of it.
+func (r *Ring) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.lines)
 }
 
 // Append records one captured line (raw + masked) and drops the oldest until both
@@ -94,10 +136,12 @@ func (r *Ring) trim() {
 		n := copy(r.lines, r.lines[drop:])
 		clear(r.lines[n:])
 		r.lines = r.lines[:n]
+		r.dropped += uint64(drop)
 	}
 }
 
-// Entries returns a copy of the buffered entries, oldest first.
+// Entries returns a copy of the buffered entries, oldest first. It is the whole
+// ring: the bug-report download wants every line it has. A poller wants Since.
 func (r *Ring) Entries() []Entry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -106,9 +150,77 @@ func (r *Ring) Entries() []Entry {
 	return out
 }
 
+// window copies lines[lo:hi] and reports the sequence bounds around it. Called
+// with r.mu held, so a caller gets its entries and its cursor from one
+// consistent snapshot - reading them under two separate locks would let an
+// Append land in between and hand back a cursor that skips it.
+func (r *Ring) window(lo, hi int) (out []Entry, first, next uint64) {
+	out = make([]Entry, hi-lo)
+	copy(out, r.lines[lo:hi])
+	return out, r.dropped, r.dropped + uint64(hi)
+}
+
+// Tail returns the newest limit entries (all of them when limit <= 0), the
+// sequence of the oldest entry still buffered, and the sequence one past the
+// newest returned - the cursor to pass to Since on the next poll.
+func (r *Ring) Tail(limit int) (out []Entry, first, next uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lo := 0
+	if limit > 0 && len(r.lines) > limit {
+		lo = len(r.lines) - limit
+	}
+	return r.window(lo, len(r.lines))
+}
+
+// Since returns up to limit entries starting at sequence seq (all of them from
+// seq on when limit <= 0), the sequence of the oldest entry still buffered, and
+// the sequence one past the last entry returned.
+//
+// It hands back the OLDEST entries after seq, not the newest, so a reader that
+// falls behind catches up over successive polls instead of skipping the middle.
+// A seq below first (the reader's cursor was evicted while it was away) resumes
+// at the oldest line still held rather than reporting a gap it cannot fill; the
+// caller compares seq against the returned first to tell the reader how many
+// lines it missed. A seq above next (a cursor from another ring, or one held
+// across a Clear) is clamped to the end, which reads as "nothing new" - the
+// caller notices the epoch changed and resyncs.
+func (r *Ring) Since(seq uint64, limit int) (out []Entry, first, next uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	end := r.dropped + uint64(len(r.lines))
+	if seq < r.dropped {
+		seq = r.dropped
+	}
+	if seq > end {
+		seq = end
+	}
+	lo := int(seq - r.dropped)
+	hi := len(r.lines)
+	if limit > 0 && hi-lo > limit {
+		hi = lo + limit
+	}
+	return r.window(lo, hi)
+}
+
 // Clear empties the buffer.
 func (r *Ring) Clear() {
 	r.mu.Lock()
+	// Rotate the epoch. Advancing the sequence is enough to stop a stale cursor
+	// addressing the WRONG lines, but not to tell a viewer that is already
+	// caught up that anything happened: its next poll returns no lines and the
+	// same next_seq it sent, which is byte-identical to an idle poll. Every other
+	// tab therefore went on rendering the lines the operator just wiped, until
+	// something else happened to be logged.
+	//
+	// The epoch already means "your cursor is not meaningful against this buffer,
+	// resync" - which is exactly true here - and the client's replace-on-epoch-change
+	// path is the one that repaints. Restart is the other event that rotates it.
+	r.epoch = newEpoch()
+	// Clearing EVICTS the buffered lines, so the sequence keeps climbing past
+	// them; resetting it to 0 would make a cursor held from before the Clear look
+	// valid again and silently re-render lines the operator just wiped.
+	r.dropped += uint64(len(r.lines))
 	// Zero the entries before reslicing to length 0. A bare r.lines[:0] keeps
 	// the backing array (sized up to the ring's bound) referencing every cleared
 	// entry's strings until they are overwritten by future Appends; clearing
@@ -143,6 +255,18 @@ func (r *Ring) SaveFile(path string) error {
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
+	}
+	// OpenFile's 0600 is honoured on Unix and IGNORED on Windows, where a new file
+	// simply inherits the parent's ACEs - and a supported layout puts this beside the
+	// database in C:\ProgramData, whose inherited ACEs grant BUILTIN\Users read. This
+	// snapshot holds the unmasked log lines (IPs, hostnames), so it needs its own
+	// DACL rather than the directory's. Applied BEFORE the rename, so the file is
+	// never briefly readable under its final name; secret.go locks the key file the
+	// same way and for the same reason.
+	if err := osperm.SecureFile(tmp); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("secure log snapshot: %w", err)
 	}
 	bw := bufio.NewWriter(f)
 	enc := json.NewEncoder(bw) // Encode appends its own '\n' per entry

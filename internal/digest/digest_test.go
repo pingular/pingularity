@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -152,7 +153,7 @@ func TestSummaryRollup(t *testing.T) {
 		t.Fatalf("insert event: %v", err)
 	}
 
-	s, err := m.summary(ctx, since, now)
+	s, err := m.Summarize(ctx, since, now)
 	if err != nil {
 		t.Fatalf("summary: %v", err)
 	}
@@ -162,10 +163,10 @@ func TestSummaryRollup(t *testing.T) {
 	if s.Outages != 1 || s.DowntimeS != 90 {
 		t.Errorf("outages=%d downtime=%d, want 1 / 90", s.Outages, s.DowntimeS)
 	}
-	if s.UptimePct <= 0 || s.UptimePct > 100 {
-		t.Errorf("uptime%% = %v, want (0,100]", s.UptimePct)
+	if s.UptimePct() <= 0 || s.UptimePct() > 100 {
+		t.Errorf("uptime%% = %v, want (0,100]", s.UptimePct())
 	}
-	if msg := s.message(); msg == "" {
+	if msg := s.Message(); msg == "" {
 		t.Error("message must not be empty")
 	}
 }
@@ -191,23 +192,79 @@ func TestSummaryClampsToRetention(t *testing.T) {
 
 	// No clamp: the 24h outage is spread across the full 7-day window (~85.7%).
 	m.RetentionFn = nil
-	s, err := m.summary(ctx, since, now)
+	s, err := m.Summarize(ctx, since, now)
 	if err != nil {
 		t.Fatalf("summary: %v", err)
 	}
-	if s.UptimePct < 84 || s.UptimePct > 87 {
-		t.Fatalf("no-clamp uptime = %.2f, want ~85.7 (diluted over 7d)", s.UptimePct)
+	if s.UptimePct() < 84 || s.UptimePct() > 87 {
+		t.Fatalf("no-clamp uptime = %.2f, want ~85.7 (diluted over 7d)", s.UptimePct())
 	}
 
 	// Retention = 3 days clamps the window to the observed 3 days, so the same
 	// outage honestly reads ~66.7%.
 	m.RetentionFn = func() time.Duration { return 3 * 24 * time.Hour }
-	s, err = m.summary(ctx, since, now)
+	s, err = m.Summarize(ctx, since, now)
 	if err != nil {
 		t.Fatalf("summary: %v", err)
 	}
-	if s.UptimePct < 65 || s.UptimePct > 68 {
-		t.Fatalf("retention-clamped uptime = %.2f, want ~66.7 (over the retained 3d)", s.UptimePct)
+	if s.UptimePct() < 65 || s.UptimePct() > 68 {
+		t.Fatalf("retention-clamped uptime = %.2f, want ~66.7 (over the retained 3d)", s.UptimePct())
+	}
+}
+
+// The outage line must clamp to the SAME retention floor the uptime% uses:
+// Prune's whole-outage rule keeps an outage straddling the retention boundary,
+// so without the clamp a weekly digest under sub-week retention books the
+// straddler's full downtime beside an uptime% whose observed window holds only
+// the post-floor slice - "Uptime 97.96% · 1 outage · 25h 0m down" over 49h
+// observed, which is arithmetically impossible (97.96% of 49h implies 1h down).
+func TestSummaryOutageLineClampsToRetention(t *testing.T) {
+	m, st, _ := newManager(t)
+	ctx := context.Background()
+	// The store clamps against the real wall clock, so anchor the data at now.
+	now := time.Now()
+	since := now.Add(-7 * 24 * time.Hour) // weekly-style window
+	// Monitoring began a week ago; one 25h outage, down@now-73h / up@now-48h.
+	if err := st.InsertSamples(ctx, []store.Sample{{TS: since, Target: "cf", Family: "ipv4", Success: true, LatencyMS: 10}}); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	down := now.Add(-73 * time.Hour)
+	up := now.Add(-48 * time.Hour)
+	if err := st.InsertEvent(ctx, down, "down", -1, ""); err != nil {
+		t.Fatalf("down event: %v", err)
+	}
+	if err := st.InsertEvent(ctx, up, "up", int(up.Sub(down).Seconds()), ""); err != nil {
+		t.Fatalf("up event: %v", err)
+	}
+	// Retention 49h: the outage straddles the floor (down before it, up inside
+	// it), so the hourly prune's whole-outage rule deliberately keeps the pair.
+	retention := 49 * time.Hour
+	m.RetentionFn = func() time.Duration { return retention }
+	if _, err := st.Prune(ctx, now.Add(-30*24*time.Hour), now.Add(-30*24*time.Hour), now.Add(-retention)); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	s, err := m.Summarize(ctx, since, now)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	// The straddler resolved inside the retained window, so it is still counted...
+	if s.Outages != 1 {
+		t.Fatalf("outages = %d, want 1 (the straddler resolved in-window)", s.Outages)
+	}
+	// ...but only the ~1h inside the retention floor may be booked - the slice
+	// the uptime% beside it describes. (Tolerance: seconds may elapse between
+	// this test's `now` and the store's own clock.)
+	if s.DowntimeS < 3590 || s.DowntimeS > 3610 {
+		t.Fatalf("downtime = %s, want ~1h: downtime booked outside the retention floor the uptime%% is clamped to",
+			time.Duration(s.DowntimeS)*time.Second)
+	}
+	// And the line must agree with itself: the downtime implied by the uptime%
+	// over the 49h observed window matches the downtime printed beside it.
+	implied := (1 - s.UptimePct()/100) * retention.Seconds()
+	if math.Abs(implied-float64(s.DowntimeS)) > 60 {
+		t.Fatalf("uptime %.2f%% over %v implies %.0fs down, but the digest books %ds - one line contradicting itself",
+			s.UptimePct(), retention, implied, s.DowntimeS)
 	}
 }
 
@@ -229,7 +286,7 @@ func TestPartialRunExcludedFromMedians(t *testing.T) {
 			t.Fatalf("insert speed: %v", err)
 		}
 	}
-	s, err := m.summary(ctx, since, now)
+	s, err := m.Summarize(ctx, since, now)
 	if err != nil {
 		t.Fatalf("summary: %v", err)
 	}
@@ -339,39 +396,135 @@ func TestFutureWatermarkRearms(t *testing.T) {
 	}
 }
 
-// A paused monitor records no outages, so UptimeSince is 1.0 and the digest would
-// email "Uptime 100.00% - no outages" - affirmatively wrong, with none of the
-// pause context the dashboard shows. EnabledFn must gate the send exactly like
-// the heartbeat. Regression proof: delete the EnabledFn clause in tick and this
-// fails, because the window is due and would otherwise send.
-func TestPausedMonitorDoesNotSend(t *testing.T) {
-	m, _, fs := newManager(t)
-	paused := false
-	m.EnabledFn = func() bool { return !paused }
-	t0 := time.Unix(1_700_000_000, 0)
-	m.now = func() time.Time { return t0 }
+// A window nobody watched must still produce a digest - one that SAYS nobody
+// watched it.
+//
+// This test previously asserted the opposite ("a paused monitor must not send"),
+// and its rationale was the same false claim Summarize carried: that suppressing
+// the send is what keeps a bogus 100.00% out of the operator's inbox. It never
+// was. The suppression hung on the monitoring master switch, while the windows
+// that actually go unobserved - a closed latency schedule, the latency sub-toggle
+// - leave that switch ON, so the 8h/day operator was never gated and got a
+// confident "Uptime 100.00% · no outages" every single day. Suppression bought
+// silence for the one case it covered and nothing at all for the common one.
+//
+// The digest now always sends and states its observed span, so this pins the
+// three properties that replaced the gate: it sends, it does NOT print a
+// percentage for a window with no measurement in it, and it says what it observed.
+func TestUnobservedWindowStillSendsAndDiscloses(t *testing.T) {
+	m, st, fs := newManager(t)
+	ctx := context.Background()
+	// Real wall clock: UptimeSince reads time.Now() for its window end, so a
+	// fixture anchored at a fabricated t0 would fall outside every window.
+	now := time.Now()
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: now.Add(-48 * time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 10},
+	}); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	// Monitoring off across the whole of the last day; +60s of slack so the span
+	// still covers the window end when UptimeSince reads its own clock.
+	if _, err := st.InsertPause(ctx, now.Add(-24*time.Hour), int64(24*time.Hour/time.Second)+60); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
 
-	m.tick(context.Background()) // arm
+	m.now = func() time.Time { return now.Add(-24 * time.Hour) }
+	m.tick(ctx) // arm
 	if fs.calls != 0 {
 		t.Fatalf("first tick must arm, not send; got %d", fs.calls)
 	}
+	m.now = func() time.Time { return now }
+	m.tick(ctx)
+	if fs.calls != 1 {
+		t.Fatalf("an unobserved window must still send a digest; got %d sends", fs.calls)
+	}
+	if strings.Contains(fs.lastMsg, "100.00%") {
+		t.Errorf("digest claimed a percentage for a window that observed nothing:\n%s", fs.lastMsg)
+	}
+	if !strings.Contains(fs.lastMsg, "Uptime not measured") {
+		t.Errorf("digest must say the uptime was not measured:\n%s", fs.lastMsg)
+	}
+	if !strings.Contains(fs.lastMsg, "observed none of") {
+		t.Errorf("digest must disclose the observed span:\n%s", fs.lastMsg)
+	}
+	if _, ok := fs.lastF["uptime_pct"]; ok {
+		t.Errorf("structured payload must omit uptime_pct when nothing was observed: %v", fs.lastF)
+	}
+	if got, ok := fs.lastF["observed_s"].(int); !ok || got != 0 {
+		t.Errorf("structured payload observed_s = %v, want 0", fs.lastF["observed_s"])
+	}
+}
 
-	// Now due (a full day on), but monitoring is paused: must not send.
-	paused = true
-	m.now = func() time.Time { return t0.Add(25 * time.Hour) }
-	m.tick(context.Background())
-	if fs.calls != 0 {
-		t.Fatalf("paused monitor must not send a digest; got %d", fs.calls)
+// The everyday case the old master-switch gate never covered: monitoring is ON,
+// but a latency schedule closes for two thirds of the day. The digest must report
+// the uptime it can vouch for AND the span it vouches over, in the prose and in
+// the machine-read fields.
+func TestPartiallyObservedWindowDiscloses(t *testing.T) {
+	m, st, _ := newManager(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: now.Add(-48 * time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 10},
+	}); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	// 16h of the last 24h unobserved - the steady state of an 8h/day schedule.
+	if _, err := st.InsertPause(ctx, now.Add(-24*time.Hour), int64(16*time.Hour/time.Second)); err != nil {
+		t.Fatalf("pause: %v", err)
 	}
 
-	// Resume: the watermark was left untouched while paused (not advanced), so the
-	// digest machinery is unbroken and sends again once due. The gate suppressed
-	// the paused window, it did not disable the feature.
-	paused = false
-	m.now = func() time.Time { return t0.Add(25 * time.Hour) }
-	m.tick(context.Background())
-	if fs.calls == 0 {
-		t.Fatal("digest must resume sending after unpause; got 0 sends")
+	s, err := m.Summarize(ctx, now.Add(-24*time.Hour), now)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if got := s.Obs.Coverage(); got < 0.32 || got > 0.35 {
+		t.Fatalf("coverage = %.4f, want ~0.3333 (8h of 24h)", got)
+	}
+	msg := s.Message()
+	if !strings.Contains(msg, "Uptime 100.00%") {
+		t.Errorf("the observed 8h were flawless, so the percentage stands:\n%s", msg)
+	}
+	if !strings.Contains(msg, "observed 8h of 1d") {
+		t.Errorf("digest must state the observed span, not just the window asked for:\n%s", msg)
+	}
+	// The wording must not read as a fault report: a scheduled window is the
+	// operator's own setting, not an error to be scolded about.
+	for _, bad := range []string{"error", "failed", "only "} {
+		if strings.Contains(strings.ToLower(msg), bad) {
+			t.Errorf("disclosure reads as a fault (%q):\n%s", bad, msg)
+		}
+	}
+	f := s.Fields()
+	if got, ok := f["observed_s"].(int); !ok || got < 8*3600-120 || got > 8*3600+120 {
+		t.Errorf("fields observed_s = %v, want ~%d", f["observed_s"], 8*3600)
+	}
+	if _, ok := f["uptime_pct"]; !ok {
+		t.Error("fields must still carry uptime_pct for a partially observed window")
+	}
+}
+
+// A window observed end to end must read exactly as it always did: no disclosure
+// line, no wording change. The sub-second difference between the digest's
+// nanosecond window and UptimeSince's whole-second one must not append a
+// disclosure to every healthy 24/7 digest (that is what discloseFloor is for).
+func TestFullyObservedWindowSaysNothingExtra(t *testing.T) {
+	m, st, _ := newManager(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: now.Add(-48 * time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 10},
+	}); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	s, err := m.Summarize(ctx, now.Add(-24*time.Hour), now)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if got := s.observedLine(); got != "" {
+		t.Errorf("a fully observed window must disclose nothing, got %q", got)
+	}
+	if want := "📊 Pingularity summary · last 1d\nUptime 100.00% · no outages\nno speedtests"; s.Message() != want {
+		t.Errorf("message =\n%s\nwant\n%s", s.Message(), want)
 	}
 }
 
@@ -425,7 +578,7 @@ func TestUnmeasuredDirectionRendersAbsent(t *testing.T) {
 			t.Fatalf("insert speed: %v", err)
 		}
 	}
-	s, err := m.summary(ctx, since, now)
+	s, err := m.Summarize(ctx, since, now)
 	if err != nil {
 		t.Fatalf("summary: %v", err)
 	}
@@ -438,10 +591,10 @@ func TestUnmeasuredDirectionRendersAbsent(t *testing.T) {
 	if s.MedDownMbps == nil || *s.MedDownMbps != 300 {
 		t.Errorf("MedDownMbps = %v, want 300", s.MedDownMbps)
 	}
-	if msg := s.message(); !strings.Contains(msg, "↑ - Mbps") || !strings.Contains(msg, "- ms ping") {
+	if msg := s.Message(); !strings.Contains(msg, "↑ - Mbps") || !strings.Contains(msg, "- ms ping") {
 		t.Errorf("message must render '-' for unmeasured upload/ping; got %q", msg)
 	}
-	f := s.fields()
+	f := s.Fields()
 	if _, ok := f["median_up_mbps"]; ok {
 		t.Error("webhook must omit median_up_mbps when upload was never measured")
 	}

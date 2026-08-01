@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -319,44 +320,110 @@ func ipmapLoc(ctx context.Context, m *Manager, ip string) (city string, lat, lon
 	return c, la, lo, true
 }
 
-// publicIPGeo geolocates the host's OWN public IP to a city + ISO country code.
-// RIPE IPmap (ipmapGeo, above) is tuned for infrastructure IPs and routinely has
-// no fix for the residential/FTTH address a host actually sits behind, so this
-// uses "eyeball" providers instead: ipwho.is first, then geojs.io. Both are
-// keyless HTTPS and city-accurate for home IPs. The caller only runs this on an
-// IP change (see fetch's per-IP cache), so it stays far below any rate limit.
-// ok is false when neither provider resolves a city.
-func publicIPGeo(ctx context.Context, m *Manager, ip string) (city, country string, ok bool) {
-	if c, cc, ok := ipwhoisGeo(ctx, m, ip); ok {
-		return c, cc, true
+// publicIPGeo geolocates the host's OWN public IP to a city + ISO country code
+// and the coordinate that city sits at. RIPE IPmap (ipmapGeo, above) is tuned for
+// infrastructure IPs and routinely has no fix for the residential/FTTH address a
+// host actually sits behind, so this uses "eyeball" providers instead: ipwho.is
+// first, then geojs.io. Both are keyless HTTPS and city-accurate for home IPs.
+// The caller runs this on an IP change, plus at most one recovery attempt per
+// IP when the cached answer named a city it could not place (see fetchGen's
+// per-IP cache and claimCoordRetry), so it stays far below any rate limit. ok
+// is false when neither provider resolves a city.
+//
+// The coordinate is not decoration. It is the only candidate centre for auto
+// server selection that describes where the SUBSCRIBER is: the exit router
+// frequently has no coordinate at all (RIPE answers with a hostname and no
+// lat/lon for a residential ISP's last hop), and Ookla's own placement of the
+// address describes where ITS geo database thinks we are, which on a coastal
+// link can be a country away. Both providers have always returned
+// latitude/longitude and both structs used to drop them on the floor, which cost
+// more than a label: Ookla's server list is fetched AROUND a coordinate, and the
+// lists around two disagreeing coordinates are disjoint, so the nearer servers
+// were not merely ranked lower - they were never fetched, and no amount of
+// ranking could reach them. lat/lon of 0,0 means the provider named a city but
+// no position (the same "unset" convention ExitInfo and serverCoord use);
+// callers must treat it as no coordinate, not as the Gulf of Guinea.
+func publicIPGeo(ctx context.Context, m *Manager, ip string) (city, country string, lat, lon float64, ok bool) {
+	c, cc, la, lo, ok1 := ipwhoisGeo(ctx, m, ip)
+	if ok1 && validCoord(la, lo) {
+		return c, cc, la, lo, true
 	}
-	return geojsGeo(ctx, m, ip)
+	// The primary either failed, or named a city it could not place. The
+	// secondary is asked in BOTH cases, because a position is the thing auto
+	// server selection needs and the primary answering "somewhere, but nowhere
+	// in particular" is exactly the state the caller is trying to escape -
+	// returning it unchallenged meant the recovery could only ever re-ask the
+	// provider that had already declined to place us.
+	c2, cc2, la2, lo2, ok2 := geojsGeo(ctx, m, ip)
+	if ok2 && validCoord(la2, lo2) {
+		return c2, cc2, la2, lo2, true
+	}
+	// Neither can place it. Keep the primary's label if it had one - a city
+	// with no coordinate still names the connection for the panel, and losing
+	// that would trade a real answer for a missing one.
+	if ok1 {
+		return c, cc, 0, 0, true
+	}
+	if ok2 {
+		return c2, cc2, 0, 0, true
+	}
+	return "", "", 0, 0, false
+}
+
+// validCoord reports whether a provider's pair is usable as a centre. 0,0 is
+// this codebase's "unset" convention rather than the Gulf of Guinea, and the
+// rest guards what the providers can actually emit: a null or absent numeric
+// field decodes to zero, geojs' strings parse through strconv (which accepts
+// "NaN" and "Inf"), and one missing component yields a half-pair like 0,-86.
+// Any of those reaching an origin would centre a server search on nothing, and
+// a NaN would additionally defeat the dedupe comparison and break the JSON
+// encode of the snapshot that carries it.
+func validCoord(lat, lon float64) bool {
+	if lat == 0 && lon == 0 {
+		return false
+	}
+	if math.IsNaN(lat) || math.IsNaN(lon) || math.IsInf(lat, 0) || math.IsInf(lon, 0) {
+		return false
+	}
+	return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
 }
 
 // ipwhoisGeo geolocates ip via ipwho.is. The "success" flag guards error payloads
 // (rate-limit / reserved range), which the API still returns with HTTP 200.
-func ipwhoisGeo(ctx context.Context, m *Manager, ip string) (city, country string, ok bool) {
+func ipwhoisGeo(ctx context.Context, m *Manager, ip string) (city, country string, lat, lon float64, ok bool) {
 	var r struct {
-		Success bool   `json:"success"`
-		City    string `json:"city"`
-		Country string `json:"country_code"`
+		Success bool    `json:"success"`
+		City    string  `json:"city"`
+		Country string  `json:"country_code"`
+		Lat     float64 `json:"latitude"`
+		Lon     float64 `json:"longitude"`
 	}
 	if !getJSON(ctx, m, "https://ipwho.is/"+ip, &r) || !r.Success || r.City == "" {
 		return
 	}
-	return r.City, r.Country, true
+	return r.City, r.Country, r.Lat, r.Lon, true
 }
 
-// geojsGeo geolocates ip via geojs.io - the fallback when ipwho.is is down or empty.
-func geojsGeo(ctx context.Context, m *Manager, ip string) (city, country string, ok bool) {
+// geojsGeo geolocates ip via geojs.io - the fallback when ipwho.is is down or
+// empty. geojs returns the coordinates as STRINGS ("45.5017"), unlike ipwho.is'
+// numbers, so they are decoded as strings and parsed here; a field that will not
+// parse costs the coordinate, never the city.
+func geojsGeo(ctx context.Context, m *Manager, ip string) (city, country string, lat, lon float64, ok bool) {
 	var r struct {
 		City    string `json:"city"`
 		Country string `json:"country_code"`
+		Lat     string `json:"latitude"`
+		Lon     string `json:"longitude"`
 	}
 	if !getJSON(ctx, m, "https://get.geojs.io/v1/ip/geo/"+ip+".json", &r) || r.City == "" {
 		return
 	}
-	return r.City, r.Country, true
+	la, e1 := strconv.ParseFloat(strings.TrimSpace(r.Lat), 64)
+	lo, e2 := strconv.ParseFloat(strings.TrimSpace(r.Lon), 64)
+	if e1 != nil || e2 != nil {
+		la, lo = 0, 0
+	}
+	return r.City, r.Country, la, lo, true
 }
 
 // getJSON GETs url with a 3s timeout and decodes the JSON body into v, returning

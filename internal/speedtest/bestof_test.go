@@ -22,7 +22,7 @@ func TestBestResultRanksOnTotalThroughput(t *testing.T) {
 		res("b", 500, 500, 5), // 1000
 		res("c", 950, 20, 5),  // 970
 	}
-	if got := bestResult(rs).Server; got != "b" {
+	if got := bestResult(rs, "both").Server; got != "b" {
 		t.Fatalf("got %q want b (highest down+up)", got)
 	}
 }
@@ -35,7 +35,7 @@ func TestBestResultNearTieOnThroughputGoesToLowerPing(t *testing.T) {
 		res("hair-faster", 500, 450, 10),
 		res("snappier", 500, 440, 6),
 	}
-	if got := bestResult(rs).Server; got != "snappier" {
+	if got := bestResult(rs, "both").Server; got != "snappier" {
 		t.Fatalf("got %q want snappier (1%% more throughput must not beat 40%% less ping)", got)
 	}
 }
@@ -48,7 +48,7 @@ func TestBestResultRealThroughputLeadStillWins(t *testing.T) {
 		res("snappy", 250, 250, 5), // 500 total
 		res("fast", 500, 400, 10),  // 900 total
 	}
-	if got := bestResult(rs).Server; got != "fast" {
+	if got := bestResult(rs, "both").Server; got != "fast" {
 		t.Fatalf("got %q want fast (an 80%% throughput lead beats 5ms of ping)", got)
 	}
 
@@ -59,7 +59,7 @@ func TestBestResultRealThroughputLeadStillWins(t *testing.T) {
 		res("snappy", 250, 250, 5), // 500 total
 		res("fast", 500, 400, 20),  // 900 total
 	}
-	if got := bestResult(rs).Server; got != "fast" {
+	if got := bestResult(rs, "both").Server; got != "fast" {
 		t.Fatalf("got %q want fast (an 80%% throughput lead beats 15ms of ping)", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestBestResultPingDiscountIsCapped(t *testing.T) {
 		res("slow-near", 500, 300, 8), // 800 total
 		res("fast-far", 540, 400, 28), // 940 total
 	}
-	if got := bestResult(rs).Server; got != "fast-far" {
+	if got := bestResult(rs, "both").Server; got != "fast-far" {
 		t.Fatalf("got %q want fast-far (17%% more throughput must survive a 20ms ping deficit)", got)
 	}
 
@@ -83,30 +83,32 @@ func TestBestResultPingDiscountIsCapped(t *testing.T) {
 		res("sat-fast", 60, 40, 600), // 100 total
 		res("sat-slow", 50, 30, 40),  // 80 total
 	}
-	if got := bestResult(rs).Server; got != "sat-fast" {
+	if got := bestResult(rs, "both").Server; got != "sat-fast" {
 		t.Fatalf("got %q want sat-fast (past the cap, throughput decides)", got)
 	}
 }
 
 func TestBestResultExactScoreTieBreaksOnPing(t *testing.T) {
 	// Distinct throughput/ping pairs can land on the exact same score in
-	// float64: 110 total @10ms and 105 total @5ms are both exactly 100. The
-	// ping key behind the score must then prefer the snappier server.
+	// float64: 110 down @10ms and 105 down @5ms are both exactly 100. The ping
+	// key behind the score must then prefer the snappier server. A down-only
+	// round, so the score is the download alone and the arithmetic is the
+	// ping factor's, which is what this pins.
 	a, b := res("tenms", 110, 0, 10), res("fivems", 105, 0, 5)
-	if sa, sb := resultScore(a), resultScore(b); sa != sb {
+	if sa, sb := resultScore(a, "down"), resultScore(b, "down"); sa != sb {
 		t.Fatalf("premise broke: scores %v vs %v are meant to tie exactly", sa, sb)
 	}
-	if got := bestResult([]Result{a, b}).Server; got != "fivems" {
+	if got := bestResult([]Result{a, b}, "down").Server; got != "fivems" {
 		t.Fatalf("got %q want fivems (exact score tie goes to the lower ping)", got)
 	}
 
 	// A run with no ping can tie too (1100 total at the substituted 1000ms is
 	// also exactly 100); the measured run must win the tie, not the absent one.
 	c := res("noping", 1100, 0, 0)
-	if sc := resultScore(c); sc != resultScore(a) {
-		t.Fatalf("premise broke: scores %v vs %v are meant to tie exactly", sc, resultScore(a))
+	if sc := resultScore(c, "down"); sc != resultScore(a, "down") {
+		t.Fatalf("premise broke: scores %v vs %v are meant to tie exactly", sc, resultScore(a, "down"))
 	}
-	if got := bestResult([]Result{c, a}).Server; got != "tenms" {
+	if got := bestResult([]Result{c, a}, "down").Server; got != "tenms" {
 		t.Fatalf("got %q want tenms (a measured ping beats an unmeasured one on a tie)", got)
 	}
 }
@@ -114,17 +116,17 @@ func TestBestResultExactScoreTieBreaksOnPing(t *testing.T) {
 func TestBestResultUnmeasuredPingIsPunishedNotFatal(t *testing.T) {
 	// A run that never measured ping is scored as if its ping were terrible:
 	// it can't beat a measured run of comparable speed by absence...
-	a, b := res("noping", 500, 450, 0), res("measured", 300, 0, 20)
-	if got := bestResult([]Result{a, b}).Server; got != "measured" {
+	a, b := res("noping", 500, 450, 0), res("measured", 300, 270, 20)
+	if got := bestResult([]Result{a, b}, "both").Server; got != "measured" {
 		t.Fatalf("got %q want measured (absence must not win)", got)
 	}
-	// ...but its throughput still counts, so it beats a genuinely slow run.
-	// 80 total at 20ms scores ~67 against noping's ~86 - close enough that the
-	// substituted ping can't drift much past 1000 without flipping this case,
+	// ...but its capacity still counts, so it beats a genuinely slow run.
+	// 50/45 at 20ms scores ~40 against noping's ~44 - close enough that the
+	// substituted ping can't drift much past 1100 without flipping this case,
 	// keeping the constant a tested decision on both sides.
-	a, b = res("noping", 500, 450, 0), res("slowpoke", 80, 0, 20)
-	if got := bestResult([]Result{a, b}).Server; got != "noping" {
-		t.Fatalf("got %q want noping (throughput is punished, not zeroed)", got)
+	a, b = res("noping", 500, 450, 0), res("slowpoke", 50, 45, 20)
+	if got := bestResult([]Result{a, b}, "both").Server; got != "noping" {
+		t.Fatalf("got %q want noping (capacity is punished, not zeroed)", got)
 	}
 }
 
@@ -132,14 +134,14 @@ func TestBestResultTieBreaksOnPingThenJitterThenBloat(t *testing.T) {
 	// Both pings past the score cap -> identical scores -> the ping KEY (not
 	// the score) must pick the lower one.
 	a, b := res("a", 500, 500, 30), res("b", 500, 500, 25)
-	if got := bestResult([]Result{a, b}).Server; got != "b" {
+	if got := bestResult([]Result{a, b}, "both").Server; got != "b" {
 		t.Fatalf("ping tie-break: got %q want b", got)
 	}
 
 	// Identical throughput AND ping -> jitter decides.
 	a, b = res("a", 500, 500, 12), res("b", 500, 500, 12)
 	a.JitterMS, b.JitterMS = f(9), f(2)
-	if got := bestResult([]Result{a, b}).Server; got != "b" {
+	if got := bestResult([]Result{a, b}, "both").Server; got != "b" {
 		t.Fatalf("jitter tie-break: got %q want b", got)
 	}
 
@@ -148,7 +150,7 @@ func TestBestResultTieBreaksOnPingThenJitterThenBloat(t *testing.T) {
 	a.JitterMS, b.JitterMS = f(2), f(2)
 	a.IdleMS, a.LoadedDownMS, a.LoadedUpMS = f(10), f(50), f(20)
 	b.IdleMS, b.LoadedDownMS, b.LoadedUpMS = f(10), f(15), f(12)
-	if got := bestResult([]Result{a, b}).Server; got != "b" {
+	if got := bestResult([]Result{a, b}, "both").Server; got != "b" {
 		t.Fatalf("bufferbloat tie-break: got %q want b", got)
 	}
 }
@@ -162,7 +164,7 @@ func TestBestResultKeepsHigherRankedServerOnExactTie(t *testing.T) {
 		r.JitterMS = f(3)
 		r.IdleMS, r.LoadedDownMS, r.LoadedUpMS = f(10), f(20), f(20)
 	}
-	if got := bestResult([]Result{a, b, c}).Server; got != "pinned" {
+	if got := bestResult([]Result{a, b, c}, "both").Server; got != "pinned" {
 		t.Fatalf("got %q want pinned (exact tie keeps the first)", got)
 	}
 }
@@ -172,14 +174,14 @@ func TestBestResultUnmeasuredLosesItsTieBreak(t *testing.T) {
 	// failing to measure is not evidence of being steadier.
 	a, b := res("nojitter", 500, 500, 12), res("measured", 500, 500, 12)
 	b.JitterMS = f(7)
-	if got := bestResult([]Result{a, b}).Server; got != "measured" {
+	if got := bestResult([]Result{a, b}, "both").Server; got != "measured" {
 		t.Fatalf("got %q want measured", got)
 	}
 	// Same for bufferbloat.
 	a, b = res("nobloat", 500, 500, 12), res("measured", 500, 500, 12)
 	a.JitterMS, b.JitterMS = f(3), f(3)
 	b.IdleMS, b.LoadedDownMS = f(10), f(11)
-	if got := bestResult([]Result{a, b}).Server; got != "measured" {
+	if got := bestResult([]Result{a, b}, "both").Server; got != "measured" {
 		t.Fatalf("bloat: got %q want measured", got)
 	}
 }
@@ -315,10 +317,10 @@ func TestBestIndexDistinguishesIdenticalServerLabels(t *testing.T) {
 		{Server: "Same Co, Montreal", DownloadMbps: 100, UploadMbps: 100},
 		{Server: "Same Co, Montreal", DownloadMbps: 900, UploadMbps: 900},
 	}
-	if got := bestIndex(rs); got != 1 {
+	if got := bestIndex(rs, "both"); got != 1 {
 		t.Fatalf("got index %d want 1 (the faster of two identically-named servers)", got)
 	}
-	if got := bestResult(rs).DownloadMbps; got != 900 {
+	if got := bestResult(rs, "both").DownloadMbps; got != 900 {
 		t.Fatalf("bestResult disagrees with bestIndex: got %v want 900", got)
 	}
 }

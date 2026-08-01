@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingular/pingularity/internal/osperm"
@@ -67,6 +68,11 @@ CREATE TABLE IF NOT EXISTS pauses (
 );
 CREATE INDEX IF NOT EXISTS idx_pauses_ts ON pauses(ts);
 
+CREATE TABLE IF NOT EXISTS pauses_quarantine (
+    ts         INTEGER NOT NULL,   -- a pause row held aside because its END reaches further past the repairing clock than any believable disagreement
+    duration_s INTEGER NOT NULL    -- see repairFutureReachingPausesAt: held, not deleted, so a corrected clock can give it back
+);
+
 CREATE TABLE IF NOT EXISTS speed (
     ts           INTEGER NOT NULL,
     down_mbps    REAL,
@@ -89,11 +95,12 @@ CREATE TABLE IF NOT EXISTS speed (
     cf_colo        TEXT,              -- Cloudflare PoP at run time
     exit_summary   TEXT,              -- exit router → handoff path at run time
     run_trigger    TEXT,              -- what started the test: scheduled|manual|reconnect|startup|degraded ("trigger" is reserved in SQLite)
+    ping_best_ms   REAL,              -- fastest of the ping samples (ping_ms is their mean); what the run's decisions use
     idle_ms        REAL,              -- latency under load: idle baseline (median, ms)
     loaded_down_ms REAL,              -- ... during the download phase; NULL when unmeasurable
     loaded_up_ms   REAL,              -- ... during the upload phase
-    loaded_down_max_ms REAL,          -- worst single sample (spike) during the download phase
-    loaded_up_max_ms   REAL,          -- ... during the upload phase
+    loaded_down_p95_ms REAL,          -- p95 of the samples taken during the download phase
+    loaded_up_p95_ms   REAL,          -- ... during the upload phase
     engine             TEXT           -- test backend: ookla|iperf3 (NULL on old rows = ookla)
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
@@ -120,6 +127,23 @@ type Store struct {
 	// Series).
 	seriesMu    sync.Mutex
 	seriesCache map[seriesKey]*seriesEntry
+
+	// opened carries a MONOTONIC reading from store open; clockBase/clockBaseUp
+	// are the wall/monotonic pair destructive pruning judges the clock against,
+	// and clockSettleUp parks pruning until that much uptime has passed. See
+	// clockStepped - the only thing that reads or writes them.
+	clockMu       sync.Mutex
+	opened        time.Time
+	clockBase     time.Time
+	clockBaseUp   time.Duration
+	clockSettleUp time.Duration
+
+	// pauseFutureRepairPending records that Open ran under an implausible clock
+	// (an RTC-less board opens the store at service start, before NTP syncs), so
+	// the now-anchored half of the pause repair could not run there. The first
+	// write that observes a plausible clock re-runs it once - see
+	// maybeRepairFuturePausesAt.
+	pauseFutureRepairPending atomic.Bool
 }
 
 // pragmaConn is the per-connection pragma query appended to every file-backed
@@ -156,6 +180,14 @@ func buildDSN(path string) string {
 // Open opens (creating if needed) the SQLite database at path and ensures the
 // schema exists.
 func Open(path string) (*Store, error) {
+	return openAt(path, time.Now().Unix())
+}
+
+// openAt is Open against a caller-supplied clock (the same seam
+// repairInsanePausesAt gives the repair), so tests can open a store the way an
+// RTC-less board does - at service start, before NTP, under an implausible
+// clock - without faking time.
+func openAt(path string, nowU int64) (*Store, error) {
 	// Create the parent dir for file-backed databases (skips ":memory:" and bare
 	// filenames, whose dir is "."). 0o700 because the DB holds secrets at rest
 	// (bcrypt auth hash, webhook URLs) - not readable by other local users.
@@ -249,6 +281,41 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("rebuild after corruption: %w", err)
 		}
 	}
+	// Repair what an OLDER build's unvalidated InsertPause left behind. The
+	// PauseSpanSane guards hold every NEW write and import to one rule, but a row
+	// already on disk answers to nobody: applySchema migrates columns, not data,
+	// and Prune's straddle rule deliberately keeps any pause whose END is still
+	// inside retention - so an epoch-boot span persisted before the guard existed
+	// keeps zeroing coverage for up to a retention year after the upgrade.
+	if err := repairInsanePausesAt(db, nowU); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// And the events-table twin: outage lengths a pre-guard import let in.
+	if err := repairInsaneEventDurations(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// And the typing door's own residue: values no read can convert, in the
+	// whole-number columns the import allowlist guards but nothing migrated. Unlike
+	// the two repairs above (cheap point deletes on small tables), this one full-scans
+	// samples/dns/speed with typeof() on every Open before the listener binds, so it
+	// is gated on a persisted, versioned generation marker: run it once per DB, stamp
+	// the generation on success, and skip it forever after. The clock-dependent future-
+	// pause repair below is deliberately NOT gated - its verdict changes with the clock.
+	if gen, err := repairGeneration(db); err != nil {
+		db.Close()
+		return nil, err
+	} else if gen < intColumnRepairGen {
+		if err := repairUnreadableIntColumns(db); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if err := stampRepairGeneration(db, intColumnRepairGen); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	// Tighten on-disk permissions to owner-only: the driver creates files 0644
 	// (umask-subject) but this DB stores secrets. Covers the main file plus the
 	// WAL/SHM sidecars; best-effort (a sidecar missing pre-first-write, or a
@@ -262,11 +329,17 @@ func Open(path string) (*Store, error) {
 			}
 		}
 	}
-	return &Store{
+	st := &Store{
 		db:          db,
 		recCache:    map[int64]recScan{},
 		seriesCache: map[seriesKey]*seriesEntry{},
-	}, nil
+		opened:      time.Now(), // carries a monotonic reading; see clockStepped
+	}
+	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
+	// When the clock could not anchor the future-end pause repair above, arm the
+	// lazy re-judgement: the first write under a plausible clock runs it instead.
+	st.pauseFutureRepairPending.Store(nowU < plausibleEpoch)
+	return st, nil
 }
 
 // applySchema creates the base tables, runs the additive column migrations, and
@@ -295,8 +368,9 @@ func applySchema(db *sql.DB) error {
 		{"speed", "jitter_ms", "REAL"},
 		{"speed", "download_bytes", "INTEGER"}, {"speed", "upload_bytes", "INTEGER"},
 		{"speed", "idle_ms", "REAL"}, {"speed", "loaded_down_ms", "REAL"},
-		{"speed", "loaded_up_ms", "REAL"}, {"speed", "loaded_down_max_ms", "REAL"},
-		{"speed", "loaded_up_max_ms", "REAL"},
+		{"speed", "loaded_up_ms", "REAL"}, {"speed", "loaded_down_p95_ms", "REAL"},
+		{"speed", "loaded_up_p95_ms", "REAL"},
+		{"speed", "ping_best_ms", "REAL"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -310,6 +384,407 @@ func applySchema(db *sql.DB) error {
 	// write/storage cost on the hot probe path.
 	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_samples_target_ts`); err != nil {
 		return fmt.Errorf("migrate: drop idx_samples_target_ts: %w", err)
+	}
+	return nil
+}
+
+// repairInsanePausesAt deletes pause rows that today's writers refuse but an older
+// InsertPause accepted (its only check was a positive duration) - above all the
+// epoch-boot span an RTC-less board recorded across its NTP correction, half a
+// million hours subtracted from every uptime window. Runs at every Open:
+// idempotent, and the pauses table is small (one row per episode).
+//
+// The clock-free half of the pause rule (pauseSpanBounded, in SQL) always
+// applies - non-positive, starting before plausibleEpoch, longer than
+// maxPauseDuration, or placed where ts+duration_s would overflow. The
+// now-anchored future-end half applies ONLY when the clock reading it is
+// plausible: at open time the clock may be the very epoch-boot clock this repair
+// cleans up after, and against such a clock every genuine row looks future - the
+// same trap Prune's plausibleEpoch skip and pauseSpanImportable's fallback exist
+// to avoid. But that import fallback is also how a future-reaching row gets IN:
+// under an epoch clock the importer can only apply the clock-free bounds, so a
+// crafted span ending a decade ahead is accepted - and nothing else ever
+// re-judges it (Prune's pause DELETE removes only future-STARTED rows, and
+// re-imports merge by ts, so a corrected file cannot displace it). Once a
+// plausible clock IS available, such a row is exactly what PauseSpanSane refuses
+// from a live writer and cannot be checkpointed history, so it goes here.
+//
+// Split out with a caller-supplied clock so tests can prove the epoch-clock
+// behaviour without faking time. Open passes its own reading; when that reading
+// cannot anchor the future-end half, maybeRepairFuturePausesAt re-runs that
+// half on the first write that observes a plausible clock.
+func repairInsanePausesAt(db *sql.DB, nowU int64) error {
+	// The ts ceiling implies no surviving row can overflow: with duration_s capped
+	// at maxPauseDuration, ts <= MaxInt64-maxPauseDuration keeps ts+duration_s in
+	// range - and a start beyond year 292 billion describes nothing anyway. Kept as
+	// constant arguments so no per-row arithmetic can itself overflow (SQLite errors
+	// on integer overflow rather than wrapping).
+	//
+	// The CAST clauses are the TYPING half of the import door (the intCols
+	// allowlist + normVal), applied at rest: a value that is not whole integer
+	// seconds - a fractional REAL from raw SQL or a pre-allowlist build, in range
+	// so the bounds above pass it - makes every read that scans the column into an
+	// int64 (pauseSpans, behind coverage and the heatmap) error permanently. CAST
+	// truncates, so a whole number compares equal whatever its storage class and
+	// is untouched; anything else is as unreadable as an out-of-range span and
+	// goes the same way.
+	//
+	// Applied to the quarantine table too, on the same rule and in the same breath:
+	// a row waiting there can be handed BACK to pauses (see
+	// repairFutureReachingPausesAt), so it must already satisfy every clock-free
+	// bound - including the ts ceiling, which is what lets the restore compute
+	// ts + duration_s in SQL without risking the overflow SQLite errors on.
+	var repaired int64
+	for _, tbl := range []string{"pauses", "pauses_quarantine"} {
+		res, err := db.Exec(`DELETE FROM `+tbl+` WHERE duration_s <= 0 OR duration_s > ? OR ts < ? OR ts > ?
+			OR CAST(duration_s AS INTEGER) != duration_s OR CAST(ts AS INTEGER) != ts`,
+			maxPauseDuration, plausibleEpoch, int64(math.MaxInt64)-maxPauseDuration)
+		if err != nil {
+			recordDBErr(err)
+			return fmt.Errorf("repair pauses: %w", err)
+		}
+		if n, e := res.RowsAffected(); e == nil {
+			repaired += n
+		}
+	}
+	if repaired > 0 {
+		stats.Add("db.pause_rows_repaired", repaired)
+		log.Printf("pingularity: removed %d pause row(s) an older build stored without validation (not a span, not whole integer seconds, longer than any retainable history, or starting before the project existed); they were subtracted from every uptime window as unobserved time", repaired)
+	}
+	// The future-end half, only under a clock that can anchor it.
+	if nowU >= plausibleEpoch {
+		return repairFutureReachingPausesAt(db, nowU)
+	}
+	return nil
+}
+
+// repairFutureReachingPausesAt is the now-anchored half of the pause repair: hold
+// aside spans ending further past the present than any believable clock
+// disagreement. The clock-free DELETE in repairInsanePausesAt has already removed
+// every row that could make ts+duration_s overflow - in both tables - so the
+// endpoints are safe to compute in SQL. The skew is deliberately more generous
+// than the live writer's pauseFutureSkew: a plausible clock can still be wrong by
+// whole timezones or stepped back hours after running fast, while everything a
+// believable writer produced ends within pauseFutureSkew of ITS clock, hours (not
+// years) from ours at worst. Rows a behind-but-plausible destination deliberately
+// imported are safe by construction: the importer bounds their ends at its own
+// now+skew, which is already the past of any later reading of the same clock.
+//
+// It MOVES rows rather than deleting them, because the clock it judges with is not
+// good enough for a permanent verdict. Any reading at/after plausibleEpoch used to
+// be trusted, so a batteryless RTC booting in 2024 with a valid 2026 database
+// cleared the threshold and destroyed real 2025-2026 pause rows before NTP synced
+// - and a deleted pause turns unobserved time into observed time, inflating uptime
+// with nothing left on disk to correct it. The frozen 2023 epoch widens that window
+// every year. So each run is one transaction that:
+//
+//   - FIRST restores quarantined rows whose end is within nowU+skew. A later,
+//     corrected clock exonerates them; the row was never disbelieved on its own
+//     merits, only against a clock that could not judge it. One row per ts is the
+//     invariant the rest of the table assumes (export/import merge pause rows on ts),
+//     so an exonerated held row with no live twin is inserted, and one that collides
+//     with a live row at that ts is merged into it - keeping the LONGER of the two
+//     spans. That merge is the point: the old NOT-EXISTS skip dropped a held row
+//     whenever a live row shared its ts and then deleted it from the quarantine
+//     anyway, silently destroying the longer span (a 7000s hold behind a 60s live
+//     row lost 6940s). Overlapping same-ts spans at read time are already unioned by
+//     mergeSpans (de13222), so this is not about double-counting a denominator - it
+//     is about not losing a span and not leaving a duplicate ts.
+//   - THEN moves rows ending beyond nowU+skew out of pauses, deduped against the
+//     quarantine (keeping the longer span) so a re-import or a re-recorded span at a
+//     ts already held does not pile up a second held row every Open. Order matters:
+//     doing it the other way round would quarantine and immediately re-restore the
+//     same row on a clock sitting near the horizon.
+//
+// A crafted decade-ahead row is therefore still out of the coverage math on the
+// first plausible open - the hole 052b50a closed stays closed - and stays out
+// forever, since no plausible clock ever reaches its end. Nothing trusts the clock
+// to be RIGHT any more, only to be a clock.
+//
+// Two things this deliberately does not do. Restoration happens here, so a
+// long-running process whose clock syncs AFTER Open keeps showing the inflated
+// uptime until it restarts: the lazy re-judgement disarms once it has run (see
+// maybeRepairFuturePausesAt), and re-arming it while the quarantine is occupied
+// would run this transaction on every probe round for as long as one crafted row
+// sits there. And quarantined rows are not in exportTables, so a backup taken
+// during that window omits them - the restore is machine-local clock repair, not
+// history, and once the clock is right the rows are back in pauses and export
+// normally.
+//
+// Shared by the at-Open path and the lazy first-plausible-write path
+// (maybeRepairFuturePausesAt): both must apply the identical judgement, or the
+// hardware that never Opens under a plausible clock keeps the rows forever.
+func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
+	horizon := nowU + pauseRepairFutureSkew
+	// One transaction: a half-applied move either loses a row (deleted from pauses,
+	// not yet held) or duplicates it (held and still live), and both are wrong in the
+	// uptime denominator.
+	tx, err := db.Begin()
+	if err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("repair future pauses: %w", err)
+	}
+	defer tx.Rollback()
+	// RESTORE. Merge FIRST into any live twin, so the INSERT below (which skips a ts
+	// already live) never re-touches a row it just created. max() keeps the LONGER
+	// span; MAX() collapses several held rows at one ts. Only exonerated held rows
+	// (end within the horizon) participate, in the merge and the insert alike.
+	resMerge, err := tx.Exec(`UPDATE pauses SET duration_s = max(duration_s,
+			(SELECT MAX(q.duration_s) FROM pauses_quarantine q
+			 WHERE q.ts = pauses.ts AND q.ts + q.duration_s <= ?))
+		WHERE EXISTS (SELECT 1 FROM pauses_quarantine q
+			WHERE q.ts = pauses.ts AND q.ts + q.duration_s <= ?)`, horizon, horizon)
+	if err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("merge quarantined pauses: %w", err)
+	}
+	resIn, err := tx.Exec(`INSERT INTO pauses (ts, duration_s)
+		SELECT q.ts, MAX(q.duration_s) FROM pauses_quarantine q
+		WHERE q.ts + q.duration_s <= ?
+		  AND NOT EXISTS (SELECT 1 FROM pauses p WHERE p.ts = q.ts)
+		GROUP BY q.ts`, horizon)
+	if err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("restore quarantined pauses: %w", err)
+	}
+	// Every exonerated held row is now represented in pauses - inserted if it had no
+	// live twin, merged into the twin (keeping the longer span) if it did - so the
+	// held copies can go. Leaving any behind would re-offer it on every open, and an
+	// exonerated row stranded in quarantine is invisible limbo: out of coverage and
+	// out of every export.
+	if _, err := tx.Exec(`DELETE FROM pauses_quarantine WHERE ts + duration_s <= ?`, horizon); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("restore quarantined pauses: %w", err)
+	}
+	// MOVE OUT, deduped against the quarantine. Merge FIRST into a held row already at
+	// that ts (keeping the longer span), then insert only future-reaching pauses rows
+	// whose ts is not already held, so repeated Opens neither pile a second row at one
+	// ts nor shrink a span already held there. GROUP BY collapses several future rows
+	// at one ts to the longer one.
+	if _, err := tx.Exec(`UPDATE pauses_quarantine SET duration_s = max(duration_s,
+			(SELECT MAX(p.duration_s) FROM pauses p
+			 WHERE p.ts = pauses_quarantine.ts AND p.ts + p.duration_s > ?))
+		WHERE EXISTS (SELECT 1 FROM pauses p
+			WHERE p.ts = pauses_quarantine.ts AND p.ts + p.duration_s > ?)`, horizon, horizon); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("quarantine future pauses: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO pauses_quarantine (ts, duration_s)
+		SELECT p.ts, MAX(p.duration_s) FROM pauses p
+		WHERE p.ts + p.duration_s > ?
+		  AND NOT EXISTS (SELECT 1 FROM pauses_quarantine q WHERE q.ts = p.ts)
+		GROUP BY p.ts`, horizon); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("quarantine future pauses: %w", err)
+	}
+	resOut, err := tx.Exec(`DELETE FROM pauses WHERE ts + duration_s > ?`, horizon)
+	if err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("quarantine future pauses: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("repair future pauses: %w", err)
+	}
+	if n, e := resOut.RowsAffected(); e == nil && n > 0 {
+		stats.Add("db.pause_rows_repaired", n)
+		log.Printf("pingularity: held aside %d pause row(s) ending further past the present than any believable clock disagreement (accepted earlier, when this machine's clock could not judge them); they were subtracting unobserved time from windows that have not happened yet, and a later open under a corrected clock gives back any that turn out to be real", n)
+	}
+	if n, e := resIn.RowsAffected(); e == nil && n > 0 {
+		stats.Add("db.pause_rows_restored", n)
+		log.Printf("pingularity: restored %d pause row(s) held aside earlier, now that the clock can see their span is in the past (a stale clock at the previous start could not); the unobserved time they record is back out of the uptime denominator", n)
+	}
+	if n, e := resMerge.RowsAffected(); e == nil && n > 0 {
+		stats.Add("db.pause_rows_merged", n)
+		log.Printf("pingularity: merged %d held pause row(s) back into a live span recorded at the same second, keeping the longer of the two; the previous restore dropped the held span whenever a live row shared its ts, losing the longer unobserved span from the uptime denominator", n)
+	}
+	return nil
+}
+
+// maybeRepairFuturePausesAt runs the future-end pause repair Open had to skip,
+// the first time a write observes a plausible clock. Gating the re-judgement on
+// the OPEN-time clock alone left a hole exactly where it matters: the RTC-less
+// board the epoch-clock import fallback serves always opens the store at
+// service start, before NTP syncs, so on that hardware the repair never fired
+// and the crafted decade-ahead row it exists to remove survived every boot.
+// Called from the per-round write paths (InsertSamples, InsertPause). Cheap by
+// design: one atomic load once judged (or when the store opened under a
+// plausible clock, which never arms the flag), and no query until a plausible
+// clock is actually observed. On a failed repair the flag re-arms - the DELETE
+// is idempotent and a later write retries - and the write itself is never
+// failed for it.
+func (s *Store) maybeRepairFuturePausesAt(nowU int64) {
+	if !s.pauseFutureRepairPending.Load() || nowU < plausibleEpoch {
+		return
+	}
+	if !s.pauseFutureRepairPending.CompareAndSwap(true, false) {
+		return // another writer won the race and is running it
+	}
+	if err := repairFutureReachingPausesAt(s.db, nowU); err != nil {
+		log.Printf("pingularity: deferred pause repair failed (a later write retries): %v", err)
+		s.pauseFutureRepairPending.Store(true)
+	}
+}
+
+// pauseRepairFutureSkew is how far past the repairing clock a stored pause may
+// end and still be believed at Open. Wider than pauseFutureSkew on purpose: the
+// live skew judges a writer against its own clock five minutes at a time, while
+// this one judges rows at rest that may have been written under a different
+// clock than the one now reading them - and deletion, unlike an import refusal,
+// cannot be re-run after the clock syncs. Two days covers every civil-time
+// misconfiguration (UTC-offset mistakes reach 26 hours) and any plausible NTP
+// step-back, and is still four orders of magnitude short of the decade-reaching
+// spans this repair exists to remove.
+const pauseRepairFutureSkew = 48 * 3600
+
+// repairInsaneEventDurations strips outage lengths today's import refuses but a
+// pre-guard build already persisted - the events-table twin of
+// repairInsanePauses. eventRowSane bounds duration_s at the import door only;
+// a row that entered before the bound existed answers to nobody:
+// completedOutagesSince anchors an unpaired 'up' at ts-duration_s with no bound,
+// so one on-disk row claiming 1e15 seconds is an outage reaching back thirty
+// million years that every queried window lands inside, and re-importing a
+// corrected backup merges by (ts, type) and changes nothing.
+//
+// The repair is eventRowSane's, applied at rest: strip the impossible length
+// (to NULL, what InsertEvent stores for "no measurement"), never the row - its
+// primary content is the transition, and deleting it would leave the preceding
+// 'down' dangling, which every reader treats as an outage still running. Same
+// predicate as the import door, no type filter: only 'up' rows carry a length
+// today, but the rule is about what a duration can MEAN, and holding both doors
+// to one rule is the point. Clock-free by nature (a bound, not a now-anchored
+// judgement), so it runs unconditionally; idempotent, and the events table is
+// small (two rows per outage).
+func repairInsaneEventDurations(db *sql.DB) error {
+	// The CAST clause is the typing half of the import door (intCols + normVal)
+	// applied at rest, exactly as in the pause repair: an in-range fractional
+	// REAL passes both bounds yet errors every int64 scan of the column
+	// (completedOutagesSince, behind uptime and the heatmap), 500ing the reads
+	// permanently. It is normalized to NULL like an out-of-bounds length - the
+	// transition is the row's primary content and stays.
+	res, err := db.Exec(`UPDATE events SET duration_s = NULL WHERE duration_s < 0 OR duration_s > ?
+		OR CAST(duration_s AS INTEGER) != duration_s`,
+		maxPauseDuration)
+	if err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("repair event durations: %w", err)
+	}
+	if n, e := res.RowsAffected(); e == nil && n > 0 {
+		stats.Add("db.event_durations_repaired", n)
+		log.Printf("pingularity: stripped the recorded length from %d outage event(s) an older build imported without validation (negative, not whole integer seconds, or longer than any retainable history); the transitions are kept, the impossible lengths were rewriting every uptime window they touched", n)
+	}
+	return nil
+}
+
+// repairUnreadableIntColumns is the intCols allowlist applied at rest: a value in
+// an INTEGER-affinity column that no read can convert to a Go int64. The import
+// door has rejected such a row since the allowlist landed, but the door came with
+// no migration, so residue an older build persisted stays forever - SQLite does
+// not enforce column types, so `healthy` holding 'yes' is stored happily and then
+// fails every scan of the column ("converting driver.Value type string ... to a
+// int64"). That is not one bad row degrading gracefully: LatestSpeed is the speed
+// panel and LatestPerTarget is the status table, and one row breaks each of them
+// permanently. Re-importing a corrected backup does not heal it either - the
+// merge is by key and only rewrites the columns the file carries.
+//
+// Which action per column follows repairInsaneEventDurations' philosophy: strip
+// the unreadable FIELD where the column is NULLable, because the row's primary
+// content is the run or the transition and NULL is a shape the readers already
+// handle; delete only where the integer column is NOT NULL, because there the
+// unreadable value IS what the row says (a probe result is its success flag) and
+// no honest row is left to keep. Every aggregate would otherwise read such a flag
+// as a failure - 'yes' = 1 is false in SQL - so leaving it mints downtime out of
+// a successful probe.
+//
+// Only non-ts columns are listed: an imported ts has been range-checked as a
+// number for every keyed table since long before the type allowlist, so there is
+// no door residue could have come through, and a ts is also the one column whose
+// removal is not recoverable by re-import. There is nothing to normalise, either:
+// SQLite's INTEGER affinity converts numeric-looking TEXT on the way in, so
+// anything still unreadable at rest is not a number in any lossless sense.
+//
+// Runs unconditionally at Open, like the sibling repairs: clock-free, idempotent,
+// and one full scan of samples costs ~0.2s per 2.6M rows - paid once per start,
+// against reads that are otherwise broken for the whole retention window.
+func repairUnreadableIntColumns(db *sql.DB) error {
+	// typeof() is the test, not CAST: the pause/event repairs compare CAST against
+	// the value because they are judging NUMBERS (a fractional REAL), while here the
+	// question is only whether the storage class is one a scan can read. 'null'
+	// counts as readable - it is the honest shape of an unmeasured field.
+	var stripped, deleted int64
+	for _, r := range []struct {
+		dst  *int64
+		stmt string
+	}{
+		// One UPDATE rather than one per column, so a run with two unreadable fields
+		// counts as the one repaired row it is. A CASE with no ELSE yields NULL, which
+		// is exactly the strip.
+		{&stripped, `UPDATE speed SET
+			healthy        = CASE WHEN typeof(healthy)        IN ('integer','null') THEN healthy        END,
+			download_bytes = CASE WHEN typeof(download_bytes) IN ('integer','null') THEN download_bytes END,
+			upload_bytes   = CASE WHEN typeof(upload_bytes)   IN ('integer','null') THEN upload_bytes   END
+			WHERE typeof(healthy)        NOT IN ('integer','null')
+			   OR typeof(download_bytes) NOT IN ('integer','null')
+			   OR typeof(upload_bytes)   NOT IN ('integer','null')`},
+		{&deleted, `DELETE FROM samples WHERE typeof(success) != 'integer'`},
+		{&deleted, `DELETE FROM dns WHERE typeof(success) != 'integer'`},
+	} {
+		res, err := db.Exec(r.stmt)
+		if err != nil {
+			recordDBErr(err)
+			return fmt.Errorf("repair integer columns: %w", err)
+		}
+		if n, e := res.RowsAffected(); e == nil && n > 0 {
+			*r.dst += n
+		}
+	}
+	if n := stripped + deleted; n > 0 {
+		stats.Add("db.int_columns_repaired", n)
+		log.Printf("pingularity: repaired %d row(s) holding a value no read can convert in a whole-number column, stored before the import door checked types: stripped the unreadable field from %d speedtest run(s) and removed %d probe row(s) whose success flag is the whole row's meaning", n, stripped, deleted)
+	}
+	return nil
+}
+
+// intColumnRepairGen is the generation of the at-rest int-column repair
+// (repairUnreadableIntColumns) that has run against a database. A fresh or pre-gate
+// DB carries generation 0; Open runs the scan only when the stored generation is
+// below this, then stamps it, so the full typeof() scan of samples/dns/speed is paid
+// once per DB rather than on every start. Bump this when the repair's coverage
+// changes so an older DB re-scans exactly once.
+//
+// ACCEPTED LIMITATION: stamping means a raw-SQL write that plants unreadable residue
+// AFTER the generation is recorded goes unrepaired. This is sound because the import
+// door (the intCols allowlist + normVal) has rejected that poison since it landed, so
+// the only doors left open are direct raw-SQL writes - which are out of scope for a
+// migration whose whole job was to clean up what a pre-allowlist build let through.
+// The forthcoming storage/clock redesign will tie the generation to a door guarantee
+// rather than to "the scan ran once".
+const intColumnRepairGen = 1
+
+// repairGeneration reads the stored int-column repair generation. It lives in PRAGMA
+// user_version - a per-database header field, so every pooled connection sees the same
+// value and a write on any connection persists to the file - chosen precisely because
+// it is NOT a table: export/import only touch the exportTables whitelist, so the marker
+// is never carried into a backup. That matters: were it exportable, restoring a backup
+// from an already-stamped machine onto a DB with its OWN unscanned residue would skip
+// the repair the destination still needs. Keeping it per-DB means each database's own
+// first Open governs its own scan.
+func repairGeneration(db *sql.DB) (int64, error) {
+	var gen int64
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&gen); err != nil {
+		recordDBErr(err)
+		return 0, fmt.Errorf("read repair generation: %w", err)
+	}
+	return gen, nil
+}
+
+// stampRepairGeneration records that the int-column repair through generation gen has
+// run. PRAGMA does not accept a bound parameter; gen is a compile-time constant, so the
+// formatted literal cannot inject.
+func stampRepairGeneration(db *sql.DB, gen int64) error {
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, gen)); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("stamp repair generation: %w", err)
 	}
 	return nil
 }
@@ -413,6 +888,10 @@ const famExpr = `COALESCE(NULLIF(family,''), CASE WHEN target LIKE '%-v6' THEN '
 // InsertSamples records one probe round's results in a single transaction (one
 // commit/fsync instead of one per target).
 func (s *Store) InsertSamples(ctx context.Context, sms []Sample) error {
+	// A probe round means the process is alive and reading its clock: the moment
+	// that clock turns plausible, run the future-end pause repair Open had to
+	// skip (an atomic no-op on every store that was judged at Open).
+	s.maybeRepairFuturePausesAt(time.Now().Unix())
 	if len(sms) == 0 {
 		return nil
 	}
@@ -467,14 +946,32 @@ func (s *Store) InsertDNS(ctx context.Context, ts time.Time, ms float64, ok bool
 // unobserved time counts as neither up nor down; only OBSERVED time is scored.
 // durationS <= 0 is a no-op. The monitor flushes spans incrementally (see Run) so
 // a pause that never resumes is still reflected.
-func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int64) error {
-	if durationS <= 0 {
-		return nil
+// Returns whether the row was STORED. A refusal is not an error - the span is
+// simply not something this table can hold - but it is not a write either, and
+// callers that pair a pause row with other state (the monitor deducts the same
+// span from an outage's length) must be able to tell the two apart. Reporting
+// refusal as `nil, nil` made a refused span look durable: the deduction was
+// applied against a row that did not exist.
+func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int64) (stored bool, err error) {
+	// The other per-round write path (a board with monitoring paused at boot
+	// checkpoints pauses, not samples): same deferred re-judgement as
+	// InsertSamples, before the live row lands.
+	s.maybeRepairFuturePausesAt(time.Now().Unix())
+	// The same rule the importer applies (PauseSpanSane). It used to check only for
+	// a positive duration, which made this the one way into the table that a
+	// crafted backup file could not have taken: the monitor measures a pause on the
+	// wall clock, so a host whose clock jumps forward at boot - no RTC, waiting on
+	// NTP - handed it a span reaching back to 1970 and it was stored without
+	// question. Dropped rather than returned as an error, matching the existing
+	// non-positive case: the caller cannot do anything useful with the failure, and
+	// the monitor now declines to offer such a span in the first place.
+	if !PauseSpanSane(start.Unix(), durationS) {
+		return false, nil
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO pauses (ts, duration_s) VALUES (?, ?)`, start.Unix(), durationS)
 	recordDBErr(err)
-	return err
+	return err == nil, err
 }
 
 // LastObservedTS returns the newest plausible samples/events timestamp - the last
@@ -784,44 +1281,435 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (down
 	return downtime, recovered, nil
 }
 
+// nextLocalDay returns the unix second at which the local date after d begins.
+//
+// It resolves to the NEXT local date's first EXISTING instant rather than
+// rebuilding midnight of the current day and adding 24h: in zones whose DST jump
+// lands at midnight (America/Havana) that midnight does not exist and Go
+// normalizes it BACKWARDS, which would collapse a whole multi-day span onto one
+// day. Shared by DowntimeByDay's proration and its observation loop so the two
+// cannot bucket the same second into different days.
+func nextLocalDay(d time.Time, loc *time.Location) int64 {
+	nd := d.AddDate(0, 0, 1)
+	b := time.Date(nd.Year(), nd.Month(), nd.Day(), 0, 0, 0, 0, loc)
+	for b.Day() != nd.Day() { // local midnight skipped by a DST jump
+		b = b.Add(time.Hour)
+	}
+	return b.Unix()
+}
+
+// pauseSpans returns the recorded pause spans overlapping [from, to), each already
+// clamped to it, oldest first.
+//
+// DowntimeByDay needs the pause overlap of EVERY day in its range, and the range
+// is a year: asking pausedOverlap per day would be 366 round trips on every
+// 60-second heatmap poll. Pause rows are few (one per episode, not per second), so
+// one query and an in-Go intersection is both cheaper and exact.
+func (s *Store) pauseSpans(ctx context.Context, from, to int64) ([][2]int64, error) {
+	if to <= from {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, duration_s FROM pauses WHERE ts < ? AND ts + duration_s > ? ORDER BY ts`, to, from)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]int64
+	for rows.Next() {
+		var ts, dur int64
+		if err := rows.Scan(&ts, &dur); err != nil {
+			return nil, err
+		}
+		a, b := ts, ts+dur
+		if a < from {
+			a = from
+		}
+		if b > to {
+			b = to
+		}
+		if b > a {
+			out = append(out, [2]int64{a, b})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Merge here, once, so every caller is handed a canonical union rather than raw
+	// rows it has to defend against. Overlap is not only the crafted-import case: a
+	// checkpoint flush and the resume flush that follows it can both cover the same
+	// wall stretch, and two rows over one stretch used to subtract it from the
+	// observed denominator TWICE - pushing coverage past the time actually paused,
+	// which nothing downstream re-derives.
+	return mergeSpans(out), nil
+}
+
+// observedOutageSpans returns the stretches of a completed outage that were
+// actually WATCHED: its real wall interval [start,end) minus the recorded pause
+// union, trimmed so the total never exceeds observed (the outage's duration_s).
+//
+// This is the canonical answer to "when was the link down?", and it exists
+// because two surfaces used to answer it differently. UptimeSince modelled the
+// outage as a contiguous [start, start+observed) - correct in TOTAL, but placed
+// in the wrong seconds whenever a pause fell inside the outage, because the real
+// recovery is later than start+observed by exactly the paused stretch. The
+// heatmap meanwhile used the real interval. Both then reported the same figure
+// for a window containing the whole outage and different figures for any window
+// whose boundary cut through it - which is every uptime pill, every heatmap day
+// boundary and every digest period.
+//
+// The trim runs from the END, matching DowntimeByDay's proration: wall time in
+// excess of the observed length is unobserved time we have no pause row for (a
+// system suspend), and the outage's leading edge is the part we are surest of.
+// For an explicit pause the trim is a no-op, since wall-minus-pause already
+// equals observed.
+func observedOutageSpans(pauses [][2]int64, start, end, observed int64) [][2]int64 {
+	if end <= start {
+		return nil
+	}
+	var out [][2]int64
+	cur := start
+	for _, p := range mergeSpans(pauses) {
+		if p[1] <= cur {
+			continue
+		}
+		if p[0] >= end {
+			break
+		}
+		if p[0] > cur {
+			out = append(out, [2]int64{cur, p[0]})
+		}
+		if p[1] > cur {
+			cur = p[1]
+		}
+	}
+	if cur < end {
+		out = append(out, [2]int64{cur, end})
+	}
+	// Trim the tail down to the observed length. A negative length is not a
+	// measurement and must never mean "no limit": this used to return the whole
+	// wall interval on `observed < 0`, and the only way a negative reaches here is
+	// a corrupt or crafted backup row - InsertEvent writes NULL, never a negative,
+	// so the product cannot produce one. One imported `up` with duration_s:-1
+	// therefore booked its entire down-to-up gap as downtime and drove the uptime
+	// ratio on every surface to near zero. Import rejects it now too (see
+	// eventRowSane); this is the second lock on the same door, because the value
+	// arrives from a file and the blast radius is every published figure.
+	if observed <= 0 {
+		return nil
+	}
+	remaining := observed
+	for i := range out {
+		width := out[i][1] - out[i][0]
+		if width <= remaining {
+			remaining -= width
+			continue
+		}
+		out[i][1] = out[i][0] + remaining
+		if out[i][1] == out[i][0] {
+			return out[:i]
+		}
+		return out[:i+1]
+	}
+	return out
+}
+
+// completedOutage is one closed outage: the wall interval it really occupied and
+// the length that was actually observed within it (its `up` row's duration_s).
+type completedOutage struct{ start, end, observed int64 }
+
+// completedOutagesSince returns the closed outages overlapping [from,to), each
+// anchored at its paired 'down' (the true wall start) and running to its 'up'.
+//
+// It is shared rather than duplicated because it was duplicated once already, in
+// SQL, and the copies drifted: UptimeSince moved to the observed-span model while
+// ResolvedOutagesSince - the digest's source - kept modelling every outage as a
+// contiguous [down, down+duration_s). Both then described the same outage in the
+// same digest line and disagreed, because a pause inside an outage puts the real
+// recovery later than the contiguous end.
+func (s *Store) completedOutagesSince(ctx context.Context, from, to int64) ([]completedOutage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT o_start, ts, duration_s FROM (
+			SELECT type, ts, duration_s,
+			       CASE WHEN LAG(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) = 'down'
+			            THEN LAG(ts) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END)
+			            ELSE ts - duration_s END AS o_start
+			FROM events WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?))
+		WHERE type='up' AND duration_s IS NOT NULL AND o_start < ? AND ts > ?`,
+		from, to, from)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []completedOutage
+	for rows.Next() {
+		var o completedOutage
+		if err := rows.Scan(&o.start, &o.end, &o.observed); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// pauseUnionFor loads the merged pause spans covering the window AND every outage
+// in it - one read, whatever the outage count (see spansIn). An outage that began
+// before the window still contributes its in-window part, so the union has to
+// reach back to the earliest outage start rather than stopping at `from`.
+func (s *Store) pauseUnionFor(ctx context.Context, outages []completedOutage, from, to int64) ([][2]int64, error) {
+	lo, hi := from, to
+	for _, o := range outages {
+		if o.start < lo {
+			lo = o.start
+		}
+		if o.end > hi {
+			hi = o.end
+		}
+	}
+	return s.pauseSpans(ctx, lo, hi)
+}
+
+// observedDowntimeIn sums how much of [from,to) these outages were OBSERVED to be
+// down, using the one interval model: the real wall span minus the pause union,
+// trimmed to each outage's recorded observed length.
+func observedDowntimeIn(outages []completedOutage, union [][2]int64, from, to int64) int64 {
+	var n int64
+	for _, o := range outages {
+		spans := observedOutageSpans(spansIn(union, o.start, o.end), o.start, o.end, o.observed)
+		n += spanOverlap(spans, from, to)
+	}
+	return n
+}
+
+// spansIn clips an already-merged, ts-sorted span list to [from,to), returning
+// exactly what a fresh pauseSpans(from,to) would have returned - without a query.
+//
+// It exists because asking the database per outage made uptime cost the PRODUCT
+// of the outage count and the pause count. Only `ts < ?` is indexable in that
+// query's predicate, so every per-outage read walked the whole pause history
+// preceding it to return the nought-or-one spans that actually overlap: measured
+// at a year of five-minute checkpoints and two outages a day, UptimeSince went
+// from ~11ms to ~2.6s and the six-window refresh to ~5.9s. Loading the union once
+// and slicing it here is the same answer for one query instead of N.
+func spansIn(spans [][2]int64, from, to int64) [][2]int64 {
+	if to <= from || len(spans) == 0 {
+		return nil
+	}
+	i := sort.Search(len(spans), func(i int) bool { return spans[i][1] > from })
+	var out [][2]int64
+	for ; i < len(spans); i++ {
+		a, b := spans[i][0], spans[i][1]
+		if a >= to {
+			break
+		}
+		if a < from {
+			a = from
+		}
+		if b > to {
+			b = to
+		}
+		if b > a {
+			out = append(out, [2]int64{a, b})
+		}
+	}
+	return out
+}
+
+// mergeSpans returns the union of a ts-sorted, half-open span list: overlapping
+// and touching spans are coalesced, so summing the result is the union's length
+// rather than the sum of its parts. Input must be sorted by start, which is what
+// pauseSpans' ORDER BY guarantees (clipping preserves it - both endpoints move
+// toward the window, never past each other).
+func mergeSpans(spans [][2]int64) [][2]int64 {
+	if len(spans) < 2 {
+		return spans
+	}
+	out := spans[:1]
+	for _, sp := range spans[1:] {
+		last := &out[len(out)-1]
+		if sp[0] <= last[1] { // overlapping or adjacent: extend
+			if sp[1] > last[1] {
+				last[1] = sp[1]
+			}
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// spanOverlap sums how many seconds of spans fall inside [from, to). Spans are
+// normally disjoint episodes; duplicated or overlapping rows (the re-import hazard
+// Prune's own comment flags) can oversum, so every caller clamps the result to the
+// segment length exactly as UptimeSince clamps its downtime.
+// PRECONDITION: spans are sorted by start and disjoint, which is what mergeSpans
+// produces and what every caller passes (pauseSpans merges before returning, and
+// observedOutageSpans emits the gaps between merged spans in order). That is what
+// lets this skip rather than scan.
+//
+// The heatmap asks this once per local day AND once per outage segment over the
+// same list, so a full scan per question is the cost that matters: a year of
+// five-minute checkpoint pauses is ~52k spans, and one render was measured at
+// 9.2ms of pure comparison before the search below. Everything ending before the
+// window and everything starting after it is skipped outright.
+func spanOverlap(spans [][2]int64, from, to int64) int64 {
+	if to <= from || len(spans) == 0 {
+		return 0
+	}
+	// First span that reaches into the window at all.
+	i := sort.Search(len(spans), func(i int) bool { return spans[i][1] > from })
+	var n int64
+	for ; i < len(spans); i++ {
+		a, b := spans[i][0], spans[i][1]
+		if a >= to {
+			break // sorted, so nothing after this one can overlap either
+		}
+		if a < from {
+			a = from
+		}
+		if b > to {
+			b = to
+		}
+		if b > a {
+			n += b - a
+		}
+	}
+	return n
+}
+
 // pausedOverlap returns the total recorded pause-span seconds overlapping [from,to].
+//
+// The WHERE clause is the same predicate pauseSpans uses and changes no result:
+// a row outside [from,to) contributes MAX(0, negative) = 0 to the sum either way.
+// It is there for the cost. `pauses` is a year of five-minute checkpoint rows for
+// anyone using the monitoring schedule (~52k rows), and unfiltered this was a full
+// SCAN doing the interval arithmetic on every one of them: 5.7ms a call, on the
+// path /api/status and the digest take. Filtered, an early window becomes SEARCH
+// pauses USING INDEX idx_pauses_ts (ts<?) and a recent one still scans but skips
+// the arithmetic - 3.1ms measured either way. Only the `ts < ?` side can use the
+// index: a pause span may be arbitrarily long (Prune deliberately keeps a
+// startup-gap row that straddles the cutoff, see
+// TestPruneKeepsPauseSpanStraddlingTheCutoff), so there is no safe lower bound on
+// `ts` to hand the planner.
 func (s *Store) pausedOverlap(ctx context.Context, from, to int64) (int64, error) {
 	if to <= from {
 		return 0, nil
 	}
-	var p sql.NullInt64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(MAX(0, MIN(ts + duration_s, ?) - MAX(ts, ?))), 0) FROM pauses`,
-		to, from).Scan(&p); err != nil {
+	// Via pauseSpans so this shares ONE union with the heatmap. The SQL aggregate
+	// this replaced summed each row's clipped length independently, so two pause
+	// rows overlapping by 50s reported 200s for a 150s union - more paused time
+	// than the window contains. Both surfaces now derive paused time the same way,
+	// which is the property the cross-render agreement tests assert.
+	spans, err := s.pauseSpans(ctx, from, to)
+	if err != nil {
 		return 0, err
 	}
-	return p.Int64, nil
+	return spanOverlap(spans, from, to), nil
 }
 
-// UptimeSince returns the fraction of time (0..1) the link was up over
-// [since, now], derived from the debounced outage events so it matches the
-// heatmap and outage table - not a per-target-probe success rate (which would,
-// e.g., halve when one address family is down though the link stayed online by
-// quorum). The window is clamped to when monitoring began (monitoringSince) so
-// a freshly-started monitor isn't credited for time it never watched. Also far
-// cheaper than scanning every sample row.
-// UptimeSince returns the up-fraction over [since, now] and the observation
-// coverage of that window (observed / wall, 0..1). The ratio's denominator is
-// OBSERVED time - wall time minus recorded pause spans - so paused, scheduled-off,
-// families-off and process-down time is neither up nor down (it would otherwise be
-// credited as up). coverage == 0 means the window observed nothing (e.g. a monitor
-// launched with probing off); callers should omit the uptime figure then. retention
-// (> 0) clamps the window start to now-retention so a window can't reach past the
-// point where outage events are pruned - beyond which downtime is lost but the wall
-// window would persist, drifting the figure optimistic (the "all" window especially).
-func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time.Duration) (ratio, coverage float64, err error) {
+// Observation is one uptime window's evidence: the wall span it describes, how
+// much of that span was actually watched, and how much of the watched time the
+// link was down. Ratio and Coverage are derived from the same three fields, so a
+// consumer that has one has necessarily been handed the other.
+//
+// It exists because UptimeSince used to return (ratio, coverage, err) and two of
+// its four consumers dropped the coverage with a single `_`: /api/status and the
+// digest both reported a confident percentage for windows that observed nothing,
+// while /metrics - the one consumer that honoured it - correctly published no
+// ratio at all. Two surfaces of one process told opposite stories in the same
+// second (reachable on the documented `-latency=false` speedtest-only mode, and
+// on `-ipv4=off -ipv6=off`, where coverage is permanently 0). Dropping coverage
+// must not be a one-character mistake, so there is no longer a second return
+// value to drop.
+type Observation struct {
+	// Window is the wall span the figure describes, AFTER UptimeSince's
+	// monitoringSince and retention clamps - not necessarily the span asked for.
+	Window time.Duration
+	// Observed is Window minus the recorded pause spans overlapping it: paused,
+	// scheduled-off, families-off, suspended and process-down time. It is the
+	// denominator of Ratio and the only span this figure can speak for.
+	Observed time.Duration
+	// Down is the OBSERVED downtime in the window. Every branch of UptimeSince
+	// already excludes the pause overlap, so it never exceeds Observed.
+	Down time.Duration
+}
+
+// Ratio is the up-fraction (0..1) of OBSERVED time - not of wall time, so a
+// stretch nobody watched is neither up nor down rather than silently credited as
+// up.
+//
+// A window that observed nothing has no measurement to report and returns 1: a
+// SENTINEL, not a reading, preserved bit-for-bit from the (ratio, coverage) tuple
+// this type replaced (`observed <= 0` returned `1, 0, nil`) because a caller that
+// renders "-" reads it and a caller that sums it must not see a NaN. Gate on
+// Defined before presenting it; a bare 1 here means "nothing to say", not "perfect".
+func (o Observation) Ratio() float64 {
+	if o.Observed <= 0 {
+		return 1
+	}
+	down := o.Down
+	if down < 0 {
+		down = 0
+	}
+	if down > o.Observed {
+		down = o.Observed // corrupt/overlapping rows must not produce a negative ratio
+	}
+	return 1 - float64(down)/float64(o.Observed)
+}
+
+// Coverage is the fraction of the window that was actually observed (0..1). A low
+// value means the ratio beside it is thin evidence; 0 means there is no ratio at
+// all (see Defined). Exported as pingularity_uptime_coverage_ratio.
+func (o Observation) Coverage() float64 {
+	if o.Window <= 0 || o.Observed <= 0 {
+		return 0
+	}
+	if o.Observed >= o.Window {
+		return 1 // pause rows are clamped to the window, so this is the ordinary "nothing paused" case
+	}
+	return float64(o.Observed) / float64(o.Window)
+}
+
+// Defined reports whether the window holds a measurement AT ALL - the question
+// /metrics asks before publishing pingularity_uptime_ratio, and the reason that
+// series is absent rather than 1 for an unwatched window.
+//
+// This is deliberately not a threshold and takes no argument. At zero observed
+// time Ratio is the hard-coded sentinel above, not a thin measurement, so there is
+// nothing here to tune: a monitor legitimately watched 8 hours a day sits at
+// coverage 0.3333 on every window forever, and any non-zero cutoff would delete
+// all six uptime_ratio series for it while the coverage series kept saying "I have
+// data". Consumers who want a cutoff apply their own, which PromQL lets them do
+// (`and on(window) pingularity_uptime_coverage_ratio > 0.95`, the pattern the
+// README already teaches) - and which nothing lets them do to a value the exporter
+// refused to emit. "Thin" is the shipped word for LOW-BUT-NONZERO coverage (see
+// the coverage HELP text and README); it is not this.
+func (o Observation) Defined() bool { return o.Observed > 0 }
+
+// UptimeSince returns the up-fraction over [since, now] and the evidence behind
+// it, derived from the debounced outage events so it matches the heatmap and
+// outage table - not a per-target-probe success rate (which would, e.g., halve
+// when one address family is down though the link stayed online by quorum). Also
+// far cheaper than scanning every sample row.
+//
+// The window is clamped to when monitoring began (monitoringSince) so a freshly
+// started monitor isn't credited for time it never watched, and the ratio's
+// denominator is OBSERVED time - wall time minus recorded pause spans - so
+// paused, scheduled-off, families-off and process-down time is neither up nor
+// down (it would otherwise be credited as up). An Observation whose Coverage is 0
+// observed nothing (e.g. a monitor launched with probing off) and has no uptime
+// figure to render; see Defined. retention (> 0) clamps the window start to
+// now-retention so a window can't reach past the point where outage events are
+// pruned - beyond which downtime is lost but the wall window would persist,
+// drifting the figure optimistic (the "all" window especially).
+func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time.Duration) (Observation, error) {
 	nowU := time.Now().Unix()
 	sinceU := since.Unix()
 
 	// Clamp the window start to when monitoring actually began.
 	first, err := s.monitoringSince(ctx, nowU)
 	if err != nil {
-		return 0, 0, err
+		return Observation{}, err
 	}
 	if first > sinceU {
 		sinceU = first
@@ -837,7 +1725,9 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 	}
 	window := nowU - sinceU
 	if window <= 0 {
-		return 1, 0, nil
+		// Nothing to describe: the zero Observation reads as Ratio 1 / Coverage 0,
+		// exactly what the (ratio, coverage) tuple returned here.
+		return Observation{}, nil
 	}
 
 	// Downtime from completed outages overlapping the window. Each 'up' records
@@ -848,20 +1738,16 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 	// or monitoring pause fell inside it. Fall back to up.ts-duration_s when no
 	// 'down' precedes the 'up'. The scan is bounded to events from the last one
 	// at/before sinceU, like the orphan scan below.
-	var down sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(MAX(0, MIN(o_start + duration_s, ?) - MAX(o_start, ?))), 0)
-		FROM (
-			SELECT type, duration_s,
-			       CASE WHEN LAG(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) = 'down'
-			            THEN LAG(ts) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END)
-			            ELSE ts - duration_s END AS o_start
-			FROM events WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?))
-		WHERE type='up' AND duration_s IS NOT NULL`,
-		nowU, sinceU, sinceU).Scan(&down); err != nil {
-		return 0, 0, err
+	// One model, one read. See completedOutagesSince / observedDowntimeIn.
+	outages, err := s.completedOutagesSince(ctx, sinceU, nowU)
+	if err != nil {
+		return Observation{}, err
 	}
-	downtime := down.Int64
+	pauseUnion, err := s.pauseUnionFor(ctx, outages, sinceU, nowU)
+	if err != nil {
+		return Observation{}, err
+	}
+	downtime := observedDowntimeIn(outages, pauseUnion, sinceU, nowU)
 
 	// Orphaned down->down gaps (a restart mid-outage wrote a second 'down' with no
 	// closing 'up') carry no duration_s, so add them explicitly, each bounded at
@@ -869,7 +1755,7 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 	// uses the recovered-gap count; uptime needs only the downtime).
 	gap, _, err := s.orphanGapDowntime(ctx, sinceU, nowU)
 	if err != nil {
-		return 0, 0, err
+		return Observation{}, err
 	}
 	downtime += gap
 
@@ -885,16 +1771,16 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 		`SELECT type, ts FROM events ORDER BY ts DESC, CASE type WHEN 'up' THEN 0 ELSE 1 END LIMIT 1`).Scan(&lastType, &lastTS); {
 	case err == sql.ErrNoRows: // no events recorded → no outages
 	case err != nil:
-		return 0, 0, err
+		return Observation{}, err
 	default:
 		if lastType == "down" {
 			end := nowU
 			if rec, ok, err := s.firstQuorumRecovery(ctx, lastTS, nowU); err != nil {
-				return 0, 0, err
+				return Observation{}, err
 			} else if ok && rec < end {
 				end = rec // quorum recovered here; not still down
 			} else if newest, ok, err := s.newestSampleAt(ctx, nowU); err != nil {
-				return 0, 0, err
+				return Observation{}, err
 			} else if ok && newest < end && newest > lastTS {
 				// No quorum recovery in samples: either the link is still down (a
 				// real outage keeps writing failed samples, so newest stays ~now and
@@ -913,10 +1799,9 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 				// Subtract any pause overlapping the still-open outage: a pause bracketed
 				// by observed down-samples (e.g. a schedule window closing while down) is
 				// unobserved, not downtime - same rule as the completed/orphan branches.
-				paused, err := s.pausedOverlap(ctx, start, end)
-				if err != nil {
-					return 0, 0, err
-				}
+				// From the union loaded above; the open outage runs to `end`, which is
+				// bounded by nowU, so it is already inside it.
+				paused := spanOverlap(pauseUnion, start, end)
 				if dt := end - start - paused; dt > 0 {
 					downtime += dt
 				}
@@ -928,18 +1813,22 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 	// spans are disjoint episodes, each clamped to the window, so their sum never
 	// exceeds the window. Downtime is already observed-only (every branch above
 	// excludes the pause overlap), so it can't exceed observed time.
-	pausedWindow, err := s.pausedOverlap(ctx, sinceU, nowU)
-	if err != nil {
-		return 0, 0, err
-	}
+	pausedWindow := spanOverlap(pauseUnion, sinceU, nowU)
 	observed := window - pausedWindow
-	if observed <= 0 {
-		return 1, 0, nil // nothing observed in this window; coverage 0 tells the caller to omit
+	if observed < 0 {
+		observed = 0 // overlapping/imported pause rows can oversum; never a negative span
 	}
+	// Keep the clamp here rather than only inside Ratio: Down is a published field
+	// (the digest and the agreement test read it), so it must be the same observed
+	// downtime the ratio divides by, not a raw sum that can exceed the window.
 	if downtime > observed {
 		downtime = observed
 	}
-	return 1 - float64(downtime)/float64(observed), float64(observed) / float64(window), nil
+	return Observation{
+		Window:   time.Duration(window) * time.Second,
+		Observed: time.Duration(observed) * time.Second,
+		Down:     time.Duration(downtime) * time.Second,
+	}, nil
 }
 
 // Event is a recorded up/down transition.
@@ -1258,11 +2147,20 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 
 // SpeedSample is one completed speedtest plus the connection context it ran in.
 type SpeedSample struct {
-	TS          int64    `json:"ts"`
-	DownMbps    float64  `json:"down_mbps"`
-	UpMbps      float64  `json:"up_mbps"`
-	PingMS      float64  `json:"ping_ms"`
-	JitterMS    *float64 `json:"jitter_ms,omitempty"`
+	TS       int64    `json:"ts"`
+	DownMbps float64  `json:"down_mbps"`
+	UpMbps   float64  `json:"up_mbps"`
+	PingMS   float64  `json:"ping_ms"`
+	JitterMS *float64 `json:"jitter_ms,omitempty"`
+	// PingBestMS is the fastest of the ping samples PingMS averages. The engine
+	// reports a MEAN, which one stalled sample drags upward without limit (a
+	// single ~225ms handshake among nine ~4.6ms ones reads as 30ms, and lands in
+	// Jitter as a ~66ms standard deviation). The floor is what the link can
+	// actually do, so the run's DECISIONS - server choice and the ping threshold -
+	// judge on this, while PingMS stays the engine's own number so the reported
+	// figure still matches what speedtest.net would show. nil on iperf3 rows and
+	// on rows written before this existed; fall back to PingMS there.
+	PingBestMS  *float64 `json:"ping_best_ms,omitempty"`
 	Server      string   `json:"server"`
 	ServerID    string   `json:"server_id,omitempty"`
 	PublicIPv4  string   `json:"public_ipv4,omitempty"`
@@ -1294,13 +2192,14 @@ type SpeedSample struct {
 	Engine string `json:"engine,omitempty"`
 	// Latency under load: idle baseline and per-phase loaded medians (ms), same
 	// method/target so loaded-minus-idle is bufferbloat. nil when unmeasurable or
-	// on older rows. The Max fields are the worst single sample per phase (the
-	// spike, not the typical).
+	// on older rows. The P95 fields are the tail of each phase's samples - not the
+	// maximum, which on a third of phases is a lost SYN retransmitted on the OS's
+	// fixed 1s timer rather than anything about the link (see speedtest.loadStat).
 	IdleMS          *float64 `json:"idle_ms,omitempty"`
 	LoadedDownMS    *float64 `json:"loaded_down_ms,omitempty"`
 	LoadedUpMS      *float64 `json:"loaded_up_ms,omitempty"`
-	LoadedDownMaxMS *float64 `json:"loaded_down_max_ms,omitempty"`
-	LoadedUpMaxMS   *float64 `json:"loaded_up_max_ms,omitempty"`
+	LoadedDownP95MS *float64 `json:"loaded_down_p95_ms,omitempty"`
+	LoadedUpP95MS   *float64 `json:"loaded_up_p95_ms,omitempty"`
 }
 
 const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESCE(server_id,''),
@@ -1308,7 +2207,8 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	COALESCE(isp_location,''), COALESCE(dns_ip,''), COALESCE(dns_provider,''), COALESCE(dns_location,''),
 	packet_loss, healthy, jitter_ms, download_bytes, upload_bytes,
 	COALESCE(cf_colo,''), COALESCE(exit_summary,''), COALESCE(run_trigger,''),
-	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_max_ms, loaded_up_max_ms, COALESCE(engine,'')`
+	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
+	ping_best_ms`
 
 // nzFinite returns a float column's value, or 0 when NULL or non-finite
 // (NaN/±Inf) - the safe sentinel for always-present scalars.
@@ -1339,20 +2239,21 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	// /api/speed and emits "+Inf" in CSV - either way one poisoned row would wedge
 	// EVERY speed read. nzFinite/ptrFinite collapse both to 0 / nil.
 	var down, up, ping sql.NullFloat64
-	var ploss, jitter, idle, loadDown, loadUp, loadDownMax, loadUpMax sql.NullFloat64
+	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest sql.NullFloat64
 	var healthy, downB, upB sql.NullInt64
 	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
-		&idle, &loadDown, &loadUp, &loadDownMax, &loadUpMax, &sp.Engine)
+		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest)
 	sp.DownMbps, sp.UpMbps, sp.PingMS = nzFinite(down), nzFinite(up), nzFinite(ping)
 	sp.IdleMS = ptrFinite(idle)
 	sp.LoadedDownMS = ptrFinite(loadDown)
 	sp.LoadedUpMS = ptrFinite(loadUp)
-	sp.LoadedDownMaxMS = ptrFinite(loadDownMax)
-	sp.LoadedUpMaxMS = ptrFinite(loadUpMax)
+	sp.LoadedDownP95MS = ptrFinite(loadDownP95)
+	sp.LoadedUpP95MS = ptrFinite(loadUpP95)
 	sp.PacketLoss = ptrFinite(ploss)
 	sp.JitterMS = ptrFinite(jitter)
+	sp.PingBestMS = ptrFinite(pingBest)
 	if healthy.Valid {
 		b := healthy.Int64 == 1
 		sp.Healthy = &b
@@ -1369,10 +2270,27 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 }
 
 // InsertSpeed records a speedtest result and the connection it ran in.
-// maxSpeedBytesPerRun bounds a single speedtest's recorded byte count: 1 PiB is
-// orders of magnitude above any real run yet far below where a SUM over the whole
-// speed table could overflow int64 (see InsertSpeed).
-const maxSpeedBytesPerRun = 1 << 50
+// maxSpeedBytesPerRun bounds a single speedtest's recorded byte count. The cap
+// exists to protect SpeedDataUsage, which SUMs download+upload across every
+// retained run inside SQLite: an int64 overflow there does not skew the total,
+// it raises "integer overflow" and hard-breaks the query, and the data-usage
+// endpoint stays broken until the offending rows are found and removed.
+//
+// So the cap has to be derived from that sum rather than eyeballed. It was 1 PiB
+// (2^50), justified in this comment as "far below where a SUM over the whole
+// speed table could overflow int64" - which was simply false arithmetic: two
+// directions at 2^50 is 2^51 per row, so int64 runs out after 4,095 rows, and a
+// default install keeps 8,760 of them (hourly runs, 365-day speed retention). A
+// crafted backup needed only a few thousand rows to wedge the usage query.
+//
+// 4 TiB per direction is the largest power of two that keeps a WORST-CASE
+// history - once-a-minute runs for a leap year, ~527k rows, far denser than any
+// real schedule - inside int64 with room to spare, while still sitting ~16,000x
+// above what a real speedtest moves. Enforced on the way in by clampSpeedBytes,
+// for both live inserts and imports; TestSpeedByteCapCannotOverflowTheUsageSum
+// re-derives the bound so changing either side fails rather than silently
+// re-opening this.
+const maxSpeedBytesPerRun = 1 << 42
 
 // clampSpeedBytes bounds an optional byte count to [0, maxSpeedBytesPerRun]. nil
 // (direction not measured) passes through unchanged.
@@ -1411,12 +2329,14 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 		`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id,
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
 			packet_loss, healthy, jitter_ms, download_bytes, upload_bytes, cf_colo, exit_summary, run_trigger,
-			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_max_ms, loaded_up_max_ms, engine)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
+			ping_best_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
-		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownMaxMS), ptrArg(sp.LoadedUpMaxMS), sp.Engine)
+		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
+		ptrArg(sp.PingBestMS))
 	recordDBErr(err)
 	return err
 }
@@ -1431,18 +2351,30 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 // figure consistent with the uptime% beside it.
 func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, downtimeS int, err error) {
 	nowU := time.Now().Unix()
-	var c, d sql.NullInt64
-	if err = s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(MAX(0, MIN(o_start + duration_s, ?) - MAX(o_start, ?))), 0)
-		FROM (
-			SELECT ts AS up_ts, type, duration_s,
-			       CASE WHEN LAG(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) = 'down'
-			            THEN LAG(ts) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END)
-			            ELSE ts - duration_s END AS o_start
-			FROM events)
-		WHERE type='up' AND duration_s IS NOT NULL AND up_ts > ?`, nowU, since, since).Scan(&c, &d); err != nil {
+	// The SAME interval model UptimeSince uses, not a second copy of it in SQL.
+	// This query used to place every outage at a contiguous [down, down+duration_s)
+	// while uptime placed it at its real span minus pauses, so a pause inside an
+	// outage made the digest print an outage total that contradicted the percentage
+	// printed beside it - "Uptime 85.71% - 1 outage - 0s down" - in one line.
+	outages, err := s.completedOutagesSince(ctx, since, nowU)
+	if err != nil {
 		return 0, 0, err
 	}
+	union, err := s.pauseUnionFor(ctx, outages, since, nowU)
+	if err != nil {
+		return 0, 0, err
+	}
+	// The COUNT is of outages that RESOLVED in the window (keyed on the 'up'), which
+	// is a different question from how much of their downtime falls inside it - an
+	// outage that began before `since` still resolved within it.
+	var resolved int
+	for _, o := range outages {
+		if o.end > since {
+			resolved++
+		}
+	}
+	c := sql.NullInt64{Int64: int64(resolved), Valid: true}
+	d := sql.NullInt64{Int64: observedDowntimeIn(outages, union, since, nowU), Valid: true}
 	// Add the orphaned down->down gap downtime UptimeSince also books (a restart
 	// mid-outage leaves a dangling 'down' whose pre-restart stretch carries no
 	// duration_s), so the digest's downtime stays consistent with the uptime%
@@ -1479,13 +2411,42 @@ func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, d
 			if rec, ok, e := s.firstQuorumRecovery(ctx, lastTS, nowU); e != nil {
 				return 0, 0, e
 			} else if ok && rec > since {
+				// Count the outage on the same evidence DowntimeByDay and
+				// orphanGapDowntime use - a quorum recovery landed in the window, so an
+				// outage began - and INDEPENDENTLY of how much of it was observed. A
+				// stretch nobody watched end to end is still an outage we saw begin and
+				// then lost sight of; suppressing the count would hide an event the
+				// heatmap still draws a dot for, trading this function's old
+				// disagreement with the uptime% for a new one with the heatmap. Only
+				// the DURATION is pause-excluded, below.
 				gapOutages++
 				start := lastTS
 				if start < since {
 					start = since
 				}
 				if rec > start {
-					gap += rec - start
+					// Subtract the pause overlap, exactly as UptimeSince's trailing-down
+					// branch and DowntimeByDay's prorate do for this same stretch: the
+					// wall gap [start, rec] can be mostly unobserved (the process was
+					// down, or monitoring was switched off mid-outage) and unobserved
+					// time is neither up nor down. Without this the digest sent an
+					// arithmetically impossible sentence - "Uptime 100.00% · 1 outage ·
+					// 168h 0m down" - because the uptime% beside it divides observed
+					// downtime by OBSERVED time while this counted raw wall seconds; the
+					// operator then opens the dashboard to a spotless heatmap. Keeping
+					// the digest consistent with the uptime% beside it is this
+					// function's whole stated purpose.
+					paused, e := s.pausedOverlap(ctx, start, rec)
+					if e != nil {
+						return 0, 0, e
+					}
+					// Only OBSERVED seconds are downtime. A trailing stretch that was
+					// unobserved end to end contributes 0 here and still counts above:
+					// "1 outage · 0m down" is the honest reading of an outage we watched
+					// begin and could not time, and it matches what the heatmap shows.
+					if dt := rec - start - paused; dt > 0 {
+						gap += dt
+					}
 				}
 			}
 		}
@@ -1496,7 +2457,12 @@ func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, d
 // TableCounts reports the row count of each data table.
 func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
 	out := map[string]int64{}
-	for _, t := range []string{"samples", "speed", "events", "settings"} {
+	// Every table Clear/import/prune can touch, so a test asserting "this dataset
+	// is empty now" cannot pass by looking at a table the operation never had.
+	// dns and pauses were both absent, and pauses is the one that matters: it is
+	// the uptime denominator, so a row left behind changes the numbers while being
+	// invisible to any count.
+	for _, t := range []string{"samples", "dns", "speed", "events", "pauses", "pauses_quarantine", "settings"} {
 		var n int64
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t).Scan(&n); err != nil {
 			return nil, err
@@ -1540,10 +2506,99 @@ func (s *Store) LatestSpeed(ctx context.Context) (*SpeedSample, error) {
 	return &sp, nil
 }
 
-// SpeedHistory returns speedtests since the given time, oldest first, with no
-// upper bound.
+// SpeedHistory returns every speedtest since the given time, oldest first, with
+// no upper bound and no downsampling - the digest reads each run, so it wants
+// them all.
 func (s *Store) SpeedHistory(ctx context.Context, since time.Time) ([]SpeedSample, error) {
-	return s.SpeedHistoryRange(ctx, since, time.Time{})
+	return s.SpeedHistoryRange(ctx, since, time.Time{}, 1)
+}
+
+// SpeedHistoryBudget returns at most budget speedtests from [since, until),
+// oldest first, by selecting every k-th RUN rather than one run per k SECONDS.
+//
+// Thinning by rank instead of by time is what makes the point count depend on
+// how many runs there are rather than on how they are spread: a time bucket has
+// to be sized from some span, and any span - the requested one, or the populated
+// extent - collapses to a handful of points as soon as the runs inside it are
+// clustered. Rank has no such failure mode; the answer is exactly
+// min(rows-in-window, budget), for every window, on every distribution.
+//
+// Two passes, both cheap. The first reads ts alone, which idx_speed_ts satisfies
+// without touching the table, and yields both the count and the timestamps to
+// keep. The second re-reads only the chosen rows whole. The kept rows are REAL
+// rows and the newest run in the window is always among them - the dashboard's
+// stat tiles read the final point, and clicking a point looks its ts up with
+// SpeedRunOffset, so a synthetic timestamp would scroll the runs table to a row
+// that does not exist.
+//
+// total is how many runs the window actually holds, which the first pass already
+// counted. It is returned rather than discarded so the API can tell a client that
+// what it received was thinned: a bare array of a thousand points looks exactly
+// like a complete history of a thousand runs, and a consumer summing bytes or
+// counting outages off it would be quietly wrong.
+func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, budget int) (out []SpeedSample, total int, err error) {
+	if budget < 1 {
+		budget = 1
+	}
+	win := ` WHERE ts >= ?`
+	winArgs := []any{since.Unix()}
+	if !until.IsZero() {
+		win += ` AND ts < ?`
+		winArgs = append(winArgs, until.Unix())
+	}
+	// Pass 1: timestamps only - an index-only scan of idx_speed_ts.
+	rows, err := s.db.QueryContext(ctx, `SELECT ts FROM speed`+win+` ORDER BY ts`, winArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	var all []int64
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		all = append(all, ts)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if len(all) == 0 {
+		return nil, 0, nil
+	}
+	keep := all
+	if len(all) > budget {
+		keep = make([]int64, 0, budget)
+		for i := 0; i < budget; i++ {
+			keep = append(keep, all[int(int64(i)*int64(len(all))/int64(budget))])
+		}
+		// Pin the newest run as the final point regardless of where the stride
+		// landed: the "last in range" caption and the stat tiles read it.
+		keep[len(keep)-1] = all[len(all)-1]
+	}
+	// Pass 2: the chosen rows, whole. budget is far below SQLite's 32766-variable
+	// ceiling. GROUP BY ts collapses the duplicate that two runs sharing a second
+	// would otherwise produce, so the response can never exceed budget.
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(keep)), ",")
+	args := make([]any, 0, len(keep))
+	for _, ts := range keep {
+		args = append(args, ts)
+	}
+	rows2, err := s.db.QueryContext(ctx,
+		`SELECT `+speedCols+` FROM speed WHERE ts IN (`+ph+`) GROUP BY ts ORDER BY ts`, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		sp, err := scanSpeed(rows2)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, sp)
+	}
+	return out, len(all), rows2.Err()
 }
 
 // SpeedHistoryRange returns speedtests in [since, until), oldest first. A zero
@@ -1552,12 +2607,40 @@ func (s *Store) SpeedHistory(ctx context.Context, since time.Time) ([]SpeedSampl
 // belongs to one side only - speedtests land on schedule, so a run at local
 // midnight is ordinary, and a closed bound would show it in both neighbouring
 // day ranges.
-func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time) ([]SpeedSample, error) {
-	q := `SELECT ` + speedCols + ` FROM speed WHERE ts >= ?`
-	args := []any{since.Unix()}
+//
+// bucketSec downsamples the result the way Series does, and for the same reason:
+// a chart window is wide but a canvas is not, so the response has to be bounded
+// by the number of points that can be drawn rather than by how long the daemon
+// has been recording. A bucket of 1 (or less) is off and every row is returned;
+// a wider bucket keeps ONE run per bucketSec-wide window, which caps a year of
+// history at the same size as a week of it.
+//
+// The kept run is the NEWEST in its bucket, and it is a REAL row, not a computed
+// average. Both matter downstream: the dashboard's stat tiles and "last in
+// range" caption read the final point as the most recent run, and clicking a
+// point looks its ts up in the runs table (SpeedRunOffset) - a synthetic
+// bucket-midpoint timestamp would scroll that table to a row that does not
+// exist. Picking the newest per bucket makes the final point the newest run by
+// construction, so neither behaviour needs a special case.
+func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, bucketSec int) ([]SpeedSample, error) {
+	win := ` WHERE ts >= ?`
+	winArgs := []any{since.Unix()}
 	if !until.IsZero() {
-		q += ` AND ts < ?`
-		args = append(args, until.Unix())
+		win += ` AND ts < ?`
+		winArgs = append(winArgs, until.Unix())
+	}
+	q := `SELECT ` + speedCols + ` FROM speed` + win
+	args := append([]any(nil), winArgs...)
+	if bucketSec > 1 {
+		// Two passes over idx_speed_ts rather than one aggregate with bare columns:
+		// SQLite would let `SELECT ts, down_mbps ... GROUP BY ts/?` pick the other
+		// columns off the MAX(ts) row, but that is a SQLite-specific extension and
+		// silently returns an arbitrary row if the aggregate is ever reshaped. The
+		// subquery names the timestamps and the outer select re-reads those rows
+		// whole, which is plain SQL and can't drift.
+		q += ` AND ts IN (SELECT MAX(ts) FROM speed` + win + ` GROUP BY ts / ?)`
+		args = append(args, winArgs...)
+		args = append(args, bucketSec)
 	}
 	rows, err := s.db.QueryContext(ctx, q+` ORDER BY ts`, args...)
 	if err != nil {
@@ -1693,10 +2776,19 @@ func (s *Store) DeleteOutage(ctx context.Context, ts int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	// First statement is the guarded write; no such 'up' = idempotent no-op
-	// (and nothing else is touched).
+	// First statement is the guarded write; no such 'up' = idempotent no-op (and
+	// nothing else is touched). The guard asks only "is this row a closing
+	// 'up'?" - 'up' IS the resolution, so the type check alone keeps a live
+	// outage (a dangling 'down') undeletable. It used to require a non-NULL,
+	// non-negative duration_s too, but a NULL length is a real shape of a
+	// FINISHED outage - InsertEvent stores NULL for "no measurement",
+	// eventRowSane strips an impossible imported length to NULL, and
+	// repairInsaneEventDurations does the same at Open - and that last one made
+	// the row undeletable exactly when deletion is the operator's only remedy
+	// left. The negative check goes with it: nothing negative survives Open
+	// anymore, and refusing it here only stranded the row the same way.
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM events WHERE ts = ? AND type = 'up' AND duration_s IS NOT NULL AND duration_s >= 0`, ts)
+		`DELETE FROM events WHERE ts = ? AND type = 'up'`, ts)
 	if err != nil {
 		recordDBErr(err)
 		return 0, err
@@ -1747,44 +2839,63 @@ func (s *Store) SpeedAvgBytes(ctx context.Context) (avgDown, avgUp int64, err er
 	return avgDown, avgUp, nil
 }
 
-// Uptime holds the up-fraction (0..1) over several time windows (mirrors the
-// DataUsage windows, so the uptime pill offers the same set as the data pill).
+// Uptime holds one Observation per dashboard time window (mirrors the DataUsage
+// windows, so the uptime pill offers the same set as the data pill). Every field
+// carries its own coverage, so no window can reach a renderer as a bare ratio.
 type Uptime struct {
-	H6  float64 `json:"6h"`
-	H24 float64 `json:"24h"`
-	D7  float64 `json:"7d"`
-	D30 float64 `json:"30d"`
-	Y1  float64 `json:"1y"`
-	All float64 `json:"all"`
+	H6  Observation
+	H24 Observation
+	D7  Observation
+	D30 Observation
+	Y1  Observation
+	All Observation
 }
 
-// UptimeWindows computes the up-fraction for each window relative to now via
+// NamedObservation is one window's label ("6h", "24h", … - the label /metrics and
+// /api/status both key on) beside its Observation.
+type NamedObservation struct {
+	Window string
+	Obs    Observation
+}
+
+// Each returns the six windows in dashboard order.
+//
+// This is the single enumeration of the window set: /metrics and /api/status both
+// iterate it, so a window cannot exist on one surface and not the other, and a
+// renderer that writes a ratio writes the coverage from the same loop variable in
+// the same loop body - there is no second collection to forget. Adding a window
+// here adds it, with its coverage, everywhere at once.
+func (u Uptime) Each() []NamedObservation {
+	return []NamedObservation{
+		{"6h", u.H6}, {"24h", u.H24}, {"7d", u.D7},
+		{"30d", u.D30}, {"1y", u.Y1}, {"all", u.All},
+	}
+}
+
+// UptimeWindows computes the Observation for each window relative to now via
 // UptimeSince (each clamps to the observed period); "all" runs from epoch so it
-// clamps to when monitoring began. Returns the first error encountered.
-// UptimeWindows computes the up-fraction for each window relative to now, plus the
-// matching observation coverage (0..1) of each window - a window whose coverage is 0
-// observed nothing and its ratio should be omitted. retention clamps the long windows
-// to retained-event coverage (see UptimeSince).
-func (s *Store) UptimeWindows(ctx context.Context, now time.Time, retention time.Duration) (u, cov Uptime, err error) {
-	at := func(d time.Duration) (float64, float64) {
+// clamps to when monitoring began. retention clamps the long windows to
+// retained-event coverage (see UptimeSince). Returns the first error encountered.
+func (s *Store) UptimeWindows(ctx context.Context, now time.Time, retention time.Duration) (u Uptime, err error) {
+	at := func(d time.Duration) Observation {
 		if err != nil {
-			return 0, 0
+			return Observation{}
 		}
-		r, c, e := s.UptimeSince(ctx, now.Add(-d), retention)
+		o, e := s.UptimeSince(ctx, now.Add(-d), retention)
 		if e != nil {
 			err = e
 		}
-		return r, c
+		return o
 	}
-	u.H6, cov.H6 = at(6 * time.Hour)
-	u.H24, cov.H24 = at(24 * time.Hour)
-	u.D7, cov.D7 = at(7 * 24 * time.Hour)
-	u.D30, cov.D30 = at(30 * 24 * time.Hour)
-	u.Y1, cov.Y1 = at(365 * 24 * time.Hour)
+	u.H6 = at(6 * time.Hour)
+	u.H24 = at(24 * time.Hour)
+	u.D7 = at(7 * 24 * time.Hour)
+	u.D30 = at(30 * 24 * time.Hour)
+	u.Y1 = at(365 * 24 * time.Hour)
 	if err == nil { // "all": from the epoch, clamped inside UptimeSince to first-seen / retention
-		u.All, cov.All, err = s.UptimeSince(ctx, time.Unix(0, 0), retention)
+		u.All, err = s.UptimeSince(ctx, time.Unix(0, 0), retention)
 	}
-	return u, cov, err
+	return u, err
 }
 
 // UptimeFloor returns the earliest timestamp the uptime figures can vouch for: the
@@ -1876,18 +2987,38 @@ type DowntimeDay struct {
 	Date      string `json:"date"`       // "YYYY-MM-DD" (in the requested zone)
 	Outages   int    `json:"outages"`    // number of LINK DOWN events
 	DowntimeS int    `json:"downtime_s"` // total seconds offline (from recoveries)
+	// WindowS/ObservedS are the day's disclosure, the same one coverage_ratio makes
+	// on /metrics: how many of the day's seconds fall inside the requested range at
+	// all (the first and last day are partial, and a DST day is 23h or 25h), and how
+	// many of those the monitor actually watched. Without them the heatmap subtracts
+	// paused time from its numerator perfectly and then tells the operator nothing:
+	// a day nobody watched and a day watched end to end with a flawless link render
+	// as the identical empty square. Correct arithmetic and honest disclosure are
+	// different properties, and this seam has now drifted on the second one six times.
+	WindowS   int `json:"window_s"`
+	ObservedS int `json:"observed_s"`
 }
 
-// DowntimeByDay returns per-day outage counts and total downtime since the
-// given time, for days with at least one event or offline second. Day
-// boundaries are taken in loc (the viewer's timezone; nil = the server's local
-// zone). Bucketing is done in Go rather than SQLite's 'localtime' so any IANA
-// zone works. A 'down' counts as an outage on the day it happened; a recovery's
-// outage duration is prorated across the local days the outage actually spanned
-// (clamped to the window), so a multi-day outage marks every offline day instead
-// of booking days of downtime on the recovery day alone. Orphaned down->down
-// gaps (a restart mid-outage) are prorated too, so the heatmap's downtime and
-// outage count match UptimeSince/ResolvedOutagesSince.
+// Observed reports whether the day holds a measurement at all - the DowntimeDay
+// spelling of Observation.Defined, and equally not a threshold. A day with
+// WindowS 0 (no in-range seconds) is treated as observed so an empty row can
+// never render as an alarming "unmonitored" square.
+func (d DowntimeDay) Observed() bool { return d.WindowS <= 0 || d.ObservedS > 0 }
+
+// DowntimeByDay returns per-day outage counts, total downtime and observation
+// span since the given time. Day boundaries are taken in loc (the viewer's
+// timezone; nil = the server's local zone). Bucketing is done in Go rather than
+// SQLite's 'localtime' so any IANA zone works. A 'down' counts as an outage on the
+// day it happened; a recovery's outage duration is prorated across the local days
+// the outage actually spanned (clamped to the window), so a multi-day outage marks
+// every offline day instead of booking days of downtime on the recovery day alone.
+// Orphaned down->down gaps (a restart mid-outage) are prorated too, so the
+// heatmap's downtime and outage count match UptimeSince/ResolvedOutagesSince.
+//
+// A row is emitted for a day with at least one event, one offline second, OR one
+// unobserved second - the last of those is why the day loop at the end exists:
+// without it a fully dark day produces no row at all and its ObservedS field would
+// have nowhere to live.
 func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Location) ([]DowntimeDay, error) {
 	if loc == nil {
 		loc = time.Local
@@ -1940,6 +3071,28 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 	}
 	sinceU := since.Unix()
 	nowU := time.Now().Unix()
+	// The window's pause spans, fetched ONCE for both loops below. prorate used to
+	// ask pausedOverlap per day-segment, which is the round trip per day that this
+	// function's own pauseSpans comment argues against - and it is worse than that
+	// comment's 366, because it is one query per outage DAY-SEGMENT: a year on the
+	// monitoring schedule (52k pause rows, ~700 outages) spent 4.1 of its 4.2
+	// seconds inside those ~705 unbounded SUMs, on every 60-second heatmap poll.
+	// One bounded query and an in-Go intersection is the same arithmetic: both
+	// paths clamp each span to the segment and clamp the result at 0, and
+	// pauseSpans has already clamped to [since, now], inside which every segment
+	// prorate builds already lies.
+	// Reach back to the earliest event pulled in, not just to sinceU: the scan
+	// deliberately starts at the last event AT/BEFORE the window so an outage
+	// straddling the boundary is visible, and its observed-span arithmetic needs the
+	// pauses over its REAL interval, not only the part inside the window.
+	pauseFrom := sinceU
+	if len(events) > 0 && events[0].ts < pauseFrom {
+		pauseFrom = events[0].ts
+	}
+	spans, err := s.pauseSpans(ctx, pauseFrom, nowU)
+	if err != nil {
+		return nil, err
+	}
 	// prorate splits [start, end] across local days, crediting each its own OBSERVED
 	// offline seconds (a recorded pause overlapping a day's segment is subtracted, so
 	// the heatmap agrees with the uptime% - both exclude paused time). start is clamped
@@ -1953,48 +3106,48 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 	// clock frozen, no pause row) the limit trims the unobserved wall time. limit < 0
 	// credits all observed time - used for spans carrying no separate duration_s (orphan
 	// restart gaps and the trailing ongoing outage).
+	// prorate splits ONE outage across the local days it touches. The seconds it
+	// splits come from observedOutageSpans - the same function uptime and the digest
+	// use - so all three now describe an outage with one piece of arithmetic rather
+	// than three that resemble each other.
+	//
+	// The old version clamped to the window and only THEN started spending the
+	// observed-length budget, which quietly refilled it at the window edge: seconds
+	// already spent before `since` became available again inside it. That was
+	// invisible while a pause row explained the gap between an outage's wall span
+	// and its observed length, because subtracting the pause left nothing for the
+	// budget to trim. It showed up on the suspend-shaped record - wall gap longer
+	// than duration_s with NO pause row, which is what a system sleep and every
+	// outage restored from an older build look like - where uptime reported 0s for a
+	// window the heatmap filled with 30s of the same outage.
 	prorate := func(start, end, limit int64) {
-		if start < sinceU {
-			start = sinceU
+		if end <= start {
+			return
 		}
-		if end > nowU {
-			end = nowU
+		// limit < 0 means "no recorded observed length" (the orphan/dangling paths);
+		// the whole interval is then creditable, so hand the budget its own width.
+		budget := limit
+		if budget < 0 {
+			budget = end - start
 		}
-		remaining := limit
-		for start < end {
-			d := time.Unix(start, 0).In(loc)
-			// Advance to the NEXT local date's first existing instant. Do not
-			// rebuild midnight of the current day and add 24h: in zones whose DST
-			// jump lands at midnight (America/Havana) that midnight does not exist
-			// and Go normalizes it BACKWARDS, which would collapse the whole
-			// remaining outage onto one day.
-			nd := d.AddDate(0, 0, 1)
-			b := time.Date(nd.Year(), nd.Month(), nd.Day(), 0, 0, 0, 0, loc)
-			for b.Day() != nd.Day() { // local midnight skipped by a DST jump
-				b = b.Add(time.Hour)
+		for _, sp := range observedOutageSpans(spansIn(spans, start, end), start, end, budget) {
+			a, b := sp[0], sp[1]
+			if a < sinceU {
+				a = sinceU
 			}
-			next := b.Unix()
-			if next > end {
-				next = end
-			} else if next <= start {
-				next = start + 1 // defensive: a boundary must advance, never swallow the rest
+			if b > nowU {
+				b = nowU
 			}
-			seg := next - start
-			if paused, err := s.pausedOverlap(ctx, start, next); err == nil {
-				if seg -= paused; seg < 0 {
-					seg = 0
+			for a < b {
+				d := time.Unix(a, 0).In(loc)
+				next := nextLocalDay(d, loc)
+				if next > b {
+					next = b
+				} else if next <= a {
+					next = a + 1 // defensive: a boundary must advance, never swallow the rest
 				}
-			}
-			if limit >= 0 {
-				if seg > remaining {
-					seg = remaining // reconcile to the observed length; trim unobserved wall time
-				}
-				remaining -= seg
-			}
-			day(d.Format("2006-01-02")).DowntimeS += int(seg)
-			start = next
-			if limit >= 0 && remaining <= 0 {
-				break
+				day(d.Format("2006-01-02")).DowntimeS += int(next - a)
+				a = next
 			}
 		}
 	}
@@ -2042,12 +3195,24 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 			// unobserved wall time. Fall back to up.ts-duration_s when the 'down'
 			// predates the window (no paired start to anchor on; [up-dur, up] still
 			// has length duration_s, so the cap stays a no-op there too).
-			start := e.ts - int64(e.dur)
+			//
+			// A NEGATIVE duration_s is corrupt-backup residue (InsertEvent writes
+			// NULL, eventRowSane strips it from new imports) - but prorate's limit
+			// uses negative as its internal "no recorded length, credit everything"
+			// sentinel, so passing the stored value through booked the whole wall gap
+			// as heatmap downtime while observedOutageSpans books ZERO for the same
+			// row (observed <= 0 means nothing was measured). Zero is the reading
+			// uptime and the digest agree on; normalize before the call.
+			dur := int64(e.dur)
+			if dur < 0 {
+				dur = 0
+			}
+			start := e.ts - dur
 			if prevDownTS >= 0 && prevDownTS < e.ts {
 				start = prevDownTS
 			}
 			prevDownTS = -1
-			prorate(start, e.ts, int64(e.dur))
+			prorate(start, e.ts, dur)
 		}
 	}
 	// A trailing 'down' with no closing 'up' is an outage still in progress (or one
@@ -2072,8 +3237,69 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 		}
 		prorate(prevDownTS, end, -1)
 	}
-	// Proration can back-fill days out of order (an 'up' credits earlier days),
-	// so sort; "YYYY-MM-DD" sorts chronologically.
+
+	// Per-day observation. Every local day in [since, now] gets its wall span and
+	// its watched span; a day that was not watched end to end gets a ROW MINTED for
+	// it, because DowntimeByDay otherwise emits nothing at all for a day with no
+	// event and no offline second - so the field alone would have had nowhere to
+	// live on exactly the days it exists to describe. Fully-watched days keep the
+	// old emission rule (no row unless something happened) so a year of healthy
+	// 24/7 monitoring still returns a handful of rows to the 60-second heatmap poll
+	// rather than 366.
+	// Time before monitoring began is UNOBSERVED, and saying so is the whole point
+	// of these two fields. Pauses cannot express it: a machine that was not running
+	// wrote no pause rows, so span-minus-pauses came out equal to the full day, the
+	// day read as watched-end-to-end-and-clean, no row was minted, and a missing row
+	// draws as a clean square. UptimeSince has clamped to this same anchor all
+	// along - which is exactly why the heatmap could show a year of green beside an
+	// uptime pill that correctly described two days.
+	began, err := s.monitoringSince(ctx, nowU)
+	if err != nil {
+		return nil, err
+	}
+	for start := sinceU; start < nowU; {
+		d := time.Unix(start, 0).In(loc)
+		next := nextLocalDay(d, loc)
+		if next > nowU {
+			next = nowU
+		} else if next <= start {
+			next = start + 1 // defensive: a boundary must advance (mirrors prorate)
+		}
+		span := next - start
+		// Nothing before the anchor was watched, whatever the pause rows say, so narrow
+		// the RANGE to the watchable part before measuring anything inside it. Taking
+		// the pauses off the whole day first and flooring afterwards discarded the
+		// subtraction entirely whenever the floor bound: pauses lying after the anchor
+		// - inside the part that really was watched - vanished with it, and the first
+		// day of monitoring claimed unbroken coverage from the moment it began.
+		lo := start
+		if began > lo {
+			lo = began
+		}
+		var obs int64
+		if lo < next {
+			// Clamp exactly as UptimeSince clamps its downtime: duplicated or
+			// overlapping pause rows must read as "the whole segment was unobserved",
+			// never as negative observed time.
+			obs = (next - lo) - spanOverlap(spans, lo, next)
+			if obs < 0 {
+				obs = 0
+			}
+		}
+		date := d.Format("2006-01-02")
+		if i, ok := byDay[date]; ok {
+			out[i].WindowS += int(span)
+			out[i].ObservedS += int(obs)
+		} else if obs < span {
+			rec := day(date)
+			rec.WindowS, rec.ObservedS = int(span), int(obs)
+		}
+		start = next
+	}
+
+	// Proration can back-fill days out of order (an 'up' credits earlier days), and
+	// the observation loop above mints unobserved days after them, so sort;
+	// "YYYY-MM-DD" sorts chronologically.
 	sort.Slice(out, func(i, j int) bool { return out[i].Date < out[j].Date })
 	return out, nil
 }
@@ -2166,6 +3392,11 @@ func (s *Store) SetSettingsDiff(ctx context.Context, kv map[string]string) ([]st
 // real rows.
 const pruneFutureSlack = 48 * time.Hour
 
+// FutureSlack publishes the bound above, so a caller outside the package can ask
+// the same question Prune asks - "is this row's ts still plausibly future?" -
+// without restating the 48h and drifting from it.
+const FutureSlack = pruneFutureSlack
+
 // metricsFutureSkew is how far ahead of wall-now a row may sit and still count as
 // "current" in the latest-reading and usage reads (LatestPerTarget, LatestSpeed,
 // SpeedDataUsage). Prune's 48h slack is deliberately generous so a stepped-back
@@ -2232,7 +3463,31 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 		// survives this prune, the samples still prove it and no synthetic event is
 		// needed (avoids re-scanning the recent, still-shifting tail too).
 		if ok && rec > g.down && rec < sampleCutoff {
-			synth = append(synth, synthUp{ts: rec, dur: rec - g.down})
+			// duration_s is OBSERVED seconds everywhere, never the raw wall gap: the
+			// monitor subtracts m.pausedGap before writing an 'up' (see
+			// Monitor.transition, "so only time actually observed down ... is
+			// recorded"), and every consumer is built on that. UptimeSince runs
+			// duration_s from the paired 'down' for the numerator and removes pause
+			// spans from the DENOMINATOR only - so a synthetic 'up' carrying wall
+			// time would book the unobserved stretch as downtime AND drop it from
+			// observed time: double-booked, and permanently, because after this
+			// prune it is an ordinary completed outage that nothing re-derives. The
+			// case that motivated this: a 'down' is written, the host loses power for
+			// weeks, and the restart books the whole gap as one pause span (see
+			// Monitor.Run's startup-gap pause) - correctly 0 downtime until an
+			// hourly prune minted a weeks-long phantom outage out of it.
+			dur := rec - g.down
+			paused, err := s.pausedOverlap(ctx, g.down, rec)
+			if err != nil {
+				return err
+			}
+			// Clamp: pause spans are normally disjoint, but an import or an
+			// overlapping startup-gap span could sum past the wall gap, and a
+			// negative duration_s would read as un-clamped downtime downstream.
+			if dur -= paused; dur < 0 {
+				dur = 0
+			}
+			synth = append(synth, synthUp{ts: rec, dur: dur})
 		}
 	}
 	for _, u := range synth {
@@ -2249,8 +3504,62 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 // Prune deletes old rows - and future-stamped ones beyond pruneFutureSlack.
 // Each table has its own cutoff so latency samples, speed history, and outage
 // events can be retained for different windows. Returns total rows removed.
+// pruneClock reads the wall clock and the store's monotonic uptime as one pair.
+// A single seam so a test can make the two disagree, which is the whole point:
+// no wall reading can be checked against itself.
+var pruneClock = func(s *Store) (time.Time, time.Duration) {
+	return time.Now(), time.Since(s.opened)
+}
+
+// pruneClockStepSlack is how far the wall clock may run ahead of monotonic time
+// before destructive pruning parks itself, and pruneClockSettle is how much
+// steady uptime it then wants before believing the clock again.
+//
+// The slack is sized to swallow ordinary hygiene - NTP slew, a leap second, the
+// scheduling gap between reading the clock and running the DELETE - while being
+// two orders of magnitude below the smallest default retention window (30d), so
+// a step big enough to shorten a window is always caught. The settle window is
+// long enough to cover several hourly attempts, giving time sync room to land.
+//
+// Neither can save a clock that boots fast and is NEVER corrected: nothing on
+// the machine can tell that apart from a correct one, and refusing forever would
+// just trade lost history for an unbounded database. It buys the time in which a
+// networked host - which a monitoring daemon is by definition - gets fixed.
+const (
+	pruneClockStepSlack = 15 * time.Minute
+	pruneClockSettle    = 6 * time.Hour
+)
+
+// clockStepped reports whether the wall clock has jumped relative to monotonic
+// time, and parks destructive pruning when it has. Reading now against the
+// baseline captured at open (or at the last step) is what makes a jump visible:
+// monotonic time cannot be stepped, so wall progress exceeding uptime progress
+// is the clock moving under us rather than time passing.
+//
+// A detected step RE-BASELINES rather than latching. Otherwise the honest case
+// poisons itself: an RTC-less board boots near 1970, the floor guard above skips
+// while it is implausible, then NTP steps it forward by decades - a legitimate
+// correction that a latching guard would read as corruption and refuse to prune
+// on forever.
+func (s *Store) clockStepped(now time.Time, uptime time.Duration) bool {
+	s.clockMu.Lock()
+	defer s.clockMu.Unlock()
+	// Round(0) strips the monotonic reading so Sub compares WALL time; without it
+	// Go silently answers with the monotonic delta and the drift is always zero.
+	drift := now.Round(0).Sub(s.clockBase) - (uptime - s.clockBaseUp)
+	if drift < 0 {
+		drift = -drift // a backward step is no more trustworthy than a forward one
+	}
+	if drift > pruneClockStepSlack {
+		s.clockBase, s.clockBaseUp = now.Round(0), uptime
+		s.clockSettleUp = uptime + pruneClockSettle
+		return true
+	}
+	return uptime < s.clockSettleUp
+}
+
 func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBefore time.Time) (int64, error) {
-	start := time.Now()
+	start, uptime := pruneClock(s)
 	// Refuse to prune while the wall clock is implausibly early: an RTC-less device
 	// (a Pi without a battery) boots near 1970, at which point EVERY real row looks
 	// "future" (> now + slack) and the future-row DELETE below would erase the whole
@@ -2261,6 +3570,23 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		stats.Inc("db.prune_skipped_clock")
 		return 0, nil
 	}
+	// The mirror of that guard, which used to be missing. A clock reading AFTER
+	// plausibleEpoch was trusted unconditionally, so one reading merely FAST -
+	// a garbage RTC, a restored VM snapshot, a hypervisor time-sync glitch -
+	// pushed every cutoff below past the newest genuine row and the `ts < before`
+	// arm deleted real latency, DNS, speed, event and pause history. Permanently,
+	// while reporting success: a later NTP correction restores nothing, and
+	// because the pauses go too, unobserved time becomes observed and uptime
+	// reads INFLATED rather than obviously broken.
+	//
+	// Same conclusion repairFutureReachingPausesAt already reaches about the same
+	// clock ("not good enough for a permanent verdict") - this is that principle
+	// applied to DELETE, and the same bargain as the floor above: the pruner
+	// retries hourly, so waiting costs a delayed cleanup and acting costs history.
+	if s.clockStepped(start, uptime) {
+		stats.Inc("db.prune_skipped_clock")
+		return 0, nil
+	}
 	cuts := []struct {
 		table  string
 		before time.Time
@@ -2268,7 +3594,6 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		{"samples", samplesBefore},
 		{"dns", samplesBefore}, // DNS samples share the latency retention
 		{"speed", speedBefore},
-		{"pauses", eventsBefore}, // pause spans share the outage retention (uptime denominator)
 	}
 	horizon := start.Add(pruneFutureSlack).Unix()
 	// Close any dangling 'down' whose recovery lives only in the samples about to
@@ -2305,6 +3630,37 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		         type = 'down'
 		         AND (SELECT MIN(u.ts) FROM events u WHERE u.type = 'up' AND u.ts > events.ts) >= ?))`,
 		horizon, eventsCut, eventsCut)
+	if err != nil {
+		recordDBErr(err)
+		return total, err
+	}
+	if n, e := res.RowsAffected(); e == nil {
+		total += n
+	}
+	// Pause spans share the outage retention (they are the uptime DENOMINATOR), and
+	// like an outage they have LENGTH - so they prune whole, on the same rule the
+	// events sweep above uses. A row is dropped only once its whole span
+	// (ts + duration_s) has fallen past the cutoff; one that starts before it but
+	// runs INTO the retained window is kept. `ts < cutoff` deleted such a row whole,
+	// and every unobserved second it covered inside the window silently became
+	// observed-and-up: coverage jumps toward 1.0 and the uptime% moves, with no data
+	// change at all. This is not a rare alignment - runPruner ticks hourly and the
+	// cutoff sweeps forward continuously, so EVERY pause row met that DELETE while
+	// most of its span was still in-window. Live pauses checkpoint every ~5 minutes
+	// (monitor.pauseCheckpoint) so each lost at most that, but the startup-gap row -
+	// one span for a whole process-down stretch - could lose months.
+	//
+	// Keep the straddling row rather than splitting it at the cutoff. Keeping is
+	// bounded: pausedOverlap already clamps every span to the window it is asked
+	// about, so a retained pre-cutoff prefix is never counted anywhere, and the row
+	// still goes at the first tick after its END passes the cutoff - at most a
+	// handful of rows outlive retention at a time, exactly as the straddling 'down'
+	// above does. Splitting would rewrite ts, which is the merge key export/import
+	// dedups pause rows on (see exportTables): a split row re-imported next to the
+	// unsplit original in an older backup would land as a SECOND overlapping span
+	// and double-subtract that time from the denominator.
+	res, err = s.db.ExecContext(ctx,
+		`DELETE FROM pauses WHERE ts > ? OR ts + duration_s < ?`, horizon, eventsCut)
 	if err != nil {
 		recordDBErr(err)
 		return total, err
@@ -2376,7 +3732,16 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 	case "speed":
 		tables = []string{"speed"}
 	case "downtime":
-		tables = []string{"events"}
+		// Both tables, for the same reason the export ships them as one category
+		// (see dataCategories): `events` holds the outages, `pauses` holds the spans
+		// that say which seconds were watched at all. Clearing only the events left
+		// the pause rows suppressing observation coverage - the outages disappear
+		// from the log and the heatmap while uptime stays exactly as thin as before,
+		// with nothing on any screen left to explain it. The quarantine goes too: a
+		// row left there is handed back to `pauses` by the next open under a good
+		// clock (see repairFutureReachingPausesAt), which would return unobserved time
+		// the operator deliberately deleted.
+		tables = []string{"events", "pauses", "pauses_quarantine"}
 	default:
 		return 0, fmt.Errorf("unknown data kind %q", kind)
 	}
@@ -2430,25 +3795,54 @@ func ptrArg[T any](p *T) any {
 // then breaks every read that scans the column into a Go int64 (the outage log and
 // heatmap 500 on it). Import rejects a row whose intCol value isn't a whole number
 // rather than persist a landmine (audit: fractional timestamps poison reads).
+// realCols is the same allowlist for REAL-affinity columns - the ones the graphs
+// actually plot. Text in one of these is the mirror landmine: a Go scan into
+// float64 errors, so a single poisoned row takes down the whole window's read,
+// and where SQLite coerces instead (inside AVG) it counts as 0 and reports a
+// fake perfect measurement rather than failing visibly.
+//
+// rowSane, when set, vets a row that already has the right column TYPES for
+// whether its values mean anything. Only tables whose rows are intervals need it:
+// a duration is not merely a number, it is the length of a span that other code
+// adds to a timestamp, and both of those have values a type check cannot catch.
 var exportTables = map[string]struct {
-	cols    []string
-	keyCols []string
-	notNull []string
-	intCols []string
+	cols     []string
+	keyCols  []string
+	notNull  []string
+	intCols  []string
+	realCols []string
+	rowSane  func(map[string]any) bool
 }{
-	"samples": {cols: []string{"ts", "target", "latency_ms", "success", "family"}, keyCols: []string{"ts", "target"}, notNull: []string{"success"}, intCols: []string{"ts", "success"}},
-	"dns":     {cols: []string{"ts", "latency_ms", "success"}, keyCols: []string{"ts"}, notNull: []string{"success"}, intCols: []string{"ts", "success"}},
-	"events":  {cols: []string{"ts", "type", "duration_s", "detail"}, keyCols: []string{"ts", "type"}, intCols: []string{"ts", "duration_s"}},
+	"samples": {cols: []string{"ts", "target", "latency_ms", "success", "family"}, keyCols: []string{"ts", "target"}, notNull: []string{"success"}, intCols: []string{"ts", "success"}, realCols: []string{"latency_ms"}},
+	"dns":     {cols: []string{"ts", "latency_ms", "success"}, keyCols: []string{"ts"}, notNull: []string{"success"}, intCols: []string{"ts", "success"}, realCols: []string{"latency_ms"}},
+	"events":  {rowSane: eventRowSane, cols: []string{"ts", "type", "duration_s", "detail"}, keyCols: []string{"ts", "type"}, intCols: []string{"ts", "duration_s"}},
+	// pauses is the uptime DENOMINATOR and rides the same "downtime" category as
+	// events (see dataCategories), because the two are one record: events carry the
+	// OBSERVED downtime, pauses carry which wall seconds were observed at all
+	// (pausedOverlap feeds UptimeSince's denominator, DowntimeByDay's prorate and
+	// orphanGapDowntime). Exporting one without the other restores a history where
+	// every unobserved second silently becomes observed-and-up, so the restored box
+	// reports a DIFFERENT uptime from the machine the backup came from - and worse,
+	// a window that observed nothing comes back with coverage 1.0, defeating the
+	// Observation.Defined guard that exists so such a window is not published as a
+	// misleading 100%. Merged by ts like the other time-series tables, which keeps a
+	// re-import idempotent - and is why Prune must never rewrite a pause row's ts
+	// (see the straddle rule there).
+	"pauses": {cols: []string{"ts", "duration_s"}, keyCols: []string{"ts"}, notNull: []string{"duration_s"},
+		intCols: []string{"ts", "duration_s"}, rowSane: pauseRowSane},
 	"speed": {cols: []string{"ts", "down_mbps", "up_mbps", "ping_ms", "server", "server_id",
 		"public_ipv4", "public_ipv6", "isp", "isp_location", "dns_ip", "dns_provider", "dns_location",
 		"packet_loss", "healthy", "jitter_ms", "download_bytes", "upload_bytes", "cf_colo", "exit_summary", "run_trigger",
-		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_max_ms", "loaded_up_max_ms", "engine"},
+		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
+		"ping_best_ms"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted
 		// as NULL, which once wedged every speed read with a Scan error.
 		notNull: []string{"server"},
-		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes"}},
+		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes"},
+		realCols: []string{"down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms", "packet_loss",
+			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms"}},
 	"settings": {cols: []string{"key", "value"}, keyCols: nil, notNull: []string{"key", "value"}},
 }
 
@@ -2473,6 +3867,21 @@ var settingsExportDeny = map[string]bool{
 	// stale/crafted value could suppress or force a digest, so it's neither
 	// exported nor accepted. The cadence preference (digest_freq) stays exportable.
 	"digest_last_sent": true,
+	// When THIS box started watching. It lives in the settings table but it is
+	// evidence, not configuration: monitoringSince takes the MIN of it and the
+	// earliest row on disk, making it the denominator behind every uptime figure.
+	//
+	// Restoring it from another machine therefore imports that machine's lifetime
+	// as this one's. Being older it always wins the MIN, so a box up for an hour
+	// reported 720h of monitoring off a 30-day-old backup - with coverage still
+	// 1.0, so nothing marked the answer as thin. Uptime then reads high, because
+	// the observed-downtime numerator is this box's and the denominator is
+	// somebody else's.
+	//
+	// Denying it loses nothing: monitoringSince re-derives the anchor from the
+	// earliest sample or event actually present, so a restore that brings HISTORY
+	// still moves it - correctly, because those rows are here to back the claim.
+	firstSeenKey: true,
 }
 
 // settingsExportRedact rewrites a settings VALUE on its way into an export. The
@@ -2680,6 +4089,10 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 	for _, c := range t.intCols {
 		intCol[c] = true
 	}
+	realCol := map[string]bool{}
+	for _, c := range t.realCols {
+		realCol[c] = true
+	}
 	for _, k := range t.keyCols {
 		known[k] = true
 	}
@@ -2829,6 +4242,7 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 		var cols, ph []string
 		var args []any
 		bad := false
+		norm := make(map[string]any, len(t.cols))
 		for _, c := range t.cols {
 			if v, ok := r[c]; ok {
 				nv, ok := normVal(v)
@@ -2839,12 +4253,59 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 				// An INTEGER-affinity column must hold a whole number: normVal turns a
 				// whole float into int64, so a value still float64 here was fractional
 				// (e.g. ts=…​.5) and would land as a REAL that breaks int64 reads. Skip it.
-				if intCol[c] {
-					if _, isFloat := nv.(float64); isFloat {
+				// This is an ALLOWLIST on purpose. normVal turns a whole JSON number
+				// into int64 and leaves every type it does not recognise alone, so a
+				// denylist of float64 (the fractional case) let all the others straight
+				// through - a string, a bool, anything. SQLite does not enforce column
+				// types, so `"duration_s": "oops"` landed as TEXT and then broke every
+				// read that scans the column into an int64: one crafted or hand-edited
+				// backup row 500s the heatmap and the uptime query for the whole
+				// retention window. nil is the single legitimate non-integer (JSON null
+				// for a nullable column - an 'up' event carries no duration_s); the
+				// notNull check above already rejects it where a value is required.
+				if intCol[c] && nv != nil {
+					if _, isInt := nv.(int64); !isInt {
 						bad = true
 						break
 					}
 				}
+				// The same allowlist for REAL-affinity columns, and for the same
+				// reason: SQLite does not enforce column types, so `"latency_ms":
+				// "oops"` landed as TEXT and every read that scans it into a Go
+				// float64 fails - one crafted row 500s the latency chart or the
+				// whole speed history for its entire window. Worse where SQLite
+				// coerces instead of erroring: inside AVG a non-numeric string
+				// counts as 0, so a poisoned DNS row reports a perfect 0 ms rather
+				// than failing visibly.
+				//
+				// normVal has already turned every JSON number into int64 or
+				// float64, so those two ARE the valid set; nil is the legitimate
+				// third (a nullable column for something genuinely unmeasured,
+				// which is most of them).
+				if realCol[c] && nv != nil {
+					if _, isF := nv.(float64); !isF {
+						if _, isInt := nv.(int64); !isInt {
+							bad = true
+							break
+						}
+					}
+				}
+				norm[c] = nv
+			}
+		}
+		// Types are right; now the SEMANTICS. Type validity is not enough for a row
+		// whose meaning is an interval - see rowSane. It runs BEFORE the insert list
+		// is built, and takes `norm` by reference, so it can also REPAIR a row rather
+		// than only reject it: dropping one impossible field is often the honest
+		// outcome where dropping the whole row is not. An imported 'up' carrying a
+		// negative duration is the case that forced this - discarding the row would
+		// discard the RECOVERY too, leaving a dangling 'down' that reads as an outage
+		// still in progress, which is worse than the number it was trying to fix.
+		if !bad && t.rowSane != nil && !t.rowSane(norm) {
+			bad = true
+		}
+		for _, c := range t.cols {
+			if nv, ok := norm[c]; ok {
 				cols = append(cols, c)
 				ph = append(ph, "?")
 				args = append(args, nv)
@@ -2922,8 +4383,225 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 // and key comparisons stay exact (e.g. ts, success). Reports ok=false for a
 // non-finite float (NaN/Inf): SQLite has no NaN/Inf literal and storing one
 // would poison aggregates - the caller drops the row.
+// pauseRowSane rejects pause rows whose interval is not one. A pause covers
+// [ts, ts+duration_s) and is the uptime DENOMINATOR, so a bad row does not look
+// wrong, it silently rewrites how much of a window the monitor claims to have
+// watched.
+//
+// Two ways a type-valid row is still nonsense:
+//
+//   - duration <= 0 is not a span. A negative one runs the interval BACKWARDS, so
+//     pausedOverlap's MIN(end)-MAX(start) subtracts a quantity with no meaning.
+//   - ts+duration_s must not overflow int64. Go computes that endpoint (pauseSpans,
+//     spanOverlap) while SQLite promotes the same expression to REAL, so a row near
+//     MaxInt64 makes the two disagree about where the pause ends - and the Go side
+//     wraps to a huge NEGATIVE endpoint that sorts before its own start.
+//
+// A negative ts is left alone deliberately: it predates the epoch, which the
+// window clamps already handle, and is not the same class of hazard.
+func pauseRowSane(row map[string]any) bool {
+	ts, okTS := row["ts"].(int64)
+	dur, okDur := row["duration_s"].(int64)
+	if !okTS || !okDur {
+		return false // both are NOT NULL; a missing one is already rejected upstream
+	}
+	if !pauseSpanImportable(ts, dur, time.Now().Unix()) {
+		// Never silently. A dropped pause row is the uptime denominator going
+		// missing while the events and samples from the same file land, so the
+		// restored box publishes a DIFFERENT uptime and coverage from the machine
+		// the backup came from - and the merge-by-ts counts make a shortfall
+		// indistinguishable from rows already present. The file still holds the
+		// rows; if the refusal was clock skew, a re-run after sync lands them.
+		stats.Inc("import.pause_dropped")
+		log.Printf("pingularity: import dropped pause row (ts=%d duration_s=%d): not a believable span; if this is a genuine backup and this machine's clock was behind when it was restored, re-run the import once the clock has synced", ts, dur)
+		return false
+	}
+	return true
+}
+
+// PauseSpanSane reports whether a pause span means anything. Exported and shared
+// so EVERY writer is held to one rule: this began as an import-only check, and the
+// monitor - writing through InsertPause, which validated nothing but a positive
+// duration - could therefore persist a row the importer would have rejected. It
+// did, on any board without an RTC: booting near the epoch with monitoring off and
+// then syncing produced a single span of half a million hours, which is subtracted
+// from every uptime window and drives observation coverage to nothing.
+func PauseSpanSane(ts, dur int64) bool {
+	if !pauseSpanBounded(ts, dur) {
+		return false
+	}
+	// And it has to END by about now. Bounding only the start and the length still
+	// admitted a span beginning two hours ago and running to the ceiling: every
+	// individual check passed, and the row then clamped to every window anyone asked
+	// about, so coverage read zero for a decade. Prune deliberately will not rewrite
+	// a row that straddles its cutoff, so retention never repairs it either.
+	//
+	// A pause describes time that has ALREADY gone unobserved, so an end in the
+	// future is not a measurement. The skew allowance is for an honest disagreement
+	// between the clock that wrote the row and the one checking it - a backup moved
+	// between machines, or a resume mid-flush - not for a span that means to reach
+	// forward.
+	return ts+dur <= time.Now().Unix()+pauseFutureSkew
+}
+
+// pauseSpanBounded is the clock-free core of the pause rule - what can be said
+// about a span from the row alone, with no appeal to the present: a positive
+// length, a start after the project existed, a believable duration, a start
+// below the shared ts ceiling (which also keeps the endpoint from
+// overflowing). repairInsanePausesAt applies exactly these bounds too.
+func pauseSpanBounded(ts, dur int64) bool {
+	if dur <= 0 {
+		return false
+	}
+	// A pause before the project existed describes nothing, and is the same class
+	// of hazard as an implausible length: it anchors nothing and only subtracts.
+	if ts < plausibleEpoch {
+		return false
+	}
+	// And it cannot be longer than the longest history this product will ever hold.
+	// A pause row is the uptime DENOMINATOR and pauseSpans clamps it to whatever
+	// window is asked about, so ONE row claiming a century subtracts every window
+	// entirely: coverage reads 0 on the pill, /metrics drops the ratio series, the
+	// digest declines to state a percentage, and every heatmap day mints as "not
+	// monitored" - permanently, because Prune's straddle rule deliberately will not
+	// rewrite a pause row's span. Nothing legitimate produces one: the monitor
+	// writes a pause per episode, bounded by the checkpoint cadence.
+	if dur > maxPauseDuration {
+		return false
+	}
+	// The ts ceiling is the REPAIR's ceiling, not the tightest per-row overflow
+	// bound. ts <= MaxInt64-dur was enough to keep ts+duration_s computable, but
+	// the at-Open repair's clock-free DELETE (repairInsanePausesAt) removes
+	// everything above MaxInt64-maxPauseDuration outright - constant arguments,
+	// so no per-row arithmetic can itself overflow in SQL - and a row in the
+	// band between the two bounds (ts=MaxInt64-100, dur=50) was accepted at the
+	// door only to be deleted at the next Open and mislogged as an older build's
+	// residue. A start within ten years of int64's end is no wall time anyway
+	// (year 292 billion), so refuse the whole band and keep door and repair in
+	// exact agreement. This also implies ts+dur cannot overflow, since dur is
+	// already capped at maxPauseDuration above.
+	return ts <= math.MaxInt64-maxPauseDuration
+}
+
+// pauseSpanImportable is the importer's acceptance rule, split from the live one
+// because the future-end check anchors on the clock CHECKING the row - for a
+// restore, the DESTINATION's - while the rows were written by the source's. On a
+// machine whose clock is implausibly early (an RTC-less board restored before NTP
+// syncs: the very hardware plausibleEpoch exists for) now+skew predates every
+// believable ts, so the live rule would fail EVERY genuine span in the file: the
+// outage events and samples land, the whole denominator vanishes, and the box
+// publishes higher uptime and full coverage for windows the source knew were
+// unobserved. A clock that early cannot anchor a judgement - Prune already
+// declines to prune under it - so fall back to the clock-free bounds instead of
+// vetoing the table. Under a plausible clock the future-end tradeoff stands
+// exactly as the live rule has it: an accepted future-reaching span clamps into
+// every queried window and Prune never repairs it, which is the worse failure.
+func pauseSpanImportable(ts, dur, nowU int64) bool {
+	if !pauseSpanBounded(ts, dur) {
+		return false
+	}
+	if nowU < plausibleEpoch {
+		return true
+	}
+	return ts+dur <= nowU+pauseFutureSkew
+}
+
+// pauseFutureSkew is how far past the present a pause may claim to end before it
+// stops being a measurement and starts being a claim about the future.
+const pauseFutureSkew = 5 * 60
+
+// maxPauseDuration is the longest single unobserved span that can be believed,
+// mirroring config.MaxRetention (10 years) - the ceiling the settings layer puts
+// on how long any history is kept. Duplicated as a literal rather than imported
+// so `store` keeps no dependency on `config`; the two are pinned together by
+// TestMaxPauseDurationTracksRetentionCeiling.
+const maxPauseDuration = 10 * 365 * 24 * 3600
+
+// eventRowSane vets an imported outage row for meaning, not just for type. The
+// events table drives every uptime figure, and two shapes in it are not data:
+//
+//   - a type that is neither 'down' nor 'up'. The readers switch on exactly those
+//     two and silently ignore anything else, so a third value is a row that will
+//     never be counted but still occupies its (ts, type) key.
+//   - an impossible duration_s. InsertEvent stores NULL when the caller passes a
+//     negative, so the product cannot emit one; a negative in a file is corrupt by
+//     construction, and it used to reach observedOutageSpans' "no limit" branch and
+//     book the whole down-to-up gap as downtime. A positive one is bounded too,
+//     at maxPauseDuration - the same retention ceiling the pause guard uses -
+//     because completedOutagesSince anchors an unpaired 'up' at ts-duration_s,
+//     so one row claiming 1e15 seconds is an outage reaching back thirty million
+//     years that every queried window lands inside: the exact single-row rewrite
+//     of every uptime figure this guard exists to stop, through its other door.
+//
+// The two are handled differently ON PURPOSE. An unreadable type makes the whole
+// row meaningless, so it goes. A bad duration does not: the row's PRIMARY content
+// is the transition - the link came back at this second - and that is worth
+// keeping. Dropping the row instead would delete the recovery and leave the
+// preceding 'down' dangling, which every reader treats as an outage still running,
+// so a file claiming one impossible number would have been "corrected" into an
+// unbounded ongoing outage. The duration alone is dropped; a completed outage with
+// no recorded length is a shape the store already handles.
+//
+// A MISSING duration is left alone: that is the real shape of a 'down' row and of
+// an 'up' whose outage was never closed.
+func eventRowSane(row map[string]any) bool {
+	// Require a STRING, then require it to be one of the two. Checking the enum only
+	// when the value happened to already be a string left the guard open to every
+	// other JSON type: normVal turns a whole number into int64 and leaves a bool
+	// alone, neither is a string, so both skipped the check and SQLite's TEXT
+	// affinity stored them as "7" and "1". Such a row is invisible to every reader -
+	// they all switch on down/up - while still occupying its (ts, type) key, and it
+	// is not inert: UptimeSince decides whether an outage is still running from the
+	// NEWEST event, so an unreadable one arriving after a dangling 'down' reads as
+	// "not down" and erased a real ongoing outage from the uptime figure while the
+	// heatmap went on counting it.
+	typ, ok := row["type"].(string)
+	if !ok || (typ != "down" && typ != "up") {
+		return false
+	}
+	if dur, ok := row["duration_s"].(int64); ok && (dur < 0 || dur > maxPauseDuration) {
+		delete(row, "duration_s") // keep the transition, discard the impossible length
+		// Counted so a restore that repaired rows is visible on /metrics rather
+		// than silent - the last time an import quietly rewrote a figure, nothing
+		// said so and the divergence went unnoticed until audit.
+		stats.Inc("import.event_duration_dropped")
+	}
+	return true
+}
+
 func normVal(v any) (any, bool) {
 	switch f := v.(type) {
+	// Go integer kinds normalize to int64 so downstream sees ONE integer type.
+	// A JSON decode only ever yields float64, but ImportTable is also called
+	// directly with hand-built maps (tests, and any in-process caller), and those
+	// carry plain ints - which the intCols allowlist would otherwise reject as
+	// "not an integer" for being the wrong Go type.
+	case int:
+		return int64(f), true
+	case int8:
+		return int64(f), true
+	case int16:
+		return int64(f), true
+	case int32:
+		return int64(f), true
+	case int64:
+		return f, true
+	case uint:
+		if uint64(f) > math.MaxInt64 {
+			return nil, false
+		}
+		return int64(f), true
+	case uint8:
+		return int64(f), true
+	case uint16:
+		return int64(f), true
+	case uint32:
+		return int64(f), true
+	case uint64:
+		if f > math.MaxInt64 {
+			return nil, false
+		}
+		return int64(f), true
 	case float64:
 		if math.IsInf(f, 0) || math.IsNaN(f) {
 			return nil, false

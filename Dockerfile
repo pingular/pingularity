@@ -39,7 +39,15 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a
 COPY --from=setcap /pingularity /pingularity
 # The data dir must exist owned by nonroot (65532) so a freshly created named
 # volume inherits that ownership and the unprivileged process can write to it.
-COPY --from=setcap --chown=65532:65532 /data /var/lib/pingularity
+# --chmod=0700 matches the mode pingularity gives a data directory it creates
+# itself. Without it COPY makes the destination directory 0755 (the source mode is
+# not carried across), and the image shipped a group/world-readable data directory
+# - which tripped pingularity's own start-up check on every container start,
+# telling the operator the directory was too open and to "consider a dedicated -db
+# directory" when this IS the dedicated directory and the image had made it that
+# way. The check rightly refuses to re-permission a directory it did not create,
+# so the mode has to be correct as shipped.
+COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity
 USER nonroot

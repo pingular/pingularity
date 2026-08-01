@@ -358,11 +358,15 @@ type Controller struct {
 	// password. Rebuilt each load; set under wmu in New/Reload, read under wmu in mutate.
 	sealedByAddr map[string]string
 	// initErr records that the initial settings read failed, so the controller is
-	// running on defaults rather than stored config. Writes are then refused (see
-	// mutate) to avoid clobbering the stored config with defaults; a successful
-	// Reload clears it. Guarded by wmu (set once in New before any concurrency,
-	// read/cleared under the writer lock).
-	initErr bool
+	// running on defaults rather than stored config. Writes are refused (see
+	// mutate) to avoid clobbering the stored config with defaults, and the web
+	// guard refuses to SERVE (see Loaded) because "no login configured" and "the
+	// login could not be read" are the same answer from here and only one of them
+	// is safe to act on. A successful Reload clears it.
+	//
+	// Atomic rather than wmu-guarded: Loaded is read on every request, and taking
+	// the writer lock on the hot path to answer it would serialise the server.
+	initErr atomic.Bool
 	// sessionEpoch is the persisted session-revocation epoch, folded into every
 	// session-token MAC. Kept in an atomic (not Values) so it's cheap to read on
 	// every authenticated request and never flows through the export/normalize path.
@@ -551,7 +555,7 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	}
 	m, err := st.AllSettings(ctx)
 	if err != nil {
-		c.initErr = true
+		c.initErr.Store(true)
 		return c, err
 	}
 	raw, legacy := c.unsealServers(m[keyIperfServers])
@@ -817,7 +821,7 @@ func (c *Controller) Reload(ctx context.Context) error {
 	// the old settings). This mirrors New, which sets vals then returns the
 	// distinguishable ErrLegacyReseal on a reseal failure.
 	c.broadcast(v)
-	c.initErr = false
+	c.initErr.Store(false)
 	// A config import can restore passwords in the clear (an older export still
 	// carries them, and mergeImportedIperfPasswords keeps them). Re-seal them
 	// here, same as New does on first load, so an import doesn't leave passwords
@@ -923,6 +927,18 @@ func (c *Controller) AuthHash() string        { return c.get().AuthHash }
 // AuthActive reports whether requests must be authenticated: auth is enabled
 // AND a password hash is set. The hash guard means enabling auth without a
 // password is inert rather than a lockout.
+// Loaded reports whether the controller is running on STORED configuration. It
+// is false when the initial read failed, in which case every value it returns is
+// a compiled-in default rather than anything the operator chose.
+//
+// This exists because the difference is invisible in the values themselves and
+// dangerous in exactly one of them: with no stored config, AuthActive() answers
+// "no login here" whether the operator never set one or the daemon merely could
+// not read the one they did set. The web guard consults this so it can refuse
+// rather than guess - a stored password must never be dropped because a page of
+// the database was unreadable at boot.
+func (c *Controller) Loaded() bool { return !c.initErr.Load() }
+
 func (c *Controller) AuthActive() bool {
 	v := c.get()
 	return v.AuthEnabled && v.AuthHash != ""
@@ -1034,7 +1050,7 @@ func (c *Controller) mutate(ctx context.Context, fn func(v *Values) map[string]s
 	// The initial load failed, so the in-memory values are defaults, not the
 	// stored config. Persisting now would overwrite the stored config with those
 	// defaults, so refuse until a successful Reload recovers the real values.
-	if c.initErr {
+	if c.initErr.Load() {
 		return ErrSettingsUnavailable
 	}
 	v := c.get()

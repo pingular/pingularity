@@ -22,3 +22,8 @@ deploy.sh
 
 # OS cruft
 .DS_Store
+
+# Agent scratch: workflow worktrees are created here at runtime and are not
+# part of the product. They are real git worktrees, so an unguarded `git add -A`
+# commits them as embedded repositories.
+.claude/

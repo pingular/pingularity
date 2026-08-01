@@ -44,6 +44,8 @@ type Monitor struct {
 
 	downPausedAt time.Time     // when the current pause episode began while down; folded into pausedGap on resume (monitor goroutine only)
 	pausedGap    time.Duration // total unwatched paused time in the current outage, excluded from its recorded duration (monitor goroutine only)
+	frozenGap    time.Duration // wall seconds of this outage's booked suspend rows that the monotonic clock slept through; transition's widen adds them back so the read model's pause subtraction lands on seconds the pair holds (guarded by mu)
+	outageGen    uint64        // opaque token identifying the current accumulator incarnation; bumped as transition() resets the two gaps above, stamped into each pendingGap so a refusal/eviction surfacing in a LATER outage is not reversed out of THIS one's accumulators. Monitor-goroutine only, save for the under-mu bump/read in transition and the accumulator functions
 
 	degradedStreak int  // consecutive rounds over the degraded-latency threshold (monitor goroutine only)
 	degraded       bool // currently inside a degraded episode, so OnDegraded fires once (monitor goroutine only)
@@ -119,6 +121,48 @@ const (
 	pauseCheckpoint = 5 * time.Minute
 	startupGapMin   = 2 * time.Minute
 )
+
+// suspendGapSlack is the headroom, ON TOP OF one probe interval, that the WALL gap
+// between two loop iterations must exceed before Run books it as unobserved time.
+// It exists because the loop is structurally blind to a suspend-to-RAM: `wait` is
+// derived from the monotonic anchor lastRound, and CLOCK_MONOTONIC does not advance
+// across suspend, so a frozen host wakes believing no time passed. Its dark hours
+// then land in UptimeSince's OBSERVED denominator and are scored as up - while the
+// SAME real gap taken by a process restart is correctly excluded by the startup-gap
+// pause above. That asymmetry (killed = excluded, frozen = counted up) is the bug.
+//
+// The threshold is `interval + slack`, deliberately not the tempting `2*interval`.
+// The interval is operator-set anywhere in [1s, 1h] (config.Min/MaxInterval), so
+// 2*interval is TEN SECONDS at the default 5s cadence - within reach of one
+// stop-the-world GC, a stalled fsync, or a busy host descheduling the loop. Every
+// false positive there writes a pause row that subtracts genuinely observed time
+// from the denominator, and that is the worse bug: Store.pausedOverlap SUMs the
+// rows it finds, so spurious spans compound, they can drive observed time to zero
+// (UptimeSince then reports coverage 0 and callers drop the uptime figure), and
+// nothing re-derives them away later. At the other end 2*interval is TWO HOURS at a
+// 1h cadence, which would sleep through a whole night's suspend. A fixed slack is
+// tighter than that where the interval is long and far safer where it is short.
+//
+// Ten minutes clears every ordinary overshoot by an order of magnitude: one wait
+// (<= max(interval, scheduleRecheck)), one round (targets are dialled concurrently,
+// so <= config.MaxTimeout = 30s), plus scheduler and GC jitter. The price is that
+// freezes shorter than ~10 minutes stay mis-booked as observed - a bounded,
+// self-limiting error, unlike a spurious row.
+const suspendGapSlack = 10 * time.Minute
+
+// waitArmedHook, when set by a test, reports the wait the loop just armed and the
+// span the next gap check will be judged against. Nil in production.
+var waitArmedHook func(armed, threshold time.Duration)
+
+// plausibleWallEpoch is the earliest believable wall-clock reading (2023-01-01 UTC,
+// before the project existed), mirroring the store's plausibleEpoch. An RTC-less
+// board (a Pi with no battery) boots near 1970 and jumps decades forward the instant
+// NTP answers; that step is a clock CORRECTION, not unobserved time, and booking it
+// would insert a pause span longer than the entire history - enough on its own to
+// zero out UptimeSince's observed denominator. Store.Prune reasons identically and
+// simply refuses to run while the clock is implausible: nothing is lost by waiting,
+// everything is lost by acting now.
+const plausibleWallEpoch = 1672531200
 
 func (m *Monitor) interval() time.Duration {
 	if m.IntervalFn != nil {
@@ -252,14 +296,63 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
+	// Seed the event-clock guard from the newest stored event. transition()'s
+	// nondecreasing clamp and strictly-after down-bump rest on lastEventWall, and
+	// only this process's own transitions used to feed it - so a restart wiped the
+	// guard exactly when it matters most: a widened recovery leaves the newest
+	// on-disk 'up' up to a backward step's size in the wall FUTURE, and a fresh
+	// process confirming an outage inside that catch-up window stored its 'down'
+	// at or before that 'up'. completedOutagesSince breaks ts ties down-before-up,
+	// so the tied 'down' steals the pairing and collapses the prior outage to the
+	// zero-width shape the widen exists to eliminate, one restart later.
+	// LastObservedTS cannot be the source here: it caps at wall now, and a
+	// future-dated 'up' - the one record that needs guarding against - is
+	// precisely what it excludes. A failed read just leaves the guard unseeded,
+	// which is the pre-seeding behavior: transitions still order within this
+	// process's lifetime.
+	//
+	// The seed is honoured only inside store.FutureSlack, the system's own
+	// definition of plausibly-future: Prune deletes events past it every hour, so
+	// a row inside it is a durable widened recovery that MUST be protected (the
+	// whole reason this seeding exists), while a row beyond it is already
+	// condemned - protecting it only clamps this process's real transitions out
+	// into the same condemned zone, where the next prune erases them while the
+	// in-memory guard survives the deletion and drags the transition after them
+	// too. Nothing bounds an event's ts on the way in, so the source can be a
+	// crafted backup or a boot clock years fast. Skipping leaves the guard
+	// unseeded, the same safe fallback as a failed read; the widen it protects
+	// never reaches beyond a backward step's size, and every step this bound
+	// tolerates is far larger than any the widen can produce.
+	//
+	// nowFn() rather than the `now` above: this is a WALL judgement against a ts
+	// read from the database, the same seam (and the same reason) as the startup
+	// gap check below, while `now` is the monotonic-carrying anchor for m.since.
+	if evs, err := m.store.EventsPage(ctx, 1, 0); err == nil && len(evs) > 0 &&
+		evs[0].TS <= nowFn().Add(store.FutureSlack).Unix() {
+		m.mu.Lock()
+		m.lastEventWall = time.Unix(evs[0].TS, 0)
+		m.mu.Unlock()
+	}
+
+	// Spans measured but not yet written; see pendingGap. Declared ahead of the
+	// startup-gap write so a failed write there joins the same retry queue as every
+	// other, rather than dropping a potentially months-long process-down stretch on
+	// one bad write - the immediate first round advances LastObservedTS past the
+	// gap, so nothing else would ever re-derive it.
+	var held []*pendingGap
 	// Process-down time is unobserved: book the gap since the last recorded activity
 	// as a pause span so it counts as neither up nor down (else uptime credits a
 	// multi-day outage-while-stopped as up). Skipped on a fresh install (no prior
 	// activity) and for restart blips below the threshold.
 	if last, ok, err := m.store.LastObservedTS(ctx); err == nil && ok {
-		if start := time.Unix(last, 0); time.Since(start) > startupGapMin {
-			if e := insertPause(m.store, ctx, start, int64(time.Since(start).Seconds())); e != nil {
-				m.log.Debug("startup gap pause persist failed", "err", e)
+		// nowFn().Sub rather than time.Since: the anchor is read from the DATABASE and
+		// carries no monotonic reading, so this is a wall subtraction either way -
+		// routing it through the seam lets a test drive the restart half of the
+		// restart/suspend symmetry against the same store the loop's gap check writes to.
+		start := time.Unix(last, 0)
+		if gap := nowFn().Sub(start); gap > startupGapMin {
+			if p := m.flushGap(ctx, &pendingGap{start: start, secs: int64(gap.Seconds()), pause: true, gen: m.outageGen}); p != nil {
+				held = appendHeldGap(m, held, p)
 			}
 		}
 	}
@@ -268,6 +361,14 @@ func (m *Monitor) Run(ctx context.Context) error {
 		m.round(ctx) // probe immediately, don't wait a full interval
 	}
 	lastRound := time.Now()
+	// The same checkpoint on the WALL clock, kept separately from lastRound because
+	// lastRound's monotonic reading is precisely what a suspend freezes; see
+	// bookUnobservedGap.
+	lastWall := nowFn()
+	// The cadence the current wait is being run at; the gap check judges the wait
+	// just finished against THIS, not against a value the operator may have changed
+	// mid-wait (see bookUnobservedGap).
+	lastInterval := m.interval()
 	paused := false              // tracks the running→paused edge for pause accounting
 	var pauseTick time.Time      // last moment paused time was accrued up to
 	var pauseSpanStart time.Time // start of the current unflushed pause span (uptime's observed denominator)
@@ -279,12 +380,73 @@ func (m *Monitor) Run(ctx context.Context) error {
 		if pauseSpanStart.IsZero() {
 			return
 		}
-		span := end.Sub(pauseSpanStart)
+		// The span is measured on the WALL clock. InsertPause stores this row as
+		// [start.Unix(), start.Unix()+duration_s), so a duration taken from
+		// end.Sub(pauseSpanStart) - which uses the MONOTONIC reading whenever both
+		// values carry one, as two time.Now() readings do - describes a different
+		// interval than the row claims the moment the two clocks diverge. A host that
+		// suspends while monitoring is switched off is exactly that case: the monotonic
+		// clock is frozen for the whole suspend, so a nine-hour freeze would be recorded
+		// as the ~30 seconds the loop was awake and the remainder would stay in
+		// UptimeSince's observed denominator, scored as up - the same defect
+		// bookUnobservedGap fixes for the probing case, reached by the other path.
+		// Floor at the monotonic elapsed so a BACKWARD wall step (NTP correcting a fast
+		// RTC) can only shorten the row to time that provably passed, never invert it.
+		// The FORWARD direction has no such defence and cannot: a step and a suspend
+		// leave identical evidence - wall advanced, the monotonic floor did not follow -
+		// so this deliberately trusts the wall, because the suspend it exists to catch
+		// is routine and a large forward step is not (chrony/ntpd slew sub-second
+		// offsets rather than stepping, and step mostly at boot, which the startup-gap
+		// path already owns). The residual error is exactly the step size, and
+		// pauseCheckpoint keeps ordinary corrections from minting a row of their own -
+		// see TestSmallForwardClockStepDoesNotMintAPauseSpan. A cap was considered and
+		// rejected: a genuine hibernate can last weeks, so any ceiling would silently
+		// truncate real unobserved time, which is the very error this path fixes.
+		// (monitor.paused_s beside this keeps its monotonic reading on purpose: it is an
+		// operator-facing duration, not part of the uptime denominator, and stats.AddF
+		// must never be handed a negative.)
+		// An implausible endpoint is a clock being corrected, not unobserved time -
+		// the same judgement unobservedGap makes on the probing path, and the same
+		// scenario, differing only in whether the master switch happened to be on. A
+		// board with no RTC boots near the epoch and stays there until NTP answers;
+		// with monitoring off (or outside its schedule window) a pause span is open
+		// across that correction, and trusting the wall clock here turned it into a
+		// single row claiming every second since 1970. That row is subtracted from
+		// every uptime window, so coverage reads nothing on the pill, /metrics, the
+		// digest and the whole heatmap.
+		//
+		// RE-ANCHOR rather than just decline: leaving pauseSpanStart at the boot
+		// instant would only defer the same row to the next flush. The corrected
+		// instant is the earliest moment this episode can honestly speak for.
+		if pauseSpanStart.Unix() < plausibleWallEpoch || end.Unix() < plausibleWallEpoch {
+			m.log.Info("pause span spans a clock correction; re-anchoring rather than recording it",
+				"from", pauseSpanStart.UTC().Format(time.RFC3339), "to", end.UTC().Format(time.RFC3339))
+			stats.Inc("monitor.pause_clock_corrections")
+			pauseSpanStart = end
+			return
+		}
+		span := time.Duration(end.Unix()-pauseSpanStart.Unix()) * time.Second
+		if mono := end.Sub(pauseSpanStart); mono > span {
+			span = mono
+		}
 		if span <= 0 || (!force && span < pauseCheckpoint) {
 			return
 		}
-		if e := insertPause(m.store, ctx, pauseSpanStart, int64(span.Seconds())); e != nil {
-			m.log.Debug("pause span persist failed", "err", e)
+		// The write gets the same discipline as the probing path's flushGap, because
+		// the stakes are identical: a slice that vanishes here stays in the observed
+		// denominator and reads as observed-and-up for as long as the data is kept. A
+		// FAILED write is held and re-offered as the exact span that was measured; a
+		// REFUSED one is dropped for good, loudly, with the resume edge's deduction
+		// kept consistent with the rows that exist (see dropRefusedPauseDeduction).
+		// Refusal is reachable from right here: the mono floor above composes with
+		// PauseSpanSane's end-by-about-now bound, so a backward wall step larger than
+		// that skew mid-pause offers a span the store deterministically refuses -
+		// silence there VOIDED the slice, not "only shortened" it. The anchor still
+		// advances either way: a held record replays its own span, and a refused one
+		// re-anchors at the corrected reading, whose stepped-back minutes the still-
+		// open pause covers with its next slice (spans are merged on read).
+		if p := m.flushGap(ctx, &pendingGap{start: pauseSpanStart, secs: int64(span.Seconds()), pause: true, gen: m.outageGen}); p != nil {
+			held = appendHeldGap(m, held, p)
 		}
 		pauseSpanStart = end
 	}
@@ -297,6 +459,33 @@ func (m *Monitor) Run(ctx context.Context) error {
 	timer.Stop()
 	defer timer.Stop()
 	for {
+		// Wall-gap check, FIRST in the iteration and before anything dispatches a
+		// round. It must precede the resume edge below: that edge clears
+		// pauseSpanStart, and a gap seen after it would be booked a second time on top
+		// of the span the flush just wrote.
+		wallNow := nowFn()
+		// Re-offer anything a previous iteration measured but could not write. Each
+		// record replays its OWN span, so a store that stays down for hours does not
+		// inflate the stretch it eventually records.
+		held = retryHeldGaps(ctx, m, held)
+		booked, p := m.bookUnobservedGap(ctx, lastWall, wallNow, !pauseSpanStart.IsZero(), lastInterval,
+			wallNow.Sub(lastWall))
+		if p != nil {
+			held = appendHeldGap(m, held, p)
+		}
+		if booked {
+			// A freeze is an observation gap exactly like a pause, so it obeys the same
+			// contract the paused branch enforces below: streaks from before it must not
+			// combine with rounds after it to confirm a transition nine hours later.
+			m.resetStreaks()
+		}
+		// The anchor always moves on. A gap that could not be written is carried in
+		// `held` as the span that was actually measured, so there is no longer any
+		// reason to leave the anchor behind - doing so made the next iteration
+		// recompute a longer span from it, and each retry annexed more of the time
+		// the monitor had genuinely been watching.
+		lastWall = wallNow
+
 		var wake <-chan struct{}
 		if m.WakeFn != nil {
 			wake = m.WakeFn()
@@ -304,16 +493,21 @@ func (m *Monitor) Run(ctx context.Context) error {
 		// Re-read the interval each round so runtime changes take effect; keep the
 		// lastRound anchor so a settings broadcast only re-derives the deadline
 		// rather than restarting the wait.
-		wait := time.Until(lastRound.Add(m.interval()))
+		iv := m.interval()
+		wait := time.Until(lastRound.Add(iv))
 		// Resume edge: probing turned back on while a pause was still open. Close the
 		// episode here, crediting only the real switched-off time up to now - deferring
 		// it to the next due round would fold on-but-idle wait time into
 		// monitor.paused_s and pausedGap.
 		if paused && m.probing() {
 			stats.AddF("monitor.paused_s", time.Since(pauseTick).Seconds())
-			flushPause(time.Now(), true) // close the pause span at the resume edge
+			flushPause(nowFn(), true) // close the pause span at the resume edge
 			pauseSpanStart = time.Time{}
 			paused = false
+			// noteResume stays on the REAL clock while the span above is wall: pausedGap
+			// is subtracted from Monitor.transition's MONOTONIC elapsed, so it has to be
+			// measured on the same clock. Feeding it wall time would double-subtract a
+			// suspend that fell inside an outage - the monotonic elapsed already omits it.
 			m.noteResume(time.Now())
 			m.log.Info("monitor recording resumed")
 		}
@@ -333,7 +527,7 @@ func (m *Monitor) Run(ctx context.Context) error {
 			// accrued between visits, not pre-credited per visit - settings broadcasts
 			// re-enter this branch at arbitrary rates, so each visit must add only the
 			// time that truly passed.
-			now := time.Now()
+			now := nowFn()
 			if !paused {
 				paused = true
 				pauseSpanStart = now // begin a new observed-pause span (flushed on checkpoint/resume)
@@ -356,6 +550,9 @@ func (m *Monitor) Run(ctx context.Context) error {
 			m.resetStreaks()
 			wait = scheduleRecheck
 		case wait <= 0:
+			// No wait is armed on this path, so the only time that can pass before the
+			// next gap check is the round itself; suspendGapSlack covers that.
+			lastInterval = 0
 			m.round(ctx)
 			lastRound = time.Now()
 			rounds++
@@ -370,6 +567,17 @@ func (m *Monitor) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		// Judge the NEXT iteration's gap against the wait actually armed here, not the
+		// nominal interval. Every mid-wait wake (a settings broadcast) re-enters this
+		// loop and re-arms only the REMAINDER of the interval, so recording the full
+		// cadence let the threshold outrun the sleep by however long the loop had
+		// already been waiting - on a long interval, a real suspend inside the last
+		// few minutes of it fell under the threshold and went unrecorded, which makes
+		// coverage read higher than the truth.
+		lastInterval = wait
+		if waitArmedHook != nil {
+			waitArmedHook(wait, lastInterval)
+		}
 		timer.Reset(wait)
 		select {
 		case <-ctx.Done():
@@ -381,6 +589,345 @@ func (m *Monitor) Run(ctx context.Context) error {
 			timer.Stop()
 		}
 	}
+}
+
+// unobservedGap reports the WALL seconds between two loop checkpoints that the
+// monitor cannot have observed, or 0 when the spacing is ordinary.
+//
+// The comparison runs on .Unix() rather than now.Sub(prev) on purpose: Sub between
+// two time.Now() values silently uses the MONOTONIC reading, and the monotonic
+// clock standing still across a suspend is the entire defect - a monotonic delta
+// here would make this check a permanent no-op that no test could distinguish from
+// a working one. (Monitor.transition makes the mirror-image choice for the same
+// reason: its outage duration MUST be monotonic, and it clamps the stored event ts
+// on .Unix() explicitly.)
+//
+// A BACKWARD wall step - NTP correcting a fast RTC, or an operator setting the
+// clock - yields a negative gap, falls under the threshold and books nothing, the
+// same direction of safety Store.InsertPause takes by ignoring durationS <= 0. The
+// caller re-anchors on every iteration regardless, so one backward step costs one
+// missed detection window rather than blinding the check until the clock catches up.
+func unobservedGap(prev, now time.Time, threshold time.Duration) int64 {
+	// A zero prev (nothing anchored yet) is negative here, so it is caught too.
+	if prev.Unix() < plausibleWallEpoch || now.Unix() < plausibleWallEpoch {
+		return 0 // a boot clock being corrected, not unobserved time
+	}
+	gap := now.Unix() - prev.Unix()
+	if gap <= int64(threshold/time.Second) {
+		return 0
+	}
+	return gap
+}
+
+// bookUnobservedGap records the wall stretch since the previous loop checkpoint as
+// unobserved time when it is too long to be ordinary loop spacing, and reports
+// whether such a gap was seen (the caller clears the debounce streaks either way).
+//
+// The span is anchored at prev, the last moment the loop is known to have been
+// running, and covers the whole delta. A freeze can have begun anywhere inside
+// [prev, now), so this over-books by at most one iteration's worth of genuinely
+// observed time - one wait plus one round. Erring in that direction is deliberate:
+// the figure this feeds, pingularity_uptime_coverage_ratio, advertises that "a low
+// value means the window was mostly paused/unobserved and its uptime_ratio is thin
+// evidence", so it has to fail CLOSED. Unfixed it read 1 - perfect confidence - for
+// a night that was nine hours dark.
+//
+// pauseOpen suppresses the row. While a pause span is open, the checkpoint/resume
+// flush already covers this same wall stretch (flushPause measures it on the wall
+// clock for exactly this case), and a second span over it would be counted twice:
+// Store.pausedOverlap SUMs the rows it finds, so two spans over one stretch
+// subtract it from the denominator twice and push observation coverage past 1.0 -
+// corruption in the opposite direction, and worse, because nothing re-derives it.
+//
+// The gap always belongs in the denominator (this pause row). Whether it also has
+// to come OUT of the numerator depends on something this code cannot assume: it
+// used to state that a suspend inside an outage is already excluded, because
+// transition measures elapsed on a monotonic clock "which is frozen for the whole
+// freeze". That is true on macOS and Linux and false on Windows, where Go's
+// monotonic clock keeps counting through sleep - so there the same stretch was
+// booked as downtime and as never-watched at once. bookUnobservedGap now measures
+// how far the monotonic clock actually moved and deducts exactly that; see
+// unobservedInOutage.
+// Returns whether a gap was seen, and whether the wall ANCHOR may advance past
+// it. The second value exists because the pause row can fail to write: the caller
+// re-anchors on every iteration, so advancing after a failed write dropped the
+// interval permanently - those dark hours stayed in the observed denominator and
+// were credited as healthy for as long as the data was kept. Holding the anchor
+// makes the next iteration re-offer a gap that still covers the failed stretch,
+// and pause spans are merged on read, so a retry that overlaps costs nothing.
+//
+// monoAdvance is how far the MONOTONIC clock moved across [prev, now]; the caller
+// owns that subtraction (Run passes now.Sub(prev) on values straight from
+// time.Now, where Sub uses the monotonic readings) because a test cannot: Go
+// couples a time.Time's wall and monotonic halves, so no synthesized value can
+// have its wall nine hours ahead while its monotonic stood still - which is
+// precisely the state a frozen-clock suspend leaves behind, and the case the
+// deduction below has to decide on.
+func (m *Monitor) bookUnobservedGap(ctx context.Context, prev, now time.Time, pauseOpen bool, waited, monoAdvance time.Duration) (booked bool, pending *pendingGap) {
+	// `waited` is the interval that SIZED the wait just completed, not whatever the
+	// interval is now. Reading m.interval() here judged a finished wait against a
+	// setting that may have changed during it: lowering the probe interval from 1h
+	// to 5s made the loop wake immediately and score the 50 minutes it had been
+	// correctly sleeping as an unobserved gap, minting a permanent 50-minute pause
+	// row that understates coverage for as long as it is retained.
+	gap := unobservedGap(prev, now, waited+suspendGapSlack)
+	if gap == 0 {
+		return false, nil
+	}
+	// If an outage is open across this gap, decide whether transition() will have
+	// counted the unwatched stretch as downtime, and if so fold it into pausedGap
+	// so it is subtracted. MEASURED, not assumed - see unobservedInOutage.
+	//
+	// Only when no explicit pause is open. When one IS open the pause episode
+	// already owns this stretch: notePause marked its start, and the resume edge
+	// will fold the whole episode into this same accumulator via noteResume. Adding
+	// here as well counted one nine-hour lid-close as eighteen, and since
+	// transition() SUBTRACTS the accumulator from the outage length, the result was
+	// not a slightly wrong figure but a real outage clamped to zero - gone from the
+	// log, the heatmap and the digest. This is the same reason the pause ROW below
+	// is suppressed on pauseOpen; the numerator needed the same rule and did not
+	// have it.
+	if pauseOpen {
+		// The open pause span already covers this stretch, so there is nothing to
+		// write and nothing to adjust.
+		return true, nil
+	}
+	// Measure the numerator correction HERE, against the outage this gap actually
+	// happened inside, and apply it straight away. Deferring it until the row lands
+	// left it stranded whenever the link came back before the store did: the
+	// recovery closes the outage and consumes the accumulator, so a nine-hour
+	// suspend was filed as nine hours off the internet and no later write could take
+	// it back.
+	//
+	// The amount is remembered so it can be REVERSED if the store turns out to
+	// refuse the span. The row and this correction are two halves of one fact, and
+	// the pair has to be kept whole in both directions - a deduction without a row
+	// rewrites uptime just as quietly as a row without a deduction.
+	p := &pendingGap{start: prev, secs: gap}
+	m.mu.Lock()
+	if !m.online {
+		// Stamp the incarnation these accumulators belong to, under the same lock as
+		// the mutation, so a refusal that surfaces in a later outage reverses out of
+		// this outage's accumulators only, never a successor's (see revertGapDeduction).
+		p.gen = m.outageGen
+		p.deduct = unobservedInOutage(time.Duration(gap)*time.Second, monoAdvance)
+		m.pausedGap += p.deduct
+		// The remainder is the row's MONO-ABSENT part: wall seconds this row books
+		// that the outage's monotonic elapsed never contained (a frozen clock's whole
+		// freeze; zero when the clock ran straight through). transition() must widen
+		// the stored pair by exactly this, or a backward wall step leaves a pair that
+		// observedOutageSpans shrinks below its own duration_s when it subtracts this
+		// very row from it. (unobservedInOutage clamps the deduction to the wall gap,
+		// so the remainder is never negative.)
+		p.frozen = time.Duration(gap)*time.Second - p.deduct
+		m.frozenGap += p.frozen
+	}
+	m.mu.Unlock()
+	return true, m.flushGap(ctx, p)
+}
+
+// maxHeldGaps bounds the records carried for retry. A store that refuses to write
+// for long enough to accumulate this many separate suspends is broken in a way
+// retrying will not fix, and an unbounded queue would turn that into a slow leak.
+const maxHeldGaps = 64
+
+// appendHeldGap adds a record to the retry queue, dropping the oldest if the queue
+// is full. A dropped record's deduction goes back: without its row the correction
+// has nothing to stand on.
+func appendHeldGap(m *Monitor, held []*pendingGap, p *pendingGap) []*pendingGap {
+	if len(held) >= maxHeldGaps {
+		m.log.Warn("too many unwritten observation gaps; dropping the oldest",
+			"dropped_since", held[0].start.UTC().Format(time.RFC3339), "dropped_gap_s", held[0].secs)
+		stats.Inc("monitor.unobserved_gap_dropped")
+		m.revertGapDeduction(held[0])
+		held = held[1:]
+	}
+	return append(held, p)
+}
+
+// retryHeldGaps re-offers every held record and returns those still unwritten.
+func retryHeldGaps(ctx context.Context, m *Monitor, held []*pendingGap) []*pendingGap {
+	if len(held) == 0 {
+		return held
+	}
+	keep := held[:0]
+	for _, p := range held {
+		if still := m.flushGap(ctx, p); still != nil {
+			keep = append(keep, still)
+		}
+	}
+	return keep
+}
+
+// pendingGap is an unobserved stretch that has been measured but whose store row
+// has not landed yet. It is IMMUTABLE once built: the retry replays this exact
+// span rather than recomputing one from the old anchor to the current time, which
+// grew the stretch on every attempt and swallowed hours the monitor really had
+// been watching.
+type pendingGap struct {
+	start  time.Time
+	secs   int64
+	deduct time.Duration // already added to pausedGap; reversed if the store refuses
+	frozen time.Duration // the span's mono-absent remainder, already added to frozenGap; reversed with deduct - the widen must not add back a row that will never exist
+	gen    uint64        // Monitor.outageGen at booking time: the accumulator incarnation deduct/frozen were added to (or, on the pause path, the outage the resume fold belongs to). A refusal or eviction reverses/advances only while this still matches; a mismatch means the booking's outage has closed and its accumulators are gone, so leave the current outage's untouched
+	// pause marks a span from the pause path - flushPause's checkpoints and resume
+	// edge, or the startup gap - rather than a suspend gap. The failed/refused
+	// mechanics are shared, but the bookkeeping around them is not: a pause span's
+	// outage deduction is the noteResume fold still to come (never deduct above),
+	// so a refusal is reconciled through dropRefusedPauseDeduction, and a success
+	// needs no gap counters or log line - the episode has its own accounting
+	// (monitor.pauses, monitor.paused_s, the paused/resumed lines). One residual
+	// asymmetry is accepted: a pause record dropped from a FULL queue cannot give
+	// its fold back (the episode may be closed and consumed by then), the same
+	// bounded cross-outage slack revertGapDeduction's zero-clamp already carries.
+	pause bool
+}
+
+// flushGap attempts the write for a measured span - a suspend gap, or a
+// pause-path record (see pendingGap.pause). It returns the record back if the
+// attempt should be repeated later, or nil once the span is settled - written,
+// or refused and its deduction taken back.
+func (m *Monitor) flushGap(ctx context.Context, p *pendingGap) *pendingGap {
+	stored, err := insertPause(m.store, ctx, p.start, p.secs)
+	switch {
+	case err != nil:
+		// A write that FAILED may succeed later, so keep the record and re-offer the
+		// same span. Warn, not Debug: an unobserved stretch that never reaches the
+		// store makes coverage read HIGHER than the truth, which is the direction
+		// nobody goes looking for.
+		m.log.Warn("unobserved span not recorded; will retry the same span", "err", err, "gap_s", p.secs,
+			"since", p.start.UTC().Format(time.RFC3339))
+		stats.Inc("monitor.unobserved_gap_retries")
+		return p
+	case !stored:
+		// REFUSED, which is a different thing from failed: the store will never accept
+		// this span, so retrying it would only waste attempts. Take the numerator
+		// correction back, since the row that justified it does not exist - each path
+		// holds its own half of that pairing.
+		if p.pause {
+			m.dropRefusedPauseDeduction(p)
+		} else {
+			m.revertGapDeduction(p)
+		}
+		m.log.Warn("unobserved span refused by the store; not recorded and deduction reversed",
+			"gap_s", p.secs, "deducted_back_s", p.deduct.Seconds(),
+			"since", p.start.UTC().Format(time.RFC3339))
+		stats.Inc("monitor.unobserved_gap_refused")
+		return nil
+	}
+	if p.pause {
+		// A stored pause-path span needs none of the gap accounting below: the
+		// episode already announced itself ("monitor recording paused",
+		// monitor.pauses, monitor.paused_s), and counting its rows under
+		// unobserved_gaps too would report the same stretch twice.
+		return nil
+	}
+	stats.Inc("monitor.unobserved_gaps")
+	stats.AddF("monitor.unobserved_s", float64(p.secs))
+	// Default level: this silently reshapes every uptime window it lands in, so an
+	// operator asking "why is coverage 62%?" must be able to answer it from the log.
+	m.log.Info("unobserved wall-clock gap", "gap_s", p.secs,
+		"since", p.start.UTC().Format(time.RFC3339))
+	return nil
+}
+
+// revertGapDeduction takes back a correction whose row was refused - both
+// halves, since they describe the same row: the numerator deduction and the
+// mono-absent remainder the widen would have added back.
+//
+// It reverses into the CURRENT accumulators only while the pending gap still
+// belongs to the open incarnation (p.gen == m.outageGen). A gap booked in one
+// outage, held because its write failed, then refused (or evicted) during a
+// LATER outage carries the earlier token: transition() has already reset and
+// re-generationed the accumulators, so subtracting p.deduct/p.frozen here would
+// come out of the LATER outage's gaps - shorting its widen and its duration with
+// a correction that was never theirs. On a mismatch the booking's outage has
+// closed and its accumulators are gone, so drop it without touching the current
+// ones and without any accumulator going negative. (The residual the token
+// cannot undo: once the earlier outage's pair was already persisted, a refusal
+// that lands after it closed cannot retroactively widen it; the token only keeps
+// the corruption from reaching the successor.) The zero-clamp stays as defence.
+func (m *Monitor) revertGapDeduction(p *pendingGap) {
+	if p.deduct <= 0 && p.frozen <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p.gen != m.outageGen {
+		return
+	}
+	if m.pausedGap > p.deduct {
+		m.pausedGap -= p.deduct
+	} else {
+		m.pausedGap = 0
+	}
+	if m.frozenGap > p.frozen {
+		m.frozenGap -= p.frozen
+	} else {
+		m.frozenGap = 0
+	}
+}
+
+// dropRefusedPauseDeduction is revertGapDeduction's counterpart for the pause
+// path. A refused span will never have a row, so the stretch it covers must not
+// be deducted from the open outage either - but a pause span's deduction is not
+// p.deduct (never set on this path): it is the noteResume fold still to come,
+// measured as resume-time minus downPausedAt. Advancing that anchor past the
+// refused span excludes exactly the rowless stretch, while the slices whose
+// rows exist stay deducted.
+//
+// The advance applies only while the SAME outage incarnation that measured the
+// span is still open (p.gen == m.outageGen) AND the current episode's anchor is
+// at or before the span's start: a refusal surfacing after that outage closed
+// has no anchor of its own left to move, and a later outage's must not be moved
+// for it. The start check alone caught the ordinary case - a later outage's
+// anchor is set after the earlier span, so the span sorts before it - but a
+// backward wall step (NTP) between the outages can land the new anchor EARLIER
+// than the old span's start, and then only the token tells the two apart. Both
+// gates are kept: within one outage the start check still fences a span from an
+// already-resumed-and-folded earlier episode out of a later one's anchor.
+// Monitor-goroutine only, like notePause/noteResume.
+func (m *Monitor) dropRefusedPauseDeduction(p *pendingGap) {
+	if !m.downPausedAt.IsZero() && p.gen == m.outageGen && !p.start.Before(m.downPausedAt) {
+		m.downPausedAt = m.downPausedAt.Add(time.Duration(p.secs) * time.Second)
+	}
+}
+
+// unobservedInOutage returns how much of an unobserved wall gap has to be
+// deducted from an open outage's recorded length, given how far the MONOTONIC
+// clock advanced across the same gap.
+//
+// transition() measures an outage with ts.Sub(m.since), a monotonic subtraction.
+// Whether that already excludes a suspend depends on the platform, and the code
+// here used to assume it always does. Go only promises that "on SOME systems the
+// monotonic clock will stop if the computer goes to sleep" - and Windows is one
+// where it does not: the runtime reads _INTERRUPT_TIME (KUSER_SHARED_DATA), the
+// BIASED interrupt time, which has sleep added back on wake. So on Windows the
+// suspend stayed inside the outage's numerator while the pause row this function
+// writes removed it from the observed denominator - the same stretch counted as
+// downtime and as never-watched.
+//
+// Rather than branch on GOOS, compare the two clocks over the gap we just
+// detected:
+//
+//   - monoGap ~ 0: the monotonic clock stopped (macOS, Linux). transition()
+//     never saw the stretch, so deduct nothing - deducting would shrink a real
+//     outage below its observed length.
+//   - monoGap ~ wallGap: the clock ran straight through (Windows; also a process
+//     stalled awake, e.g. a long GC pause or a suspended container). transition()
+//     counted every second of it, so deduct all of it.
+//
+// Anything between is a partial freeze; deduct what the clock actually saw. The
+// result is clamped to the wall gap so a clock that reports MORE monotonic time
+// than wall time cannot over-deduct.
+func unobservedInOutage(wallGap, monoGap time.Duration) time.Duration {
+	if monoGap <= 0 {
+		return 0
+	}
+	if monoGap > wallGap {
+		return wallGap
+	}
+	return monoGap
 }
 
 // resetStreaks clears the overall, per-family, and degraded debounce counters.
@@ -432,6 +979,15 @@ var insertEvent = (*store.Store).InsertEvent
 // insertPause is Store.InsertPause behind a var so tests can capture the pause
 // spans the loop records (uptime's observed-time denominator; see Run).
 var insertPause = (*store.Store).InsertPause
+
+// nowFn is time.Now behind a var so tests can drive Run's WALL clock - a suspend,
+// an NTP step - without waiting real hours. It supplies the wall readings only: the
+// pause spans, the startup gap and the wall-gap check. Run's SCHEDULING anchors
+// (lastRound, time.Until, the timer) deliberately stay on the real monotonic clock,
+// because a suspend has to look to them exactly as it does in production - frozen -
+// and because the whole point of unobservedGap is that it disagrees with them.
+// Mirrors the resolveTime / insertEvent / insertPause seams.
+var nowFn = time.Now
 
 // pendingEvent is a confirmed transition whose durable InsertEvent failed. It is
 // retried verbatim on a later round until it lands; only the persisted record is
@@ -833,15 +1389,63 @@ func (m *Monitor) transition(ctx context.Context, online bool, res prober.Result
 	// DESC read the 'down' as newest and book a phantom outage. Comparing against
 	// m.since with .Before() (as the old code did) is a no-op in production because
 	// .Before() uses the monotonic reading, which never steps back - so clamp the
-	// stored WALL time nondecreasing here, comparing .Unix() explicitly. On a tie
-	// (same Unix second) the 'up' shares the 'down' second, never earlier, which is
-	// enough to keep the pairing intact; the monotonic duration above is unaffected.
+	// stored WALL time nondecreasing here, comparing .Unix() explicitly. For an
+	// 'up' a tie (same Unix second) is enough: the pairing breaks ts ties
+	// down-before-up, so an 'up' sharing its own down's second still closes it. A
+	// 'down' must land strictly AFTER the 'up' before it, because that same tie
+	// rule reads a 'down' sharing the PREVIOUS up's second as coming between that
+	// up and its down - stealing the pairing, collapsing the prior outage to zero
+	// width. The widen below manufactures exactly that tie without any help from
+	// the clock: it stamps a recovery ahead of a stepped-back wall, and until the
+	// wall catches up every new outage's 'down' clamps to precisely that second.
 	evWall := ts
-	if !m.lastEventWall.IsZero() && evWall.Unix() < m.lastEventWall.Unix() {
-		evWall = m.lastEventWall
+	if !m.lastEventWall.IsZero() {
+		if evWall.Unix() < m.lastEventWall.Unix() {
+			evWall = m.lastEventWall
+		}
+		if !online && evWall.Unix() == m.lastEventWall.Unix() {
+			evWall = time.Unix(m.lastEventWall.Unix()+1, 0)
+		}
+	}
+	// Ordering is not enough for an 'up': the pair it closes must also be as WIDE
+	// as the wall window the read model reconstructs from it. observedOutageSpans
+	// takes the stored pair, subtracts the recorded pause rows, then trims to
+	// duration_s - and duration above already had the pause fold subtracted, so
+	// the pair must span the RAW monotonic elapsed, not the duration: a pair only
+	// duration wide has the pause subtracted from it a second time on read, and
+	// books duration-minus-pause on uptime, the digest and the heatmap while
+	// duration_s claims the full length. (A zero-width pair is worse still: no
+	// observed spans at all, downtime deleted from uptime and the digest while
+	// the heatmap's fallback anchor still booked it.) So stretch the stored
+	// second to down + elapsed - the window an unstepped wall clock would have
+	// stored, and the timeline the outage's pause rows were stamped into: the
+	// monotonic elapsed is the one honest measurement here, and lastEventWall is
+	// the paired 'down' (transitions alternate), already stamped on the pre-step
+	// timeline this clamp preserves - the wall clock rejoins it as it catches up.
+	// In ordinary runs wall >= monotonic, so this fires only when a backward step
+	// (or slew) squeezed the pair below the window it needs.
+	//
+	// Elapsed alone is only the whole window when every pause row inside the
+	// outage is also inside the monotonic elapsed - true for explicit pauses,
+	// which advance both clocks. A SUSPEND on a frozen-monotonic platform books
+	// its row for wall seconds the elapsed never contained, so those rows must be
+	// added on top (frozenGap, measured row by row in bookUnobservedGap) or the
+	// read model subtracts them from seconds the pair does not hold and books
+	// duration-minus-suspend while duration_s claims the full length. An
+	// unstepped wall stores down + elapsed + frozenGap on its own, so this still
+	// fires only when a backward step squeezed the pair.
+	if online && duration > 0 && !m.lastEventWall.IsZero() {
+		if width := int64(elapsed.Seconds()) + int64(m.frozenGap.Seconds()); evWall.Unix()-m.lastEventWall.Unix() < width {
+			evWall = time.Unix(m.lastEventWall.Unix()+width, 0)
+		}
 	}
 	m.lastEventWall = evWall
-	m.downPausedAt, m.pausedGap = time.Time{}, 0
+	// A fresh accumulator incarnation begins here. Bumping the generation as the two
+	// gaps reset lets a pendingGap booked into the OLD incarnation be recognised as
+	// stale if its store row is refused or the record is evicted during this new
+	// outage - reversing it now would corrupt the new outage's gaps (see B4).
+	m.outageGen++
+	m.downPausedAt, m.pausedGap, m.frozenGap = time.Time{}, 0, 0
 	m.online = online
 	m.since = ts // keep the monotonic-carrying ts, so the NEXT duration stays monotonic
 	m.mu.Unlock()

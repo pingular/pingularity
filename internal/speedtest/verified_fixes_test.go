@@ -94,7 +94,7 @@ func TestRunOnceReleasesFlagBeforeAlert(t *testing.T) {
 
 	// The flag must already be down (the alert fires only after its release), so a
 	// manual run during the stuck webhook must be allowed, not bounced with ErrBusy.
-	if s.running.Load() {
+	if s.Running() {
 		t.Fatal("single-flight flag still held while OnUnhealthy is in flight")
 	}
 	if _, err := s.RunOnce(context.Background(), "manual"); err != nil {

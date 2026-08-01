@@ -283,26 +283,6 @@ func TestCityFromRDNS(t *testing.T) {
 	}
 }
 
-// ColoCoord backs exit-based auto server-selection on hosts that can't traceroute
-// (containers, non-Linux): a Cloudflare colo code must resolve to its city and a
-// plausible coordinate, and an unknown code must report not-ok so the caller falls
-// through to the public IP.
-func TestColoCoord(t *testing.T) {
-	city, lat, lon, ok := ColoCoord("YUL") // case-insensitive
-	if !ok || city != "Montreal" {
-		t.Fatalf("ColoCoord(YUL) = (%q, ok=%v), want Montreal, ok", city, ok)
-	}
-	if lat < 45 || lat > 46 || lon > -73 || lon < -74 {
-		t.Errorf("ColoCoord(YUL) coord = (%v, %v), not near Montreal", lat, lon)
-	}
-	if _, _, _, ok := ColoCoord("zzz"); ok {
-		t.Error("ColoCoord(zzz) ok = true, want false for an unknown code")
-	}
-	if _, _, _, ok := ColoCoord(""); ok {
-		t.Error("ColoCoord(\"\") ok = true, want false")
-	}
-}
-
 // A public-IP change means a different network, so the cached exit must go -
 // the VALUE, not just its freshness stamp. cachedExit deliberately keeps the
 // last-known exit when a trace fails (a silent hop must not make the row

@@ -2,6 +2,7 @@ package speedtest
 
 import (
 	"context"
+	"math"
 	"net"
 	"sort"
 	"sync"
@@ -25,8 +26,12 @@ import (
 //
 // Known limits, by design (medians over many samples keep these tolerable):
 //   - A SYN lost to saturation retransmits after ~1s, so a sample can read as
-//     RTO quantization, not queue depth. Not filtered: seconds-deep buffers are
-//     real, and the median absorbs outliers.
+//     RTO quantization, not queue depth. The median absorbs that, and the tail
+//     is a p95 rather than a maximum for the same reason - a maximum IS the
+//     retransmit on about a third of phases (see loadStat). What neither can
+//     absorb is loss so heavy that the retransmitted handshake exceeds
+//     lulConnTimeout: connectRTT discards it, so the very worst congestion is
+//     the one case this metric cannot see at all.
 //   - If the transfer bottlenecked remotely (slow server, far peering), the
 //     last-mile buffer never fills and the link looks cleaner than it is. Read
 //     results as "no bloat at the measured throughput", never "no bufferbloat".
@@ -89,6 +94,32 @@ func lulDialAddr() string {
 	return lulResolved
 }
 
+// lulRunEndpoint resolves the probe target ONCE for a whole run, so the idle
+// baseline and both loaded phases are provably the same endpoint. The delta is
+// only meaningful if the two halves measured the same path: connectRTT used to
+// resolve per sample, and lulNoteConnect can drop the cached literal mid-run
+// after lulFailInvalidate failures - exactly what congestion produces - after
+// which later samples could re-resolve onto a different address or address
+// family than the baseline they are subtracted from. Pinning it means an
+// invalidation takes effect at the next run boundary instead of inside one.
+//
+// It also takes the resolve mutex once per run rather than once per sample,
+// which matters when the samples are the thing being timed.
+//
+// "" is returned when the resolve is still failing; callers pass it straight
+// through and connectRTT falls back to resolving per sample, which is the old
+// behaviour and the best available when there is no literal to pin.
+func lulRunEndpoint() string {
+	addr := lulDialAddr()
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return ""
+	}
+	if host, _, _ := net.SplitHostPort(addr); net.ParseIP(host) == nil {
+		return "" // still the hostname: the resolve has not succeeded yet
+	}
+	return addr
+}
+
 // lulNoteConnect feeds connect outcomes back into the resolve cache. The cached
 // literal never expires on its own, so if the stack it belongs to dies later
 // (the first resolve picked IPv6 and IPv6 then breaks while IPv4 still works -
@@ -123,8 +154,10 @@ const (
 // connectRTT takes one latency sample: dial, time the handshake, close. Dials
 // "tcp" (v4 or v6) against the pre-resolved literal, so the timed handshake is
 // pure connect RTT with no DNS in it.
-func connectRTT(ctx context.Context) (float64, bool) {
-	addr := lulDialAddr()
+func connectRTT(ctx context.Context, addr string) (float64, bool) {
+	if addr == "" {
+		addr = lulDialAddr()
+	}
 	d := net.Dialer{Timeout: lulConnTimeout}
 	start := time.Now()
 	c, err := d.DialContext(ctx, "tcp", addr)
@@ -140,6 +173,35 @@ func connectRTT(ctx context.Context) (float64, bool) {
 	return rtt, true
 }
 
+// summarizeLoad reduces one phase's samples to the pair the product stores. It
+// is a named function, not an inline literal in the sampler, so a test can pin
+// WHICH statistic the tail is: asserting p95's arithmetic proves nothing about
+// the sampler if the sampler still reduces with a maximum.
+func summarizeLoad(ms []float64) loadStat {
+	return loadStat{med: median(ms), tail: p95(ms)}
+}
+
+// p95 is the nearest-rank 95th percentile of an unsorted slice: the smallest
+// sample at least 95% of the others fall at or below. Nearest-rank rather than
+// interpolated so the value is always one that was actually measured - an
+// interpolated tail between a real 40 ms and a retransmitted 1022 ms would be a
+// latency the link never produced. With this sampler's ~90 samples per phase
+// the index is ~86, so it is well clear of both ends; below ~20 samples it
+// degenerates towards the maximum, which is the honest behaviour when there is
+// too little data to have a tail.
+func p95(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), v...)
+	sort.Float64s(s)
+	i := int(math.Ceil(0.95*float64(len(s)))) - 1
+	if i < 0 {
+		i = 0
+	}
+	return s[i]
+}
+
 // median of an unsorted slice (averages the middle pair for even lengths).
 func median(v []float64) float64 {
 	s := append([]float64(nil), v...)
@@ -153,7 +215,7 @@ func median(v []float64) float64 {
 
 // measureIdleLatency takes the pre-transfer baseline burst. nil when too few
 // probes succeed to call it a baseline (target unreachable, dying link).
-func measureIdleLatency(ctx context.Context) *float64 {
+func measureIdleLatency(ctx context.Context, addr string) *float64 {
 	// Cap the whole burst: on a firewalled LAN every connect can hit the full
 	// lulConnTimeout, stretching this to ~probes*3s and making a manual Run Now
 	// look hung. connectRTT's DialContext honors this.
@@ -164,7 +226,7 @@ func measureIdleLatency(ctx context.Context) *float64 {
 		if ctx.Err() != nil {
 			break
 		}
-		if v, ok := connectRTT(ctx); ok {
+		if v, ok := connectRTT(ctx, addr); ok {
 			ms = append(ms, v)
 		}
 		if i < lulIdleProbes-1 { // no need to wait after the final probe
@@ -182,11 +244,27 @@ func measureIdleLatency(ctx context.Context) *float64 {
 }
 
 // loadStat summarizes one load phase's samples: the median (typical added
-// latency) and the max (worst spike - what real-time apps feel; a call stutters
-// on the peaks, not the median).
-type loadStat struct{ med, max float64 }
+// latency) and the p95 (the tail - what real-time apps feel; a call stutters on
+// the peaks, not the median).
+//
+// The tail was the raw MAXIMUM until it was measured against real history, and
+// the maximum turned out to describe the operating system rather than the link.
+// A single lost SYN is retransmitted on a fixed 1000 ms RTO, so on a link whose
+// base RTT is 22 ms the largest of ~90 handshakes lands at ~1022 ms - the same
+// number on any connection, for any severity, whenever one packet is lost.
+// Measured over 30 days of runs: 32% of phases had a max in [900,1100] ms, 96%
+// of those inside [1020,1045], with an EMPTY valley at 500-900 ms and a second
+// rung at ~2030 ms. A continuous queueing delay cannot produce that shape; a
+// retransmit ladder is the only thing that can.
+//
+// So the maximum was a coin-flip on packet loss dressed as a latency
+// measurement. The p95 of the same samples is contaminated by an RTO in 0.005%
+// of phases against the max's 31.6%, and it is also STRICTER about real bloat:
+// under this sampler's response-paced cadence a p95 rises once a 1022 ms
+// episode occupies 26% of the phase, where the median needs 87%.
+type loadStat struct{ med, tail float64 }
 
-// medPtr/maxPtr return the stat as a *float64, nil-safe so the caller can chain
+// medPtr/tailPtr return the stat as a *float64, nil-safe so the caller can chain
 // off a possibly-nil sampler result.
 func (s *loadStat) medPtr() *float64 {
 	if s == nil {
@@ -195,11 +273,11 @@ func (s *loadStat) medPtr() *float64 {
 	m := s.med
 	return &m
 }
-func (s *loadStat) maxPtr() *float64 {
+func (s *loadStat) tailPtr() *float64 {
 	if s == nil {
 		return nil
 	}
-	m := s.max
+	m := s.tail
 	return &m
 }
 
@@ -207,7 +285,7 @@ func (s *loadStat) maxPtr() *float64 {
 // a slow connect just delays the next). The returned stop function ends
 // sampling, waits for the goroutine, and reduces to median + max - or nil when
 // the phase was too short or too few samples succeeded to mean anything.
-func startLoadSampler(ctx context.Context) (stop func() *loadStat) {
+func startLoadSampler(ctx context.Context, addr string) (stop func() *loadStat) {
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	var ms []float64
@@ -222,7 +300,7 @@ func startLoadSampler(ctx context.Context) (stop func() *loadStat) {
 				return
 			default:
 			}
-			if v, ok := connectRTT(ctx); ok {
+			if v, ok := connectRTT(ctx, addr); ok {
 				ms = append(ms, v)
 			}
 			select {
@@ -240,12 +318,7 @@ func startLoadSampler(ctx context.Context) (stop func() *loadStat) {
 		if time.Since(start) < lulMinPhase || len(ms) < lulMinSamples {
 			return nil
 		}
-		mx := ms[0]
-		for _, v := range ms {
-			if v > mx {
-				mx = v
-			}
-		}
-		return &loadStat{med: median(ms), max: mx}
+		st := summarizeLoad(ms)
+		return &st
 	}
 }
