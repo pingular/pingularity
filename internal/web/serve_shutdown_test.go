@@ -22,6 +22,8 @@ func (b *blockingSpeed) RunOnce(ctx context.Context, reason string) (store.Speed
 	return store.SpeedSample{}, ctx.Err()
 }
 func (b *blockingSpeed) Running() bool         { return false }
+func (b *blockingSpeed) RunID() uint64         { return 0 }
+func (b *blockingSpeed) Abort(uint64) bool     { return false }
 func (b *blockingSpeed) CurrentServer() string { return "" }
 func (b *blockingSpeed) NextRun() time.Time    { return time.Time{} }
 

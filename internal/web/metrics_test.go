@@ -594,7 +594,7 @@ func TestMetricsUptimeObserved(t *testing.T) {
 	}
 	// 2h paused inside the observed 4h span -> the 24h window (clamped to the 4h of
 	// monitoring) observed 2h of 4h: coverage 0.5.
-	if err := st.InsertPause(ctx, now.Add(-3*time.Hour), int64((2 * time.Hour).Seconds())); err != nil {
+	if _, err := st.InsertPause(ctx, now.Add(-3*time.Hour), int64((2 * time.Hour).Seconds())); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
 	status := func() LiveStatus { return LiveStatus{Online: true, Probing: true, Since: now} }

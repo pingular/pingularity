@@ -20,6 +20,18 @@ import (
 // callers can tell "already running" (HTTP 409) from a real failure.
 var ErrBusy = errors.New("a speedtest is already in progress")
 
+// ErrAborted is returned when the user cancelled a run (via Abort) BEFORE any
+// server produced a usable result - not a measurement failure, and nothing is
+// stored. An abort AFTER a best-of-N server has succeeded keeps that (best)
+// result instead, so this only fires when the abort lands before the first one.
+var ErrAborted = errors.New("speedtest aborted")
+
+// afterClaimHook is called by RunOnce immediately after it claims the
+// single-flight flag. Test seam only (nil in production): the interesting window
+// for Abort is between that claim and the cancel becoming visible, and it is a
+// few instructions wide, so a stress test hits it by luck rather than by design.
+var afterClaimHook func()
+
 // Scheduler runs speedtests on a fixed interval, on reconnect, and on demand,
 // persisting each result. A single-flight guard keeps tests from overlapping (a
 // reconnect during a scheduled run is just skipped).
@@ -28,8 +40,11 @@ type Scheduler struct {
 	store     *store.Store
 	log       *slog.Logger
 	interval  time.Duration
-	running   atomic.Bool
-	curServer atomic.Value // string: server of the in-progress run ("" when idle)
+	curServer atomic.Value             // string: server of the in-progress run ("" when idle)
+	runSeq    atomic.Uint64            // hands out run ids; seeded per boot (see bootRunSeed) so they are never reused, restarts included
+	curID     atomic.Uint64            // id of the run holding the single-flight claim (0 when idle)
+	cur       atomic.Pointer[inflight] // the in-flight run's id and cancel; nil when idle
+	abortFor  atomic.Uint64            // the run id an abort was raised for; carries it across RunOnce's startup window
 
 	// IntervalFn, if set, supplies the schedule interval live so it can change at
 	// runtime. Falls back to the fixed interval when nil.
@@ -124,7 +139,60 @@ func (s *Scheduler) enabled() bool {
 
 // Running reports whether a speedtest is in progress (any trigger). Safe for
 // concurrent use.
-func (s *Scheduler) Running() bool { return s.running.Load() }
+// Running reports whether a run holds the single-flight claim. It reads the same
+// word as RunID, so the two can never disagree: a caller that sees a run in
+// progress always has an id to name it by. Keeping "is one running" in a separate
+// bool left a window where the dashboard was told yes while there was still no id
+// to send back, and a stop click landing there was dropped.
+func (s *Scheduler) Running() bool { return s.curID.Load() != 0 }
+
+// inflight is the in-progress run's identity paired with its cancel, stored as one
+// value so a cancel can never be applied to a run other than the one it belongs to.
+type inflight struct {
+	id     uint64
+	cancel context.CancelFunc
+}
+
+// RunID returns the id of the run currently in progress, or 0 when idle. Callers
+// that later want to stop THAT run pass this back to Abort.
+func (s *Scheduler) RunID() uint64 { return s.curID.Load() }
+
+// Abort cancels the run with the given id and reports whether it signalled one.
+// An id of 0 means "whatever is running now", for callers that never observed a
+// particular run.
+//
+// A best-of-N run that has already measured at least one server keeps that (best)
+// result; an abort before the first result stores nothing (ErrAborted).
+//
+// The id is what makes this safe to act on late. A stop is decided against a run
+// the operator can SEE and arrives some time afterwards - the dashboard polls
+// status every few seconds and then opens a confirm() dialog, which blocks that
+// tab until it is answered. Resolving the request against whoever held the flag on
+// arrival meant a run that started in the meantime was the one killed: an ordinary
+// few seconds spent reading the dialog was enough, no race needed. Worse when the
+// victim was a reconnect run, since ErrAborted (unlike ErrBusy) does not hand the
+// reconnect window back, so the post-outage measurement was suppressed for up to a
+// full speed interval.
+func (s *Scheduler) Abort(id uint64) bool {
+	cur := s.curID.Load()
+	if cur == 0 {
+		return false // genuinely nothing running
+	}
+	if id != 0 && id != cur {
+		return false // the run this was decided for has already ended
+	}
+	// Record the request BEFORE cancelling. RunOnce publishes its cancel several
+	// statements after it takes its id, and a stop landing in that window used to
+	// find nil, do nothing, and report that it had done nothing - while Running()
+	// (which is what puts the stop button on screen) already said yes. The id
+	// carries the request across the gap: RunOnce checks it once its cancel is live.
+	s.abortFor.Store(cur)
+	// Only cancel a run that still IS this one; the pointer and the id move together.
+	if f := s.cur.Load(); f != nil && f.id == cur {
+		f.cancel()
+	}
+	return true
+}
 
 // SetCurrentServer records the server the in-progress run selected (called by
 // the tester). CurrentServer returns it ("" when idle or not yet selected).
@@ -152,8 +220,27 @@ func (s *Scheduler) curTester() Tester {
 
 // NewScheduler builds a Scheduler.
 func NewScheduler(t Tester, st *store.Store, interval time.Duration, log *slog.Logger) *Scheduler {
-	return &Scheduler{tester: t, store: st, log: log, interval: interval, runWake: make(chan struct{}, 1)}
+	s := &Scheduler{tester: t, store: st, log: log, interval: interval, runWake: make(chan struct{}, 1)}
+	s.runSeq.Store(bootRunSeed())
+	return s
 }
+
+// bootRunSeed is where run ids start counting from THIS boot, chosen so ids are
+// unique across restarts and not merely within one process. An id makes a stop
+// safe to act on late (see Abort), but the dashboard's confirm() dialog can
+// outlive the daemon: with the sequence restarting at 1 every boot, a stale
+// tab's queued click deterministically named the NEXT boot's startup run - the
+// same id, three seconds in - and session cookies survive restarts, so nothing
+// in between noticed the process changed.
+//
+// The arithmetic: ids ride the JSON status API into a JavaScript client, whose
+// numbers are exact only below 2^53. UnixMilli is ~2^41 today and shifting it
+// left 10 bits (~2^51) leaves room for 1024 runs per millisecond of boot
+// spacing - real restarts are seconds apart, and a run takes seconds - while
+// staying under 2^53 until roughly the year 2248. Best-effort by design: a
+// clock that repeats itself (an RTC-less host booting at the epoch twice) can
+// repeat ids, but there is nowhere to persist a sequence a crash can't lose.
+func bootRunSeed() uint64 { return uint64(time.Now().UnixMilli()) << 10 }
 
 // adaptiveFactor / adaptiveCap shape the sped-up cadence while a breach persists:
 // base/4, but no slower than adaptiveCap (so even a 1h base samples densely
@@ -246,10 +333,31 @@ func speedFailStage(err error) string {
 // which case it returns ErrBusy. Any other error is the measurement failure
 // itself. On success the result is persisted and returned.
 func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSample, error) {
-	if !s.running.CompareAndSwap(false, true) {
+	// A stop can land while this run is still setting up - after the claim below,
+	// before the cancel is published - and it must not be lost. The run id carries
+	// it across that window, by a store/load pairing with Abort whose ORDER is the
+	// whole correctness argument: Abort stores the id it is stopping (abortFor)
+	// and only then looks for the cancel (cur); RunOnce publishes its cancel (cur)
+	// and only then checks abortFor. Whichever way those four operations
+	// interleave, one side sees the other - Abort finds the published cancel and
+	// calls it, or the post-publish check finds its own id in abortFor and cancels
+	// itself. Reorder either pair and a stop can fall between: Abort finds no
+	// cancel yet AND the check reads a not-yet-stored abortFor, so the run
+	// continues after the user was told it was stopping
+	// (abort_window_test.go drives exactly that window).
+	//
+	// Claiming the flag and taking an id are ONE operation: the id IS the claim.
+	// (A burnt id on a lost race is fine - ids need to be unique, not consecutive.)
+	myID := s.runSeq.Add(1)
+	if !s.curID.CompareAndSwap(0, myID) {
 		stats.Inc("speed.errbusy") // collisions, e.g. a reconnect during a scheduled test
 		s.log.Debug("speedtest skipped: already running", "reason", reason)
 		return store.SpeedSample{}, ErrBusy
+	}
+	// afterClaimHook exists only so a test can drive the window between claiming the
+	// flag and publishing the cancel; nil in production.
+	if afterClaimHook != nil {
+		afterClaimHook()
 	}
 	// OnUnhealthy (an HTTP webhook to an operator's endpoint) must fire only AFTER
 	// the single-flight flag is released: a slow or dead endpoint held inline would
@@ -265,7 +373,7 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 			notify()
 		}
 	}()
-	defer s.running.Store(false)
+	defer s.curID.Store(0)
 	s.curServer.Store("")       // not selected yet
 	defer s.curServer.Store("") // clear when the run ends
 	s.log.Debug("speedtest start", "reason", reason)
@@ -281,10 +389,29 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	}()
 
 	s.log.Info("speedtest started", "reason", reason)
-	res, err := runTester(ctx, s.curTester(), reason)
+	// A cancellable child of ctx so a user Abort() can stop THIS run without tearing
+	// down the daemon. Only runTester rides runCtx; everything after (conninfo, the
+	// ctx.Err() persist gate, InsertSpeed) stays on the parent ctx - so a user abort
+	// still persists the best-of-N result measured so far, while a shutdown (parent
+	// cancelled) still skips the store.
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cur.Store(&inflight{id: myID, cancel: cancel})
+	defer func() { s.cur.Store(nil); cancel() }()
+	// The cancel is live now. If a stop for THIS run arrived while it was not - the
+	// window the id exists to cover - honour it here instead of losing it.
+	if s.abortFor.Load() == myID {
+		cancel()
+	}
+	res, err := runTester(runCtx, s.curTester(), reason)
 	if err != nil {
-		// A caller-aborted run (browser disconnect mid-test, shutdown) isn't a
-		// measurement failure - keep the fleet failure rate honest.
+		// A user Abort() before any server produced a result: the parent ctx is still
+		// live but runCtx was cancelled. Not a failure, and nothing to store.
+		if ctx.Err() == nil && runCtx.Err() != nil {
+			s.log.Info("speedtest aborted", "reason", reason)
+			return store.SpeedSample{}, ErrAborted
+		}
+		// A caller-aborted run (shutdown) isn't a measurement failure - keep the
+		// fleet failure rate honest.
 		if ctx.Err() == nil {
 			stats.Inc("speed.fail")
 			stats.Inc("speed.fail." + speedFailStage(err)) // which stage (fleet diagnostics)
@@ -301,11 +428,12 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		PacketLoss: res.PacketLoss, DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
 		Trigger:         reason,
 		Engine:          res.Engine,
+		PingBestMS:      res.PingBestMS,
 		IdleMS:          res.IdleMS,
 		LoadedDownMS:    res.LoadedDownMS,
 		LoadedUpMS:      res.LoadedUpMS,
-		LoadedDownMaxMS: res.LoadedDownMaxMS,
-		LoadedUpMaxMS:   res.LoadedUpMaxMS,
+		LoadedDownP95MS: res.LoadedDownP95MS,
+		LoadedUpP95MS:   res.LoadedUpP95MS,
 	}
 	// Capture the connection context (public IP/ISP/DNS) this run ran in.
 	if s.ConnInfoFn != nil {
@@ -329,11 +457,31 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 			// green and (below) clearing a real breach streak. Happens with iperf3
 			// 'both' when the only threshold is on the direction that failed.
 			if thresholdsMeasurable(sp, t) {
-				judged = true
 				failures = evalThresholds(sp, t)
-				healthy := len(failures) == 0
-				sp.Healthy = &healthy
-				s.log.Debug("speedtest thresholds", "healthy", healthy, "failures", failures)
+				// A breach is a breach whatever else went unmeasured - evidence of
+				// failure needs no corroboration. But a CLEAN sweep only means
+				// "everything passed" if everything was actually checked. Without
+				// this, an enabled threshold whose inputs the run never captured
+				// contributed no failure, len(failures)==0 read as green, and the
+				// run cleared a real breach streak on the strength of a check that
+				// never ran. Same hazard the branch below already guards for the
+				// all-unmeasured case; this is the PARTIAL case, which fell
+				// through it.
+				switch {
+				case len(failures) > 0:
+					judged = true
+					healthy := false
+					sp.Healthy = &healthy
+					s.log.Debug("speedtest thresholds", "healthy", false, "failures", failures)
+				case thresholdsUnmeasured(sp, t):
+					// Unknown, not green: leave Healthy nil and the streak alone.
+					s.log.Debug("speedtest thresholds passed what was measurable, but an enabled check had no inputs; recording no verdict")
+				default:
+					judged = true
+					healthy := true
+					sp.Healthy = &healthy
+					s.log.Debug("speedtest thresholds", "healthy", true, "failures", failures)
+				}
 			} else {
 				s.log.Debug("speedtest thresholds active but nothing measurable to check them against")
 			}
@@ -407,12 +555,12 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		"server", s.CurrentServer(),
 		"down_mbps", util.Round1(res.DownloadMbps),
 		"up_mbps", util.Round1(res.UploadMbps),
-		"ping_ms", util.Round1(res.PingMS),
+		"ping_ms", util.Round1(res.PingMS), "ping_best_ms", f64v(res.PingBestMS),
 		"idle_ms", fptr(res.IdleMS),
 		"loaded_down_ms", fptr(res.LoadedDownMS),
 		"loaded_up_ms", fptr(res.LoadedUpMS),
-		"loaded_down_max_ms", fptr(res.LoadedDownMaxMS),
-		"loaded_up_max_ms", fptr(res.LoadedUpMaxMS))
+		"loaded_down_p95_ms", fptr(res.LoadedDownP95MS),
+		"loaded_up_p95_ms", fptr(res.LoadedUpP95MS))
 
 	return sp, nil
 }
@@ -492,7 +640,32 @@ func (s *Scheduler) Loop(ctx context.Context) {
 					s.log.Info("speedtest resumed")
 					deferred = false
 				}
-				s.RunOnce(ctx, "scheduled")
+				// A scheduled run refused because another trigger already holds the
+				// single-flight is SKIPPED, and the anchor advances with it. The
+				// asymmetry with the deferral below is deliberate, not an oversight:
+				// a closed window or a busy link means NOTHING was measured, so those
+				// poll and fire the moment they clear; a collision means a
+				// measurement is already in flight, so this slot has effectively
+				// been served. Preserving the anchor here would leave wait<=0 true
+				// and fire a second full test the instant the first released it -
+				// another ~123MB against a link still settling from the one that
+				// just finished.
+				//
+				// The cost is that the run holding the flag may FAIL, in which case
+				// the interval passes with nothing recorded. Loop cannot see that
+				// outcome from here, and one missed interval after a failed manual
+				// test is a smaller problem than a guaranteed double test after
+				// every successful one.
+				//
+				// Counted and logged separately from the other collisions
+				// (speed.errbusy covers reconnect and degraded too, which are
+				// opportunistic and lose nothing by being dropped): a scheduled slot
+				// going unfilled is the one a gap in the history can be traced to.
+				if _, err := s.RunOnce(ctx, "scheduled"); errors.Is(err, ErrBusy) {
+					stats.Inc("speed.scheduled_skipped")
+					s.log.Info("scheduled speedtest skipped: another run was already in progress",
+						"next_in", s.curInterval())
+				}
 				lastRun = time.Now()
 				jitter = scheduleJitter(s.curInterval())
 				s.setAnchor(lastRun, jitter)
@@ -541,6 +714,19 @@ func bytesPtr(n int64) *int64 {
 	return &n
 }
 
+// samplePingMS is the latency a STORED run is judged on: the fastest of its ping
+// samples when the engine recorded one, else the reported mean. The store-side
+// twin of decisionPingMS, and it exists for the same reason - the mean is an
+// average of ten samples, so one stalled handshake can breach a ping threshold
+// on a link that never slowed down. Older rows and iperf3 rows have no floor and
+// fall back to the mean, exactly as before.
+func samplePingMS(sp store.SpeedSample) float64 {
+	if sp.PingBestMS != nil && validMS(*sp.PingBestMS) {
+		return *sp.PingBestMS
+	}
+	return sp.PingMS
+}
+
 // evalThresholds returns a human-readable failure for each enabled threshold the
 // sample misses (download/upload below the minimum, ping/jitter/loss/bloat above
 // the maximum).
@@ -555,8 +741,8 @@ func evalThresholds(sp store.SpeedSample, t settings.Thresholds) []string {
 	if t.UpMbps > 0 && sp.UpBytes != nil && sp.UpMbps < t.UpMbps {
 		f = append(f, fmt.Sprintf("upload %.1f < %.0f Mbps", sp.UpMbps, t.UpMbps))
 	}
-	if t.PingMS > 0 && validMS(sp.PingMS) && sp.PingMS > t.PingMS {
-		f = append(f, fmt.Sprintf("ping %.0f > %.0f ms", sp.PingMS, t.PingMS))
+	if p := samplePingMS(sp); t.PingMS > 0 && validMS(p) && p > t.PingMS {
+		f = append(f, fmt.Sprintf("ping %.0f > %.0f ms", p, t.PingMS))
 	}
 	if t.JitterMS > 0 && sp.JitterMS != nil && *sp.JitterMS > t.JitterMS {
 		f = append(f, fmt.Sprintf("jitter %.0f > %.0f ms", *sp.JitterMS, t.JitterMS))
@@ -584,6 +770,40 @@ func evalThresholds(sp store.SpeedSample, t settings.Thresholds) []string {
 	return f
 }
 
+// thresholdsUnmeasured reports whether any threshold that is ENABLED and
+// APPLICABLE to this run lacked the inputs to judge it. The counterpart to
+// thresholdsMeasurable: that one asks "could we check ANYTHING", this asks
+// "did we fail to check SOMETHING we were asked to". A run may be recorded
+// green only when this is false.
+//
+// Applicable is not the same as enabled. A direction that never ran cannot be
+// judged and was never promised: an upload limit on a download-only run is
+// inert by configuration, not unmeasured, so it must not hold every run
+// hostage. The byte counts are the proxy for "this direction ran", the same
+// one evalThresholds already uses to avoid firing a false 0 Mbps breach.
+//
+// Throughput itself is never listed: when a direction ran its Mbps is always
+// set, so an enabled Mbps threshold on a direction that ran is always
+// judgeable. What can genuinely go missing is a measurement layered ON a
+// direction - the loaded-latency sampler behind bufferbloat - or a probe that
+// is allowed to fail on its own (ping, jitter, the optional UDP loss probe).
+func thresholdsUnmeasured(sp store.SpeedSample, t settings.Thresholds) bool {
+	ranDown, ranUp := sp.DownBytes != nil, sp.UpBytes != nil
+	switch {
+	case t.PingMS > 0 && !validMS(samplePingMS(sp)):
+		return true
+	case t.JitterMS > 0 && sp.JitterMS == nil:
+		return true
+	case t.LossPct > 0 && sp.PacketLoss == nil:
+		return true
+	case t.BloatDownMS > 0 && ranDown && (sp.IdleMS == nil || sp.LoadedDownMS == nil):
+		return true
+	case t.BloatUpMS > 0 && ranUp && (sp.IdleMS == nil || sp.LoadedUpMS == nil):
+		return true
+	}
+	return false
+}
+
 // thresholdsMeasurable reports whether this run measured at least one quantity an
 // active threshold covers - i.e. whether evalThresholds could actually have
 // judged it. Mirrors evalThresholds's presence guards exactly (kept beside it so
@@ -596,7 +816,7 @@ func thresholdsMeasurable(sp store.SpeedSample, t settings.Thresholds) bool {
 		return true
 	case t.UpMbps > 0 && sp.UpBytes != nil:
 		return true
-	case t.PingMS > 0 && validMS(sp.PingMS):
+	case t.PingMS > 0 && validMS(samplePingMS(sp)):
 		return true
 	case t.JitterMS > 0 && sp.JitterMS != nil:
 		return true

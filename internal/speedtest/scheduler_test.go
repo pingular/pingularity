@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,7 +187,7 @@ func TestSchedulerSingleFlight(t *testing.T) {
 
 	// Once it has finished, a fresh run should be allowed again.
 	deadline := time.Now().Add(time.Second)
-	for s.running.Load() && time.Now().Before(deadline) {
+	for s.Running() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if _, err := s.RunOnce(context.Background(), "third"); err != nil {
@@ -254,8 +255,16 @@ func TestSchedulerRunsWhenWindowOpens(t *testing.T) {
 	s.EnabledFn = func() bool { return allowed.Load() }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Loop(ctx)
+	done := make(chan struct{})
+	// Join the loop, don't just cancel it. The fake tester signals from INSIDE
+	// tester.Run, so the moment this test stops waiting the loop is still inside
+	// RunOnce with counter and store writes ahead of it; unjoined, one of those
+	// increments lands in whatever test runs next (under -shuffle that is a real
+	// cross-test failure). Loop calls RunOnce synchronously and rechecks ctx right
+	// after, so the join is prompt, and this defer is registered after st.Close's
+	// so LIFO joins before the store shuts under the write.
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
 
 	// The window stays closed across the first deadline (t=500ms): no run.
 	select {
@@ -447,4 +456,65 @@ func TestSchedulerNextRunTracksMonotonicDeadline(t *testing.T) {
 	if d := (remaining - time.Hour).Abs(); d > 50*time.Millisecond {
 		t.Fatalf("NextRun is %v away, want ~1h (off by %v)", remaining, d)
 	}
+}
+
+// A SCHEDULED SLOT LOST TO A COLLISION MUST BE VISIBLE. When another trigger
+// already holds the single-flight, the scheduled run is refused and its slot is
+// not retried - the anchor advances as though it had run, so the next one is a
+// whole interval away. That is the right call (a measurement IS in flight, and
+// firing again the moment it releases would spend a second full test on a link
+// still settling), but it is also the one path that can leave a gap in an
+// otherwise regular history, so it must not be silent.
+//
+// speed.errbusy cannot answer it: reconnect and degraded collisions share that
+// counter and lose nothing by being dropped.
+func TestScheduledRunSkippedByACollisionIsCounted(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, r time.Duration) { startupDelay, scheduleRecheck = d, r }(startupDelay, scheduleRecheck)
+	startupDelay = 0
+	scheduleRecheck = 5 * time.Millisecond
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	// A manual run that holds the flag until the test releases it.
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	tester := testerFunc(func(context.Context) (Result, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, 20*time.Millisecond, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	manualDone := make(chan struct{})
+	go func() { defer close(manualDone); s.RunOnce(ctx, "manual") }()
+	<-entered // the manual run now holds the single-flight
+
+	loopDone := make(chan struct{})
+	go func() { defer close(loopDone); s.Loop(ctx) }()
+
+	// The schedule comes due while the manual run still holds the flag.
+	deadline := time.After(3 * time.Second)
+	for stats.Lifetime().Counters["speed.scheduled_skipped"] == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			close(release)
+			<-manualDone
+			<-loopDone
+			t.Fatal("a scheduled run collided with the manual run but nothing recorded the lost slot")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	close(release)
+	<-manualDone
+	<-loopDone
 }

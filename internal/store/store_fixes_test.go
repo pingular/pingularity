@@ -199,7 +199,7 @@ func TestUptimeSinceClampedToZero(t *testing.T) {
 	eventAt(t, st, now, 99, "up", 98)    // closes the now-100 down
 	eventAt(t, st, now, 1, "up", 100000) // LAG is the up above -> o_start = ts-dur, far back
 
-	up, _, err := st.UptimeSince(ctx, now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestOrphanGapConsistentAcrossAggregators(t *testing.T) {
 	}
 
 	// And all three reconcile with the uptime fraction: 500s down of 10000s.
-	up, _, err := st.UptimeSince(ctx, now.Add(-10000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, now.Add(-10000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func sumDowntimeDays(rows []DowntimeDay) (downS, outages int) {
 // impliedDowntime is the downtime (seconds) UptimeSince attributes over a window.
 func impliedDowntime(t *testing.T, st *Store, since time.Time, windowS float64) int {
 	t.Helper()
-	up, _, err := st.UptimeSince(context.Background(), since, 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), since, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,36 +31,83 @@ jobs:
       - name: service lifecycle (install auto-starts, probes, stop, restart, uninstall)
         shell: pwsh
         run: |
+          # Failures are counted, then asserted at the end - never thrown.
+          # $ErrorActionPreference stays 'Continue' (overriding the 'stop' the
+          # runner prepends) so one dead probe cannot end the script before the
+          # log is complete, and Tee-Object is a cmdlet that always succeeds,
+          # so no native exit code ever reaches the step on its own. Unlike the
+          # launchd leg there is no subshell here, so a plain counter survives
+          # to the final assertion.
           $ErrorActionPreference = 'Continue'
+          $script:fails = 0
+          function Note($msg) {
+            "ASSERT FAIL: $msg" | Tee-Object svc.log -Append
+            $script:fails += 1
+          }
+          # Judges the exit code of the native command that just ran; Tee-Object
+          # and Start-Sleep are cmdlets and do not touch $LASTEXITCODE, but call
+          # this straight after the pipeline it belongs to anyway.
+          function Must($what) { if ($LASTEXITCODE -ne 0) { Note "$what exited $LASTEXITCODE" } }
           function Probe($what, $url) {
             try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 $url
-                  "PROBE OK  $what -> $($r.StatusCode)" }
-            catch { "PROBE FAIL $what -> $($_.Exception.Message)" }
+                  "PROBE OK  $what -> $($r.StatusCode)" | Tee-Object svc.log -Append
+                  if ($r.StatusCode -ne 200) { Note "$what returned $($r.StatusCode), want 200" } }
+            catch { "PROBE FAIL $what -> $($_.Exception.Message)" | Tee-Object svc.log -Append
+                    Note "$what did not return 200" }
           }
           "=== install (must register AND start) ===" | Tee-Object svc.log -Append
           .\pingularity.exe install 2>&1 | Tee-Object svc.log -Append
+          Must "install"
           Start-Sleep 8
           .\pingularity.exe status 2>&1 | Tee-Object svc.log -Append
+          Must "status"
           foreach ($i in 1..15) { try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:9000/metrics | Out-Null; break } catch { Start-Sleep 2 } }
-          Probe "metrics"   http://127.0.0.1:9000/metrics    | Tee-Object svc.log -Append
-          Probe "status"    http://127.0.0.1:9000/api/status | Tee-Object svc.log -Append
-          Probe "dashboard" http://127.0.0.1:9000/           | Tee-Object svc.log -Append
-          try { Invoke-WebRequest -UseBasicParsing -Method POST -ContentType 'application/json' -TimeoutSec 10 http://127.0.0.1:9000/api/netinfo | Out-Null } catch {}
+          Probe "metrics"   http://127.0.0.1:9000/metrics
+          Probe "status"    http://127.0.0.1:9000/api/status
+          Probe "dashboard" http://127.0.0.1:9000/
+          try { Invoke-WebRequest -UseBasicParsing -Method POST -ContentType 'application/json' -TimeoutSec 10 http://127.0.0.1:9000/api/netinfo | Out-Null } catch { Note "netinfo POST failed" }
           Start-Sleep 20
-          try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:9000/api/netinfo).Content | Tee-Object svc.log -Append } catch { "netinfo GET failed" | Tee-Object svc.log -Append }
+          try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://127.0.0.1:9000/api/netinfo).Content | Tee-Object svc.log -Append } catch { Note "netinfo GET failed" }
+          "=== stop / status / start / status ===" | Tee-Object svc.log -Append
           .\pingularity.exe stop    2>&1 | Tee-Object svc.log -Append
+          Must "stop"
           Start-Sleep 3
+          # `status` exits 0 whether running, stopped or not installed, so the
+          # port going quiet is the assertion here, not an exit code.
           .\pingularity.exe status  2>&1 | Tee-Object svc.log -Append
+          try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:9000/metrics | Out-Null
+                Note "the dashboard still answered after stop" } catch {}
           .\pingularity.exe start   2>&1 | Tee-Object svc.log -Append
+          Must "start"
           Start-Sleep 5
           .\pingularity.exe status  2>&1 | Tee-Object svc.log -Append
-          "=== data dir + DACL ===" | Tee-Object svc.log -Append
-          icacls C:\ProgramData\pingularity 2>&1 | Tee-Object svc.log -Append
+          Must "status after restart"
+          Probe "metrics-after-restart" http://127.0.0.1:9000/metrics
+          "=== data dir + DACL (want owner-only: no Users/Everyone entry) ===" | Tee-Object svc.log -Append
+          # The Windows analogue of the launchd leg's 700/600 check: osperm sets
+          # a protected DACL naming only the service account, SYSTEM and
+          # Administrators, so a broad principal on the data dir or the database
+          # means every local user can read the monitoring history.
+          $dirAcl = icacls C:\ProgramData\pingularity 2>&1
+          Must "icacls data dir"
+          $dirAcl | Tee-Object svc.log -Append
+          $dbAcl = icacls C:\ProgramData\pingularity\pingularity.db 2>&1
+          Must "icacls database"
+          $dbAcl | Tee-Object svc.log -Append
+          $broad = @($dirAcl) + @($dbAcl) | Select-String 'Everyone|BUILTIN\\Users|Authenticated Users'
+          if ($broad) { Note "the DACL grants a broad principal: $(($broad.Line.Trim()) -join '; ')" }
           .\pingularity.exe reset-auth 2>&1 | Tee-Object svc.log -Append
+          Must "reset-auth"
           .\pingularity.exe uninstall -y 2>&1 | Tee-Object svc.log -Append
+          Must "uninstall"
           Start-Sleep 3
           .\pingularity.exe status 2>&1 | Tee-Object svc.log -Append
-          Test-Path C:\ProgramData\pingularity\pingularity.db | ForEach-Object { "db survives uninstall: $_" } | Tee-Object svc.log -Append
+          if (Test-Path C:\ProgramData\pingularity\pingularity.db) {
+            "db survives uninstall: True" | Tee-Object svc.log -Append
+          } else {
+            Note "uninstall deleted the database - removing the service must not take the user's history with it"
+          }
+          if ($script:fails -ne 0) { "::error::$script:fails assertion(s) failed in the service lifecycle - see svc.log"; exit 1 }
 
       - name: upload logs
         if: always()
@@ -74,6 +121,12 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 30
+    # `shell: bash` is what selects `bash -eo pipefail`; without it GitHub runs
+    # `bash -e`, where `cmd | tee log` reports tee's exit status and a failing
+    # command inside the pipeline passes silently. Every block below pipes to tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -89,7 +142,18 @@ jobs:
 
       - name: service lifecycle (launchd; install auto-starts, probes, stop, restart, uninstall)
         run: |
-          probe() { code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$2" || echo FAIL); echo "PROBE $1 -> $code"; }
+          # Failures are counted in a FILE. The block below is the left side of a
+          # pipe, so it runs in a subshell and a shell variable would not survive
+          # back out to the step's exit status - the step would pass while the log
+          # it just wrote was full of failures.
+          FAILS=$(mktemp)
+          note() { echo "ASSERT FAIL: $*"; echo 1 >> "$FAILS"; }
+          probe() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$2" || echo FAIL)
+            echo "PROBE $1 -> $code"
+            [ "$code" = "200" ] || note "$1 returned $code, want 200"
+          }
+          DIR="/Library/Application Support/pingularity"
           {
             echo "=== install (must register AND start) ==="
             sudo ./pingularity install
@@ -100,24 +164,42 @@ jobs:
             probe status    http://127.0.0.1:9000/api/status
             probe dashboard http://127.0.0.1:9000/
             echo "=== netinfo refresh (macOS ICMP-socket traceroute path) ==="
-            curl -fsS -X POST -H 'Content-Type: application/json' --max-time 10 http://127.0.0.1:9000/api/netinfo >/dev/null 2>&1 || true
+            curl -fsS -X POST -H 'Content-Type: application/json' --max-time 10 http://127.0.0.1:9000/api/netinfo >/dev/null 2>&1 \
+              || note "netinfo POST failed"
             sleep 20
-            curl -fsS --max-time 5 http://127.0.0.1:9000/api/netinfo || echo "netinfo GET failed"
+            curl -fsS --max-time 5 http://127.0.0.1:9000/api/netinfo || note "netinfo GET failed"
             echo
             echo "=== stop / status / start / status ==="
-            sudo ./pingularity stop;  sleep 3; sudo ./pingularity status
-            sudo ./pingularity start; sleep 5; sudo ./pingularity status
+            sudo ./pingularity stop;  sleep 3
+            # `status` reports NOT running here, so its exit code is not the
+            # assertion - the port going quiet is.
+            sudo ./pingularity status || true
+            curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 \
+              && note "the dashboard still answered after stop"
+            sudo ./pingularity start; sleep 5
+            sudo ./pingularity status
+            probe metrics-after-restart http://127.0.0.1:9000/metrics
             echo "=== data dir perms (root daemon path, want 700/600) ==="
-            sudo ls -la "/Library/Application Support/pingularity" || true
-            sudo stat -f '%Sp %N' "/Library/Application Support/pingularity" "/Library/Application Support/pingularity/pingularity.db" || true
+            sudo ls -la "$DIR" || true
+            dperm=$(sudo stat -f '%Sp' "$DIR")
+            fperm=$(sudo stat -f '%Sp' "$DIR/pingularity.db")
+            echo "perms: dir=$dperm db=$fperm"
+            [ "$dperm" = "drwx------" ] || note "data dir is $dperm, want drwx------"
+            [ "$fperm" = "-rw-------" ] || note "database is $fperm, want -rw-------"
             echo "=== reset-auth ==="
             sudo ./pingularity reset-auth
             echo "=== uninstall -y ==="
             sudo ./pingularity uninstall -y
             sleep 3
-            sudo ./pingularity status
-            sudo test -f "/Library/Application Support/pingularity/pingularity.db" && echo "db survives uninstall: True" || echo "db survives uninstall: False"
+            sudo ./pingularity status || true   # not installed: non-zero is correct
+            if sudo test -f "$DIR/pingularity.db"; then
+              echo "db survives uninstall: True"
+            else
+              note "uninstall deleted the database - removing the service must not take the user's history with it"
+            fi
           } 2>&1 | tee svc.log
+          n=$(wc -l < "$FAILS" | tr -d ' ')
+          [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the launchd lifecycle - see svc.log"; exit 1; }
 
       - name: upload logs
         if: always()
@@ -131,6 +213,12 @@ jobs:
   docker-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # `shell: bash` is what selects `bash -eo pipefail`; without it GitHub runs
+    # `bash -e`, where `cmd | tee log` reports tee's exit status and a failing
+    # command inside the pipeline passes silently. Every block below pipes to tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -171,18 +259,39 @@ jobs:
 
       - name: host-mode docker run (the README command)
         run: |
+          # See the launchd step for why failures are counted in a file.
+          FAILS=$(mktemp)
+          note() { echo "ASSERT FAIL: $*"; echo 1 >> "$FAILS"; }
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || echo FAIL; }
           {
             docker run -d --name ping-host --network=host --cap-add=NET_RAW \
               -v pingularity-data:/var/lib/pingularity ghcr.io/pingular/pingularity:0.7.0
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
-            echo "metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
-            echo "status  -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/api/status)"
+            m=$(code http://127.0.0.1:9000/metrics);    echo "metrics -> $m"
+            st=$(code http://127.0.0.1:9000/api/status); echo "status  -> $st"
+            [ "$m" = "200" ]  || note "host-mode /metrics returned $m, want 200"
+            [ "$st" = "200" ] || note "host-mode /api/status returned $st, want 200"
+            # The image must ship its data directory owner-only. At 0755 the daemon
+            # spends every start telling the operator their data directory is too
+            # open and to use a dedicated one - which is the one this image made.
+            dperm=$(docker run --rm -v pingularity-data:/d alpine stat -c '%a' /d)
+            fperm=$(docker run --rm -v pingularity-data:/d alpine stat -c '%a' /d/pingularity.db)
+            echo "volume perms: dir=$dperm db=$fperm"
+            [ "$dperm" = "700" ] || note "container data dir is $dperm, want 700"
+            [ "$fperm" = "600" ] || note "container database is $fperm, want 600"
+            docker logs ping-host 2>&1 | grep -q "group/world-accessible" \
+              && note "the daemon warned about its own data directory on startup"
             echo "--- container logs ---"; docker logs ping-host 2>&1 | tail -20
             docker rm -f ping-host
           } 2>&1 | tee docker.log
+          n=$(wc -l < "$FAILS" | tr -d ' ')
+          [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the host-mode run - see docker.log"; exit 1; }
 
       - name: compose one-shot flow (mirrors install.pingularity.dev/compose.yaml)
         run: |
+          # See the launchd step for why failures are counted in a file.
+          FAILS=$(mktemp)
+          note() { echo "ASSERT FAIL: $*"; echo 1 >> "$FAILS"; }
           {
             # This block mirrors the canonical hosted compose (served by the dl
             # Worker at dl.pingularity.dev/compose.yaml; template lives in the
@@ -206,7 +315,9 @@ jobs:
           EOF
             docker compose up -d
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
-            echo "compose host-mode metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
+            cm=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9000/metrics || echo FAIL)
+            echo "compose host-mode metrics -> $cm"
+            [ "$cm" = "200" ] || note "compose host-mode /metrics returned $cm, want 200"
             echo "--- volume carries the docker-run data (interchange check) ---"
             docker run --rm -v pingularity-data:/d alpine ls -la /d
             docker compose down
@@ -214,9 +325,45 @@ jobs:
             sed -i 's/^    network_mode: host$/    ports: ["9000:9000"]/' compose.yaml
             docker compose up -d
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
-            echo "compose bridge-mode metrics -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/metrics)"
+            bm=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9000/metrics || echo FAIL)
+            echo "compose bridge-mode metrics -> $bm"
+            [ "$bm" = "200" ] || note "compose bridge-mode /metrics returned $bm, want 200"
             docker compose down
           } 2>&1 | tee -a docker.log
+          n=$(wc -l < "$FAILS" | tr -d ' ')
+          [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the compose flow - see docker.log"; exit 1; }
+
+      - name: iperf3 image variant (nothing but .goreleaser.yaml ever referenced it)
+        run: |
+          # See the launchd step for why failures are counted in a file.
+          FAILS=$(mktemp)
+          note() { echo "ASSERT FAIL: $*"; echo 1 >> "$FAILS"; }
+          {
+            # Dockerfile.iperf ships in every release and no test ever built it, so a
+            # break in it - the apt layer, the hand-recreated 65532 account debian has
+            # no distroless `nonroot` for, the /data COPY that gives the volume its
+            # mode - would first surface in a user's release. The amd64 binary is
+            # already staged at linux/amd64/pingularity by the build step above.
+            docker build -f Dockerfile.iperf -t ping-iperf .
+            uid=$(docker run --rm --entrypoint id ping-iperf -u)
+            perm=$(docker run --rm --entrypoint stat ping-iperf -c '%a' /var/lib/pingularity)
+            echo "iperf image: uid=$uid data-dir=$perm"
+            [ "$uid" = "65532" ] || note "iperf image runs as uid $uid, want 65532 (what the default image uses)"
+            [ "$perm" = "700" ] || note "iperf image data dir is $perm, want 700"
+            docker run --rm --entrypoint iperf3 ping-iperf --version \
+              || note "iperf3 does not run in the image that exists to carry it"
+            docker run -d --name ping-iperf -p 9112:9000 ping-iperf
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9112/metrics >/dev/null 2>&1 && break; sleep 2; done
+            im=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9112/metrics || echo FAIL)
+            echo "iperf image metrics -> $im"
+            [ "$im" = "200" ] || note "iperf image /metrics returned $im, want 200"
+            docker logs ping-iperf 2>&1 | grep -q "group/world-accessible" \
+              && note "the iperf image warned about its own data directory on startup"
+            echo "--- iperf container logs ---"; docker logs ping-iperf 2>&1 | tail -15
+            docker rm -f ping-iperf
+          } 2>&1 | tee -a docker.log
+          n=$(wc -l < "$FAILS" | tr -d ' ')
+          [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the iperf3 image - see docker.log"; exit 1; }
 
       - name: upload logs
         if: always()

@@ -47,12 +47,23 @@ func approx(t *testing.T, got, want float64) {
 	}
 }
 
+// ratioOf keeps the many tests that assert only the up-fraction to one line:
+//
+//	up, err := ratioOf(st.UptimeSince(ctx, since, 0))
+//
+// It is TEST-ONLY sugar and deliberately not exported: production hands the whole
+// Observation around so a renderer cannot end up holding a ratio whose coverage
+// was dropped, which is the defect the type exists to make unspellable. A test
+// that cares about coverage takes the Observation itself (see the coverage tests
+// below).
+func ratioOf(o Observation, err error) (float64, error) { return o.Ratio(), err }
+
 // A clean run with no outage events is fully up.
 func TestUptimeNoOutages(t *testing.T) {
 	st := open(t)
 	now := time.Now()
 	sampleAt(t, st, now, 1000, "cf", "ipv4", true)
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +79,7 @@ func TestUptimeCompletedOutage(t *testing.T) {
 	// Outage spanned [now-600, now-500] (100s), closed by an 'up' at now-500.
 	eventAt(t, st, now, 600, "down", -1)
 	eventAt(t, st, now, 500, "up", 100)
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +95,7 @@ func TestUptimeOrphanedDoubleDown(t *testing.T) {
 	eventAt(t, st, now, 600, "down", -1) // outage begins
 	eventAt(t, st, now, 300, "down", -1) // restart re-detects: orphaned gap 600->300 = 300s
 	eventAt(t, st, now, 100, "up", 200)  // recovery closes the second down: 300->100 = 200s
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +121,7 @@ func TestUptimeDanglingDownQuorumRecovery(t *testing.T) {
 	sampleAt(t, st, now, 100, "b", "ipv4", true)
 	sampleAt(t, st, now, 100, "c", "ipv4", false)
 
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +144,7 @@ func TestUptimeOrphanGapBoundedByQuorumRecovery(t *testing.T) {
 	sampleAt(t, st, now, 500, "cf", "ipv4", true)
 	eventAt(t, st, now, 200, "down", -1) // the next real outage
 	eventAt(t, st, now, 100, "up", 100)
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +164,7 @@ func TestUptimeDanglingDownRecoveryBeyondFirstChunk(t *testing.T) {
 	eventAt(t, st, now, 8000, "down", -1)
 	sampleAt(t, st, now, 3000, "cf", "ipv4", true) // first quorum second, 5000s after the down
 	for i := 0; i < 2; i++ {
-		up, _, err := st.UptimeSince(context.Background(), now.Add(-10000*time.Second), 0)
+		up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-10000*time.Second), 0))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +216,7 @@ func TestUptimeAnchorSurvivesSamplePruning(t *testing.T) {
 	eventAt(t, st, now, 6000, "down", -1)
 	eventAt(t, st, now, 5000, "up", 1000)
 	// The first call persists the anchor (now-10000).
-	up, _, err := st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +226,7 @@ func TestUptimeAnchorSurvivesSamplePruning(t *testing.T) {
 	if _, err := st.Prune(ctx, now, now.Add(-9999*time.Hour), now.Add(-9999*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	up, _, err = st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err = ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +247,7 @@ func TestUptimeIgnoresEpochGarbageAnchor(t *testing.T) {
 	sampleAt(t, st, now, 1000, "cf", "ipv4", true)
 	eventAt(t, st, now, 600, "down", -1)
 	eventAt(t, st, now, 500, "up", 100)
-	up, _, err := st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,6 +469,18 @@ func TestDowntimeByDayTimezone(t *testing.T) {
 
 	// 2026-01-02 00:30 UTC: still 2026-01-01 in New York (UTC-5).
 	ts := time.Date(2026, 1, 2, 0, 30, 0, 0, time.UTC)
+	// Anchor monitoring before the requested window so the monitoring floor is a
+	// no-op here: this test is about which local day an outage lands on, not about
+	// how the heatmap discloses time that predates the install (see
+	// heatmap_floor_test.go). Without a sample, monitoringSince falls back to the
+	// first EVENT, which in a fixture seeded only with events is the outage
+	// itself - so every hour before it would correctly read as unobserved and
+	// bury what this test is actually checking.
+	if err := st.InsertSamples(ctx, []Sample{{
+		TS: ts.Add(-48 * time.Hour), Target: "1.1.1.1", Family: "ipv4", LatencyMS: 10, Success: true,
+	}}); err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
 	if err := st.InsertEvent(ctx, ts.Add(-90*time.Second), "down", -1, ""); err != nil {
 		t.Fatalf("insert down: %v", err)
 	}
@@ -507,6 +530,15 @@ func TestDowntimeByDayProratesAcrossDays(t *testing.T) {
 	// Down Mon 2026-01-05 20:00 UTC, back Thu 2026-01-08 08:00 UTC (60h).
 	down := time.Date(2026, 1, 5, 20, 0, 0, 0, time.UTC)
 	up := time.Date(2026, 1, 8, 8, 0, 0, 0, time.UTC)
+	// Anchor monitoring before the window so the monitoring floor is a no-op: this
+	// test is about splitting one outage across local days, not about how the heatmap discloses
+	// pre-install time (see heatmap_floor_test.go). monitoringSince otherwise falls
+	// back to the first EVENT, which here is the outage itself.
+	if err := st.InsertSamples(ctx, []Sample{{
+		TS: down.Add(-48 * time.Hour), Target: "1.1.1.1", Family: "ipv4", LatencyMS: 10, Success: true,
+	}}); err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
 	if err := st.InsertEvent(ctx, down, "down", -1, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -517,11 +549,13 @@ func TestDowntimeByDayProratesAcrossDays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every day here is a whole UTC day inside the window and has no pause row, so
+	// each is fully observed: WindowS == ObservedS == 86400.
 	want := []DowntimeDay{
-		{Date: "2026-01-05", Outages: 1, DowntimeS: 4 * 3600},
-		{Date: "2026-01-06", DowntimeS: 24 * 3600},
-		{Date: "2026-01-07", DowntimeS: 24 * 3600},
-		{Date: "2026-01-08", DowntimeS: 8 * 3600},
+		{Date: "2026-01-05", Outages: 1, DowntimeS: 4 * 3600, WindowS: 86400, ObservedS: 86400},
+		{Date: "2026-01-06", DowntimeS: 24 * 3600, WindowS: 86400, ObservedS: 86400},
+		{Date: "2026-01-07", DowntimeS: 24 * 3600, WindowS: 86400, ObservedS: 86400},
+		{Date: "2026-01-08", DowntimeS: 8 * 3600, WindowS: 86400, ObservedS: 86400},
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("rows = %+v, want %+v", rows, want)
@@ -544,6 +578,15 @@ func TestDowntimeByDayAnchorsOnDownEvent(t *testing.T) {
 	// but only 1h was observed down - a 4h suspend fell inside.
 	down := time.Date(2026, 1, 5, 22, 0, 0, 0, time.UTC)
 	up := time.Date(2026, 1, 6, 3, 0, 0, 0, time.UTC)
+	// Anchor monitoring before the window so the monitoring floor is a no-op: this
+	// test is about which day an outage is anchored to, not about how the heatmap discloses
+	// pre-install time (see heatmap_floor_test.go). monitoringSince otherwise falls
+	// back to the first EVENT, which here is the outage itself.
+	if err := st.InsertSamples(ctx, []Sample{{
+		TS: down.Add(-48 * time.Hour), Target: "1.1.1.1", Family: "ipv4", LatencyMS: 10, Success: true,
+	}}); err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
 	if err := st.InsertEvent(ctx, down, "down", -1, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +599,7 @@ func TestDowntimeByDayAnchorsOnDownEvent(t *testing.T) {
 	}
 	// One day only: 01-05, carrying both the outage marker and the full 1h.
 	// up.ts-duration_s would have booked the hour on 01-06 instead.
-	want := []DowntimeDay{{Date: "2026-01-05", Outages: 1, DowntimeS: 3600}}
+	want := []DowntimeDay{{Date: "2026-01-05", Outages: 1, DowntimeS: 3600, WindowS: 86400, ObservedS: 86400}}
 	if len(rows) != len(want) || rows[0] != want[0] {
 		t.Fatalf("rows = %+v, want %+v", rows, want)
 	}
@@ -580,7 +623,7 @@ func TestDowntimeByDayReconcilesPauseWithinOutage(t *testing.T) {
 	if err := st.InsertEvent(ctx, up, "up", 60, ""); err != nil { // duration_s already pause-adjusted
 		t.Fatal(err)
 	}
-	if err := st.InsertPause(ctx, down.Add(30*time.Second), 60); err != nil { // pause [+30s, +90s)
+	if _, err := st.InsertPause(ctx, down.Add(30*time.Second), 60); err != nil { // pause [+30s, +90s)
 		t.Fatal(err)
 	}
 	rows, err := st.DowntimeByDay(ctx, down.Add(-time.Hour), time.UTC)
@@ -614,7 +657,7 @@ func TestDowntimeByDayPauseAcrossMidnight(t *testing.T) {
 	if err := st.InsertEvent(ctx, up, "up", 180, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.InsertPause(ctx, down.Add(30*time.Second), 60); err != nil {
+	if _, err := st.InsertPause(ctx, down.Add(30*time.Second), 60); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := st.DowntimeByDay(ctx, down.Add(-time.Hour), time.UTC)
@@ -691,7 +734,7 @@ func TestUptimeOutagePlacementAcrossSuspend(t *testing.T) {
 	// A window starting 47h ago is entirely after the down-anchored interval
 	// [50h, 49h ago], so it sees no downtime. The old up-anchored placement
 	// [46h, 45h ago] would have fallen inside this window.
-	narrow, _, err := st.UptimeSince(ctx, now.Add(-47*time.Hour), 0)
+	narrow, err := ratioOf(st.UptimeSince(ctx, now.Add(-47*time.Hour), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +742,7 @@ func TestUptimeOutagePlacementAcrossSuspend(t *testing.T) {
 
 	// A window covering the whole outage still counts exactly the observed 1h,
 	// so the total is preserved: 1 - 3600/(90*3600).
-	wide, _, err := st.UptimeSince(ctx, now.Add(-90*time.Hour), 0)
+	wide, err := ratioOf(st.UptimeSince(ctx, now.Add(-90*time.Hour), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +931,7 @@ func TestUptimeOrphanGapSurvivesSamplePrune(t *testing.T) {
 	eventAt(t, st, now, 500, "up", 500)
 
 	// Warm: orphan gap bounded at the recovery (1000s) + closed outage (500s).
-	up, _, err := st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +943,7 @@ func TestUptimeOrphanGapSurvivesSamplePrune(t *testing.T) {
 	}
 	st.invalidateReadCaches() // simulate a restart: cold recCache
 
-	up, _, err = st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err = ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -920,7 +963,7 @@ func TestUptimeDanglingFinalDownSurvivesSamplePrune(t *testing.T) {
 	eventAt(t, st, now, 90000, "down", -1)          // last event stays a 'down'
 	sampleAt(t, st, now, 89000, "cf", "ipv4", true) // quorum recovery 1000s later
 
-	up, _, err := st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -931,7 +974,7 @@ func TestUptimeDanglingFinalDownSurvivesSamplePrune(t *testing.T) {
 	}
 	st.invalidateReadCaches()
 
-	up, _, err = st.UptimeSince(ctx, time.Unix(0, 0), 0)
+	up, err = ratioOf(st.UptimeSince(ctx, time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,7 +994,7 @@ func TestUptimePausedMidOutageNotCounted(t *testing.T) {
 	sampleAt(t, st, now, 560, "cf", "ipv4", false) // last observation before the pause
 	// ...then monitoring is paused: no samples after now-560, no closing 'up'.
 
-	up, _, err := st.UptimeSince(ctx, now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -973,7 +1016,7 @@ func TestUptimeOngoingOutageStillCountsToNow(t *testing.T) {
 	for _, ago := range []int{480, 300, 100, 2} {
 		sampleAt(t, st, now, ago, "cf", "ipv4", false)
 	}
-	up, _, err := st.UptimeSince(ctx, now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(ctx, now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1015,7 +1058,7 @@ func TestUptimeSinceClampsCraftedDuration(t *testing.T) {
 	// Down 120s ago, "recovered" 60s ago but with an absurd ~31,700-year duration.
 	eventAt(t, st, now, 120, "down", -1)
 	eventAt(t, st, now, 60, "up", 1_000_000_000_000)
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,7 +1152,7 @@ func TestSeriesCacheDoesNotAliasNearbyEnds(t *testing.T) {
 // pauseAt records a pause span [now-secsAgo, +durS) - unobserved wall time.
 func pauseAt(t *testing.T, st *Store, now time.Time, secsAgo int, durS int64) {
 	t.Helper()
-	if err := st.InsertPause(context.Background(), now.Add(-time.Duration(secsAgo)*time.Second), durS); err != nil {
+	if _, err := st.InsertPause(context.Background(), now.Add(-time.Duration(secsAgo)*time.Second), durS); err != nil {
 		t.Fatalf("insert pause: %v", err)
 	}
 }
@@ -1121,10 +1164,11 @@ func TestUptimePausedExcludedFromDenominator(t *testing.T) {
 	now := time.Now()
 	sampleAt(t, st, now, 1000, "cf", "ipv4", true) // anchors monitoringSince at now-1000
 	pauseAt(t, st, now, 800, 500)                  // paused [now-800, now-300]: 500s unobserved
-	up, cov, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	o, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	up, cov := o.Ratio(), o.Coverage()
 	approx(t, up, 1.0)  // no outages; the paused span is neither up nor down
 	approx(t, cov, 0.5) // 500 observed / 1000 wall
 }
@@ -1139,10 +1183,11 @@ func TestUptimeOutageWithPause(t *testing.T) {
 	eventAt(t, st, now, 600, "down", -1)
 	eventAt(t, st, now, 500, "up", 100) // 100s observed down
 	pauseAt(t, st, now, 400, 400)       // 400s paused while up
-	up, cov, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	o, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	up, cov := o.Ratio(), o.Coverage()
 	approx(t, up, 1-100.0/600.0) // 100s down / 600s observed (1000 wall - 400 paused)
 	approx(t, cov, 0.6)
 }
@@ -1154,10 +1199,11 @@ func TestUptimeFullyPausedZeroCoverage(t *testing.T) {
 	now := time.Now()
 	sampleAt(t, st, now, 3600, "cf", "ipv4", true) // monitoringSince = now-3600
 	pauseAt(t, st, now, 3600, 3600)                // entire window paused
-	up, cov, err := st.UptimeSince(context.Background(), now.Add(-3600*time.Second), 0)
+	o, err := st.UptimeSince(context.Background(), now.Add(-3600*time.Second), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	up, cov := o.Ratio(), o.Coverage()
 	approx(t, cov, 0.0)
 	_ = up // ratio is meaningless at 0 coverage; the caller omits it
 }
@@ -1175,16 +1221,17 @@ func TestUptimeRetentionClamp(t *testing.T) {
 	eventAt(t, st, now, 8*86400, "up", 100) // 100s outage, 8 days ago
 
 	// With no retention clamp, "all" runs from the 10-day anchor and includes the outage.
-	full, _, err := st.UptimeSince(context.Background(), time.Unix(0, 0), 0)
+	full, err := ratioOf(st.UptimeSince(context.Background(), time.Unix(0, 0), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// With a 7-day retention clamp, the window starts 7 days ago - the 8-day-old
 	// outage is now outside it, so uptime reads 100% over the retained period.
-	clamped, cov, err := st.UptimeSince(context.Background(), time.Unix(0, 0), 7*24*time.Hour)
+	co, err := st.UptimeSince(context.Background(), time.Unix(0, 0), 7*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
+	clamped, cov := co.Ratio(), co.Coverage()
 	if !(full < clamped) {
 		t.Fatalf("retention clamp should drop the old outage: full=%.5f clamped=%.5f", full, clamped)
 	}
@@ -1211,7 +1258,7 @@ func TestUptimeEventTiebreakerSameTS(t *testing.T) {
 	sampleAt(t, st, now, 1000, "cf", "ipv4", true)
 	eventAt(t, st, now, 500, "up", 0)    // recovery inserted first (lower rowid)
 	eventAt(t, st, now, 500, "down", -1) // outage start at the SAME second
-	up, _, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1245,10 +1292,11 @@ func TestUptimeOrphanGapExcludesPause(t *testing.T) {
 	eventAt(t, st, now, 300, "down", -1)          // restart mid-outage re-detects it (2nd down)
 	eventAt(t, st, now, 100, "up", 200)           // recovers; completed portion [-300,-100]=200s
 	pauseAt(t, st, now, 500, 200)                 // pause [-500,-300] sits INSIDE the [-600,-300] gap
-	up, cov, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
+	o, err := st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	up, cov := o.Ratio(), o.Coverage()
 	// observed = 1000 - 200 paused = 800; observed downtime = 200 (completed) + (300-200) (gap
 	// minus its interior pause) = 300; ratio = 1 - 300/800 = 0.625. The bug gives 0.375.
 	approx(t, cov, 0.8)

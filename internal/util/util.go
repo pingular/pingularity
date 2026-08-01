@@ -44,7 +44,13 @@ func InContainer() bool {
 // BridgedContainer reports whether we are in a container that does NOT share the
 // host's network namespace - the case where every measurement describes the
 // container network instead of the host's real path: an extra hop of latency,
-// and a traceroute that dead-ends at the container gateway.
+// a traceroute that dead-ends at the container gateway, and a DNS resolver the
+// runtime substituted for the host's. That last one is the largest distortion
+// and the least obvious: a loopback stub means "me", so it is unreachable from a
+// bridged namespace and Docker replaces it with its own public default - the
+// reported DNS provider and ASN are then a different operator, not a nearer one.
+// Sharing the namespace (--network=host) keeps the stub reachable, so a
+// host-networked container reads the host's real resolver and is not warned.
 //
 // It matters because `network_mode: host` is Linux-only, so every Docker Desktop
 // user on macOS or Windows is pushed into exactly this mode by the compose file,

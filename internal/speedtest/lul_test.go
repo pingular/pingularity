@@ -31,7 +31,7 @@ func TestMedian(t *testing.T) {
 func TestLoadSamplerGating(t *testing.T) {
 	// Real network unavailable in tests isn't assumed; we only exercise the
 	// gating path: stop immediately, far under both thresholds.
-	stop := startLoadSampler(context.Background())
+	stop := startLoadSampler(context.Background(), "")
 	time.Sleep(50 * time.Millisecond)
 	if got := stop(); got != nil {
 		t.Fatalf("sampler returned %v for a %v phase, want nil (< %v / < %d samples)", *got, 50*time.Millisecond, lulMinPhase, lulMinSamples)
@@ -116,7 +116,7 @@ func (c stubConn) Close() error         { return nil }
 func TestLoadSamplerHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	stop := startLoadSampler(ctx)
+	stop := startLoadSampler(ctx, "")
 	done := make(chan *loadStat, 1)
 	go func() { done <- stop() }()
 	select {

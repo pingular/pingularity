@@ -9,7 +9,7 @@ import (
 // right ASNs against live origin6.asn.cymru.com (Cloudflare AS13335, Google AS15169).
 func TestCymruOriginQuery(t *testing.T) {
 	cases := []struct{ ip, want string }{
-		{"155.138.130.135", "135.130.138.155.origin.asn.cymru.com"},
+		{"198.51.100.135", "135.100.51.198.origin.asn.cymru.com"},
 		{"1.1.1.1", "1.1.1.1.origin.asn.cymru.com"},
 		{"2606:4700:4700::1111", "1.1.1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.4.0.0.7.4.6.0.6.2.origin6.asn.cymru.com"},
 		{"2001:4860:4860::8888", "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.origin6.asn.cymru.com"},

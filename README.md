@@ -29,14 +29,21 @@ Connectivity is probed over **both IPv4 and IPv6** (each as an independent
 quorum of three anycast anchors). IPv6 is auto-detected - skipped on IPv4-only
 hosts - and the families are tracked separately, so an IPv6-only outage is
 visible without falsely reporting the whole link down. Overall status is
-"online" when *either* family has connectivity.
+"online" when *either* family has connectivity. Be precise about where that
+shows up: a single-family outage appears in the live status bubbles, the raw
+latency samples, and the `monitor.v4_only_down_s` / `monitor.v6_only_down_s`
+counters - but **outage events, the downtime heatmap, and the uptime ratios are
+driven by the overall state**, so a loss of just one family is not recorded as
+downtime there. That is the intended reading of "either family": the link still
+carried traffic.
 
 ## Install
 
 Prebuilt binaries and packages for Linux, macOS, and Windows (amd64 + arm64) are
 published on every tagged release. Pick the channel that fits your OS - each one
-lands the same single static binary; the packaged channels also wire up the
-background service for you.
+lands the same single static binary. The `.deb`/`.rpm` packages also register
+and start the background service for you; Homebrew and winget install the binary
+and leave `pingularity install` to you (each section below says which).
 
 ### Linux
 
@@ -136,9 +143,11 @@ The image is multi-arch (amd64 + arm64). Two flags matter:
   host and the VM - it still does not expose the host's own interfaces or
   anything below L4, so the raw-ICMP traceroute behind the **Exit** panel and
   true native-host parity remain unavailable. Even with it turned on, the
-  readings describe the VM's path rather than your machine's, and the dashboard
-  says so when it detects it. Run Pingularity natively on macOS or Windows if you
-  want the measurements to match the host.
+  readings describe the VM's path rather than your machine's. Run Pingularity
+  natively on macOS or Windows if you want the measurements to match the host.
+  (The dashboard's container notice is raised for a *bridged* container, which is
+  the case it can detect; it does not detect Docker Desktop's host-networking
+  mode specifically.)
 - **`--cap-add=NET_RAW`** (keep it for portability) - the **Exit** panel walks
   a raw-socket ICMP traceroute to find where traffic leaves your ISP. Stock
   Docker still grants `NET_RAW` by default, so plain `docker run` works without
@@ -197,8 +206,15 @@ sudo pingularity install    # no flags - DB goes to /var/lib/pingularity, UI on 
 pingularity status          # running | stopped | not installed
 ```
 
-The database path and its directory are chosen and created automatically
-(`/var/lib/pingularity/pingularity.db` as a service, a per-user data dir otherwise).
+The database path and its directory are chosen and created automatically. On
+Windows that is always `%ProgramData%\pingularity\` - service or not - so the
+installed service and an admin prompt (`reset-auth`) find the same database.
+On Linux and macOS what decides is root, not the service: as root (which is how
+`install`'s service runs) it is `/var/lib/pingularity/` on Linux and
+`/Library/Application Support/pingularity/` on macOS; as a regular user it is a
+per-user data dir - `~/.config/pingularity/` on Linux (`$XDG_CONFIG_HOME`
+honoured), `~/Library/Application Support/pingularity/` on macOS - with a
+temp-dir path as the last resort when there is no home directory at all.
 Any flags you *do* pass to `install` are persisted into the service definition.
 Manage with `pingularity stop | restart | status | uninstall`.
 
@@ -215,16 +231,23 @@ unlike your dashboard login it can't be hashed. Two things follow:
   a backup, a snapshot, a stray copy - which now carries ciphertext, not your password.
 
 Backup exports never contain passwords at all (neither the login nor the iperf3
-ones). Two consequences worth knowing before you need them:
+ones). **They are still sensitive files.** A config export deliberately carries
+your **webhook URL** and **heartbeat URL** so that a restore is complete, and for
+both of those the URL *is* the credential - there is no separate token to
+withhold. Anyone holding an export file can post to your alert channel or tick
+your dead-man's-switch (masking a real outage), so store and share it like a
+secret, and rotate both URLs at their provider if one leaks. Two more
+consequences worth knowing before you need them:
 
 - **Copying the database files by hand?** Stop the service first. While it runs,
   recent rows live in a sidecar file (`pingularity.db-wal`) that a copy of just
   `pingularity.db` misses - on a young install that can be *everything*. A clean
   stop folds the sidecar back into the main file. (The Data tab's **Export** is
   the safe way to back up a *running* instance - it streams a single consistent
-  read-snapshot, so categories can't skew across it. **Import has a 256 MiB
-  ceiling**, so a very long full-retention history may not round-trip in one file;
-  export a shorter window, or copy the files after a clean stop, for a huge DB.)
+  read-snapshot, so categories can't skew across it. **A full-retention export
+  round-trips**, however large - import puts no ceiling on the total file, only on
+  a single record (8 MiB) or a single JSON element (256 MiB), which no real backup
+  reaches.)
 - **Restoring a backup where login was enabled?** The export carries the
   "login on" preference but never the password, so on a machine that doesn't
   already have one the restore leaves login **off**, **forces access to
@@ -232,6 +255,12 @@ ones). Two consequences worth knowing before you need them:
   new password in the Access tab, then re-enable Network access. (Restoring onto
   the same machine, where the password still exists, keeps login working untouched
   and access unchanged.)
+- **Restoring onto a *different* machine?** A backup never carries the source's
+  install date, so the destination keeps its own answer to "monitoring since".
+  That date is the denominator behind every uptime figure, and importing it would
+  have this box reporting uptime over a stretch it did not watch. Restore the
+  **history** too and the date moves anyway - derived from the earliest row that
+  actually arrived, which is a claim the restored data backs up.
 
 ## Architecture
 
@@ -289,15 +318,35 @@ flowchart TB
 
 ## Speedtests
 
-Every run records download, upload, ping, **jitter**, (best-effort) **packet
-loss**, and **bufferbloat**, plus the bytes used and the connection it ran on
-(public IP, ISP, DNS resolver).
+A run records download, upload, ping, **jitter**, (best-effort) **packet loss**,
+and **bufferbloat**, plus the bytes used and the connection it ran on (public IP,
+ISP, DNS resolver). Not every field is present on every run: a download-only or
+upload-only run has no figures for the direction it skipped, packet loss is
+optional and not always measurable, and bufferbloat is absent when a transfer
+phase was too short to sample, returned too few samples, or the latency target
+was unreachable. Missing is stored as missing rather than as a zero, so charts
+and thresholds can tell "not measured" from "measured, and it was bad".
 
-![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with per-chart show/hide toggles and a save-as-image button](docs/speed-panel.png)
+The **ping** shown is the engine's own number, a mean over ten samples, so it
+keeps matching what speedtest.net would report. A mean has no defence against an
+outlier, though: one stalled handshake among nine fast ones reports several times
+the real latency (and lands in jitter, which is their standard deviation, as a
+much larger distortion still). So the run also keeps the **fastest** of those
+same samples - no extra probes - and everything that *decides* on latency uses
+that floor instead: which server wins a best-of round, which server the very
+first run picks, and whether your ping threshold breached. A pothole shouldn't
+pick your server or page you, but a genuinely distant link has a high floor too
+and still breaches. iperf3 reports no per-sample values, so it is judged on its
+mean exactly as before.
+
+![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, and a save-as-image button](docs/speed-panel.png)
 
 **Bufferbloat** is the extra lag that appears only while the line is busy - the
 reason a video call breaks up the moment a big download starts. Pingularity
-measures it by pinging before the test (idle) and during it (loaded):
+measures it by pinging before the test (idle) and during it (loaded) - both
+against a fixed target of its own rather than the speedtest server, so only the
+gap between them is meaningful, and the idle figure will not match the **ping**
+recorded above:
 
 ```mermaid
 flowchart LR
@@ -305,6 +354,15 @@ flowchart LR
   load --> queued["your packets now wait in the<br/>modem's queue: ping 190 ms"]
   queued --> bloat["bufferbloat = 190 - 24<br/>= +166 ms under load"]
 ```
+
+Both figures are **medians** of their probes, and the headline bufferbloat number
+- the one the tiles show and the one your **max bufferbloat** threshold is
+compared against - is `median(loaded) - median(idle)`. The chart also plots a
+**p95** per direction, the sustained bad end of the distribution. p95 is
+deliberately not the maximum: these are TCP-connect probes, and a single worst
+sample on one is usually a SYN retransmission (a fixed ~1000 ms OS retry, and
+~2000 ms for a second one) rather than queue delay, so a max-based number
+reports round figures that say more about packet loss than about buffering.
 
 There are two engines, picked in the settings drawer:
 
@@ -324,27 +382,50 @@ There are two engines, picked in the settings drawer:
 Scheduled speedtests are **off by default** - turn them on in the Speedtest
 settings (or with `-speedtest`). Once enabled, they run on startup and on a
 schedule (`-speedtest-interval`, default `1h`). Two extra triggers are governed
-separately: a test runs **after each reconnect** (on by default;
-`-speedtest-on-reconnect=false` to disable), and an optional **while degraded**
+separately: a test runs **after a reconnect** (on by default;
+`-speedtest-on-reconnect=false` to disable) - spaced out so a flapping line
+cannot fire tests back to back: at most one reconnect test per
+`-speedtest-interval`, or per 15 minutes when that interval is shorter. There is
+also an optional **while degraded**
 toggle in the Speedtest settings (off by default, needs scheduled tests on)
 fires a test when latency stays high without the link fully dropping. **Run
 now** (or `POST /api/speedtest`) always works.
+
+Only one speedtest runs at a time, and the triggers do not queue behind each
+other. If a **scheduled** slot comes due while any other test is already
+running, that slot is **skipped** and the schedule advances to the next one - it
+is not retried, and not run late (the counter
+`pingularity_stat_total{stat="speed.scheduled_skipped"}` records it). A slot
+held back by a **closed window** or a **busy link** behaves the opposite way:
+nothing was measured, so it keeps polling and fires as soon as the condition
+clears.
 
 For iperf3, the separate UDP loss/jitter pass probes the same direction you
 test: downstream normally, upstream for an upload-only run - so a one-direction
 test on an asymmetric line reports loss for the direction you asked about.
 
-For Ookla, choose a server (search a city) or leave **Auto (fastest)**. Auto
+For Ookla, choose a server (search a city) or leave **Auto - fastest near you**
+(it reads **Auto - fastest in \<city\>** once you've searched one). Auto
 isn't just "nearest": every server that's effectively equidistant gets to race
 (in a big city, a dozen providers all sit "0 km away" - one of each is pinged
 rather than an arbitrary few) and the lowest latency wins. Your own ISP's
-server, when Ookla lists one nearby, is **always in the race** - traffic to it
-never leaves your provider's network, so it's the most likely winner - but it
-still has to win on ping like everyone else. Distances are centred on, in
-order: a **city you searched** (when set), else your **ISP's exit-router
-location** (a truer origin than the public IP's geolocation), else the
-Cloudflare PoP serving you (containers and other hosts where the traceroute
-can't run), else the public IP.
+server, when Ookla lists one nearby **and the sponsor name can be matched to
+your ISP**, is guaranteed a place in the race - traffic to it never leaves your
+provider's network, so it's the most likely winner - but it still has to win on
+ping like everyone else. (That match is a name heuristic: if your ISP is unknown
+or trades under a different name than it sponsors servers under, its server
+simply competes on distance like any other.) The **centre** of that search is
+measured, not guessed: the candidate cities your connection names - your
+**ISP's exit-router city** (found by traceroute), the city your **IP's
+geolocation** puts you in, and the one **speedtest.net itself** places you in -
+each enter their six closest servers into one deduplicated ping race, and the
+city whose server answers fastest becomes the centre. (Ookla returns the
+servers *around* a coordinate, so a different centre yields a genuinely
+different list rather than the same one reordered - picking the wrong city can
+hide the fast servers entirely, which is why it's raced. The lists usually
+overlap, and where two candidate cities are close enough to be
+interchangeable they collapse, so a server never gets to race twice.) A
+**city you searched** overrides the race and becomes the centre directly.
 
 ## Dashboard
 
@@ -393,13 +474,20 @@ Below that:
   "online, but DNS was struggling." Selectable window (5m / 1h / 6h / 1d / 7d,
   a **custom** duration, or a typed **date range** exactly like the Speed panel;
   rolling windows are capped at the relevant retention), with red bands marking
-  real outages. Hover either chart to read the exact point.
-- **Downtime heatmap** - a GitHub-style year of per-day outage time.
+  **rounds that failed their checks**. Those come from the latency samples
+  themselves, not from the debounced outage log below - so a blip too short to
+  become an outage event still shows a band, and deleting an outage does not
+  erase the bands underneath it. Hover either chart to read the exact point.
+- **Downtime heatmap** - a GitHub-style year of daily outages. A cell's shade is
+  **how many outages that day**, not how long they lasted: one 23-hour outage and
+  one 1-second blip are both a single event and shade identically, while three
+  blips shade darker than either. Hover a cell for the figure that answers "how
+  bad was it" - the actual downtime, and how much of the day was observed.
 - **Recent outages** - the debounced up/down event log. Each resolved outage has a
   ✕ to delete it (removes it from the log, heatmap, and uptime stats -
   handy after planned maintenance you don't want counted).
 
-![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day tinted by how much outage time it saw, above a Show recent outages button](docs/downtime-heatmap.png)
+![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day shaded by how many outages it saw, above a Show recent outages button](docs/downtime-heatmap.png)
 
 > **Who does Pingularity talk to?** Only keyless public infrastructure - no API
 > token, no signup, and nothing is ever *pushed* anywhere. The complete list of
@@ -415,7 +503,7 @@ Below that:
 > | **ipwho.is**, then **geojs.io** | your public IP, for the ISP/geo line | connection refresh |
 > | **Cloudflare** (`/cdn-cgi/trace`) | a plain fetch, to learn the serving PoP | connection refresh |
 > | reverse DNS | router/host IPs, for names | connection refresh |
-> | **Ookla** servers | the speedtest traffic itself | only when a speedtest runs |
+> | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup | when a speedtest runs, and when the Server settings tab is opened or a city is searched |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
 > | **dl.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on |
 >
@@ -447,14 +535,22 @@ and persist across restarts:
   server you picked, not on your exit, so the round stays in the area you asked
   for (with nothing pinned, they come from the auto location instead). It keeps
   only the best result - handy when one server has a bad day and you'd rather
-  it didn't define your history. The best result is the highest *score*:
-  download + upload discounted by ping (roughly 1% of throughput per
-  millisecond, topping out at 20ms), so a near-tie on speed goes to the
-  lower-ping server while a clearly faster one still wins. Ties break on ping, then jitter, then
+  it didn't define your history. The best result is the highest *score*: a
+  capacity figure weighting download 70% and upload 30% **relative to each
+  other** (not as raw Mbps, so it means the same on a symmetric line and a 20:1
+  asymmetric one), discounted by ping (roughly 1% per millisecond, topping out
+  at 20ms). So a server that measured a fifth of your real upload can't hide
+  behind a big download number, a near-tie on speed goes to the lower-ping
+  server, and a clearly faster one still wins. Ties break on ping, then jitter, then
   bufferbloat; the other two runs are discarded (their
-  data volume is still counted, since it was really spent). Each server gets 90
+  data volume is still counted, since it was really spent). The run that is kept
+  is one real test, so its **ping, jitter and bufferbloat are the winner's too**:
+  when a round is decided on throughput, those columns can jump because the round
+  changed hands, not because your connection did. It is not averaged across
+  servers - that would describe a test that never happened - so read latency and
+  jitter from the charts, which sample continuously and do not depend on who won. Each server gets 90
   seconds before it is dropped and the next is tried, so a stalled server can't
-  hold up the round; a whole round is capped at 7 minutes. It costs roughly **3x
+  hold up the round; a whole round budgets 6 minutes of work (3 servers x 90s, plus 90s to pick them), under a 7-minute hard ceiling. It costs roughly **3x
   the time and data** of a normal test, so only the runs worth being thorough
   about use it: the ones on your chosen interval, and the **RUN** button. The
   quick automatic tests - at startup, after a reconnect, and the while-degraded
@@ -483,8 +579,10 @@ and persist across restarts:
   values in effect when it ran, with a debounce so one blip doesn't page) and
   *Notifications* (alert-on-outage, a generic **webhook** with a Test button, an
   optional **periodic summary** posted to the webhook - off / daily / weekly, a
-  "how it went" report of uptime, median speeds, and outage count/downtime - and a
-  dead-man's-switch **heartbeat** URL).
+  "how it went" report of uptime, median speeds, and outage count/downtime; it
+  always goes out on its cadence and states the span it actually observed, so a
+  period spent scheduled-off or paused is reported as such rather than as a
+  confident 100% - and a dead-man's-switch **heartbeat** URL).
 - **Access** → access controls (changes here apply on **Save**).
   **Network access** decides whether other devices can reach the dashboard /
   API / `/metrics`, or only this machine - a live loopback filter, so remote
@@ -574,7 +672,7 @@ the settings drawer afterward and persists across restarts.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket) |
-| `-db` | per-user / `/var/lib/...` | SQLite path (dir auto-created) |
+| `-db` | per-OS ([details](#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
 | `-interval` | `5s` | time between probe rounds, `1s`-`1h` (a value saved in the UI takes precedence) |
 | `-timeout` | `3s` | per-target dial timeout, `1s`-`30s` (a value saved in the UI takes precedence) |
 | `-down-after` / `-up-after` | `2` / `1` | consecutive rounds to confirm down / up (1-10) |
@@ -583,7 +681,7 @@ the settings drawer afterward and persists across restarts.
 | `-ipv6` | `auto` | IPv6 probing: `auto` \| `on` \| `off` (live) |
 | `-speedtest` | `false` | run scheduled speedtests (startup + interval); opt-in. On-reconnect tests are governed separately by `-speedtest-on-reconnect`, the while-degraded trigger by its own UI toggle |
 | `-speedtest-interval` | `1h` | time between scheduled speedtests, `1m`-`24h` |
-| `-speedtest-on-reconnect` | `true` | speedtest after each reconnect |
+| `-speedtest-on-reconnect` | `true` | speedtest after a reconnect (at most one per `-speedtest-interval`, or per 15m if that is shorter) |
 | `-retain` / `-retain-speed` / `-retain-downtime` | `720h` (30 days) / `8760h` (1 year) / `8760h` | prune windows in Go duration units (`0` = keep forever) |
 | `-allow-host` | *(none)* | extra `Host` header values the DNS-rebinding guard accepts - only needed behind a reverse proxy on a public domain |
 | `-trusted-proxy` | *(none)* | proxy IPs/CIDRs whose `X-Forwarded-For` identifies the real client, so one visitor's failed logins can't rate-limit everyone behind the proxy |
@@ -648,7 +746,13 @@ self-describing):
 - `pingularity_uptime_ratio{window}` - up-fraction over `6h`, `24h`, `7d`, `30d`,
   `1y`, and `all`. This is **observed** downtime / **observed** time: paused,
   scheduled-off, families-off, and process-down wall time is excluded from the
-  denominator (it's neither up nor down), so it can't inflate uptime. A window that
+  denominator (it's neither up nor down), so it can't inflate uptime. Two small
+  gaps are deliberately *not* booked, and so stay in the denominator (and are
+  normally credited as up): a restart that took **2 minutes or less**, and a
+  suspend/freeze shorter than **one probe interval plus 10 minutes** - below
+  that, a gap can't be told apart from ordinary scheduler overshoot, and the
+  error is bounded and self-limiting where a spurious unobserved row would not
+  be. A window that
   observed **nothing** is omitted entirely rather than published as a misleading
   100%. Each window is also clamped to the outage-retention horizon, so it can't
   reach past where the downtime events behind it were pruned.
@@ -671,17 +775,30 @@ self-describing):
   `pingularity_speed_ping_seconds` / `pingularity_speed_packet_loss_ratio` (0..1) -
   use whichever your dashboards expect, but don't mix the two unit systems in one
   expression
+- `pingularity_speed_ping_best_ms` - the **fastest** of the ping samples
+  `_ping_ms` averages. The engine reports a mean over ten samples, so one stalled
+  handshake moves it several-fold; this is the floor beneath it. Alert on this
+  one to mean "the link really is far", and watch the **gap** between the two to
+  spot a lossy path. Absent on iperf3 runs, which report no per-sample values
 - `pingularity_speed_healthy` - 1/0, did the last run pass your configured
   thresholds (lets alerting reuse the in-app verdict instead of re-encoding it);
-  absent when no thresholds are configured
+  **absent** when no thresholds are configured *or* when the run couldn't measure
+  something a threshold covers. A check that never ran is not a check that
+  passed, so those runs get no verdict rather than a green one - alert on
+  `absent()` if a silently unjudged run matters to you
 - `pingularity_speed_idle_latency_ms` / `pingularity_speed_loaded_latency_ms{direction}`
-  (+ `_max_ms`) - latency idle vs under load; **loaded minus idle is bufferbloat**.
+  (+ `_p95_ms`) - latency idle vs under load; **loaded minus idle is bufferbloat**.
   Present only when the engine measured them
 - `pingularity_speed_data_used_bytes` (total within retention),
   `pingularity_speed_data_used_window_bytes{window}` (per `6h`/`24h`/`7d`/`30d`/`1y`
   window - the total is non-monotonic under pruning, so metered-link budgets
   should use these), `pingularity_speed_last_run_bytes{direction}` (what the
-  last run itself consumed), and `pingularity_speed_avg_run_bytes{direction}`
+  last run itself consumed), and `pingularity_speed_avg_run_bytes{direction}`.
+  Treat all of these as a **measured lower bound on wire usage, not a bill**:
+  they count the payload the engine reports moving, so they exclude warm-up
+  traffic, the UDP loss/jitter probe, runs that failed or were abandoned partway,
+  TCP/TLS/IP overhead, and retransmits. On a metered link, budget with headroom
+  above these numbers rather than against them
 - `pingularity_process_start_time_seconds` - process start (the Prometheus-conventional
   form; `pingularity_runtime_seconds` kept for compatibility)
 - `pingularity_goroutines` / `pingularity_memory_heap_bytes` / `_memory_sys_bytes` /
@@ -695,10 +812,12 @@ self-describing):
   per background worker (`scheduler`, `pruner`, `netinfo`, `update-check`,
   `heartbeat`, `digest`): `up` is 1 while its loop runs and 0 once it stops or gives
   up after repeated panics; `restarts_total` climbing means it's thrashing
-- `pingularity_monitor_pending_events` / `pingularity_stat_total{stat="monitor.event_dropped"}`
-  - the outage-persistence retry queue's depth (0 = healthy) and a counter of
-  transitions dropped for good when the DB stayed unwritable past the buffer cap
-  (each drop leaves a gap in uptime history)
+- `pingularity_stat_total{stat="monitor.pending_events"}` /
+  `pingularity_stat_total{stat="monitor.event_dropped"}` - the outage-persistence
+  retry queue's depth (0 = healthy) and a counter of transitions dropped for good
+  when the DB stayed unwritable past the buffer cap (each drop leaves a gap in
+  uptime history). `pending_events` is a depth, not a counter, so it is not seeded
+  at startup: the series appears the first time an event has to be queued
 - `pingularity_metrics_data_valid` - **1 only when every store read on this scrape
   succeeded**; 0 when any failed (so a DB outage that would otherwise be a silent
   `200` with missing/stale series is directly alertable). Paired with
@@ -847,20 +966,47 @@ rate(pingularity_stat_total{stat="speed.duration_s_sum"}[6h])
 
 ## HTTP API
 
+Responses are gzip-encoded when the client sends `Accept-Encoding: gzip` and the
+body is at least 1 KiB (smaller ones are sent as-is - gzip's framing can make a
+short body bigger, and it already fits in one packet). Every such response
+carries `Vary: Accept-Encoding`. The two streaming downloads, `/api/export` and
+`/api/speed/runs.csv`, are always sent uncompressed so they keep streaming at
+constant memory.
+
 - `GET /api/status` - current status, uptime, per-family state, targets, latest
-  speed, and live speedtest progress
+  speed, and live speedtest progress. Every uptime figure ships with its
+  observation coverage (`uptime_coverage` per window, `uptime_custom_coverage`
+  for `?upMins=`); a coverage of `0` means the window observed nothing and has no
+  uptime to report, exactly as `pingularity_uptime_ratio` is then absent. A
+  running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
+  (`0` when idle) - that id is what `/api/speedtest/abort` takes, so a stop can
+  name the run it was decided against
 - `GET /api/series?mins=…[&exclude=…]` - latency / online time series (server-side
   bucketed); `exclude` drops targets from the lowest-latency line. Also takes an
   absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`; omit `to`
-  for an open end), which wins over `mins` - the bucket width then follows the
-  requested span
+  for an open end), which wins over `mins`. The bucket width follows the part of
+  the window that can hold data - `[from, min(to, now))` - so an omitted or
+  future `to` buckets as if the window ended now rather than coarsening the lot
 - `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log
 - `POST /api/outages/delete` - `{ts}` delete one resolved outage (`ts` = the unix
   seconds of its closing up event); removes it from the log, heatmap, and
   uptime stats. Idempotent
-- `GET /api/speed?mins=…` - speedtest history. Also takes an absolute window as
-  `?from=&to=` (unix seconds, half-open `[from, to)`; omit `to` for an open end),
-  which wins over `mins` when present
+- `GET /api/speed?mins=…` - speedtest history for the chart, capped at about 1500
+  points. A window holding fewer runs than that is returned in full; a larger one
+  is thinned by taking an even stride through the runs *by position* (not by
+  time), always keeping the newest. Every point is a real recorded row, never a
+  derived value - unlike `/api/series`, which buckets by time and reduces each
+  bucket to one number (the lowest latency measured in it, and the mean DNS time). The stride is positional, so widening a window past 1500 runs re-picks
+  from scratch: the newest run is always kept, but the other points are generally
+  *different* runs rather than a superset of the narrower window's. The body stays
+  a bare array; the disclosure is
+  in the headers - `X-Total-Count` (runs in the window), `X-Returned-Count` and
+  `X-Sampled` (`true` when thinned), so a client can tell a thinned answer from a
+  complete one. For every run, use `/api/speed/runs` (paginated) or
+  `/api/speed/runs.csv` - both cover the whole history rather than a window, so a
+  caller that wants one window filters on `ts` itself. Also
+  takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
+  omit `to` for an open end), which wins over `mins` when present
 - `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail)
 - `GET /api/speed/runs.csv` - all runs as CSV
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
@@ -868,23 +1014,44 @@ rate(pingularity_stat_total{stat="speed.duration_s_sum"}[6h])
 - `GET /api/speedtest/servers?city=` - list Ookla servers (near a city or you)
 - `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable (POST
   with an `application/json` content-type, like the other network-side-effect endpoints)
-- `GET /api/heatmap?days=366` - per-day downtime
+- `GET /api/heatmap?days=366` - per-day downtime, plus `window_s`/`observed_s`
+  per day (how much of it was in range and how much was actually monitored)
 - `GET /api/netinfo` - connection info (IP/ISP/DNS); `POST` forces a full refresh
 - `GET|POST /api/settings` - read / update live settings
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password)
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout
 - `POST /api/speedtest` - run a speedtest now
+- `POST /api/speedtest/abort[?run=…]` - stop a speedtest in flight. A bare POST
+  stops whatever is running when it arrives; `run=` (the `speedtest_run_id` from
+  `/api/status`) stops only that run, and is **recommended for any client that
+  might be delayed** - a stop decided seconds ago would otherwise kill a run that
+  started in between. `204` = stopped, `409` = nothing matching to stop (idle, or
+  that run already ended), `400` = `run` was not a run id. A best-of-N run that
+  has already measured a server keeps that result; an abort before the first
+  result stores nothing
 - `GET|POST /api/monitoring` - read / set `{enabled}` master start/stop (the power toggle)
 - `GET|POST /api/update` - update-check status / toggle the daily release poll
 - `GET|POST /api/logs` - the About-tab log viewer: read recent lines (or
-  `?download=1` for a text file) / set log level, PII redaction, or clear the buffer
+  `?download=1` for a text file, still the complete buffer) / set log level, PII
+  redaction, or clear the buffer. A bare read returns the newest 500 lines;
+  `?limit=` asks for a different window (capped at 1000, `?limit=0` for the whole
+  buffer). Responses carry `limit` (the cap applied) and `buffered` (lines held),
+  so a short answer can be told from a complete one, plus `epoch`, `first_seq`,
+  `next_seq` and `dropped`, so a
+  poller can pass `?since=<next_seq>&epoch=<epoch>` and be sent only what has
+  arrived since - `since` is ignored unless `epoch` matches, because a restart
+  reseeds the buffer and re-uses the same sequence numbers for different lines
 - `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
 - `GET /api/export?…` / `POST /api/import` - export / import config + history
   (JSON; export streams a single consistent snapshot with a small manifest; import
   streams in bounded batches and is **not atomic** - a mid-file error leaves earlier
-  categories applied and returns `{partial:true, committed:{…}}`. Import caps the
-  request at 256 MiB. Config is applied last, so a data failure can't half-change
-  your settings)
+  categories applied and returns `{partial:true, committed:{…}}`. Import puts no
+  cap on the total request (a default install's own export outgrows any fixed one)
+  and bounds the pieces instead: 8 MiB per record, 256 MiB per JSON element
+  (413), 8 MiB per batch held in memory. In a file from Pingularity's own
+  exporter, config is applied last, so a data failure can't half-change your
+  settings; a hand-built or third-party file is applied in *its* key order, so put
+  `config` last yourself)
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 
 > All endpoints are **unauthenticated** by default; what protects a fresh
@@ -950,7 +1117,7 @@ flowchart LR
   events --> log["recent outages"]
 ```
 
-**The store is four independent time-series tables** (plus a key/value settings
+**The store is five independent time-series tables** (plus a key/value settings
 table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
 
 ```mermaid
@@ -971,6 +1138,10 @@ erDiagram
     int  ts
     text type "up | down"
     int  duration_s
+  }
+  pauses {
+    int  ts
+    int  duration_s "unobserved span: paused, scheduled-off, or process-down"
   }
   speed {
     int  ts

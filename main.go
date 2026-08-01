@@ -287,9 +287,23 @@ func (p *program) run(ctx context.Context) {
 		// New still returns a controller seeded with defaults, so log and proceed
 		// rather than crash on a transient read error. Same pre-level stderr
 		// treatment as above.
-		fmt.Fprintf(os.Stderr, "pingularity: WARNING: could not load settings; using defaults: %v\n", err)
+		// The web guard now REFUSES to serve on this controller rather than
+		// answering from defaults (see settings.Controller.Loaded): "no login
+		// configured" and "the login could not be read" are indistinguishable
+		// from here, and serving on the wrong one hands out an unauthenticated
+		// dashboard while the operator's password sits on disk.
+		//
+		// So the wording is no longer "using defaults" - nothing is served on
+		// them - and a retry is armed, because failing closed on a transient
+		// read error would otherwise cost the dashboard until someone noticed
+		// and sent SIGHUP. Monitoring is unaffected either way; it does not go
+		// through the guard.
+		fmt.Fprintf(os.Stderr, "pingularity: WARNING: could not load settings; refusing to serve the UI/API until they load: %v\n", err)
 		err := err
-		earlyLog = append(earlyLog, func() { p.log.Error("load settings; using defaults", "err", err) })
+		earlyLog = append(earlyLog, func() {
+			p.log.Error("load settings; refusing to serve until a reload succeeds", "err", err)
+		})
+		spawnLoop("settings-retry", func() { p.retrySettingsLoad(ctx, set) })
 	}
 
 	// Apply the saved log level now that settings are loaded (the logger starts
@@ -499,34 +513,41 @@ func (p *program) run(ctx context.Context) {
 	notifier := notify.New(set.WebhookURL, p.log)
 	spawnLoop("heartbeat", func() { p.runHeartbeat(ctx, set) })
 
-	// Periodic health digest (off/daily/weekly) to the same webhook.
-	dig := &digest.Manager{Store: p.store, Notify: notifier, Log: p.log, FreqFn: set.DigestFreq, EnabledFn: set.Monitoring, RetentionFn: set.DowntimeRetention}
+	// Periodic health digest (off/daily/weekly) to the same webhook. Deliberately
+	// NOT gated on set.Monitoring: the digest now states the span it observed, so a
+	// paused or scheduled-off period is reported honestly instead of either
+	// silently skipped (power button) or reported as a confident 100% (schedule).
+	dig := &digest.Manager{Store: p.store, Notify: notifier, Log: p.log, FreqFn: set.DigestFreq, RetentionFn: set.DowntimeRetention}
 	spawnLoop("digest", func() { dig.Loop(ctx) })
 
 	// Speedtest scheduler - always constructed so it can be toggled live.
 	tester := speedtest.NewOokla()
 	tester.ServerIDFn = set.SpeedServerID // honor the chosen server, live
-	// Auto server selection centres on, in order: a city the user searched, then
-	// the ISP's exit-router location (the last hop inside the ISP - a truer network
-	// origin than the public IP's geolocation), then the Cloudflare PoP (the same
-	// idea where a traceroute exit can't run - containers, non-Linux), then the
-	// public IP itself.
-	tester.AutoLocFn = func() (lat, lon float64, ok bool) {
-		if lat, lon, ok := set.AutoLocation(); ok {
-			return lat, lon, true
-		}
-		if ex := ni.Get().Exit; ex != nil && (ex.Lat != 0 || ex.Lon != 0) {
-			return ex.Lat, ex.Lon, true
-		}
-		if _, clat, clon, ok := netinfo.ColoCoord(ni.Get().CFColo); ok {
-			return clat, clon, true
-		}
-		return 0, 0, false
-	}
+	// Auto server selection: a city the user searched overrides everything
+	// (AutoLocFn - a statement of intent, not a hypothesis to measure).
+	// Otherwise the candidate cities the connection itself names - the exit
+	// router's, the ISP geolocation's, and the one the Ookla API places our
+	// address in - each contribute their closest servers to one deduplicated
+	// ping race, and the city whose server answers fastest becomes the centre
+	// (see speedtest.raceCities and autoOrigins).
+	tester.AutoLocFn = set.AutoLocation
+	tester.OriginsFn = func() []speedtest.Origin { return autoOrigins(ni.Get()) }
 	// The user's ISP name grants its own server a guaranteed lane in the
 	// auto-select ping race (an on-net server is the most likely winner). A
 	// stale or empty name is harmless - it only adds or skips one racer.
 	tester.ISPFn = func() string { return ni.Get().ISP }
+	// Whether there is any speed history yet. The first best-of round on a fresh
+	// install is the one that seeds the baseline later checks read, so it is
+	// decided on ping alone rather than on throughput nothing can vet yet (see
+	// firstRunByPing). Counted, not cached: it flips false->true after one run
+	// and the query is one indexed count per run, not per sample.
+	tester.PriorDataFn = func() bool {
+		c, err := p.store.TableCounts(context.Background())
+		if err != nil {
+			return true // cannot tell: assume history exists rather than re-seeding
+		}
+		return c["speed"] > 0
+	}
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer    // surface the live server during a run
 	tester.DirectionFn = set.SpeedDirection     // Ookla direction (per-engine; iperf3 has its own)
@@ -635,13 +656,50 @@ func (p *program) run(ctx context.Context) {
 	// loop, and the work they spawn touches the store - so route it through spawn()
 	// (not a bare `go`) so the shutdown drain waits for it before store.Close(). All
 	// of it honors ctx, so a cancelled refresh/run/alert returns inside the bound.
+	//
+	// Both jobs are rate-limited: a flapping link confirms a reconnect every few
+	// seconds and neither may be dispatched per flap (see reconnectGate). The two
+	// gates are separate so the cheap lookup and the expensive speedtest keep
+	// their own last-fire time and their own floor.
+	var netinfoGate, speedGate reconnectGate
 	m.OnReconnect = func() {
-		spawn(func() { ni.Refresh(ctx) })
+		// One clock reading for the whole callback, so the two gates and the speed
+		// schedule all judge the same instant.
+		now := time.Now()
+		if netinfoGate.allow(now, reconnectNetinfoGap) {
+			spawn(func() { ni.Refresh(ctx) })
+		} else {
+			// Flap storm: skip the lookups. The hourly netinfo loop is still the
+			// backstop, so the panel is never worse than an hour stale. Note a
+			// Refresh that no-ops (connection info off) also consumes the window -
+			// re-checking NetinfoEnabled here would duplicate the enable check
+			// netinfo deliberately centralizes in Refresh, for at most an extra
+			// few minutes of staleness after the toggle goes back on.
+			stats.Inc("netinfo.reconnect_suppressed")
+		}
 		// Independent of the Automatic (scheduled) toggle: run as long as monitoring
 		// (power) and on-reconnect are both on. The speed schedule (quiet hours) is
-		// still honored via SpeedAllowed.
-		if set.Monitoring() && set.SpeedtestOnReconnect() && set.SpeedAllowed(time.Now()) {
-			spawn(func() { sched.RunOnce(ctx, "reconnect") })
+		// still honored via SpeedAllowed. The gate is consulted LAST, after every
+		// setting that could veto the run: a trigger the settings already suppressed
+		// must not consume the window and space out the next allowed one.
+		if set.Monitoring() && set.SpeedtestOnReconnect() && set.SpeedAllowed(now) {
+			if speedGate.allow(now, reconnectSpeedGap(set.SpeedInterval())) {
+				spawn(func() {
+					// A dispatch that bounces off RunOnce's single-flight has measured
+					// nothing, so it must not consume the window: the run it collided
+					// with may have started BEFORE this reconnect, in which case it is
+					// measuring the link that was still down, and keeping the window
+					// would suppress the real recovery test for up to a day. Bounced
+					// dispatches are free (the busy check returns before any network
+					// work), so handing the window back cannot cost a flap storm
+					// anything.
+					if _, err := sched.RunOnce(ctx, "reconnect"); errors.Is(err, speedtest.ErrBusy) {
+						speedGate.release(now)
+					}
+				})
+			} else {
+				stats.Inc("speed.reconnect_suppressed") // too soon after the last reconnect test
+			}
 		}
 	}
 	// Degradation-triggered speedtest: when base latency stays high without fully
@@ -716,7 +774,10 @@ func (p *program) run(ctx context.Context) {
 	srv.SessionKey = sessionKey           // key-file-bound secret folded into session-token MACs (see tokenKey)
 	srv.MetricsToken = p.cfg.MetricsToken // optional read-only scrape credential for /metrics
 	srv.Update = upd                      // update status on /api/status + powers the toggle
-	srv.Logs = p.ring                     // backs the About-tab log viewer (/api/logs)
+	// The settings server-browsing list centres on the same candidates auto
+	// races, so the picker can never point at a city the race would not choose.
+	srv.AutoOriginsFn = tester.OriginsFn
+	srv.Logs = p.ring // backs the About-tab log viewer (/api/logs)
 	srv.OnLogClear = func() {
 		// The /api/logs clear already emptied the ring; rewrite the on-disk
 		// snapshot to match so a restart within the snapshot interval can't
@@ -761,6 +822,41 @@ func seedKnownCounters() {
 		"monitor.event_dropped",
 		"dns.attempts",
 		"speed.fail", "speed.errbusy", "speed.iperf_unavailable", "speed.iperf_partial",
+		// Reconnect triggers the spacing gates refused (see reconnectGate): a
+		// climbing rate is a flapping link, not a broken feature.
+		"speed.reconnect_suppressed", "netinfo.reconnect_suppressed",
+		// A run that had to start while a previous run's abandoned transfer was still
+		// moving bytes: those numbers read low. Climbing = someone is abort-storming.
+		"speed.overlapped_orphan", "speed.abandoned_resumed",
+		// A panic inside the measurement library, contained to its own transfer.
+		"speed.transfer_panic",
+		// A best-of round where one server reported a direction the rest of the
+		// round contradicts (a buffer-absorbing server counting bytes it never
+		// delivered). Climbing means a server near you is inflating results -
+		// worth knowing, because before the guard those rounds became history.
+		"speed.implausible_direction",
+		// The first best-of round on an install with no history, decided on ping
+		// alone so an unverifiable throughput reading cannot seed the baseline.
+		// Fires at most once per install; a nonzero value long after setup means
+		// history is being lost.
+		"speed.first_run_by_ping",
+		// A scheduled run dropped because another trigger (manual, reconnect,
+		// degraded) already held the single-flight. The slot is not retried, so a
+		// climbing rate explains gaps in an otherwise regular history.
+		"speed.scheduled_skipped",
+		// The auto city race: how many runs chose a centre by measurement, how
+		// many found nobody answering (a ping-hostile network - the condition
+		// worth alerting on, so its first occurrence after a restart must be
+		// visible), and how many skipped the race because no candidate city had
+		// a coordinate at all (a climbing rate means auto is running blind, e.g.
+		// connection-info lookups switched off).
+		"speed.cityrace_decided", "speed.cityrace_silent", "speed.cityrace_unanchored",
+		// A pause span that crossed a clock correction and was refused rather than
+		// recorded: expected once on an RTC-less boot, never in steady state.
+		"monitor.pause_clock_corrections",
+		// An unobserved stretch the store refused: retried until it lands, because
+		// dropping it makes coverage read HIGHER than the truth.
+		"monitor.unobserved_gap_retries", "monitor.unobserved_gap_refused",
 		"notify.outage_dropped",
 		"db.err", "db.busy", "db.io_err", "db.disk_full", "db.corrupt", "db.prune_count",
 		"db.prune_skipped_clock",
@@ -781,6 +877,43 @@ func seedKnownCounters() {
 	stats.Seed(names...)
 }
 
+// retrySettingsLoad re-attempts the initial settings read until it succeeds.
+//
+// It exists because the web guard fails CLOSED when settings never loaded: that
+// is the right call for a stored password, but on a transient fault - a lock the
+// busy timeout did not absorb, a passing I/O error - it would otherwise cost the
+// operator the whole UI and API until they noticed and sent SIGHUP. A read that
+// failed once is very likely to succeed shortly after, so retrying turns a
+// permanent outage back into a blip.
+//
+// Reload is the same call SIGHUP makes, and clears the flag on success. It stops
+// as soon as it wins: a controller that has loaded has nothing to retry, and a
+// later failure is a different problem with its own handling (settings writes
+// refuse, and Reload is not on any hot path).
+func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controller) {
+	const (
+		first = 5 * time.Second
+		max   = 5 * time.Minute
+	)
+	for wait := first; ; {
+		if !sleepCtx(ctx, wait) {
+			return
+		}
+		if set.Loaded() {
+			return // SIGHUP or an import beat us to it
+		}
+		if err := set.Reload(ctx); err == nil || errors.Is(err, settings.ErrLegacyReseal) {
+			p.log.Warn("settings loaded on retry; serving normally again")
+			return
+		} else {
+			p.log.Error("settings retry failed; still refusing to serve", "err", err, "next_try_in", wait)
+		}
+		if wait *= 2; wait > max {
+			wait = max
+		}
+	}
+}
+
 func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 	// cutoff returns the prune-before time for a window (epoch = keep forever).
 	cutoff := func(d time.Duration) time.Time {
@@ -799,6 +932,20 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 			p.log.Info("pruned old data", "rows", n)
 		}
 	}
+	// Deliberately NOT pruned here. Prune's own guard catches a clock that STEPS
+	// while we are running, by checking it against monotonic time - but a machine
+	// whose clock is already wrong at boot never steps, so there is nothing for
+	// that guard to see. Pruning is the one irreversible thing this process does
+	// on a schedule, and at t=0 it would run on the least trustworthy reading the
+	// process will ever hold: before NTP, on hardware that may have no RTC at all.
+	//
+	// So the first pass waits. Nothing is lost by it - the cleanup is idempotent
+	// and the ticker below repeats forever - and the wait is what turns "boots
+	// with a garbage RTC" from data loss into a delayed tidy-up, because time
+	// sync on a networked host (which a monitoring daemon is) lands inside it.
+	if !sleepCtx(ctx, pruneStartupGrace) {
+		return
+	}
 	prune()
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
@@ -809,6 +956,181 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		case <-t.C:
 			prune()
 		}
+	}
+}
+
+// pruneStartupGrace is how long the pruner waits before its first destructive
+// pass, giving time sync a chance to correct a boot clock. Comfortably longer
+// than NTP needs on a working network, and irrelevant on a healthy clock since
+// the work is a no-op cleanup either way.
+var pruneStartupGrace = 10 * time.Minute
+
+// sleepCtx waits d, reporting false if the context was cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// autoOrigins enumerates the candidate cities auto server selection races. Kept
+// as a plain function so the enumeration itself is tested rather than a copy of
+// it - the same reason listCentre is one.
+//
+// Each origin yields its OWN Ookla server list, and those lists are disjoint
+// rather than reordered: measured on a live connection, three candidate cities
+// returned 29, 20 and 20 servers with an empty pairwise intersection.
+// So choosing a centre decides which servers EXIST at all - which is why the
+// centre is raced (see speedtest.raceCities) rather than taken from a priority
+// cascade that measures nothing. Order here decides only what an unanswered
+// race falls back to (the exit router, the old cascade's answer); who wins is
+// decided by ping.
+//
+// EVERY ORIGIN HERE IS DERIVED FROM THE CONNECTION. A searched city is not one
+// of them: it is a statement of intent, wired through AutoLocFn, and it
+// bypasses the race. A pinned server (speed_server_id) overrides both.
+func autoOrigins(i netinfo.Info) []speedtest.Origin {
+	var out []speedtest.Origin
+	// The exit-node city: the last hop still inside the ISP, and the truest
+	// network origin we can name - when RIPE has a coordinate for it, which for
+	// a residential ISP's last hop it frequently does not (a hostname, no
+	// lat/lon).
+	if ex := i.Exit; ex != nil && (ex.Lat != 0 || ex.Lon != 0) {
+		out = append(out, speedtest.Origin{Kind: "exit", Label: ex.Loc, Lat: ex.Lat, Lon: ex.Lon, Anchored: true})
+	}
+	// The ISP city: the eyeball geolocation of our own public IP, the only
+	// origin that claims to describe where the SUBSCRIBER is. netinfo has
+	// always fetched it for the Connection panel and used to throw the
+	// coordinate away (see publicIPGeo), which is why the old cascade fell
+	// through to the Cloudflare PoP on exactly the links where the two
+	// disagree.
+	if i.Lat != 0 || i.Lon != 0 {
+		label := i.City
+		if label != "" && i.Country != "" {
+			label += ", " + i.Country
+		}
+		out = append(out, speedtest.Origin{Kind: "isp", Label: label, Lat: i.Lat, Lon: i.Lon, Anchored: true})
+	}
+	// The geo city: no centre of ours at all - the Ookla API geolocates our
+	// source address and returns the pool IT believes we belong to. Usually a
+	// duplicate of the ISP city's pool, which the union dedupe collapses for
+	// free; on CGNAT or a tunnelled link it is not, and it is the only origin
+	// that reflects the server operator's own opinion of where we are rather
+	// than ours.
+	out = append(out, speedtest.Origin{Kind: "geo", Label: "your connection"})
+	return out
+}
+
+// Minimum spacing for the work a reconnect triggers (see m.OnReconnect in run).
+// The callback fires on every confirmed down->up transition, and a marginal
+// DSL/Wi-Fi/PPPoE link with the shipped defaults (5s interval, down_after 2,
+// up_after 1) confirms one roughly every 15s for as long as it flaps - so
+// without a floor the trigger dispatches a full speedtest and a full round of
+// third-party lookups per flap. Neither is survivable: consecutive speedtests
+// burn the data allowance this product itself meters (see
+// pingularity_speed_data_used_bytes), compete with the link that is trying to
+// recover, and measure a link that is still flapping - garbage numbers at the
+// highest possible cost; the lookups are cheap but there are ~4 per refresh and
+// a third party is entitled to answer 429. RunOnce's single-flight only prevents
+// OVERLAP, which is why it never bounded any of this: the run after an ErrBusy
+// starts the instant the previous one ends.
+const (
+	// reconnectNetinfoGap floors the reconnect connection-info refresh. Far
+	// cheaper than a speedtest (a handful of small HTTPS requests, no bulk
+	// transfer) and far more time-sensitive - a new PPPoE session usually means a
+	// new public IP, and showing the old one is a visible lie - so it gets its own
+	// short floor rather than the speedtest's. At 5 minutes a flap storm costs
+	// ~12 refreshes an hour instead of ~240, which keeps the per-provider request
+	// rate inside the free tiers these endpoints hand out.
+	reconnectNetinfoGap = 5 * time.Minute
+
+	// minReconnectSpeedGap is the hard floor between reconnect-triggered
+	// speedtests: 15 minutes, i.e. the larger of 15x the smallest schedule the
+	// settings layer will accept (settings.MinSpeed / config.MinSpeedInterval =
+	// 1m) and a quarter of the shipped hourly schedule. A run moves hundreds of
+	// megabytes and takes 30-60s, so this is the shortest spacing that is still
+	// defensible on a metered LTE/5G backup link.
+	minReconnectSpeedGap = 15 * time.Minute
+)
+
+// reconnectSpeedGap returns the minimum spacing between reconnect-triggered
+// speedtests for a configured scheduled interval.
+//
+// The constant above is a floor, not the answer: the interval the user
+// configured is their own statement of how much data and how much link
+// contention a speedtest is worth, and someone who asked for one test every 6
+// hours plainly does not want this trigger running one every 15 minutes behind
+// their back. So take the larger of the two - the reconnect trigger never fires
+// more often than either the hard floor or the user's own cadence. Reading the
+// interval as a BUDGET rather than as a schedule is what keeps this consistent
+// with the trigger being independent of SpeedtestEnabled (a stock install ships
+// scheduled tests off and on-reconnect on, config.Default): the number still
+// says what a test is worth to them, whether or not it is also a schedule.
+// settings clamps Speed to MinSpeed..MaxSpeed (1m..24h), so the result is
+// bounded at one reconnect test per day in the worst case.
+func reconnectSpeedGap(interval time.Duration) time.Duration {
+	if interval > minReconnectSpeedGap {
+		return interval
+	}
+	return minReconnectSpeedGap
+}
+
+// reconnectGate spaces out one kind of reconnect-triggered work. Extracted from
+// run() for the same reason as defaultSettings below: policy buried in a 600-line
+// closure is policy no test can reach, and this one only misbehaves during a flap
+// storm that no unit test would otherwise reproduce. See main_reconnect_test.go.
+//
+// The zero value is an OPEN gate. The first reconnect of a process must never be
+// suppressed - measuring the link right after it recovers is the entire point of
+// the trigger, and it is on by default - so only a recorded previous fire can
+// close it.
+//
+// allow takes now rather than reading the clock itself so the policy is testable
+// with a fake one; the caller passes time.Now(), whose monotonic reading makes
+// the comparison immune to a wall-clock step (an NTP correction must not open or
+// wedge the gate).
+type reconnectGate struct {
+	// OnReconnect runs on the monitor goroutine today, so the lock is uncontended -
+	// but a gate whose safety depends on which goroutine its caller happens to be
+	// is a trap for the next call site, and this type is meant to be reused.
+	mu   sync.Mutex
+	last time.Time // zero = never fired, i.e. open
+}
+
+// allow reports whether the gated work may run at now, given a minimum spacing
+// of min, and records the fire when it says yes. A SUPPRESSED call records
+// nothing: the window is measured from the last thing that actually ran, so a
+// link flapping faster than the window cannot slide it forward forever and
+// starve the trigger completely.
+func (g *reconnectGate) allow(now time.Time, min time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.last.IsZero() && now.Sub(g.last) < min {
+		return false
+	}
+	g.last = now
+	return true
+}
+
+// release gives back a window that allow() reserved for work which then turned
+// out not to happen. It only rewinds if `now` is still the recorded fire, so a
+// later allow() that has already claimed the gate is never undone.
+//
+// This exists for the ErrBusy case. Reserving the window at dispatch and keeping
+// it regardless assumed the run we collided with is measuring the same recovery -
+// but a scheduled run that STARTED BEFORE the link came back is measuring the
+// link that was still broken. Keeping the window then suppressed the reconnect
+// test for up to a day on the strength of a measurement of the wrong thing.
+// Giving it back costs nothing: a bounced dispatch never reached the network.
+func (g *reconnectGate) release(now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.last.Equal(now) {
+		g.last = time.Time{}
 	}
 }
 
@@ -1339,8 +1661,9 @@ Run flags (all optional - defaults work with no flags):
                             off by default. Reconnect-triggered tests are
                             separate: see -speedtest-on-reconnect)
   -speedtest-interval dur   Time between scheduled speedtests (default 1h; 1m-24h)
-  -speedtest-on-reconnect=false  Don't run a speedtest after each reconnect
-                            (they are on by default, independent of -speedtest)
+  -speedtest-on-reconnect=false  Don't run a speedtest after a reconnect
+                            (on by default, independent of -speedtest; rate-limited
+                            to one per -speedtest-interval, or per 15m if shorter)
   -latency=false            Disable latency probing (speedtest-only mode)
   -retain dur               Prune latency samples older than this
                             (default 720h = 30 days; 0 = forever)

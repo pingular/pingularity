@@ -36,6 +36,8 @@ type Info struct {
 	ISP                string    `json:"isp"`
 	City               string    `json:"city"`
 	Country            string    `json:"country"`
+	Lat                float64   `json:"lat,omitempty"` // where the geo provider puts City - a candidate centre for auto server selection (see publicIPGeo)
+	Lon                float64   `json:"lon,omitempty"` // 0,0 = the provider named a city but no position; not a coordinate
 	DNSUpstream        *DNSEntry `json:"dns_upstream,omitempty"`
 	DNSConfigured      []string  `json:"dns_configured,omitempty"`       // resolvers set on the host (resolv.conf), vs the egress above
 	DNSConfiguredLabel string    `json:"dns_configured_label,omitempty"` // those resolvers' provider names, deduped (e.g. "NextDNS, Inc."); IPs when un-nameable
@@ -95,6 +97,24 @@ type Manager struct {
 	// or blackout. Guarded by mu; see fetch's IPv6-only flip rule.
 	v4MissSince time.Time
 	v4MissLast  time.Time
+
+	// coordTriedIP/coordTriedAt throttle the cached-city COORDINATE recovery:
+	// the public IP it last ran for, and when. Without a throttle the recovery
+	// never cancels, because publicIPGeo answers ok=true for a city it cannot
+	// place (a null latitude, geojs' unparseable strings), leaving the "no
+	// coordinate yet" condition still true after the query - a keyless
+	// third-party GET per refresh, forever. The same trap egressGeo's per-IP
+	// cache exists to avoid, and it is throttled the same way rather than spent
+	// once, because "the provider did not answer" is not "the provider cannot
+	// place this address": a 429, a timeout or an outage must not disable a
+	// load-bearing origin for the life of the IP.
+	//
+	// Recorded only when the attempt did NOT yield a usable coordinate, so a
+	// lookup that succeeded but whose refresh was superseded before it could
+	// publish (see claimPublish) leaves the next fetch free to ask again.
+	// Guarded by mu.
+	coordTriedIP string
+	coordTriedAt time.Time
 
 	// egressGeo caches the DNS-egress location per IP (an IP's geo doesn't move),
 	// so a flipping/rotating egress doesn't re-hit rate-limited RIPE IPmap or
@@ -224,6 +244,33 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 // nextGen claims this refresh's generation at its start. A later-started refresh
 // gets a higher number and so outranks an earlier one regardless of finish order.
 func (m *Manager) nextGen() uint64 { return m.gen.Add(1) }
+
+// coordRetryInterval is how long a fruitless coordinate recovery stands before
+// it is worth asking again. It matches egressLocRevalidate's reasoning: an IP's
+// placement does not move, so re-asking buys nothing on the timescale of a
+// fetch, while never re-asking turns one bad minute at a provider into a
+// permanently missing origin.
+const coordRetryInterval = time.Hour
+
+// coordRetryDue reports whether the coordinate recovery for ip may run now.
+// Read-only: the attempt is recorded by noteCoordMiss, and only when it failed
+// to produce a coordinate, so nothing is spent before its outcome is known.
+func (m *Manager) coordRetryDue(ip string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.coordTriedIP != ip || time.Since(m.coordTriedAt) >= coordRetryInterval
+}
+
+// noteCoordMiss records that a recovery for ip ran and did not come back with a
+// usable coordinate - whether because the providers place the address nowhere,
+// or because they did not answer at all. Both are retried on the interval; the
+// difference between them is not observable from here, and treating the second
+// as permanent is what made a transient outage disable the ISP origin for good.
+func (m *Manager) noteCoordMiss(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.coordTriedIP, m.coordTriedAt = ip, time.Now()
+}
 
 // claimPublish reports whether a refresh at generation g may still commit an
 // externally-visible effect - true only while no later-started refresh has
@@ -403,6 +450,8 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 		ip4Host string // reverse DNS of ip4
 		ip4City string
 		ip4Ctry string
+		ip4Lat  float64 // the geo provider's coordinate for ip4City (0,0 = none)
+		ip4Lon  float64
 		v6      string
 		colo    string
 		dns     *DNSEntry
@@ -420,12 +469,31 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 		// when the IP does, so the Cymru/geo/rDNS lookups run rarely. Geo and rDNS
 		// re-run while blank: a provider outage at the IP-change moment must not
 		// lock in an empty city/hostname until the next IP change.
+		//
+		// A city with NO COORDINATE gets ONE recovery lookup, because the
+		// coordinate is load-bearing now (it anchors the ISP city in auto server
+		// selection) and there are ordinary ways to cache one without it: a geo
+		// provider that names a city but returns no position, and - structurally
+		// - the persisted last-known identity, which is built from a speed sample
+		// and so has no coordinate to carry at all. Without any retry, one failed
+		// IP echo publishes a city at 0,0 and the ISP city is dropped from the
+		// race for the life of that IP. Bounded rather than repeated (see
+		// claimCoordRetry): an answer that names a city and cannot place it is
+		// the provider's final word, and re-asking it every fetch would buy
+		// nothing at a keyless third party's expense. A still-blank CITY keeps
+		// retrying unbounded as before - || short-circuits, so it never spends
+		// the claim - because a blank city means the lookup did not land at all.
 		if prev.PublicIP == ip4 && prev.ISP != "" {
 			ip4ISP, ip4Host = prev.ISP, prev.Hostname
 			ip4City, ip4Ctry = prev.City, prev.Country
-			if ip4City == "" {
-				if city, ctry, ok := publicIPGeo(ctx, m, ip4); ok {
-					ip4City, ip4Ctry = city, ctry
+			ip4Lat, ip4Lon = prev.Lat, prev.Lon
+			if ip4City == "" || (ip4Lat == 0 && ip4Lon == 0 && m.coordRetryDue(ip4)) {
+				city, ctry, la, lo, ok := publicIPGeo(ctx, m, ip4)
+				if ok {
+					ip4City, ip4Ctry, ip4Lat, ip4Lon = city, ctry, la, lo
+				}
+				if la == 0 && lo == 0 {
+					m.noteCoordMiss(ip4)
 				}
 			}
 			if ip4Host == "" {
@@ -441,8 +509,8 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 				ip4ISP += " " + name
 			}
 		}
-		if city, ctry, ok := publicIPGeo(ctx, m, ip4); ok {
-			ip4City, ip4Ctry = city, ctry
+		if city, ctry, la, lo, ok := publicIPGeo(ctx, m, ip4); ok {
+			ip4City, ip4Ctry, ip4Lat, ip4Lon = city, ctry, la, lo
 		}
 		// rdns has its own 1.5s timeout. ctx has no deadline on the Loop or
 		// post-speedtest paths, so without it a blackholed reverse zone would
@@ -535,6 +603,7 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 	case ip4 != "":
 		info.PublicIP, info.Hostname, info.ISP = ip4, ip4Host, ip4ISP
 		info.City, info.Country = ip4City, ip4Ctry
+		info.Lat, info.Lon = ip4Lat, ip4Lon
 		// IP echo succeeded but the Cymru ISP lookup failed (blank ISP): fill it
 		// from speed history for this same IP, and if still blank flag the snapshot
 		// so Loop retries at the faster errRetryStale cadence instead of waiting a
@@ -562,6 +631,7 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 			// moment prev's ISP/geo/hostname came from the dead IPv4.
 			info.Hostname, info.ISP = prev.Hostname, prev.ISP
 			info.City, info.Country = prev.City, prev.Country
+			info.Lat, info.Lon = prev.Lat, prev.Lon
 		}
 		if info.ISP == "" {
 			if asn := cymruASN(ctx, v6); asn != "" {
@@ -582,9 +652,18 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 				info.Error = "isp lookup failed"
 			}
 		}
-		if info.City == "" {
-			if city, ctry, ok := publicIPGeo(ctx, m, v6); ok {
+		// Same rule as the IPv4 branch, bounded the same way: a cached city with
+		// no coordinate is not a complete answer, because the coordinate anchors
+		// the ISP city in auto server selection - but one lookup settles whether
+		// this address can be placed at all.
+		if info.City == "" || (info.Lat == 0 && info.Lon == 0 && m.coordRetryDue(v6)) {
+			city, ctry, la, lo, ok := publicIPGeo(ctx, m, v6)
+			if ok {
 				info.City, info.Country = city, ctry
+				info.Lat, info.Lon = la, lo
+			}
+			if la == 0 && lo == 0 {
+				m.noteCoordMiss(v6)
 			}
 		}
 		if info.Hostname == "" {
@@ -606,6 +685,7 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 		}
 		info.PublicIP, info.Hostname, info.ISP = src.PublicIP, src.Hostname, src.ISP
 		info.City, info.Country = src.City, src.Country
+		info.Lat, info.Lon = src.Lat, src.Lon
 	}
 	// Carry forward fields whose empty value only means "lookup failed" (not a
 	// real state), so a transient failure doesn't vanish a row. IPv6 is excluded:

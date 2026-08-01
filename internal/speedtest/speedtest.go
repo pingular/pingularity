@@ -19,16 +19,22 @@ type Result struct {
 	DownloadBytes int64    // bytes received during the download test
 	UploadBytes   int64    // bytes delivered during the upload test (sender-side for Ookla)
 
+	// PingBestMS is the fastest of the samples PingMS averages; nil when the engine
+	// reports no per-sample values (iperf3). See store.SpeedSample.PingBestMS for
+	// why the decisions use the floor and the report keeps the mean.
+	PingBestMS *float64
+
 	// Latency under load (see lul.go): medians of TCP-connect RTTs to a fixed anycast
 	// target - idle just before the transfers, then during each phase. Loaded minus idle
 	// is the bufferbloat. nil when unmeasurable (phase too short, too few samples, target
-	// unreachable). The Max fields are the worst single sample in each phase - the spike
-	// real-time apps actually feel.
+	// unreachable). The P95 fields are the 95th percentile (nearest-rank) of each phase -
+	// the sustained bad end of the distribution, not the single worst sample, which on a
+	// TCP-connect probe is usually a SYN retransmission rather than queue delay.
 	IdleMS          *float64
 	LoadedDownMS    *float64
 	LoadedUpMS      *float64
-	LoadedDownMaxMS *float64
-	LoadedUpMaxMS   *float64
+	LoadedDownP95MS *float64
+	LoadedUpP95MS   *float64
 }
 
 // Tester runs one measurement. Implemented by Ookla and Iperf.

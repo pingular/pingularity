@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -76,6 +77,8 @@ type StatusFunc func() LiveStatus
 type SpeedTrigger interface {
 	RunOnce(ctx context.Context, reason string) (store.SpeedSample, error)
 	Running() bool
+	RunID() uint64
+	Abort(id uint64) bool
 	CurrentServer() string
 	NextRun() time.Time
 }
@@ -113,6 +116,15 @@ type Server struct {
 	// -allow-host before Serve; nil is fine.
 	AllowedHosts []string
 
+	// AutoOriginsFn enumerates the candidate cities auto server-selection races
+	// - main's autoOrigins, the same closure the tester gets, so the two cannot
+	// drift. The settings server-BROWSING list centres on the first of them
+	// carrying a coordinate. Asking main rather than re-deriving it here IS the
+	// repair: this handler used to run its own cascade and the two agreed on
+	// nothing. Nil leaves the list uncentred, which is the unanchored candidate
+	// and an honest answer.
+	AutoOriginsFn func() []speedtest.Origin
+
 	// SessionKey is an independent secret (derived from the key file beside the DB
 	// via secret.Box.DeriveSubkey) folded into every session-token MAC, so a
 	// DB-only copy - which holds the bcrypt hash but not the key file - can't forge
@@ -144,6 +156,18 @@ type Server struct {
 	// viewer (/api/logs). Set by main before Serve; nil-checked.
 	Logs *logbuf.Ring
 
+	// importMu serializes a restore's settings reconcile against credential changes
+	// (POST /api/access). Without it the reconcile has to GUESS whether a username
+	// it did not expect came from the backup or from the operator, and it guessed
+	// wrong for a password-only rotation - which keeps the username by design, so
+	// the password hash moved while the name did not.
+	importMu sync.Mutex
+	// reconciling is true while imported settings are live but the safety repair has
+	// not finished. The guard treats it as local-only, because during that window
+	// the box is running on whatever the backup said - and a backup taken from an
+	// open machine says "no login, reachable from the network".
+	reconciling atomic.Bool
+
 	// OnLogClear, when set, runs after the /api/logs clear branch empties the
 	// in-memory ring, so main can also drop the on-disk logs.txt snapshot that
 	// would otherwise resurrect the cleared lines after an unclean restart. Nil is
@@ -166,12 +190,14 @@ type Server struct {
 	// Cached status aggregates: uptime windows scan the outage events table, the
 	// data totals/averages scan the speed table. Recomputed at most once per
 	// aggTTL instead of on every status poll.
-	aggMu     sync.Mutex
-	aggAt     time.Time
-	aggBusy   bool   // a recompute is in flight; others serve the stale cache
-	aggGen    uint64 // bumped by invalidators; an in-flight recompute that started before the bump can't re-stamp aggAt
+	aggMu   sync.Mutex
+	aggAt   time.Time
+	aggBusy bool   // a recompute is in flight; others serve the stale cache
+	aggGen  uint64 // bumped by invalidators; an in-flight recompute that started before the bump can't re-stamp aggAt
+	// One Observation per window, ratio and coverage together: the cache cannot
+	// hold a ratio whose coverage was dropped on the way in (it used to hold two
+	// parallel store.Uptime values, and only /metrics ever read the second).
 	uptime    store.Uptime
-	uptimeCov store.Uptime // per-window observation coverage (0..1); a 0 window is omitted from /metrics
 	dataBytes int64
 	avgDownB  int64
 	avgUpB    int64
@@ -206,7 +232,7 @@ const aggTTL = 30 * time.Second
 
 // aggregates returns the cached status figures (uptime ratios + speedtest data
 // totals/averages), recomputing only when the cache has expired.
-func (s *Server) aggregates() (uptime, uptimeCov store.Uptime, dataBytes, avgDown, avgUp int64, usage store.DataUsage) {
+func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp int64, usage store.DataUsage) {
 	s.aggMu.Lock()
 	fresh := !s.aggAt.IsZero() && time.Since(s.aggAt) < aggTTL
 	// Serve the cache when fresh, or when stale but another caller is already
@@ -218,7 +244,7 @@ func (s *Server) aggregates() (uptime, uptimeCov store.Uptime, dataBytes, avgDow
 	// redundant scan at cold start; the aggGen guard keeps the re-stamp honest).
 	if (fresh || s.aggBusy) && !s.aggAt.IsZero() {
 		defer s.aggMu.Unlock()
-		return s.uptime, s.uptimeCov, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+		return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
 	}
 	// This goroutine owns the recompute; run the scans without the lock so other
 	// callers keep serving the cache. Always release ownership, even on a scan
@@ -237,7 +263,7 @@ func (s *Server) aggregates() (uptime, uptimeCov store.Uptime, dataBytes, avgDow
 	scanCtx, cancel := context.WithTimeout(context.Background(), aggTTL)
 	defer cancel()
 	now := time.Now()
-	nUptime, nUptimeCov, e1 := s.store.UptimeWindows(scanCtx, now, s.settings.DowntimeRetention())
+	nUptime, e1 := s.store.UptimeWindows(scanCtx, now, s.settings.DowntimeRetention())
 	nUsage, e3 := s.store.SpeedDataUsage(scanCtx, now)
 	nAvgDown, nAvgUp, e2 := s.store.SpeedAvgBytes(scanCtx)
 	// The store has no logger, so time its aggregate scans here - a slow refresh is
@@ -254,7 +280,6 @@ func (s *Server) aggregates() (uptime, uptimeCov store.Uptime, dataBytes, avgDow
 		s.log.Warn("aggregate refresh failed; serving previous values", "err", err)
 	} else {
 		s.uptime = nUptime
-		s.uptimeCov = nUptimeCov
 		s.usage = nUsage
 		s.dataBytes = nUsage.All
 		s.avgDownB, s.avgUpB = nAvgDown, nAvgUp
@@ -265,7 +290,7 @@ func (s *Server) aggregates() (uptime, uptimeCov store.Uptime, dataBytes, avgDow
 			s.aggAt = now
 		}
 	}
-	return s.uptime, s.uptimeCov, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+	return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
 }
 
 // targetGrace is how far a target's newest sample may lag the newest round
@@ -296,6 +321,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/speed/usage", s.handleSpeedUsage)
 	mux.HandleFunc("/api/notify/test", s.handleNotifyTest)
 	mux.HandleFunc("/api/speedtest", s.handleSpeedtest)
+	mux.HandleFunc("/api/speedtest/abort", s.handleSpeedtestAbort)
 	mux.HandleFunc("/api/speedtest/servers", s.handleSpeedtestServers)
 	mux.HandleFunc("/api/iperf/check", s.handleIperfCheck)
 	mux.HandleFunc("/api/heatmap", s.handleHeatmap)
@@ -318,8 +344,23 @@ func (s *Server) Handler() http.Handler {
 	// guard applies the loopback-only filter and authentication to every route;
 	// securityHeaders stamps its headers on every response, including guard
 	// rejections; logRequests wraps it all (outermost) so even rejected
-	// requests are logged at debug.
-	return s.logRequests(securityHeaders(writeDeadline(s.guard(mux))))
+	// requests are logged at debug. compressResponses sits near the routes: it
+	// needs the handler's own Content-Type/Content-Encoding to decide, and guard's
+	// rejections are a few bytes each anyway.
+	//
+	// recoverPanics is INSIDE compressResponses on purpose - a defer that
+	// finalizes the response must not run before the recover that sets its status.
+	// See recoverPanics.
+	return s.middleware(mux)
+}
+
+// middleware wraps a route handler in the full production chain. It is a named
+// function rather than an expression inside Handler so a test can put its own
+// handler through the REAL ordering: the panic/compression interaction this
+// ordering exists to fix is invisible to a test that composes the chain by hand
+// and drifts from it.
+func (s *Server) middleware(routes http.Handler) http.Handler {
+	return s.logRequests(securityHeaders(writeDeadline(s.guard(compressResponses(s.recoverPanics(routes))))))
 }
 
 // securityHeaders adds defense-in-depth headers to every response: nosniff
@@ -404,7 +445,7 @@ const baselineWriteWindow = 3 * time.Minute
 // exempt from baselineWriteWindow.
 func selfPacedPath(p string) bool {
 	switch p {
-	case "/api/speedtest", "/api/speedtest/servers", "/api/netinfo",
+	case "/api/speedtest", "/api/speedtest/abort", "/api/speedtest/servers", "/api/netinfo",
 		"/api/iperf/check", "/api/export", "/api/import",
 		"/api/speed/runs.csv", "/api/update", "/api/notify/test":
 		return true
@@ -560,6 +601,279 @@ func (r *statusRecorder) WriteHeader(code int) { r.status = code; r.ResponseWrit
 // extension silently fails whenever debug logging is on).
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// compressMinBytes is the response size below which gzip is skipped. Three
+// reasons for 1 KiB rather than something smaller:
+//   - gzip's header+trailer is 18 bytes before any deflate framing, so a short
+//     body can come back BIGGER than it went in. /api/heatmap's empty answer is
+//     87 bytes and gzips to 95.
+//   - a sub-1 KiB body already fits in one TCP segment (a 1500-byte MTU leaves
+//     ~1460 bytes of payload), so compressing it removes no round trip - it just
+//     spends CPU on both ends.
+//   - it is the same order as the tuned gzip_min_length operators put on nginx
+//     (whose own default of 20 is widely treated as a footgun).
+//
+// The endpoints this exists for are all far above it: /api/speed is 82 KB,
+// /api/series 101 KB, /api/speed/runs 35 KB, /api/status 2 KB.
+const compressMinBytes = 1024
+
+// gzipPool recycles gzip writers: a level-6 deflate state is a ~260 KB
+// allocation, and the pollers hit these endpoints every few seconds per open
+// tab. gzip.Writer.Reset makes reuse safe.
+var gzipPool = sync.Pool{New: func() any {
+	zw, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+	return zw
+}}
+
+// streamsBody reports whether a path writes its response incrementally under a
+// progress-refreshed write deadline (exportDeadlineBumper). These are EXCLUDED
+// from compression rather than wrapped: their whole design is to hold O(1) rows
+// in memory while a slow client drains them, and the deadline is rearmed per
+// flushed chunk. Putting a compressor in that path would (a) interpose a deflate
+// window between the row iterator and the socket, so "bytes moved" - which is
+// what the bumper is really measuring - stops meaning what it means today, and
+// (b) buy little: both are one-shot manual downloads, not the polled endpoints
+// that re-transfer the same payload every few seconds. The rest of the API,
+// including /metrics, goes through the compressor.
+func streamsBody(p string) bool {
+	switch p {
+	case "/api/export", "/api/speed/runs.csv":
+		return true
+	}
+	return false
+}
+
+// compressible reports whether a status code may carry a body worth encoding.
+// 204 and 304 must not have one at all, and a 1xx is informational - stamping
+// Content-Encoding on any of them is a protocol error, not an optimization.
+func compressible(status int) bool {
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
+}
+
+// compressResponses gzips eligible responses. It sits between the mux and the
+// rest of the chain and is deliberately conservative: it holds the first
+// compressMinBytes of body back to learn how big the response actually is, and
+// only then decides. A response that never reaches the threshold is passed
+// through byte-for-byte with no Content-Encoding, so small answers cost one
+// buffer copy and nothing else.
+func compressResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// HEAD has no body to compress; the only effect would be on advisory
+		// headers, and serveUI already computes its own for HEAD.
+		if r.Method == http.MethodHead || !acceptsGzip(r) || streamsBody(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The chosen representation depends on Accept-Encoding whichever way the
+		// size decision falls, so a shared cache must key on it. Add (not Set) to
+		// avoid clobbering a Vary a handler may already have set.
+		addVary(w.Header(), "Accept-Encoding")
+		gw := &gzipWriter{ResponseWriter: w, status: http.StatusOK}
+		defer gw.close()
+		next.ServeHTTP(gw, r)
+	})
+}
+
+// addVary appends a field name to Vary unless it is already listed.
+func addVary(h http.Header, field string) {
+	for _, v := range h.Values("Vary") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), field) {
+				return
+			}
+		}
+	}
+	h.Add("Vary", field)
+}
+
+// gzipWriter is the deferred-decision compressing ResponseWriter behind
+// compressResponses.
+//
+// It buffers plaintext into sniff until either compressMinBytes is reached (so
+// compression is worth it) or the handler finishes (so the exact size is known).
+// Compressed output then accumulates in buf so the response can carry a real
+// Content-Length instead of falling back to chunked - the body was already fully
+// materialized in memory by the handler, and buf holds the COMPRESSED bytes,
+// which are several times smaller than the slice the handler built.
+//
+// A handler that calls Flush is telling us it wants bytes on the wire now, so
+// that abandons the Content-Length path and streams from there on (see flush).
+type gzipWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool // the handler called WriteHeader
+
+	decided bool // the compress/passthrough choice has been made
+	plain   bool // decided: pass through uncompressed
+	sniff   []byte
+	gz      *gzip.Writer
+	buf     bytes.Buffer // compressed bytes held back for Content-Length
+	stream  bool         // Flush forced the body out; no Content-Length
+	sentHdr bool         // inner WriteHeader has been called
+}
+
+// Unwrap keeps http.NewResponseController's search reaching the real conn
+// through this wrapper - the same contract statusRecorder documents. Without it
+// the write deadlines writeDeadline installs would silently stop being settable
+// for every compressed route.
+func (g *gzipWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
+func (g *gzipWriter) WriteHeader(code int) {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader, g.status = true, code
+	// A bodyless or informational status is passed straight through: there is
+	// nothing to encode and the header must not claim otherwise.
+	if !compressible(code) {
+		g.decide(true)
+	}
+	// Otherwise the inner WriteHeader is deferred until the decision, because
+	// compressing has to Del Content-Length and Set Content-Encoding first.
+}
+
+func (g *gzipWriter) Write(p []byte) (int, error) {
+	if !g.wroteHeader {
+		g.wroteHeader = true
+	}
+	if !g.decided {
+		// Buffer only as far as the DECISION needs, never the whole write. The
+		// threshold is 1 KiB, so appending all of p first meant a handler that wrote
+		// its body in one call - the JSON endpoints marshal into a single buffer and
+		// hand it over whole - held a second full copy of a multi-megabyte response
+		// purely to answer "is this at least 1 KiB?". The answer is known after the
+		// first KiB; everything past it goes straight to the writer decide picks.
+		need := compressMinBytes - len(g.sniff)
+		if len(p) < need {
+			g.sniff = append(g.sniff, p...)
+			return len(p), nil
+		}
+		g.sniff = append(g.sniff, p[:need]...)
+		g.decide(false) // drains sniff into the chosen writer
+		if rest := p[need:]; len(rest) > 0 {
+			if _, err := g.writeDecided(rest); err != nil {
+				return 0, err
+			}
+		}
+		return len(p), nil
+	}
+	return g.writeDecided(p)
+}
+
+// writeDecided sends bytes to whichever writer decide settled on.
+func (g *gzipWriter) writeDecided(p []byte) (int, error) {
+	if g.plain {
+		return g.ResponseWriter.Write(p)
+	}
+	return g.gz.Write(p)
+}
+
+// decide settles compress-vs-passthrough. plain forces passthrough (a bodyless
+// status, an already-encoded body, or a body that stayed under the threshold).
+func (g *gzipWriter) decide(plain bool) {
+	if g.decided {
+		return
+	}
+	g.decided = true
+	h := g.Header()
+	// Never double-encode: serveUI serves the precompressed dashboard and sets
+	// Content-Encoding itself, and any future handler that does the same is
+	// likewise left alone.
+	if plain || h.Get("Content-Encoding") != "" {
+		g.plain = true
+		g.sendHeader()
+		g.flushSniff()
+		return
+	}
+	// Content-Type must be pinned from the PLAINTEXT before any deflate byte
+	// reaches the inner writer: net/http sniffs the first 512 bytes it is given,
+	// and handed gzip it would label a JSON response application/x-gzip.
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", http.DetectContentType(g.sniff))
+	}
+	h.Del("Content-Length") // whatever the handler declared describes the plaintext
+	h.Set("Content-Encoding", "gzip")
+	g.gz = gzipPool.Get().(*gzip.Writer)
+	g.gz.Reset(&g.buf)
+	if len(g.sniff) > 0 {
+		_, _ = g.gz.Write(g.sniff)
+	}
+	g.sniff = nil
+}
+
+// sendHeader calls the inner WriteHeader exactly once.
+func (g *gzipWriter) sendHeader() {
+	if g.sentHdr {
+		return
+	}
+	g.sentHdr = true
+	g.ResponseWriter.WriteHeader(g.status)
+}
+
+// flushSniff drains the held-back plaintext to the inner writer.
+func (g *gzipWriter) flushSniff() {
+	if len(g.sniff) > 0 {
+		_, _ = g.ResponseWriter.Write(g.sniff)
+		g.sniff = nil
+	}
+}
+
+// Flush implements http.Flusher, which is also what http.NewResponseController
+// finds first when it walks this wrapper. A flush means the handler wants bytes
+// delivered now, so the Content-Length optimization is dropped and everything
+// buffered so far goes out; from here the response streams.
+func (g *gzipWriter) Flush() {
+	if !g.decided {
+		// Under the threshold at flush time, so the size test has failed on the
+		// evidence available: send it uncompressed rather than betting on more.
+		g.decide(len(g.sniff) < compressMinBytes)
+	}
+	if g.plain {
+		g.sendHeader()
+		g.flushSniff()
+	} else {
+		g.stream = true
+		_ = g.gz.Flush()
+		g.sendHeader()
+		if g.buf.Len() > 0 {
+			_, _ = g.ResponseWriter.Write(g.buf.Bytes())
+			g.buf.Reset()
+		}
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// close finalizes the response. Called from compressResponses' defer, so it runs
+// even when a handler panics after writing.
+func (g *gzipWriter) close() {
+	if !g.decided {
+		// Nothing more is coming, so sniff is the WHOLE body and the threshold
+		// test is exact rather than a prefix guess.
+		g.decide(len(g.sniff) < compressMinBytes)
+	}
+	if g.plain {
+		// A handler that wrote nothing and never set a status leaves the inner
+		// writer untouched, so net/http still emits its own default.
+		if g.wroteHeader {
+			g.sendHeader()
+		}
+		g.flushSniff()
+		return
+	}
+	_ = g.gz.Close()
+	g.gz.Reset(io.Discard) // drop the reference to buf before pooling
+	gzipPool.Put(g.gz)
+	g.gz = nil
+	if !g.stream {
+		g.Header().Set("Content-Length", strconv.Itoa(g.buf.Len()))
+	}
+	g.sendHeader()
+	if g.buf.Len() > 0 {
+		_, _ = g.ResponseWriter.Write(g.buf.Bytes())
+	}
+}
+
 // Serve runs the HTTP server until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, addr string) error {
 	s.listenAddr = addr // set before serving; handlers read it for the reachable-URL display
@@ -618,6 +932,28 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	return nil
 }
 
+// uptimePayload renders the window set for /api/status: the up-fractions the
+// uptime pill shows, and beside them the fraction of each window that was
+// actually observed.
+//
+// Both maps are filled in ONE loop over store.Uptime.Each() on purpose. /api/status
+// used to take the ratios and throw the coverage away with a `_`, so on a
+// speedtest-only install (`-latency=false`, documented) or with both families off
+// the dashboard rendered "100.000%" for a window that observed nothing while
+// /metrics, in the same second, correctly published no ratio at all. Filling the
+// two maps from the same loop variable makes publishing a ratio without its
+// coverage impossible to do by omission - you would have to delete a line that is
+// visibly paired with the one above it.
+func uptimePayload(u store.Uptime) (ratios, coverage map[string]float64) {
+	ratios = make(map[string]float64, 6)
+	coverage = make(map[string]float64, 6)
+	for _, n := range u.Each() {
+		ratios[n.Window] = n.Obs.Ratio()
+		coverage[n.Window] = n.Obs.Coverage()
+	}
+	return ratios, coverage
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if s.status == nil { // not wired (only happens in misconfiguration/tests) - degrade, don't panic
@@ -628,7 +964,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	online, since := st.Online, st.Since
 	now := time.Now()
 
-	uptime, _, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
+	uptime, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
+	uptimeRatios, uptimeCoverage := uptimePayload(uptime)
 	targets, terr := s.store.LatestPerTarget(ctx, s.targetGrace())
 	if terr != nil {
 		s.log.Debug("status read failed", "op", "latest_per_target", "err", terr)
@@ -656,6 +993,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		dnsMS = &v
 	}
 
+	// One snapshot for every speedtest field (see speedRunStatus): separate
+	// calls re-split the scheduler's one-word running/id pair, and a run ending
+	// between them said "running with no id" - arming an id-0 abort.
+	speedRunning, speedRun, speedServer := speedRunStatus(s.speed)
+
 	resp := map[string]any{
 		"version":              s.version,
 		"online":               online,
@@ -663,16 +1005,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"runtime_seconds":      int(now.Sub(s.started).Seconds()),
 		"latency_ms":           latency,
 		"dns_ms":               dnsMS,
-		"uptime":               uptime,     // up-fraction per window (6h/24h/7d/30d/1y/all) for the selectable pill
-		"uptime_24h":           uptime.H24, // kept for back-compat / metrics parity
-		"uptime_7d":            uptime.D7,
+		"uptime":               uptimeRatios,       // up-fraction per window (6h/24h/7d/30d/1y/all) for the selectable pill
+		"uptime_coverage":      uptimeCoverage,     // the same windows' observation coverage - the pill must not show a % for a 0 here
+		"uptime_24h":           uptime.H24.Ratio(), // kept for back-compat / metrics parity
+		"uptime_7d":            uptime.D7.Ratio(),
 		"targets":              targets,
 		"speed":                speed,          // nil until the first test completes
 		"speedtest":            s.speed != nil, // whether manual triggering is available
-		"speedtest_running":    s.speed != nil && s.speed.Running(),
-		"speedtest_server":     speedRunningServer(s.speed),
+		"speedtest_running":    speedRunning,
+		"speedtest_run_id":     speedRun, // 0 when idle; pass back to abort THIS run
+		"speedtest_server":     speedServer,
 		"speedtest_auto":       s.settings.SpeedServerID() == "", // auto-select fastest server
-		"speedtest_auto_label": s.settings.SpeedAutoLabel(),      // city the auto-picker centres on
+		"speedtest_auto_label": s.settings.SpeedAutoLabel(),      // the city the USER searched, which overrides the race; empty when auto races for its own centre (speedtest.raceCities) - a centre decided per run, which this snapshot cannot name in advance
 		"speedtest_enabled":    s.settings.SpeedtestEnabled(),
 		"speed_interval_s":     int(s.settings.SpeedInterval().Seconds()),
 		"data_used_bytes":      dataBytes,                  // cumulative speedtest data (down+up)
@@ -701,10 +1045,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Optional custom uptime window for the uptime pill (?upMins=N), same parsing
-	// and cap as the data window.
+	// and cap as the data window. Its coverage ships beside it for the same reason
+	// the preset windows' does: this pill is a fourth uptime figure on the dashboard
+	// and was the one the "two of four consumers" framing missed.
 	if d, ok := customDataMins(r.URL.Query().Get("upMins")); ok {
-		if v, _, err := s.store.UptimeSince(ctx, now.Add(d), s.settings.DowntimeRetention()); err == nil {
-			resp["uptime_custom"] = v
+		if o, err := s.store.UptimeSince(ctx, now.Add(d), s.settings.DowntimeRetention()); err == nil {
+			resp["uptime_custom"] = o.Ratio()
+			resp["uptime_custom_coverage"] = o.Coverage()
 		}
 	}
 	// Cached update status (non-blocking read) for the About tab's cue and
@@ -713,7 +1060,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp["update"] = s.Update.Status()
 	}
 	// A bridged container measures the CONTAINER's path, not this host's: an
-	// extra hop of latency and a traceroute that stops at the container gateway.
+	// extra hop of latency, a traceroute that stops at the container gateway, and
+	// a DNS resolver the runtime substituted - the host's own is typically a
+	// loopback stub (systemd-resolved's 127.0.0.53) that means "me", and inside a
+	// bridged namespace "me" is the container, so Docker swaps in its public
+	// default. resolverEgressIP then correctly reports THAT resolver's operator,
+	// which is a different network entirely, not merely a hop further away.
 	// The dashboard has to say so, because the numbers look perfectly healthy
 	// either way. Only sent when true, so the common case costs nothing.
 	if util.BridgedContainer() {
@@ -732,6 +1084,56 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // ?mins= form and the absolute ?from/?to one - an absolute window must never be
 // able to ask for a wider scan than the parameter beside it already allows.
 const maxWinMins = 366 * 24 * 60
+
+// The read API's sizing policy, in one place so no endpoint invents its own.
+// Every handler that returns a list bounds its response BY CONSTRUCTION - not by
+// how long the daemon has been running - and takes that bound from one of
+// exactly two shapes:
+//
+//   - A list a human scrolls (outages, speed runs) pages with ?limit/?offset,
+//     capped at maxPageLimit. See parsePage.
+//   - A series a canvas draws (latency, speedtests) is downsampled to about
+//     maxSeriesPoints, the bucket width from seriesBucket. See handleSeries and
+//     handleSpeedHistory.
+//
+// The log viewer is the one reader whose backing store shifts underneath it, so
+// it pages by a monotonic cursor rather than an offset - an offset into a ring
+// silently skips or repeats lines as it evicts - but it takes its window size
+// from the same maxPageLimit ceiling. See handleLogs.
+//
+// /api/heatmap is the shape that has no list to bound: its output is already
+// fixed at ~366 day rows. What it has to bound instead is the WORK, and the rule
+// there is the one pauseSpans' comment already states - one query per table per
+// request, intersect in Go - never one query per row of the answer.
+const (
+	maxPageLimit    = 1000
+	maxSeriesPoints = 1500
+)
+
+// seriesBucket returns the downsampling bucket width, in seconds, for the window
+// [since, until) evaluated at now: wide enough that the window holds about
+// maxSeriesPoints buckets, and 1 (off) for any window narrow enough not to need
+// it. The width is floored, so a window can hold a handful more buckets than
+// maxSeriesPoints - unchanged from the arithmetic /api/series has always used,
+// and the difference is a rounding error against the bound that matters.
+//
+// The width comes from the part of the window that can actually HOLD data, not
+// from the requested span: measuring to a requested end would bucket a two-hour
+// window from last year as coarsely as a whole year, and counting an end that
+// has not arrived yet would coarsen every window whose end is in the future -
+// which is most of them, since typing a bare year or "jul 1 to dec 31" ends next
+// January.
+func seriesBucket(since, until, now time.Time) int {
+	end := until
+	if end.IsZero() || end.After(now) {
+		end = now
+	}
+	bucket := int(end.Sub(since)/time.Second) / maxSeriesPoints
+	if bucket < 1 {
+		bucket = 1
+	}
+	return bucket
+}
 
 // parseRangeParams reads an absolute window from ?from/?to (unix seconds,
 // half-open [from, to); to may be omitted or 0 for an open end). ok=false means
@@ -794,7 +1196,15 @@ func (s *Server) handleSpeedHistory(w http.ResponseWriter, r *http.Request) {
 	if f, u, ok := parseRangeParams(r, now); ok {
 		since, until = f, u
 	}
-	hist, err := s.store.SpeedHistoryRange(r.Context(), since, until)
+	// Downsample on the same rule as /api/series. Without it this endpoint's size
+	// was set by retention x cadence rather than by anything the chart can draw: a
+	// year of the DEFAULT hourly schedule is 8,759 runs and 6.4 MB, re-fetched
+	// every 60s by every visible tab, and the same year of 5-minute LAN tests is
+	// 105k runs and 74 MB with the whole slice held in memory per in-flight
+	// request. Bucketed, both are the ~1500 points the canvas has pixels for. A
+	// window with fewer runs than that is returned unchanged, so 1d/7d/30d are
+	// byte-for-byte what they were.
+	hist, total, err := s.store.SpeedHistoryBudget(r.Context(), since, until, maxSeriesPoints)
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -802,6 +1212,15 @@ func (s *Server) handleSpeedHistory(w http.ResponseWriter, r *http.Request) {
 	if hist == nil {
 		hist = []store.SpeedSample{}
 	}
+	// Say so when the response is a thinned view rather than the whole window.
+	// The body is a bare array and has been since this endpoint existed, so the
+	// disclosure goes in headers rather than wrapping it in an object and breaking
+	// every existing consumer. Without it a thinned response is indistinguishable
+	// from a complete one: a client totalling bytes or counting runs off a 1500-
+	// point array covering 40,000 runs is wrong and has no way to know.
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	w.Header().Set("X-Returned-Count", strconv.Itoa(len(hist)))
+	w.Header().Set("X-Sampled", strconv.FormatBool(len(hist) < total))
 	writeJSON(w, hist)
 }
 
@@ -960,8 +1379,8 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 	// the DB cursor open for minutes. Rearm on the header and every flushed row.
 	bump := exportDeadlineBumper(w, s.log)
 	bump()
-	cw.Write([]string{"timestamp", "download_mbps", "upload_mbps", "ping_ms", "jitter_ms",
-		"packet_loss_pct", "idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_max_ms", "loaded_up_max_ms", "healthy", "download_bytes", "upload_bytes",
+	cw.Write([]string{"timestamp", "download_mbps", "upload_mbps", "ping_ms", "ping_best_ms", "jitter_ms",
+		"packet_loss_pct", "idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "healthy", "download_bytes", "upload_bytes",
 		"trigger", "engine", "server", "server_id", "isp", "isp_location",
 		"public_ipv4", "public_ipv6", "dns_server", "dns_provider", "dns_location",
 		"cf_colo", "exit_path"})
@@ -979,8 +1398,9 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			csvMbps(sp.DownMbps, sp.DownBytes),
 			csvMbps(sp.UpMbps, sp.UpBytes),
 			strconv.FormatFloat(sp.PingMS, 'f', 1, 64),
+			fptr1(sp.PingBestMS),
 			fptr1(sp.JitterMS), fptr(sp.PacketLoss),
-			fptr1(sp.IdleMS), fptr1(sp.LoadedDownMS), fptr1(sp.LoadedUpMS), fptr1(sp.LoadedDownMaxMS), fptr1(sp.LoadedUpMaxMS), healthStr(sp.Healthy),
+			fptr1(sp.IdleMS), fptr1(sp.LoadedDownMS), fptr1(sp.LoadedUpMS), fptr1(sp.LoadedDownP95MS), fptr1(sp.LoadedUpP95MS), healthStr(sp.Healthy),
 			iptr(sp.DownBytes), iptr(sp.UpBytes),
 			csvSafe(sp.Trigger), csvSafe(engineCSV(sp.Engine)),
 			csvSafe(sp.Server), csvSafe(sp.ServerID), csvSafe(sp.ISP), csvSafe(sp.ISPLocation),
@@ -1140,11 +1560,82 @@ func (s *Server) handleSpeedtest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	if errors.Is(err, speedtest.ErrAborted) {
+		// Aborted before any server produced a result: a clean stop, not a failure.
+		// (An abort after a best-of-N server succeeded returns that result below.)
+		writeJSON(w, map[string]any{"aborted": true})
+		return
+	}
 	if err != nil {
 		http.Error(w, "speedtest failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, res)
+}
+
+// handleSpeedtestAbort cancels a run in flight. A best-of-N run that has already
+// measured a server keeps that result (the in-flight POST to /api/speedtest
+// returns it); an abort before the first result stores nothing and that POST
+// returns {"aborted":true}. A stop the scheduler refused - nothing running, or
+// the named run already over - answers 409, not the kill's 204, so the two
+// outcomes are distinguishable to a caller. The dashboard never reads this
+// response (its abort fetch ignores it and re-syncs from the status poll), so
+// the honest status costs the UI nothing.
+func (s *Server) handleSpeedtestAbort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireJSONCT(w, r) { // body-less POST: CSRF guard (see requireJSONCT)
+		return
+	}
+	if s.speed == nil {
+		http.Error(w, "speedtests are disabled", http.StatusServiceUnavailable)
+		return
+	}
+	// `run` names the run the caller decided to stop, as reported by
+	// speedtest_run_id when they saw it. A stop is acted on some time after it is
+	// decided - the dashboard polls every few seconds and then waits on a confirm()
+	// dialog - and without the id the daemon could only cancel whoever held the flag
+	// on arrival, which is a different run if one started in between. Omitting it
+	// still means "whatever is running now", for a caller who never saw a specific
+	// run.
+	var id uint64
+	if v := r.URL.Query().Get("run"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			http.Error(w, "run must be a run id", http.StatusBadRequest)
+			return
+		}
+		id = n
+	}
+	if !s.speed.Abort(id) {
+		// Refused: nothing is running, or the run this stop was decided against
+		// has already ended (a stale id from a previous boot looks the same).
+		// Answering 204 here made a refusal byte-identical to a kill.
+		http.Error(w, "no matching speedtest run to stop: nothing is running, or that run already ended", http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// speedRunStatus derives every speedtest status field from ONE load of the run
+// id. The scheduler keeps "is one running" and "which one" in a single word
+// precisely so they cannot disagree (see Scheduler.Running) - but reading them
+// back through separate calls re-split them: each call is one load of that
+// word, so a run ending between the loads answered running=true with run_id=0,
+// the exact "running with no id" state whose stop click sends an id-0 abort.
+// Deriving running from the id keeps the pair whole in either evaluation
+// order, and the server label rides the same snapshot so it can never name a
+// run this answer says is not there.
+func speedRunStatus(sp SpeedTrigger) (running bool, id uint64, server string) {
+	if sp == nil {
+		return false, 0, ""
+	}
+	if id = sp.RunID(); id == 0 {
+		return false, 0, ""
+	}
+	return true, id, sp.CurrentServer()
 }
 
 func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
@@ -1159,21 +1650,8 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	if f, u, ok := parseRangeParams(r, now); ok {
 		since, until = f, u
 	}
-	// Downsample to ~1500 buckets so wide windows stay small/fast. The width
-	// comes from the part of the window that can actually HOLD data, not from
-	// ?mins=: using mins would bucket a two-hour window from last year as
-	// coarsely as a whole year, and counting an end that has not arrived yet
-	// would coarsen every window whose end is in the future - which is most of
-	// them, since typing a bare year or "jul 1 to dec 31" ends next January.
-	end := until
-	if end.IsZero() || end.After(now) {
-		end = now
-	}
-	span := end.Sub(since)
-	bucket := int(span/time.Second) / 1500
-	if bucket < 1 {
-		bucket = 1
-	}
+	// Downsample so wide windows stay small/fast; see seriesBucket for the rule.
+	bucket := seriesBucket(since, until, now)
 	// ?exclude=name,name drops those targets from the lowest-latency line (the
 	// UI toggle). Capped so a hostile client can't grow the IN clause unbounded.
 	var exclude []string
@@ -1263,6 +1741,26 @@ func (s *Server) handleIperfCheck(w http.ResponseWriter, r *http.Request) {
 // it geocodes the city and returns servers near it; otherwise servers near the
 // caller's own location.
 func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) {
+	// POST + application/json, for the same reason handleIperfCheck demands them
+	// ("body-less POST: CSRF guard"): this handler REACHES OUT - to Ookla, and to
+	// a geocoder for a city query. Any page open in the operator's browser can aim
+	// a form-style GET or POST at http://127.0.0.1:9000 without reading the reply
+	// and without tripping CORS, and the loopback filter cannot object because the
+	// request really is from loopback. Requiring a JSON content type puts it
+	// outside what a cross-site request can send without a preflight, which this
+	// daemon never approves.
+	//
+	// Nothing here is SSRF - the destinations are fixed and redirects are refused
+	// (see geocodeClient) - so what is being closed is a page making someone
+	// else's daemon generate traffic, not an attacker choosing its target.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireJSONCT(w, r) {
+		return
+	}
 	if s.netinfo == nil { // permitted nil: 503, not a panic (see handleNetinfo)
 		http.Error(w, "network info unavailable", http.StatusServiceUnavailable)
 		return
@@ -1301,20 +1799,41 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "invalid lat/lon", http.StatusBadRequest)
 			return
 		}
-		// With no explicit coordinate, centre the default list on the ISP's
-		// exit-router location (matching the live auto-select), then the Cloudflare
-		// PoP where a traceroute exit can't run (containers, non-Linux), falling
-		// through to the caller's IP when neither is known yet.
-		if lat == 0 && lon == 0 {
-			if ex := s.netinfo.Get().Exit; ex != nil && (ex.Lat != 0 || ex.Lon != 0) {
-				lat, lon, locName = ex.Lat, ex.Lon, ex.Loc
-			} else if city, clat, clon, ok := netinfo.ColoCoord(s.netinfo.Get().CFColo); ok {
-				lat, lon, locName = clat, clon, city
+		// With no explicit coordinate, centre the default list on the first
+		// candidate city auto-select would race that carries a coordinate: the
+		// exit router when RIPE placed it, else the ISP geolocation of our
+		// public IP (main.autoOrigins, via speedtest.FirstAnchoredOrigin).
+		// Nothing anchored leaves the fetch uncentred, which is not a gap but
+		// the remaining candidate itself - the Ookla API then places our source
+		// address and returns the pool IT puts us in.
+		//
+		// This handler used to run its OWN cascade - exit coordinate, else the
+		// Cloudflare PoP - which agreed with auto-select on nothing. The PoP
+		// rung fired on any missing exit COORDINATE, not only where a traceroute
+		// could not run, so on a residential link whose last hop RIPE cannot
+		// place (measured: the traceroute RAN and found the hop) it centred on
+		// a distant PoP while every city auto considers was domestic - and
+		// those pools are disjoint, so the server auto actually tests from could
+		// not be found in the picker at all. The PoP is gone from this list
+		// because it is the one centre the race can never choose.
+		//
+		// Still a BROWSING list: it deliberately does NOT reproduce live
+		// auto-select, which RACES these candidates per run (see
+		// speedtest.raceCities) and can land on a different one. Racing here
+		// would spend a list fetch per city and a round of pings at other
+		// people's servers every time the settings pane opens, to reorder a list
+		// the user is about to pick from by hand. So the guarantee is the weaker
+		// one, and the panel says so: the centre is always a city the race would
+		// CONSIDER, never one it could not choose, and the server auto tests
+		// from need not appear here - search its city to see it.
+		if lat == 0 && lon == 0 && s.AutoOriginsFn != nil {
+			if org, ok := speedtest.FirstAnchoredOrigin(s.AutoOriginsFn()); ok {
+				lat, lon, locName = org.Lat, org.Lon, org.Label
 			}
 		}
 	}
 
-	list, err := speedtest.ListOoklaServers(ctx, lat, lon)
+	list, err := listOoklaServers(ctx, lat, lon)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1328,6 +1847,12 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 // geocodeClient caps the Nominatim fetch like netinfo's lookup clients: an
 // explicit timeout and no redirects, so a hijacked upstream can't bounce the
 // daemon's GET to an arbitrary host and stream an unbounded body back.
+// listOoklaServers is the settings picker's list fetch. A package var for the
+// same reason speedtest's own fetch seams are: it is the only way a test can
+// assert WHAT COORDINATE this handler centres on without opening a socket at
+// Ookla, and that coordinate is the whole defect this handler was fixed for.
+var listOoklaServers = speedtest.ListOoklaServers
+
 var geocodeClient = &http.Client{
 	Timeout:       10 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -1820,7 +2345,78 @@ var dataCategories = []struct{ cat, key, table string }{
 	{"latency", "dns", "dns"},
 	{"speed", "speed", "speed"},
 	{"downtime", "downtime", "events"},
+	// The downtime category spans two tables, the way latency spans samples + dns:
+	// the outage transitions AND the pause spans that say which wall seconds were
+	// observed at all. pauses is the uptime DENOMINATOR (store.pausedOverlap feeds
+	// UptimeSince, DowntimeByDay's prorate and orphanGapDowntime), so a backup
+	// carrying events without it restores a history where every unobserved second
+	// becomes observed-and-up: the restored box reads a different uptime% than the
+	// one it was copied from, and publishes uptime for windows the source correctly
+	// omitted. Written after "downtime" so a restore lands the events first; both
+	// merge by ts, so order only matters for config staying last.
+	{"downtime", "pauses", "pauses"},
 	{"config", "config", "settings"},
+}
+
+// importMidHook is called by handleImport just after it snapshots the pre-import
+// login state. Test seam only (nil in production): the interesting window for a
+// concurrent credential change is between that snapshot and the post-reload
+// repair, and it is otherwise reachable only by racing.
+var importMidHook func()
+
+// importReconcileBudget bounds the post-commit reconcile. It runs detached from
+// the client, so it needs its own ceiling: long enough for a handful of settings
+// writes, short enough that a wedged write cannot hold importMu indefinitely.
+// A var only so tests can exhaust the budget deliberately.
+var importReconcileBudget = 30 * time.Second
+
+// importRestoreBudget bounds the last-resort restore of the pre-import
+// auth/access keys after the reload has failed for good. Deliberately NOT the
+// shared reconcile budget: exhausting that budget is one of the ways the
+// reload fails in the first place, and the restore is what stands between that
+// failure and a restart silently adopting the backup's login settings.
+const importRestoreBudget = 10 * time.Second
+
+// importReconcileHook is called once the imported settings are live but before the
+// safety repair has run - the window in which the destination is running on
+// whatever the backup said. Test seam only; nil in production.
+var importReconcileHook func()
+
+// exportSchema is the newest envelope version this build writes or accepts. It
+// is a COMPATIBILITY CONTRACT, not a build stamp: bump it whenever an export
+// starts carrying data an older build would silently drop. Each file is stamped
+// with the version its own content needs (exportSchemaFor), not this constant:
+// a file without any v2-only key is v1-shaped in every byte, and stamping it
+// higher would only make older builds refuse a backup they fully understand.
+//
+// It went to 2 when the downtime category gained `pauses`. Pause rows are the
+// uptime denominator, so a build that does not know the key skips it, restores
+// the outage events alone, and reports success - leaving a history where every
+// unobserved second reads as observed-and-up. The restored box then publishes a
+// different uptime% than the one it was copied from, and publishes one for
+// windows the source correctly refused to. v0.54.0 accepts 1 and rejects anything
+// higher, so stamping 2 is exactly what converts that silent downgrade into its
+// "update before restoring it" error.
+//
+// minExportSchema is the oldest we still read: bumping the writer must not orphan
+// the backups already on disk.
+const (
+	exportSchema    = 2
+	minExportSchema = 1
+)
+
+// exportSchemaFor is the version an export carrying exactly these category keys
+// needs: the OLDEST schema whose readers keep every one of them. v0.54.0
+// rejects anything above 1 before reading a byte, so stamping the file's own
+// requirement rather than exportSchema is what keeps a pauses-less backup
+// restorable on the builds that predate pauses (the roll-back path).
+func exportSchemaFor(keys []string) int {
+	for _, k := range keys {
+		if k == "pauses" { // the key the schema went to 2 for (see exportSchema)
+			return 2
+		}
+	}
+	return 1
 }
 
 // handleExport streams selected categories as a downloadable JSON file.
@@ -1879,8 +2475,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		cats = append(cats, dc.key)
 	}
 	catsJSON, _ := json.Marshal(cats)
-	fmt.Fprintf(bw, `{"pingularity_export":1,"producer_version":%q,"exported_at":%d,"categories":%s`,
-		s.version, time.Now().Unix(), catsJSON)
+	fmt.Fprintf(bw, `{"pingularity_export":%d,"producer_version":%q,"exported_at":%d,"categories":%s`,
+		exportSchemaFor(cats), s.version, time.Now().Unix(), catsJSON)
 	for _, dc := range sel {
 		fmt.Fprintf(bw, ",%q:[", dc.key)
 		first := true
@@ -1995,14 +2591,31 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	resetDeadline()
-	// Whole-body ceiling: also the per-element ceiling, since one JSON value is
-	// materialized whole (see importBodyCap). Kept well below process memory.
-	r.Body = http.MaxBytesReader(w, r.Body, importBodyCap)
+	// No whole-body ceiling - the product's own exports outgrow any workable one
+	// (see importReadBurst). What IS bounded is consumption per decode step: body
+	// reads go through a renewable allowance, so any SINGLE element (which the
+	// decoder materializes whole before a size check can see it) stays well below
+	// process memory while total file size stays unbounded.
+	body := &burstReader{r: r.Body, remaining: importReadBurst}
+	// progress marks real decode progress: it rearms the read deadline AND renews
+	// the byte allowance in one place, so the two bounds cannot drift apart.
+	progress := func() { resetDeadline(); body.renew() }
 
-	// Envelope check. Our exporter always writes {"pingularity_export":1,...}
+	// A leading UTF-8 BOM (0xEF 0xBB 0xBF) is legal at the start of a UTF-8 file and
+	// some exporters/editors prepend one, but json.Decoder.Token rejects it, turning
+	// a valid export into a misleading "not a Pingularity export file" 400. Strip
+	// exactly one BOM through the existing metered reader WITHOUT buffering the whole
+	// body: a small bufio.Reader peeks the first three bytes and discards them only
+	// when they are the BOM.
+	br := bufio.NewReader(body)
+	if pre, _ := br.Peek(3); len(pre) == 3 && pre[0] == 0xEF && pre[1] == 0xBB && pre[2] == 0xBF {
+		_, _ = br.Discard(3)
+	}
+
+	// Envelope check. Our exporter always writes {"pingularity_export":N,...}
 	// first, so the version is known before any data row is applied - streaming
 	// means rows land as they parse, so this can't wait for the whole file.
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(br)
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		http.Error(w, "not a Pingularity export file", http.StatusBadRequest)
 		return
@@ -2012,11 +2625,14 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var ver int
-	if err := dec.Decode(&ver); err != nil || ver < 1 {
+	if err := dec.Decode(&ver); err != nil || ver < minExportSchema {
 		http.Error(w, "unrecognized export file version", http.StatusBadRequest)
 		return
 	}
-	if ver > 1 {
+	// Older files still restore: an earlier schema is a SUBSET of this one (v1
+	// simply had no pauses key), so nothing is misread - the restore just carries
+	// less. Newer ones cannot, for the reason exportSchema exists.
+	if ver > exportSchema {
 		http.Error(w, "this backup is from a newer Pingularity version; update before restoring it", http.StatusBadRequest)
 		return
 	}
@@ -2030,19 +2646,37 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	retention := map[string]time.Duration{
 		"samples": s.settings.Retention(), "dns": s.settings.Retention(),
 		"speed": s.settings.SpeedRetention(), "events": s.settings.DowntimeRetention(),
+		// pauses is pruned on the downtime horizon like events, and was missing here:
+		// a restore could land pause rows already past it and say nothing, so the
+		// spans that shape uptime coverage disappeared at the next prune without the
+		// warning every other category gets.
+		"pauses": s.settings.DowntimeRetention(),
 	}
 	result := map[string]int{}
 	prunable := map[string]bool{} // category -> imported rows predate its retention window
 	importedConfig := false
-	// Each category is committed as it is reached (config first in our own
-	// exports). A later failure can't roll the earlier ones back, so record it
-	// and fall through to the reload/invalidate below instead of returning early
-	// - otherwise applied config would sit latent in the DB and silently
-	// activate only on the next restart.
+	// The login state BEFORE any config lands. A backup carries the login settings
+	// but never the password hash (settingsExportDeny), so applying it verbatim can
+	// leave this box in a state its own credentials do not fit - and the endpoint
+	// that would fix that is itself behind the login. Captured here, repaired after
+	// the reload below.
+	var preAuthActive, preAuthEnabled, preHasPassword, preLocalOnly bool
+	var preAuthUser string
+	// Test seam: lets a test place a concurrent credential write exactly inside the
+	// window between this snapshot and the repair below. Nil in production.
+	if importMidHook != nil {
+		importMidHook()
+	}
+	// Each category is committed as it is reached. Our own exports write config
+	// LAST (see dataCategories) precisely so a data failure mid-restore never
+	// touches the destination's settings. A later failure can't roll the earlier
+	// ones back, so record it and fall through to the reload/invalidate below
+	// instead of returning early - otherwise applied config would sit latent in
+	// the DB and silently activate only on the next restart.
 	var importErr error
 	importStatus := http.StatusInternalServerError
 	for importErr == nil && dec.More() {
-		resetDeadline() // progress made: rearm before the next (possibly large) value
+		progress() // progress made: rearm before the next (possibly large) value
 		keyTok, err := dec.Token()
 		if err != nil {
 			importErr, importStatus = fmt.Errorf("invalid JSON: %w", err), http.StatusBadRequest
@@ -2051,14 +2685,31 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		key, _ := keyTok.(string)
 		dc, known := keyToCat[key]
 		if !known || r.URL.Query().Get(dc.cat) == "" {
-			// exported_at, an unselected category, or an unknown key: walk past
-			// its value without materializing it.
-			if err := skipJSONValue(dec); err != nil {
-				importErr, importStatus = fmt.Errorf("invalid JSON: %w", err), http.StatusBadRequest
+			// exported_at, an unselected category, or an unknown key: walk past its
+			// value without materializing it. Every token renews the byte allowance
+			// (the category as a whole may be arbitrarily large; only a single token
+			// must stay bounded) and every few thousand tokens rearms the read
+			// deadline, so a big skipped category on a slow link is not reaped
+			// mid-walk while a stalled body still is.
+			skippedToks := 0
+			if err := skipJSONValue(dec, func() {
+				body.renew()
+				if skippedToks++; skippedToks%4096 == 0 {
+					resetDeadline()
+				}
+			}); err != nil {
+				// An element outgrowing the allowance is a size problem, and saying
+				// "invalid JSON" about it sends the operator debugging the wrong thing.
+				var tooBig *importElementTooLargeError
+				if errors.As(err, &tooBig) {
+					importErr, importStatus = err, http.StatusRequestEntityTooLarge
+				} else {
+					importErr, importStatus = fmt.Errorf("invalid JSON: %w", err), http.StatusBadRequest
+				}
 			}
 			continue
 		}
-		n, old, err := s.importArray(r.Context(), dec, key, dc.table, retention[dc.table], resetDeadline)
+		n, old, err := s.importArray(r.Context(), dec, key, dc.table, retention[dc.table], progress)
 		result[dc.cat] += n // latency spans two tables (samples + dns); sum them
 		if old {
 			prunable[dc.cat] = true
@@ -2067,10 +2718,12 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			importedConfig = true
 		}
 		if err != nil {
-			var maxErr *http.MaxBytesError
+			var tooBig *importElementTooLargeError
 			switch {
-			case errors.As(err, &maxErr):
-				importErr, importStatus = fmt.Errorf("backup exceeds the import size limit (%d MiB)", maxErr.Limit>>20), http.StatusRequestEntityTooLarge
+			case errors.As(err, &tooBig):
+				// Before the "bad " prefix case: importArray wraps the reader's error
+				// as "bad <key> data: ...", and a size trip must stay a 413.
+				importErr, importStatus = err, http.StatusRequestEntityTooLarge
 			case strings.Contains(err.Error(), "unknown column"):
 				// Rows carrying columns this binary doesn't know come from a newer
 				// version's backup - the caller's file, not a server fault.
@@ -2101,15 +2754,186 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// so the applied config takes effect immediately (and is logged) rather than
 	// lurking until the next restart.
 	if importedConfig {
-		if err := s.settings.Reload(r.Context()); err != nil {
-			s.log.Warn("settings reload after import", "err", err)
+		// Everything from here is RECONCILE, and it must finish. It runs on a
+		// context detached from the client's: once a category has committed, hanging
+		// up mid-restore used to leave the live controller and the stored settings
+		// disagreeing, with a restart quietly adopting the backup's values. Bounded,
+		// so a wedged write cannot pin the lock.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(r.Context()), importReconcileBudget)
+		defer rcancel()
+
+		// One writer at a time. Holding this across the whole reconcile is what lets
+		// the repair below KNOW that a username it did not expect came from the
+		// backup: nothing else can change credentials in between.
+		s.importMu.Lock()
+		defer s.importMu.Unlock()
+
+		// Snapshot here, not at parse time. The imported rows are already in the
+		// database but not yet in the live controller, so these still describe the
+		// destination's own settings - and taking them under the lock means they
+		// cannot go stale before the repair reads them.
+		preAuthActive = s.settings.AuthActive()
+		preAuthEnabled = s.settings.AuthEnabled()
+		preHasPassword = s.settings.HasPassword()
+		preAuthUser = s.settings.AuthUser()
+		preLocalOnly = s.settings.AccessLocalOnly()
+
+		// From the reload until the repair finishes, the box is running on whatever
+		// the backup said. Refuse remote requests for that window rather than
+		// publishing an unprotected configuration and repairing it afterwards.
+		s.reconciling.Store(true)
+		defer s.reconciling.Store(false)
+
+		rerr := s.settings.Reload(rctx)
+		if rerr != nil {
+			s.log.Warn("settings reload after import", "err", rerr)
+		}
+		// Test seam: fires INSIDE the reconcile window - after the imported settings
+		// are live (or the reload has just failed), before the retry and the safety
+		// repair below have run. Nil in production.
+		if importReconcileHook != nil {
+			importReconcileHook()
+		}
+		// The repairs below compare live values against the snapshot above, so they
+		// only work once the reload has made the imported settings live. A reload
+		// that failed BEFORE the broadcast (ErrLegacyReseal fails after it, so the
+		// config is live regardless) leaves the live cache at the snapshot: every
+		// repair condition reads "nothing changed", nothing is appended, and the
+		// response is a clean success - while the backup's auth/access keys sit
+		// committed in the DB, waiting for the next restart to pair the backup's
+		// username with this machine's password hash (which never rides in a
+		// backup). That silent deferred lockout is the exact state the repairs
+		// exist to prevent, so a failed reload must end either with the imported
+		// settings live or with the pre-import auth/access keys back in the store -
+		// never in between, and never quietly. backupLive gates the repairs: when
+		// the backup never went live there is nothing to repair, and the blanket
+		// restore below has already put the pre-import keys back.
+		backupLive := true
+		if rerr != nil && !errors.Is(rerr, settings.ErrLegacyReseal) {
+			if rerr = s.settings.Reload(rctx); rerr != nil && !errors.Is(rerr, settings.ErrLegacyReseal) {
+				backupLive = false
+				// rctx may be the very thing that failed (the shared budget can be
+				// exhausted before the reload even runs), so the last-resort restore
+				// gets its own small detached budget: skipping it BECAUSE the budget
+				// ran out would be the one outcome this block exists to prevent.
+				sctx, scancel := context.WithTimeout(context.WithoutCancel(rctx), importRestoreBudget)
+				defer scancel()
+				var restoreErrs []error
+				if preAuthUser != "" { // "" = never configured; SetAuthUser would invent "admin"
+					restoreErrs = append(restoreErrs, s.settings.SetAuthUser(sctx, preAuthUser))
+				}
+				restoreErrs = append(restoreErrs,
+					s.settings.SetAuthEnabled(sctx, preAuthEnabled),
+					s.settings.SetAccessLocalOnly(sctx, preLocalOnly))
+				if restoreErr := errors.Join(restoreErrs...); restoreErr != nil {
+					// Neither safe state was reachable: the backup's login settings are
+					// in the DB and could not be replaced. Fail LOUDLY - a clean success
+					// here is a lockout deferred to whenever the box next restarts.
+					s.log.Error("post-import reload failed and restoring the pre-import login settings failed too",
+						"reload_err", rerr, "restore_err", restoreErr)
+					warnings = append(warnings, "The imported settings were saved but could not be loaded into "+
+						"the running app ("+rerr.Error()+"), and putting your own login and network-access "+
+						"settings back failed too ("+restoreErr.Error()+"). A restart would adopt the backup's "+
+						"login settings - re-save yours in the Access tab before restarting.")
+					if importErr == nil {
+						importErr = errors.New("imported settings could not be reloaded, and the pre-import login settings could not be restored")
+						importStatus = http.StatusInternalServerError
+					}
+				} else {
+					s.log.Error("post-import reload failed; kept the pre-import login and access settings", "err", rerr)
+					if err := s.settings.Reload(sctx); err != nil && !errors.Is(err, settings.ErrLegacyReseal) {
+						// Still not live, but now safe: the stored auth/access keys are
+						// the pre-import ones, so a restart changes nothing the operator
+						// owns.
+						warnings = append(warnings, "The imported settings were saved but could not be loaded "+
+							"into the running app ("+rerr.Error()+"). Your login and network-access settings were "+
+							"kept; the rest of the backup's configuration takes effect at the next restart.")
+					} else {
+						warnings = append(warnings, "The imported settings are active, except the backup's login "+
+							"and network-access settings: loading them cleanly failed ("+rerr.Error()+"), so yours "+
+							"were kept. Review the Access tab if you meant to change them.")
+						if err != nil {
+							// ErrLegacyReseal, same as the ladder's earlier reloads treat it:
+							// the reload succeeded past the broadcast, so the config above IS
+							// live - only re-encrypting the backup's clear-text iperf3
+							// passwords failed, which leaves them on disk unencrypted. That
+							// consequence is the warning, not a bogus "takes effect at the
+							// next restart".
+							s.log.Warn("legacy iperf3 password re-encryption failed during the post-rollback reload; settings loaded", "err", err)
+							warnings = append(warnings, "The backup's iperf3 password(s) could not be re-encrypted "+
+								"("+err.Error()+"), so they are stored unencrypted for now. They will be re-encrypted "+
+								"by the next successful settings save or restart.")
+						}
+					}
+				}
+			}
+		}
+		// A backup's username must not rename an account whose PASSWORD this box
+		// still owns. The hash never rides in a backup, so applying a foreign
+		// auth_user leaves a username and a hash that were never a pair: the
+		// operator's credentials stop working, their session dies with them (tokens
+		// are bound to the username), and POST /api/access - the only way to set new
+		// ones - is behind the very login that no longer accepts them. Restoring onto
+		// a box with no password set is untouched: there is nothing to lock out of.
+		// preHasPassword, NOT preAuthActive. What makes a rename dangerous is owning a
+		// PASSWORD the backup does not carry; whether login happened to be switched on
+		// at that moment is beside the point. Keying on AuthActive (enabled AND a hash)
+		// left a real state unprotected: a box with a password stored but login turned
+		// off got renamed and re-enabled in one restore, pairing this machine's
+		// password with a name nobody here chose.
+		if backupLive && preHasPassword && s.settings.AuthUser() != preAuthUser {
+			imported := s.settings.AuthUser()
+			switch {
+			default:
+				if err := s.settings.SetAuthUser(rctx, preAuthUser); err != nil {
+					// Only claim preservation once it is actually persisted.
+					s.log.Error("restore login username after import", "err", err)
+					warnings = append(warnings, "This backup's login name could not be replaced with "+
+						"yours ("+err.Error()+"). The login name is now "+strconv.Quote(imported)+
+						" while the password is still yours - set both in the Access tab.")
+					break
+				}
+				warnings = append(warnings, "This backup uses the login name "+strconv.Quote(imported)+
+					", but backups never include the password. Your existing login name and password were kept, "+
+					"so you are not locked out. Change them in the Access tab if you meant to switch.")
+				s.log.Warn("imported config would have renamed the login account; kept the existing one",
+					"imported", imported, "kept", preAuthUser)
+			}
+		}
+		// A backup that turns login OFF on a box that HAD a working login would leave
+		// the dashboard readable by any LAN peer - or, behind a declared same-host
+		// proxy, any visitor - with no credentials. The old repair forced local-only,
+		// which does NOT shield a box reached through such a proxy. But the password
+		// hash never rides in a backup (settingsExportDeny), so the destination's own
+		// hash is still in the store: re-enabling auth_enabled restores full protection
+		// with the operator's own credentials. Keep the login the operator already had
+		// rather than let the backup disable it.
+		if backupLive && preAuthActive && !s.settings.AuthActive() {
+			if err := s.settings.SetAuthEnabled(rctx, true); err != nil {
+				// Persist-before-claim, as the username repair above: only say the login
+				// was kept once the write lands. If it did not, the login switch is off
+				// while the password is still stored, so say plainly that the box may be
+				// exposed - do not force local-only in its place, which cannot protect a
+				// proxied box anyway.
+				s.log.Error("preserve destination login after import", "err", err)
+				warnings = append(warnings, "This backup turns login protection off, and re-enabling your "+
+					"existing login FAILED ("+err.Error()+"): the login switch is now off although your "+
+					"password is still stored, so the dashboard may be reachable without a login. Re-enable "+
+					"login in the Access tab now.")
+			} else {
+				warnings = append(warnings, "This backup turns login protection off, but backups never include "+
+					"your password, so your existing login was kept and the dashboard stays protected. Turn "+
+					"login off in the Access tab if that is really what you want.")
+			}
+			s.log.Warn("imported config would have removed login protection; kept the destination login",
+				"user", preAuthUser, "auth_active", s.settings.AuthActive())
 		}
 		// Backups never carry the password hash (settingsExportDeny), so restoring
 		// onto a box without its own password can import auth_enabled=true that
 		// nothing can enforce - the login toggle would show ON while every request
 		// sails through. Make intent match enforcement, and say so.
-		if s.settings.AuthEnabled() && !s.settings.AuthActive() {
-			if err := s.settings.SetAuthEnabled(r.Context(), false); err != nil {
+		if backupLive && s.settings.AuthEnabled() && !s.settings.AuthActive() {
+			if err := s.settings.SetAuthEnabled(rctx, false); err != nil {
 				s.log.Warn("disable unenforceable imported auth", "err", err)
 			}
 			// Fail CLOSED: the backup wanted login on but no password rode with it, so
@@ -2117,15 +2941,41 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			// blindly applying it would expose the dashboard to the LAN with no login.
 			// Force local-only until a password is set, so a "LAN + login" source can't
 			// silently restore as "LAN, no login" (audit: access restore fails open).
+			// When a same-host proxy is declared (-allow-host), local-only CANNOT block
+			// visitors arriving through it, so the "restricted to this machine" wording
+			// would be a false promise: state the exposure and urge a password instead.
+			// With no proxy declared the local-only restriction is real, so keep the
+			// existing truthful wording.
+			caveat := proxyLocalOnlyCaveat(s.AllowedHosts)
 			if !s.settings.AccessLocalOnly() {
-				if err := s.settings.SetAccessLocalOnly(r.Context(), true); err != nil {
-					s.log.Warn("force local-only after unenforceable imported auth", "err", err)
+				// Persist-before-claim, as above: "restricted to this machine" may only
+				// be said of a write that landed.
+				if err := s.settings.SetAccessLocalOnly(rctx, true); err != nil {
+					s.log.Error("force local-only after unenforceable imported auth", "err", err)
+					if caveat != "" {
+						warnings = append(warnings, "This backup had login protection on, but backups never include "+
+							"the password, so login cannot be enforced, and restricting access to this machine "+
+							"FAILED ("+err.Error()+"). "+caveat)
+					} else {
+						warnings = append(warnings, "This backup had login protection on, but backups never include "+
+							"the password, so login cannot be enforced - and restricting access to this machine "+
+							"FAILED ("+err.Error()+"): the dashboard is now reachable over the network without a "+
+							"password. Set a new password in the Access tab.")
+					}
+				} else if caveat != "" {
+					warnings = append(warnings, "This backup had login protection on, but backups never include "+
+						"the password, so login cannot be enforced. Access was set to this machine only, but "+caveat)
+				} else {
+					warnings = append(warnings, "This backup had login protection on, but backups never include the password. Login stays off AND access was restricted to this machine only - set a new password in the Access tab, then re-enable Network access.")
 				}
-				warnings = append(warnings, "This backup had login protection on, but backups never include the password. Login stays off AND access was restricted to this machine only - set a new password in the Access tab, then re-enable Network access.")
+			} else if caveat != "" {
+				warnings = append(warnings, "This backup had login protection on, but backups never include the "+
+					"password, so login stays off. Access is limited to this machine, but "+caveat)
 			} else {
 				warnings = append(warnings, "This backup had login protection on, but backups never include the password - login stays off until you set a new password in the Access tab.")
 			}
-			s.log.Warn("imported config had login enabled but no password; login left off and access forced local-only")
+			s.log.Warn("imported config had login enabled but no password; login left off",
+				"local_only", s.settings.AccessLocalOnly())
 		}
 	}
 	if result["downtime"] > 0 || result["speed"] > 0 {
@@ -2216,7 +3066,7 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		}
 		// Reject a single oversized row before it is unmarshalled and batched: no
 		// legitimate record approaches maxRowBytes, and this keeps one hostile row
-		// from bloating a batch (the whole-body cap bounds the transient decode).
+		// from bloating a batch (importReadBurst bounds the transient decode).
 		if len(raw) > maxRowBytes {
 			return n, prunable, fmt.Errorf("bad %s data: a single record exceeds the %d MiB per-record limit", key, maxRowBytes>>20)
 		}
@@ -2251,18 +3101,64 @@ const importBatchBytes = 8 << 20
 // its connection is reaped (see handleImport's per-progress deadline).
 const importReadWindow = 2 * time.Minute
 
-// importBodyCap is the whole-body ceiling. It is a "justified maximum", not just a
-// DoS tripwire: because a single JSON value (a selected row's json.RawMessage, or a
-// skipped scalar like a giant string) is materialized whole, the body cap is also
-// the ceiling on ANY one element - so it is kept well below the process's memory
-// rather than at multi-GiB. maxRowBytes additionally rejects a single SELECTED row
-// far smaller than that, so a batch never holds a pathological row and a hostile
-// file is refused early. (Skipped category arrays are walked token-by-token at O(1)
-// memory, so they are not bounded here.)
+// importReadBurst is how many body bytes the import may consume between two
+// progress marks (a flushed batch, a skipped token). There is deliberately NO
+// whole-body cap to pair it with: the product's own DEFAULT export outgrew the
+// old 256 MiB one - 6 dual-stack targets probed every 5s for the 30-day latency
+// retention is 6 x (30d / 5s) = 3,110,400 sample rows at ~90-100 encoded bytes
+// each, ~280-300 MB for the samples array alone before the dns series rides
+// along (a test pins this arithmetic to the config defaults) - and retention
+// and interval are settings, so the honest maximum is unbounded. Any fixed
+// number either rejects real backups mid-restore (the file streams whole even
+// when only small categories are selected) or is too large to buffer. What the
+// old cap actually protected - a single materialized element (a selected row's
+// json.RawMessage, or one giant skipped scalar token) staying well below
+// process memory - the allowance still bounds, and it deliberately EQUALS the
+// old cap: any single element the old pipeline could buffer still restores
+// (a test pins a 65 MiB skipped scalar); what changed is only that progress
+// renews the allowance, so total size no longer accumulates toward it, while
+// an element that outgrows it trips importElementTooLargeError before it can
+// balloon. Legitimate consumption between marks tops out at a batch
+// (importBatchBytes) plus one row (maxRowBytes) plus decoder lookahead, far
+// under the allowance. maxRowBytes additionally rejects a single SELECTED row
+// much smaller than that, so a batch never holds a pathological row and a
+// hostile file is refused early.
 const (
-	importBodyCap = 256 << 20
-	maxRowBytes   = 8 << 20
+	importReadBurst = 256 << 20
+	maxRowBytes     = 8 << 20
 )
+
+// importElementTooLargeError reports one JSON element consuming the whole read
+// allowance. A distinct type (mirroring http.MaxBytesError) so handleImport can
+// answer 413 naming the size instead of calling it invalid JSON.
+type importElementTooLargeError struct{ limit int64 }
+
+func (e *importElementTooLargeError) Error() string {
+	return fmt.Sprintf("a single element in the backup exceeds the %d MiB import limit", e.limit>>20)
+}
+
+// burstReader meters body reads against a renewable allowance: Read draws it
+// down, renew refills it at each progress mark. Total throughput is unbounded
+// by design; what cannot happen is one element consuming without bound, since
+// json.Decoder materializes each value whole before any size check can see it.
+type burstReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (b *burstReader) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, &importElementTooLargeError{limit: importReadBurst}
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+func (b *burstReader) renew() { b.remaining = importReadBurst }
 
 // maxImportDepth bounds skipJSONValue's recursion. json.Decoder.Token does NOT
 // enforce encoding/json's nesting limit, so without a cap the depth of a skipped
@@ -2275,9 +3171,13 @@ const maxImportDepth = 64
 // skipJSONValue advances dec past exactly one JSON value (scalar, object, or
 // array) without materializing it - how the import walks past categories it
 // wasn't asked to restore, at O(1) memory even when that category is huge.
-func skipJSONValue(dec *json.Decoder) error { return skipJSONValueDepth(dec, 0) }
+// onTok, if non-nil, runs after every consumed token, so the caller can mark
+// progress (read allowance, deadline) through an arbitrarily long walk.
+func skipJSONValue(dec *json.Decoder, onTok func()) error {
+	return skipJSONValueDepth(dec, onTok, 0)
+}
 
-func skipJSONValueDepth(dec *json.Decoder, depth int) error {
+func skipJSONValueDepth(dec *json.Decoder, onTok func(), depth int) error {
 	if depth > maxImportDepth {
 		return fmt.Errorf("bad import data: JSON nested too deeply")
 	}
@@ -2285,14 +3185,21 @@ func skipJSONValueDepth(dec *json.Decoder, depth int) error {
 	if err != nil {
 		return err
 	}
+	if onTok != nil {
+		onTok()
+	}
 	if d, ok := tok.(json.Delim); ok && (d == '{' || d == '[') {
 		for dec.More() {
-			if err := skipJSONValueDepth(dec, depth+1); err != nil {
+			if err := skipJSONValueDepth(dec, onTok, depth+1); err != nil {
 				return err
 			}
 		}
-		_, err = dec.Token() // the matching closing delimiter
-		return err
+		if _, err := dec.Token(); err != nil { // the matching closing delimiter
+			return err
+		}
+		if onTok != nil {
+			onTok()
+		}
 	}
 	return nil
 }
@@ -2330,11 +3237,71 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"enabled": s.settings.UpdateCheckEnabled()})
 }
 
-// handleLogs backs the About-tab log viewer. GET returns {level, redact, lines}
-// (the current on/off level, PII-redaction flag, and the in-memory tail); POST
+// defaultLogLines is the window a bare /api/logs returns: the newest lines, not
+// the whole ring. The viewer polls every 2.5s and the ring holds 4000 entries in
+// two forms, so "the whole ring" was a 1.1 MB uncompressed no-store response
+// every 2.5s once the ring filled - which it does after ~1.8h of debug logging
+// and stays filled, because logs.txt restores it across restarts. That is
+// invisible on a LAN and fatal over the link being diagnosed: below ~1.8 Mbps
+// the fetch cannot finish inside its own 5s deadline, and the viewer's
+// catch-swallowed abort leaves the previously-rendered lines on screen, so it
+// freezes while still looking live.
+const defaultLogLines = 500
+
+// logWindow reads the ?since/?limit/?epoch window for one /api/logs response and
+// returns the entries plus the cursor fields the viewer needs.
+//
+// The cursor is a monotonic sequence, not an offset, because the ring evicts
+// under the reader: an offset would silently skip or repeat lines every time it
+// did. ?since is honoured only when ?epoch matches the ring that issued it - a
+// restart reseeds the ring from logs.txt with sequences starting at 0 again, so
+// a cursor an open tab has held across the restart names a DIFFERENT line, and
+// answering it would render a wrong window with nothing to show it was wrong.
+//
+// dropped reports how many lines fell out of the ring while the reader was away,
+// so the viewer can mark the gap rather than silently splicing over it.
+func (s *Server) logWindow(r *http.Request) (lines []logbuf.Entry, first, next, dropped uint64, epoch string, limit, buffered int) {
+	lines = []logbuf.Entry{}
+	if s.Logs == nil {
+		return lines, 0, 0, 0, "", 0, 0
+	}
+	epoch = s.Logs.Epoch()
+	q := r.URL.Query()
+	// ?limit=0 is the documented escape hatch for a scripted caller that really
+	// does want the whole buffer; anything else is clamped to the same ceiling
+	// parsePage puts on every other paged read. (parsePage itself can't be reused:
+	// it treats 0 as "unset", which is the opposite of what it means here.)
+	limit = defaultLogLines
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n >= 0 {
+		if n > maxPageLimit {
+			n = maxPageLimit
+		}
+		limit = n
+	}
+	sv := q.Get("since")
+	if sv == "" || q.Get("epoch") != epoch {
+		lines, first, next = s.Logs.Tail(limit)
+		return lines, first, next, 0, epoch, limit, s.Logs.Len()
+	}
+	since, err := strconv.ParseUint(sv, 10, 64)
+	if err != nil {
+		lines, first, next = s.Logs.Tail(limit)
+		return lines, first, next, 0, epoch, limit, s.Logs.Len()
+	}
+	lines, first, next = s.Logs.Since(since, limit)
+	if since < first {
+		dropped = first - since
+	}
+	return lines, first, next, dropped, epoch, limit, s.Logs.Len()
+}
+
+// handleLogs backs the About-tab log viewer. GET returns the log window
+// (see logWindow) plus the current on/off level and PII-redaction flag; POST
 // {level, redact} sets logging and PII redaction (persisted + applied live via
 // the settings broadcast) and {clear:true} empties the buffer. Either way it
-// returns the fresh {level, redact, lines}.
+// returns the fresh window, read from the same query parameters - so the redact
+// toggle, which is a purely client-side view flip, no longer costs a full-ring
+// response just to acknowledge itself.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -2397,11 +3364,18 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	// Each entry carries both the raw and PII-masked line; the dashboard toggles
 	// between them at display time. "redact" is the persisted default mask state.
-	lines := []logbuf.Entry{}
-	if s.Logs != nil {
-		lines = s.Logs.Entries()
-	}
-	writeJSON(w, map[string]any{"level": s.settings.LogLevel(), "redact": s.settings.LogRedactPII(), "lines": lines})
+	// first_seq/next_seq/dropped/epoch are the cursor; see logWindow.
+	lines, first, next, dropped, epoch, limit, buffered := s.logWindow(r)
+	writeJSON(w, map[string]any{
+		"level": s.settings.LogLevel(), "redact": s.settings.LogRedactPII(),
+		"epoch": epoch, "first_seq": first, "next_seq": next, "dropped": dropped,
+		// limit is the cap that was applied and buffered is how many lines the ring
+		// holds, so a caller can tell a truncated read from a complete one. 500 lines
+		// back is otherwise ambiguous: it could be the entire buffer or its newest
+		// tenth, and nothing in the body distinguished them.
+		"limit": limit, "buffered": buffered,
+		"lines": lines,
+	})
 }
 
 // promLabel escapes a label value for the Prometheus text exposition format,
@@ -2472,6 +3446,14 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// A daemon that could not read its access configuration is refusing every
+	// other route (see the guard), so it is emphatically not ready - and saying so
+	// here is the only way a supervisor or load balancer finds out. Checked before
+	// the store ping, because this failure survives a perfectly healthy database.
+	if s.settings != nil && !s.settings.Loaded() {
+		http.Error(w, "not ready: settings could not be loaded", http.StatusServiceUnavailable)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if s.store == nil || s.store.DB().PingContext(ctx) != nil {
@@ -2522,7 +3504,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		targets = targets[:metricsMaxTargets]
 	}
 	aStart := time.Now()
-	uptime, uptimeCov, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
+	uptime, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
 	aggDur := time.Since(aStart)
 	s.aggMu.Lock()
 	aggValid := !s.aggAt.IsZero() // false only when every aggregate scan has failed since startup
@@ -2664,17 +3646,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE pingularity_uptime_ratio gauge")
 	fmt.Fprintln(w, "# HELP pingularity_uptime_coverage_ratio Fraction of each uptime window that was actually observed (0..1); a low value means the window was mostly paused/unobserved and its uptime_ratio is thin evidence.")
 	fmt.Fprintln(w, "# TYPE pingularity_uptime_coverage_ratio gauge")
-	for _, wc := range []struct {
-		w         string
-		ratio, cv float64
-	}{
-		{"6h", uptime.H6, uptimeCov.H6}, {"24h", uptime.H24, uptimeCov.H24},
-		{"7d", uptime.D7, uptimeCov.D7}, {"30d", uptime.D30, uptimeCov.D30},
-		{"1y", uptime.Y1, uptimeCov.Y1}, {"all", uptime.All, uptimeCov.All},
-	} {
-		fmt.Fprintf(w, "pingularity_uptime_coverage_ratio{window=\"%s\"} %g\n", promLabel(wc.w), wc.cv)
-		if wc.cv > 0 { // omit the ratio for a window that observed nothing
-			fmt.Fprintf(w, "pingularity_uptime_ratio{window=\"%s\"} %g\n", promLabel(wc.w), wc.ratio)
+	for _, n := range uptime.Each() {
+		fmt.Fprintf(w, "pingularity_uptime_coverage_ratio{window=\"%s\"} %g\n", promLabel(n.Window), n.Obs.Coverage())
+		// Defined() is the old `coverage > 0` guard, unchanged in behaviour and
+		// deliberately unchanged in strictness: it asks whether there is a
+		// measurement at all, not whether the measurement is good enough. Anything
+		// stricter here would delete all six ratio series, permanently, for every
+		// install that legitimately monitors part-time - and a consumer can always
+		// impose their own floor with `and on(window)
+		// pingularity_uptime_coverage_ratio > X`, while nothing lets them recover a
+		// value this exporter refused to emit.
+		if n.Obs.Defined() {
+			fmt.Fprintf(w, "pingularity_uptime_ratio{window=\"%s\"} %g\n", promLabel(n.Window), n.Obs.Ratio())
 		}
 	}
 	if floor, e := s.store.UptimeFloor(ctx, s.settings.DowntimeRetention()); e == nil && floor > 0 {
@@ -2775,9 +3758,27 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "pingularity_speed_upload_mbps %g\n", sp.UpMbps)
 		}
 		if sp.PingMS != 0 {
-			fmt.Fprintln(w, "# HELP pingularity_speed_ping_ms Last measured speedtest latency (ms); absent when the run did not probe latency.")
+			// Says WHERE it measures to, because the scrape also carries
+			// pingularity_speed_idle_latency_ms and the two are routinely graphed
+			// together: that one is the bufferbloat baseline against a fixed target of
+			// its own, so the pair diverging is expected, not a fault. The iperf3 caveat
+			// is not hypothetical - iperf.go falls back to the idle baseline when no
+			// handshake probe lands, which is reachable whenever --bind names an
+			// interface the probe's default route does not use, so an unhedged "to the
+			// test server" would be false to a scraper in exactly that configuration.
+			fmt.Fprintln(w, "# HELP pingularity_speed_ping_ms Last measured speedtest latency to the test server (ms); the iperf3 engine falls back to the bufferbloat idle baseline when no handshake probe reaches the server. Absent when the run did not probe latency.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_ping_ms gauge")
 			fmt.Fprintf(w, "pingularity_speed_ping_ms %g\n", sp.PingMS)
+		}
+		if sp.PingBestMS != nil {
+			// The floor under pingularity_speed_ping_ms, which is a MEAN over the
+			// engine's ten samples and so moves several-fold on one stalled
+			// handshake. A large gap between the two is a single slow sample, not a
+			// slow link - alert on this one to mean "the link really is far", and
+			// diff them to spot a lossy path.
+			fmt.Fprintln(w, "# HELP pingularity_speed_ping_best_ms Fastest of the last speedtest's ping samples (ms); pingularity_speed_ping_ms is their mean. Absent on iperf3 runs, which report no per-sample values.")
+			fmt.Fprintln(w, "# TYPE pingularity_speed_ping_best_ms gauge")
+			fmt.Fprintf(w, "pingularity_speed_ping_best_ms %g\n", *sp.PingBestMS)
 		}
 		if sp.JitterMS != nil {
 			fmt.Fprintln(w, "# HELP pingularity_speed_jitter_ms Last measured speedtest jitter (ms).")
@@ -2803,7 +3804,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "pingularity_speed_upload_bytes_per_second %g\n", sp.UpMbps*1e6/8)
 		}
 		if sp.PingMS != 0 {
-			fmt.Fprintln(w, "# HELP pingularity_speed_ping_seconds Last measured speedtest latency (seconds).")
+			fmt.Fprintln(w, "# HELP pingularity_speed_ping_seconds Last measured speedtest latency to the test server (seconds); same value and same iperf3 caveat as pingularity_speed_ping_ms.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_ping_seconds gauge")
 			fmt.Fprintf(w, "pingularity_speed_ping_seconds %g\n", sp.PingMS/1000)
 		}
@@ -2829,14 +3830,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprintf(w, "pingularity_speed_loaded_latency_ms{direction=\"up\"} %g\n", *sp.LoadedUpMS)
 			}
 		}
-		if sp.LoadedDownMaxMS != nil || sp.LoadedUpMaxMS != nil {
-			fmt.Fprintln(w, "# HELP pingularity_speed_loaded_latency_max_ms Worst-case latency during the speedtest load phase, by direction (ms).")
-			fmt.Fprintln(w, "# TYPE pingularity_speed_loaded_latency_max_ms gauge")
-			if sp.LoadedDownMaxMS != nil {
-				fmt.Fprintf(w, "pingularity_speed_loaded_latency_max_ms{direction=\"down\"} %g\n", *sp.LoadedDownMaxMS)
+		if sp.LoadedDownP95MS != nil || sp.LoadedUpP95MS != nil {
+			fmt.Fprintln(w, "# HELP pingularity_speed_loaded_latency_p95_ms 95th-percentile latency during the speedtest load phase, by direction (ms).")
+			fmt.Fprintln(w, "# TYPE pingularity_speed_loaded_latency_p95_ms gauge")
+			if sp.LoadedDownP95MS != nil {
+				fmt.Fprintf(w, "pingularity_speed_loaded_latency_p95_ms{direction=\"down\"} %g\n", *sp.LoadedDownP95MS)
 			}
-			if sp.LoadedUpMaxMS != nil {
-				fmt.Fprintf(w, "pingularity_speed_loaded_latency_max_ms{direction=\"up\"} %g\n", *sp.LoadedUpMaxMS)
+			if sp.LoadedUpP95MS != nil {
+				fmt.Fprintf(w, "pingularity_speed_loaded_latency_p95_ms{direction=\"up\"} %g\n", *sp.LoadedUpP95MS)
 			}
 		}
 	}
@@ -3184,14 +4185,6 @@ func sortedKeys(m map[string]float64) []string {
 	return ks
 }
 
-// speedRunningServer returns the in-progress run's server, or "" when idle.
-func speedRunningServer(t SpeedTrigger) string {
-	if t == nil || !t.Running() {
-		return ""
-	}
-	return t.CurrentServer()
-}
-
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -3287,11 +4280,10 @@ func parsePage(r *http.Request, defLimit int) (limit, offset int) {
 	// Cap the page size: an unbounded ?limit flows straight into SELECT ... LIMIT
 	// and, on the default auth-off LAN posture, lets any client force a huge
 	// materialize+JSON-encode - a cheap memory-amplification vector.
-	const maxLimit = 1000
 	limit = defLimit
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
-		if n > maxLimit {
-			n = maxLimit
+		if n > maxPageLimit {
+			n = maxPageLimit
 		}
 		limit = n
 	}

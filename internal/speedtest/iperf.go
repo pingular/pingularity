@@ -441,7 +441,8 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	// reject) - version caveats are surfaced to the UI via IperfVersion, not gated
 	// here (see iperfArgs).
 	res := Result{Engine: "iperf3", Server: name}
-	res.IdleMS = measureIdleLatency(ctx)
+	probeAddr := lulRunEndpoint()
+	res.IdleMS = measureIdleLatency(ctx, probeAddr)
 	// Unloaded ping to the server, taken now while the link is idle (see measureServerRTT
 	// for why iperf3's own min_rtt isn't trusted here).
 	serverRTT := measureServerRTT(ctx, host, port, tp)
@@ -459,7 +460,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		var bd iperfBidir
 		var load *loadStat
 		err := withRetry(ctx, retries, func() error {
-			stop := startLoadSampler(ctx)
+			stop := startLoadSampler(ctx, probeAddr)
 			var e error
 			bd, e = runIperfBidir(ctx, host, port, tp, auth)
 			load = stop()
@@ -472,8 +473,8 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		res.UploadMbps, res.UploadBytes = bd.upMbps, bd.upBytes
 		// Both directions loaded at once, so the single sampled bloat applies to each -
 		// report it under both so the chart reads "latency under full load".
-		res.LoadedDownMS, res.LoadedDownMaxMS = load.medPtr(), load.maxPtr()
-		res.LoadedUpMS, res.LoadedUpMaxMS = load.medPtr(), load.maxPtr()
+		res.LoadedDownMS, res.LoadedDownP95MS = load.medPtr(), load.tailPtr()
+		res.LoadedUpMS, res.LoadedUpP95MS = load.medPtr(), load.tailPtr()
 		rttMS = bd.rttMS
 	} else {
 		// Run the requested direction(s), best-effort: some servers are download-only and
@@ -484,7 +485,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		if dir != "up" {
 			var dnLoad *loadStat
 			dnErr = withRetry(ctx, retries, func() error {
-				stop := startLoadSampler(ctx) // bufferbloat sampled during the transfer
+				stop := startLoadSampler(ctx, probeAddr) // bufferbloat sampled during the transfer
 				var e error
 				dn, e = runIperf(ctx, host, port, tp, auth, true)
 				dnLoad = stop()
@@ -492,7 +493,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			})
 			if dnErr == nil {
 				res.DownloadMbps, res.DownloadBytes = dn.mbps, dn.bytes
-				res.LoadedDownMS, res.LoadedDownMaxMS = dnLoad.medPtr(), dnLoad.maxPtr()
+				res.LoadedDownMS, res.LoadedDownP95MS = dnLoad.medPtr(), dnLoad.tailPtr()
 			}
 		}
 		if dir != "down" {
@@ -501,7 +502,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			}
 			var upLoad *loadStat
 			upErr = withRetry(ctx, retries, func() error {
-				stop := startLoadSampler(ctx)
+				stop := startLoadSampler(ctx, probeAddr)
 				var e error
 				up, e = runIperf(ctx, host, port, tp, auth, false)
 				upLoad = stop()
@@ -509,7 +510,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			})
 			if upErr == nil {
 				res.UploadMbps, res.UploadBytes = up.mbps, up.bytes
-				res.LoadedUpMS, res.LoadedUpMaxMS = upLoad.medPtr(), upLoad.maxPtr()
+				res.LoadedUpMS, res.LoadedUpP95MS = upLoad.medPtr(), upLoad.tailPtr()
 			}
 		}
 		if (dir == "down" && dnErr != nil) || (dir == "up" && upErr != nil) || (dir == "both" && dnErr != nil && upErr != nil) {

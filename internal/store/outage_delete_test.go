@@ -82,16 +82,32 @@ func TestDeleteOutageRejectsNonOutageRows(t *testing.T) {
 	ctx := context.Background()
 	base := int64(plausibleEpoch) + 1000
 	evAt(t, st, base+1000, "down", -1) // an open outage has no closing up yet
-	evAt(t, st, base+2000, "up", -1)   // an up with NULL duration isn't a deletable outage
 
 	if n, err := st.DeleteOutage(ctx, base+1000); err != nil || n != 0 {
 		t.Fatalf("down ts: deleted = %d,%v want 0,nil", n, err)
 	}
-	if n, err := st.DeleteOutage(ctx, base+2000); err != nil || n != 0 {
-		t.Fatalf("null-duration up: deleted = %d,%v want 0,nil", n, err)
+	if c, _ := st.EventCount(ctx); c != 1 {
+		t.Fatalf("events left = %d, want 1 (nothing deleted)", c)
 	}
-	if c, _ := st.EventCount(ctx); c != 2 {
-		t.Fatalf("events left = %d, want 2 (nothing deleted)", c)
+}
+
+// An 'up' with a NULL duration is a FINISHED outage whose length was never
+// measured (or was stripped by a repair) - not a live one - so it is
+// deletable, and its 'down' markers are swept with it like any other
+// outage's. It used to be refused, which left the repair-nulled residue row
+// permanently undeletable (see repaired_outage_delete_test.go).
+func TestDeleteOutageAcceptsANullDurationUp(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	base := int64(plausibleEpoch) + 1000
+	evAt(t, st, base+1000, "down", -1)
+	evAt(t, st, base+2000, "up", -1) // recovery recorded without a measured length
+
+	if n, err := st.DeleteOutage(ctx, base+2000); err != nil || n != 2 {
+		t.Fatalf("null-duration up: deleted = %d,%v want 2,nil (the up and its down)", n, err)
+	}
+	if c, _ := st.EventCount(ctx); c != 0 {
+		t.Fatalf("events left = %d, want 0", c)
 	}
 }
 

@@ -202,6 +202,330 @@ func TestBackwardClockStepClampsRecovery(t *testing.T) {
 	}
 }
 
+// The clamp above keeps the ORDER intact, but ordering alone is not enough:
+// when the wall steps back by at least the outage's length, pinning the 'up' to
+// the down's second stores a ZERO-WIDTH pair whose duration_s still carries
+// the true monotonic elapsed. The observed-span model reads the pair as the
+// outage's wall interval (completedOutagesSince), and observedOutageSpans
+// yields nothing for a zero-width one - so uptime and the digest booked ZERO
+// downtime for an outage the digest still counted and the outage table still
+// showed at its real length, while the heatmap's fallback booked all of it.
+// The stored pair must be at least as wide as the duration it claims.
+func TestBackwardStepCannotZeroAnOutageOutOfDowntime(t *testing.T) {
+	m, st := newTestMonitor(t, 1, 1)
+	ctx := context.Background()
+
+	down := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	// A monitoring anchor an hour before the outage, so UptimeSince has an
+	// observed window to score.
+	if err := st.InsertSamples(ctx, []store.Sample{{
+		TS: down.Add(-time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12,
+	}}); err != nil {
+		t.Fatalf("insert sample: %v", err)
+	}
+
+	feed(m, false, down) // DOWN, stamped at wall second `down`
+	if m.online {
+		t.Fatal("expected DOWN after the failing round")
+	}
+	// Mid-outage the wall steps back a minute while two monotonic minutes pass.
+	// No synthesized time.Time can carry that decoupling (Add moves both
+	// readings), so fabricate the halves separately, exactly as production leaves
+	// them: m.since anchors the MONOTONIC measurement - move it so ts.Sub(m.since)
+	// reads the true 120s elapsed - while the recovery's WALL second lands before
+	// the down's, which is what reaches the .Unix() clamp.
+	m.mu.Lock()
+	m.since = down.Add(-3 * time.Minute)
+	m.mu.Unlock()
+	feed(m, true, down.Add(-time.Minute))
+	if !m.online {
+		t.Fatal("expected UP after recovery")
+	}
+
+	var downTS, upTS, dur int64
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='down'`).Scan(&downTS); err != nil {
+		t.Fatalf("read down ts: %v", err)
+	}
+	if err := st.DB().QueryRow(`SELECT ts, duration_s FROM events WHERE type='up'`).Scan(&upTS, &dur); err != nil {
+		t.Fatalf("read up event: %v", err)
+	}
+	if dur != 120 {
+		t.Fatalf("outage duration = %d, want 120 (the monotonic elapsed)", dur)
+	}
+	if upTS-downTS < dur {
+		t.Errorf("stored pair is %ds wide for a %ds outage; a zero-width pair yields no observed "+
+			"spans, so the downtime vanishes from uptime and the digest while the outage table "+
+			"still shows it", upTS-downTS, dur)
+	}
+	// And the figure every surface derives: the outage must be booked, not zeroed.
+	o, err := st.UptimeSince(ctx, down.Add(-time.Hour), 0)
+	if err != nil {
+		t.Fatalf("UptimeSince: %v", err)
+	}
+	if o.Down != 120*time.Second {
+		t.Errorf("UptimeSince booked %v of downtime for the 120s outage the events table records; "+
+			"a backward wall step must not delete an outage from the headline figure", o.Down)
+	}
+}
+
+// The widen above stamps a recovery ahead of a stepped-back wall clock, so for
+// the whole catch-up window the stored 'up' second sits in the wall FUTURE. Any
+// NEW outage confirmed during that window has its 'down' clamped nondecreasing
+// to exactly that second - and completedOutagesSince breaks ts ties
+// down-before-up, so a tied 'down' slots between the widened 'up' and its own
+// 'down' and steals the pairing: the first outage collapses to the zero-width
+// shape the widen exists to eliminate, one event later. A 'down' must land
+// strictly after the 'up' it follows.
+func TestOutageDuringCatchUpDoesNotCollapseTheWidenedPair(t *testing.T) {
+	m, st := newTestMonitor(t, 1, 1)
+	ctx := context.Background()
+
+	down := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	// A monitoring anchor for the observed window, and a real quorum-up second in
+	// the up-stretch between the outages: without it the mispaired first outage
+	// is partly re-booked by the orphan down->down heuristic and the loss hides.
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: down.Add(-time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+		{TS: down.Add(35 * time.Second), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+	}); err != nil {
+		t.Fatalf("insert samples: %v", err)
+	}
+
+	feed(m, false, down) // outage 1 DOWN at wall `down`
+	// The wall steps back mid-outage: 120 monotonic seconds elapse while the
+	// wall advances 30. Decouple the halves as production leaves them (see the
+	// test above): m.since anchors the monotonic measurement, the fed ts carries
+	// the wall second.
+	m.mu.Lock()
+	m.since = down.Add(30*time.Second - 120*time.Second)
+	m.mu.Unlock()
+	feed(m, true, down.Add(30*time.Second)) // recovery: widened to down+120, ahead of the wall
+	// Outage 2 is confirmed while the wall (down+90) is still behind the widened
+	// recovery (down+120), and closes cleanly 60 monotonic seconds later.
+	feed(m, false, down.Add(90*time.Second))
+	feed(m, true, down.Add(150*time.Second))
+
+	var up1, down2 int64
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='up' ORDER BY ts LIMIT 1`).Scan(&up1); err != nil {
+		t.Fatalf("read first up ts: %v", err)
+	}
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='down' ORDER BY ts DESC LIMIT 1`).Scan(&down2); err != nil {
+		t.Fatalf("read second down ts: %v", err)
+	}
+	if down2 <= up1 {
+		t.Errorf("second outage's down ts=%d does not clear the widened up ts=%d; the tie sorts "+
+			"down-before-up and steals the first outage's pairing", down2, up1)
+	}
+	// The figure the pairing feeds: both outages' observed downtime, 120s + 60s.
+	o, err := st.UptimeSince(ctx, down.Add(-time.Hour), 0)
+	if err != nil {
+		t.Fatalf("UptimeSince: %v", err)
+	}
+	if want := 180 * time.Second; o.Down != want {
+		t.Errorf("UptimeSince booked %v of downtime, want %v: a down tied to the widened up "+
+			"collapses the first outage to zero width", o.Down, want)
+	}
+}
+
+// The tie-breaking above rests on m.lastEventWall, which used to exist only in
+// memory: a RESTART inside the catch-up window came up with the guard empty, the
+// IsZero check short-circuited the clamp, and the next outage's 'down' was
+// stored at or before the on-disk widened 'up' - recreating the very
+// same-second tie/overlap the previous process's guard had just eliminated. Run
+// must seed the guard from the newest stored event before its first round can
+// transition. (LastObservedTS cannot serve as the source: it caps at wall now,
+// and a future-dated 'up' - the one case that needs the guard - is precisely
+// what it excludes.)
+func TestWidenGuardSurvivesARestart(t *testing.T) {
+	m, st := newTestMonitor(t, 1, 1)
+	ctx := context.Background()
+
+	down := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	// The same anchors as the test above: an observed window, and a real
+	// quorum-up second so a mispaired first outage can't hide behind the orphan
+	// down->down heuristic.
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: down.Add(-time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+		{TS: down.Add(35 * time.Second), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+	}); err != nil {
+		t.Fatalf("insert samples: %v", err)
+	}
+
+	feed(m, false, down) // outage 1 DOWN at wall `down`
+	// The wall steps back mid-outage (see the tests above for the fabrication):
+	// the recovery is widened to down+120, ahead of the stepped-back wall.
+	m.mu.Lock()
+	m.since = down.Add(30*time.Second - 120*time.Second)
+	m.mu.Unlock()
+	feed(m, true, down.Add(30*time.Second))
+
+	// The process restarts while the wall (down+90) is still behind the widened
+	// 'up' (down+120): a fresh Monitor over the SAME store, started the way
+	// production starts one - through Run, whose startup must seed the guard.
+	// Probing is gated off so the harness's loop measures nothing on its own and
+	// the outage below can be fed deterministically once Run has exited.
+	clk := newWallClock(down.Add(90 * time.Second))
+	swapNow(t, clk)
+	buf := &syncBuf{}
+	m2 := New(config.Config{DownAfter: 1, UpAfter: 1}, prober.New(nil, time.Second), st,
+		slog.New(slog.NewTextHandler(buf, nil)))
+	m2.DNSFn = func() bool { return false }
+	m2.LatencyFn = func() bool { return false }
+	m2.IntervalFn = func() time.Duration { return time.Hour }
+	_, stop := startLoop(t, m2)
+	// The paused line is logged by the first loop iteration, which startup
+	// strictly precedes: once it appears, the seeding has happened (or never will).
+	waitFor(t, "the restarted loop to come up", func() bool {
+		return buf.has("monitor recording paused")
+	})
+	stop()
+
+	// Outage 2 is confirmed during the catch-up window and closes 60 monotonic
+	// seconds later.
+	feed(m2, false, down.Add(90*time.Second))
+	feed(m2, true, down.Add(150*time.Second))
+
+	var up1, down2 int64
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='up' ORDER BY ts LIMIT 1`).Scan(&up1); err != nil {
+		t.Fatalf("read first up ts: %v", err)
+	}
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='down' ORDER BY ts DESC LIMIT 1`).Scan(&down2); err != nil {
+		t.Fatalf("read second down ts: %v", err)
+	}
+	if down2 <= up1 {
+		t.Errorf("after a restart, the second outage's down ts=%d does not clear the widened up ts=%d; "+
+			"the guard did not survive the process boundary", down2, up1)
+	}
+	o, err := st.UptimeSince(ctx, down.Add(-time.Hour), 0)
+	if err != nil {
+		t.Fatalf("UptimeSince: %v", err)
+	}
+	if want := 180 * time.Second; o.Down != want {
+		t.Errorf("UptimeSince booked %v of downtime, want %v: a down at or before the widened up "+
+			"collapses the first outage exactly as it did before f133282, one restart later", o.Down, want)
+	}
+}
+
+// The seed above is only ever a RECOVERY of this process's own guard, so its
+// source must be a row the system still believes in. An event stamped years
+// ahead of the wall is not: Prune deletes events beyond now+48h on its hourly
+// pass, so seeding from one clamps every genuine transition that follows into
+// the condemned zone - the outage is stored in the far future, erased by the
+// next prune, and because the guard lives in memory it survives that deletion
+// and drags the transition after it out there too. Nothing bounds an event's ts
+// on the way in (eventRowSane vets type and duration only, InsertEvent not at
+// all), so a crafted backup or a boot clock years fast both reach the seed.
+func TestAFutureDatedEventDoesNotSeedTheGuard(t *testing.T) {
+	_, st := newTestMonitor(t, 1, 1)
+	ctx := context.Background()
+
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	// The poisoned row: an 'up' a year out, arriving by the door with no bound.
+	if err := st.InsertEvent(ctx, now.AddDate(1, 0, 0), "up", 5, ""); err != nil {
+		t.Fatalf("insert future event: %v", err)
+	}
+	// An observed window, and a real quorum-up second after the recovery so the
+	// pairing can't hide behind the orphan down->down heuristic.
+	if err := st.InsertSamples(ctx, []store.Sample{
+		{TS: now.Add(-time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+		{TS: now.Add(65 * time.Second), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12},
+	}); err != nil {
+		t.Fatalf("insert samples: %v", err)
+	}
+
+	// Started the way production starts one - through Run, whose startup seeds -
+	// with probing gated off so the outage below is fed deterministically once
+	// Run has stopped.
+	clk := newWallClock(now)
+	swapNow(t, clk)
+	buf := &syncBuf{}
+	m := New(config.Config{DownAfter: 1, UpAfter: 1}, prober.New(nil, time.Second), st,
+		slog.New(slog.NewTextHandler(buf, nil)))
+	m.DNSFn = func() bool { return false }
+	m.LatencyFn = func() bool { return false }
+	m.IntervalFn = func() time.Duration { return time.Hour }
+	_, stop := startLoop(t, m)
+	waitFor(t, "the loop to come up", func() bool { return buf.has("monitor recording paused") })
+	stop()
+
+	// A real 60-second outage, entirely in the present.
+	feed(m, false, now)
+	feed(m, true, now.Add(60*time.Second))
+
+	var downTS int64
+	if err := st.DB().QueryRow(`SELECT ts FROM events WHERE type='down'`).Scan(&downTS); err != nil {
+		t.Fatalf("read down ts: %v", err)
+	}
+	if downTS != now.Unix() {
+		t.Errorf("the outage's down was stored at ts=%d, want %d (wall now): a future-dated event "+
+			"seeded the guard and clamped a real transition %v ahead of the clock that saw it",
+			downTS, now.Unix(), time.Duration(downTS-now.Unix())*time.Second)
+	}
+	o, err := st.UptimeSince(ctx, now.Add(-time.Hour), 0)
+	if err != nil {
+		t.Fatalf("UptimeSince: %v", err)
+	}
+	if want := 60 * time.Second; o.Down != want {
+		t.Errorf("UptimeSince booked %v of downtime, want %v: the outage was stamped outside every "+
+			"window it belongs to (and beyond the horizon the pruner will erase)", o.Down, want)
+	}
+}
+
+// The widen must stretch the pair to down + ELAPSED (the raw monotonic wall
+// window), not down + duration: duration already has the outage's pause fold
+// subtracted, and observedOutageSpans subtracts the stored pause rows from the
+// stored pair AGAIN before trimming to duration_s. A pair widened only to the
+// duration therefore books duration-minus-pause on uptime, the digest and the
+// heatmap while duration_s claims the full length - the cross-surface
+// disagreement the one-interval model exists to prevent.
+func TestWidenedPairIsWideEnoughForTheReadModelsPauseSubtraction(t *testing.T) {
+	m, st := newTestMonitor(t, 1, 1)
+	ctx := context.Background()
+
+	down := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	if err := st.InsertSamples(ctx, []store.Sample{{
+		TS: down.Add(-time.Hour), Target: "cf", Family: "ipv4", Success: true, LatencyMS: 12,
+	}}); err != nil {
+		t.Fatalf("insert sample: %v", err)
+	}
+
+	feed(m, false, down) // DOWN at wall `down`
+	// A 20-minute monitoring pause inside the outage, recorded the way Run does:
+	// the row persisted for the read model, the fold accumulated for transition.
+	pauseStart := down.Add(10 * time.Minute)
+	m.notePause(pauseStart)
+	if stored, err := st.InsertPause(ctx, pauseStart, 1200); err != nil || !stored {
+		t.Fatalf("insert pause: stored=%v err=%v", stored, err)
+	}
+	m.noteResume(pauseStart.Add(20 * time.Minute))
+	// The wall steps back 2400s across a 3600s-monotonic outage: the recovery's
+	// wall second reads down+1200 while m.since anchors the true hour elapsed.
+	m.mu.Lock()
+	m.since = down.Add(1200*time.Second - 3600*time.Second)
+	m.mu.Unlock()
+	feed(m, true, down.Add(1200*time.Second))
+	if !m.online {
+		t.Fatal("expected UP after recovery")
+	}
+
+	var dur int64
+	if err := st.DB().QueryRow(`SELECT duration_s FROM events WHERE type='up'`).Scan(&dur); err != nil {
+		t.Fatalf("read up duration: %v", err)
+	}
+	if dur != 2400 {
+		t.Fatalf("outage duration = %d, want 2400 (3600s elapsed minus the 1200s pause fold)", dur)
+	}
+	// The invariant: what the read model books must equal what duration_s claims.
+	o, err := st.UptimeSince(ctx, down.Add(-time.Hour), 0)
+	if err != nil {
+		t.Fatalf("UptimeSince: %v", err)
+	}
+	if want := time.Duration(dur) * time.Second; o.Down != want {
+		t.Errorf("UptimeSince booked %v for an outage whose duration_s says %v: the pair was "+
+			"widened into an interval the pause subtraction shrinks below its own claim", o.Down, want)
+	}
+}
+
 // Streaks accumulated before a monitoring pause must not survive it: a single
 // post-resume failure must not combine with pre-pause failures to confirm a
 // transition (Run resets the streaks whenever it skips a round while paused).

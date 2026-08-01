@@ -13,6 +13,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pingular/pingularity/internal/store"
@@ -44,13 +45,6 @@ type Manager struct {
 	// FreqFn returns the live cadence ("daily"|"weekly"; anything else, incl.
 	// "off"/"", disables). Read each tick so a settings change applies live.
 	FreqFn func() string
-
-	// EnabledFn gates the digest on the monitoring master switch (nil = always
-	// on). A paused monitor records no outages, so UptimeSince returns 1.0 and the
-	// digest would email "Uptime 100.00% - no outages" - affirmatively wrong, not
-	// merely stale, and with none of the pause context the dashboard shows. Same
-	// reasoning as the heartbeat, which a paused monitor also silences.
-	EnabledFn func() bool
 
 	// RetentionFn returns the live downtime-retention window (0 = keep forever), so
 	// UptimeSince can clamp the digest window to what event history actually covers.
@@ -113,10 +107,22 @@ func (m *Manager) Loop(ctx context.Context) {
 
 func (m *Manager) tick(ctx context.Context) {
 	p := period(m.FreqFn())
-	// Treat a paused monitor exactly like the digest being off: drop any pending
-	// retry and leave the last-sent watermark untouched, so resuming arms a fresh
-	// window from now rather than back-filling the paused gap with a false 100%.
-	if p <= 0 || (m.EnabledFn != nil && !m.EnabledFn()) {
+	// Only the digest's own cadence setting suppresses a digest. There used to be a
+	// second gate here on the monitoring master switch, justified by "a paused
+	// monitor records no outages, so the digest would email a false 100%" - but the
+	// false 100% came from Summarize DISCARDING coverage, and the gate never
+	// covered the cases that actually produce it: pause spans are written whenever
+	// probing() is false, which includes the latency schedule window and the
+	// latency sub-toggle, and both leave Monitoring() true. So an operator on an
+	// 8h/day schedule was never gated and got a confident 100.00% every single day,
+	// while an operator who pressed the power button got silence - the digest
+	// disclosing nothing in one case and saying nothing at all in the other.
+	//
+	// Summarize now states the observed span, so the honest report is available in
+	// every case and suppression buys nothing: silence is indistinguishable from a
+	// broken webhook, and it is the same false all-clear that omitting a series
+	// gives a Prometheus alert. Always send; say what was observed.
+	if p <= 0 {
 		m.pendingSince = time.Time{} // disabled: drop any pending retry so re-enabling arms/caps fresh
 		return                       // leave last-sent untouched so re-enabling arms cleanly
 	}
@@ -175,15 +181,16 @@ func (m *Manager) tick(ctx context.Context) {
 }
 
 func (m *Manager) send(ctx context.Context, since, now time.Time) error {
-	s, err := m.summary(ctx, since, now)
+	s, err := m.Summarize(ctx, since, now)
 	if err != nil {
 		return err
 	}
-	if err := m.Notify.Send(ctx, s.message(), s.fields()); err != nil {
+	if err := m.Notify.Send(ctx, s.Message(), s.Fields()); err != nil {
 		return err
 	}
 	m.Log.Info("digest sent",
-		"window", s.Window.String(), "uptime_pct", util.Round2(s.UptimePct),
+		"window", s.Window.String(), "observed", s.Obs.Observed.String(),
+		"uptime_pct", util.Round2(s.UptimePct()), "measured", s.Obs.Defined(),
 		"outages", s.Outages, "downtime_s", s.DowntimeS, "speed_runs", s.Runs)
 	return nil
 }
@@ -191,9 +198,16 @@ func (m *Manager) send(ctx context.Context, since, now time.Time) error {
 // Summary is one period's roll-up.
 type Summary struct {
 	Since, Until time.Time
-	Window       time.Duration
-	UptimePct    float64
-	Runs         int
+	// Window is the span the digest was ASKED for (Until-Since). Obs.Window may be
+	// shorter - UptimeSince clamps to when monitoring began and to the retention
+	// horizon - and Obs.Observed shorter still. The disclosure line compares the
+	// two, so "last 1d" can never again describe eight watched hours in silence.
+	Window time.Duration
+	// Obs is the uptime evidence, ratio and coverage inseparable. There is no
+	// UptimePct FIELD any more: a Summary that carries a percentage but not the
+	// coverage behind it is exactly the object this cluster kept re-creating.
+	Obs  store.Observation
+	Runs int
 	// Median speeds/ping are nil when no run measured that direction/metric (e.g.
 	// a download-only speed setting never measures upload), so absence is rendered
 	// as "-" rather than a fake measured 0.
@@ -204,29 +218,40 @@ type Summary struct {
 	DowntimeS   int
 }
 
-func (m *Manager) summary(ctx context.Context, since, now time.Time) (Summary, error) {
+// Summarize rolls one window up without sending it. Exported so a cross-package
+// test can put the digest's figures beside /api/status, /metrics and the heatmap
+// over the SAME window (internal/web's four-renderer agreement test) - the seam
+// this cluster kept drifting at, and the one thing no test in the tree could see
+// before, because every cross-component fixture stopped at the store boundary.
+func (m *Manager) Summarize(ctx context.Context, since, now time.Time) (Summary, error) {
 	s := Summary{Since: since, Until: now, Window: now.Sub(since)}
 
 	// Clamp the window to downtime retention: usually the digest period (<= a week)
 	// sits well inside the default 365-day retention and this is a no-op, but an
 	// operator who set retention SHORTER than the digest cadence would otherwise have
 	// UptimeSince read the pruned early days as outage-free and report a falsely high
-	// uptime. coverage is ignored - the digest independently suppresses a paused
-	// period (see the pause guard above), so it only reaches here with a
-	// genuinely-observed window.
+	// uptime.
+	//
+	// The coverage is kept, not dropped. The comment that used to stand here said it
+	// could be ignored because "the digest independently suppresses a paused period,
+	// so it only reaches here with a genuinely-observed window" - which was false in
+	// both halves: the suppression was on the monitoring master switch, and a
+	// scheduled-off or latency-disabled window leaves that switch ON while writing
+	// pause spans all day. A digest for a window that observed 8 of 24 hours reached
+	// this line every day and left with a bare 100.00%.
 	var retention time.Duration
 	if m.RetentionFn != nil {
 		retention = m.RetentionFn()
 	}
-	up, _, err := m.Store.UptimeSince(ctx, since, retention)
+	obs, err := m.Store.UptimeSince(ctx, since, retention)
 	if err != nil {
-		return s, err
+		return s, fmt.Errorf("digest uptime: %w", err)
 	}
-	s.UptimePct = up * 100
+	s.Obs = obs
 
 	runs, err := m.Store.SpeedHistory(ctx, since)
 	if err != nil {
-		return s, err
+		return s, fmt.Errorf("digest speed history: %w", err)
 	}
 	s.Runs = len(runs)
 	// A direction an iperf3 partial run never measured is recorded as 0 Mbps;
@@ -239,15 +264,64 @@ func (m *Manager) summary(ctx context.Context, since, now time.Time) (Summary, e
 	// Outages resolved in the window. An outage still ongoing at send time isn't
 	// counted yet and rolls into the next digest, so reported durations are final.
 	// A direct aggregate so the count/downtime can't undercount a busy window.
-	s.Outages, s.DowntimeS, err = m.Store.ResolvedOutagesSince(ctx, since.Unix())
+	// The outage window gets the SAME retention clamp UptimeSince applied above:
+	// Prune keeps an outage that straddles the retention floor whole (deleting
+	// only its 'down' would orphan the 'up'), so an unclamped query would book
+	// the straddler's full downtime while the uptime% describes only the
+	// post-floor slice - one line contradicting itself ("1 outage · 25h down"
+	// beside 97.96% over 49h observed). Clamping the start makes
+	// ResolvedOutagesSince clip the straddler to the window the uptime% covers.
+	outageSince := since
+	if retention > 0 {
+		if floor := now.Add(-retention); floor.After(outageSince) {
+			outageSince = floor
+		}
+	}
+	s.Outages, s.DowntimeS, err = m.Store.ResolvedOutagesSince(ctx, outageSince.Unix())
 	if err != nil {
-		return s, err
+		return s, fmt.Errorf("digest outages: %w", err)
 	}
 	return s, nil
 }
 
-// message renders the human-readable digest line(s).
-func (s Summary) message() string {
+// discloseFloor is the shortfall between the window asked for and the span
+// actually observed below which the digest says nothing about it.
+//
+// It exists only to keep a sub-second rounding difference (Since/Until carry
+// nanoseconds; UptimeSince works in whole seconds) from appending a disclosure to
+// every digest a perfectly healthy 24/7 monitor sends. It is NOT a
+// quality threshold and it is not visible outside this package: /metrics'
+// definedness guard takes no threshold at all, and deliberately cannot see this
+// one. A real unobserved episode is minutes at minimum - the monitor only records
+// a pause span for a gap past its detection threshold - so nothing genuine falls
+// under a minute.
+const discloseFloor = time.Minute
+
+// observedLine is the digest's disclosure: what span the figures above actually
+// describe, or "" when the window was observed end to end and there is nothing to
+// disclose.
+//
+// It never suppresses the digest and never scolds. Monitoring is off for a
+// scheduled window because the operator asked for it to be, so the sentence
+// reports a span and lists the ordinary reasons without implying a fault; the
+// alternative wording ("only 8h of 24h were monitored") reads as a warning about
+// the user's own setting.
+func (s Summary) observedLine() string {
+	if s.Window-s.Obs.Observed < discloseFloor {
+		return ""
+	}
+	if !s.Obs.Defined() {
+		return fmt.Sprintf("observed none of %s - monitoring was off for the whole period, so there is no uptime figure for it",
+			humanWindow(s.Window))
+	}
+	return fmt.Sprintf("observed %s of %s - the rest was not monitored (scheduled off, paused, asleep, or past retention); the figures above describe what was observed",
+		humanWindow(s.Obs.Observed), humanWindow(s.Window))
+}
+
+// Message renders the human-readable digest line(s). Exported alongside Fields so
+// a cross-package test can compare what the digest actually EMITS with what
+// /api/status, /metrics and the heatmap emit for the same window.
+func (s Summary) Message() string {
 	speed := "no speedtests"
 	if s.Runs > 0 {
 		speed = fmt.Sprintf("median ↓ %s Mbps · ↑ %s Mbps · %s ms ping (%d test%s)",
@@ -257,21 +331,50 @@ func (s Summary) message() string {
 	if s.Outages > 0 {
 		outages = fmt.Sprintf("%d outage%s · %s down", s.Outages, plural(s.Outages), util.HumanDur(s.DowntimeS))
 	}
-	return fmt.Sprintf("📊 Pingularity summary · last %s\nUptime %.2f%% · %s\n%s",
-		humanWindow(s.Window), s.UptimePct, outages, speed)
+	// A window that observed nothing has no percentage to report - Obs.Ratio is a
+	// sentinel 1 there, not a measurement, and printing it as "100.00%" is the
+	// original defect. Say so in words, exactly as /metrics omits the ratio series.
+	uptime := "Uptime not measured"
+	if s.Obs.Defined() {
+		uptime = fmt.Sprintf("Uptime %.2f%%", s.UptimePct())
+	}
+	lines := []string{
+		"📊 Pingularity summary · last " + humanWindow(s.Window),
+		uptime + " · " + outages,
+	}
+	if obs := s.observedLine(); obs != "" {
+		lines = append(lines, obs)
+	}
+	return strings.Join(append(lines, speed), "\n")
 }
 
-// fields are the structured payload merged into a generic webhook body. A median
+// UptimePct is the up-fraction of OBSERVED time as a percentage. It is a method,
+// not a field, so it cannot be read off a Summary that was never handed its
+// coverage; check Obs.Defined before presenting it (see Message).
+func (s Summary) UptimePct() float64 { return s.Obs.Ratio() * 100 }
+
+// Fields is the structured payload merged into a generic webhook body. A median
 // a direction/metric never measured is omitted, not shipped as 0, so a consumer
 // can tell "not measured" from a genuine zero.
-func (s Summary) fields() map[string]any {
+func (s Summary) Fields() map[string]any {
 	f := map[string]any{
 		"event":      "digest",
 		"window_s":   int(s.Window.Seconds()),
-		"uptime_pct": util.Round2(s.UptimePct),
 		"outages":    s.Outages,
 		"downtime_s": s.DowntimeS,
 		"speed_runs": s.Runs,
+		// The observed span rides the structured payload too, not just the prose:
+		// these fields are machine-consumed, and a consumer charting uptime_pct
+		// needs the same qualifier a human reading the message gets. observed_s
+		// against window_s is the digest's coverage_ratio.
+		"observed_s": int(s.Obs.Observed.Seconds()),
+	}
+	// Omitted, not zeroed or faked, when the window observed nothing - the same
+	// rule the medians below follow, so a consumer can tell "not measured" from a
+	// genuine reading. A 100 here for an unwatched day is the exact figure this
+	// change exists to stop shipping.
+	if s.Obs.Defined() {
+		f["uptime_pct"] = util.Round2(s.UptimePct())
 	}
 	if s.MedDownMbps != nil {
 		f["median_down_mbps"] = util.Round1(*s.MedDownMbps)
@@ -347,17 +450,39 @@ func medianBy(runs []store.SpeedSample, pick func(store.SpeedSample) (float64, b
 
 // humanWindow renders a digest's span compactly ("1d", "7d", "3d 4h"). Day-scale
 // (windows are always >= 24h), unlike util.HumanDur's second-scale for outages.
+// humanWindow renders a span at the two coarsest units it has, never rounding a
+// real span away to nothing.
+//
+// It used to stop at whole hours, which put every span under an hour - and the
+// sub-hour remainder of every longer one - into the string "0h". Two of the three
+// callers describe how much the machine WATCHED, and one of those is the coverage
+// disclosure that tells the operator how far to trust the rest of the digest. A
+// machine awake for forty-five minutes reported "observed 0h of 1d", which is the
+// string a machine that observed nothing would print, and the digest words that
+// case as a separate sentence precisely because the two mean different things.
 func humanWindow(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
 	days := int(d / (24 * time.Hour))
 	hours := int(d%(24*time.Hour)) / int(time.Hour)
+	mins := int(d%time.Hour) / int(time.Minute)
+	secs := int(d%time.Minute) / int(time.Second)
 	switch {
-	case days == 0:
-		return fmt.Sprintf("%dh", hours)
-	case hours == 0:
-		return fmt.Sprintf("%dd", days)
-	default:
+	case days > 0 && hours > 0:
 		return fmt.Sprintf("%dd %dh", days, hours)
+	case days > 0:
+		return fmt.Sprintf("%dd", days)
+	case hours > 0 && mins > 0:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	case hours > 0:
+		return fmt.Sprintf("%dh", hours)
+	case mins > 0:
+		return fmt.Sprintf("%dm", mins)
 	}
+	// Below a minute, seconds - including a genuine zero, which is the one span
+	// that is allowed to read as nothing.
+	return fmt.Sprintf("%ds", secs)
 }
 
 func plural(n int) string {

@@ -49,8 +49,8 @@
   /* Retro - green-phosphor CRT with amber accents. */
   html[data-theme="retro"]{
     --bg:#2c3b32; --bg2:#314137; --panel:#38493e; --panel2:#3e5044;
-    --line:#4d6155; --line2:#607869; --fg:#dcf6d4; --muted:#99bca0;
-    --up:#4cf08a; --down:#ff7a52; --warn:#ffc24a; --accent:#ffb000; --accent2:#4fe0a0;
+    --line:#4d6155; --line2:#607869; --fg:#dcf6d4; --muted:#a7c5ad;
+    --up:#4cf08a; --down:#ffa98f; --warn:#ffc24a; --accent:#ffb000; --accent2:#4fe0a0;
     --grid:rgba(160,255,180,.08); --hm0:#3e5044; --header-bg:rgba(56,73,62,.85);
   }
   /* Retro: coordinate the brand wordmark + radar logo with the green/amber palette. */
@@ -73,7 +73,7 @@
   html[data-theme="slate"]{
     --bg:#16171b; --bg2:#1b1c21; --panel:#212228; --panel2:#282932;
     --line:#363842; --line2:#464855; --fg:#f2f3f6; --muted:#989aa4;
-    --up:#e6e6ea; --down:#9a9da3; --warn:#7e8189; --accent:#e6e6ea; --accent2:#9a9da3; --on-accent:#16171b;
+    --up:#e6e6ea; --down:#9a9da3; --warn:#8f9299; --accent:#e6e6ea; --accent2:#9a9da3; --on-accent:#16171b;
     --grid:rgba(255,255,255,.05); --hm0:#212228; --header-bg:#212228;
   }
   /* Greyscale wordmark + radar logo and desaturated graph (monochrome). */
@@ -86,7 +86,7 @@
   html[data-theme="light"]{
     --bg:#f2f1ed; --bg2:#e9e8e2; --panel:#fffefa; --panel2:#f8f7f2;
     --line:#ddd9d0; --line2:#c8c2b6; --fg:#1e1f21; --muted:#64665f;
-    --up:#12a150; --down:#e5484d; --warn:#c47f0a; --accent:#3060b4; --accent2:#0c8a72; --on-accent:#ffffff;
+    --up:#0e8040; --down:#db1f25; --warn:#996308; --accent:#3060b4; --accent2:#0c8a72; --on-accent:#ffffff;
     --grid:rgba(0,0,0,.06); --hm0:#e7e4db; --header-bg:#fbfaf5;
     color-scheme:light;
   }
@@ -96,8 +96,8 @@
   /* Solarized (dark) - the classic petrol base with blue/teal accents; keeps the soft depth. */
   html[data-theme="solarized"]{
     --bg:#002b36; --bg2:#013440; --panel:#073642; --panel2:#0a4250;
-    --line:#0f4d5c; --line2:#16606f; --fg:#93a1a1; --muted:#7f9294;
-    --up:#859900; --down:#dc322f; --warn:#b58900; --accent:#268bd2; --accent2:#2aa198; --on-accent:#06101f;
+    --line:#0f4d5c; --line2:#16606f; --fg:#93a1a1; --muted:#9cabac;
+    --up:#9cb400; --down:#ec8f8d; --warn:#d4a000; --accent:#268bd2; --accent2:#2aa198; --on-accent:#06101f;
     --grid:rgba(147,161,161,.07); --hm0:#073642; --header-bg:rgba(7,54,66,.88);
   }
   /* Coordinate the wordmark + radar logo with Solarized's blue/teal palette. */
@@ -106,7 +106,7 @@
   html[data-theme="parchment"]{
     --bg:#efe4c8; --bg2:#e7dab9; --panel:#f9f1da; --panel2:#fdf7e8;
     --line:#d6c39c; --line2:#c4ad80; --fg:#3c3124; --muted:#6b5a40;
-    --up:#5c7d34; --down:#a83a29; --warn:#b5791a; --accent:#9a4e22; --accent2:#6f7d43; --on-accent:#faf3e0;
+    --up:#577631; --down:#a83a29; --warn:#936215; --accent:#9a4e22; --accent2:#6f7d43; --on-accent:#faf3e0;
     --grid:rgba(60,49,36,.08); --hm0:#e2d4b0; --header-bg:rgba(249,241,218,.88);
     color-scheme:light;
   }
@@ -515,6 +515,16 @@
   .log-window .lg-err{color:var(--down);}
   .log-window .lg-warn{color:var(--warn);}
   .log-window .lg-dbg{color:var(--muted);}
+  /* A cursor gap: the ring evicted lines between two polls, so the history above
+     this marker is not contiguous with the history below it. Centred and dimmed so
+     it reads as a seam rather than as a log line. */
+  .log-window .lg-gap{color:var(--muted);text-align:center;opacity:.75;}
+  /* The stall note. A failed poll used to be swallowed, leaving the last payload
+     on screen looking live; this says the pane is frozen. */
+  /* Says when the pane holds only the newest slice of the retained log. Same muted
+     treatment as the stall notice below it - a statement of fact, not a warning. */
+  .log-trunc{font-size:11px;color:var(--muted);padding:2px 8px;opacity:.85;}
+  .log-stall{margin:5px 2px 0;font-size:11.5px;color:var(--warn);}
   /* iperf3 saved-server cards: a compact list (a dot picks the test target, Edit opens
      the inline editor, x removes), plus the collapsible editor panel below it. */
   .iperf-list{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;margin:6px 0 2px;}
@@ -738,11 +748,68 @@
      + drag handle) their space.
      Muted like the handle, brightening to accent on hover; a hidden chart's button is
      dimmed (opacity), which is the settled look - do NOT restyle it. */
-  .runs-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:10px;padding-right:32px;}
+  .runs-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:18px;padding-right:32px;}
   .chart-toggles{display:flex;gap:5px;align-items:center;margin-left:auto;}
-  .chart-toggle{font:600 9px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.5px;text-transform:uppercase;
-    height:24px;padding:0 9px;border-radius:7px;border:1px solid var(--line2);background:var(--bg2);
-    color:var(--muted);opacity:.5;cursor:pointer;transition:opacity .15s,border-color .15s,color .15s;}
+  /* Range-average readouts, parked between the "show all runs" button and the toggles.
+     Deliberately NO margin-left:auto: .chart-toggles' auto margin absorbs ALL the free
+     space left on its flex line, so the toggles keep hugging the right edge and these
+     stay tucked against the button however wide they grow. Their own flex-wrap means
+     that when the bar finally runs out of room the three of them break among
+     themselves rather than pushing the toggles down onto the save button's reserve. */
+  .chart-stats{display:flex;gap:5px;align-items:center;flex-wrap:wrap;}
+  /* Box and type are SHARED with .chart-toggle rather than restated, so the two
+     clusters read as one family and can never drift apart; only the affordance
+     differs, and that is the little that stays split out below. */
+  /* Box shared with .chart-stat so the two clusters sit as one row; TYPE is not,
+     see .chart-stat below. */
+  .chart-toggle,.chart-stat{height:24px;padding:0 9px;border-radius:7px;border:1px solid var(--line2);
+    background:var(--bg2);color:var(--muted);}
+  .chart-toggle{font:600 9px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.5px;text-transform:uppercase;}
+  .chart-toggle{opacity:.5;cursor:pointer;transition:opacity .15s,border-color .15s,color .15s;}
+  /* A readout, not a control: no cursor, no hover, no pressed state. inline-flex is
+     load-bearing - these are <span>s, and `height` does nothing to a non-replaced
+     INLINE box, so without it the pills would quietly render short and the shared
+     24px would be a lie. Resting a little brighter than a toggle's .5 because this
+     carries a number to be read, not an affordance to be noticed; half-opacity on a
+     9px figure is genuinely hard to make out. */
+  /* Type matches .btn (the "Show all runs" button beside it): the body font at
+     500/12px (the .ghost weight), no letter-spacing, no uppercasing. These are readouts sitting next
+     to a button, not controls sitting next to the chart toggles, so they take
+     the button's voice. tabular-nums keeps the digits from shifting width as the
+     averages tick over. */
+  .chart-stat{display:inline-flex;align-items:center;gap:.22em;opacity:.75;white-space:nowrap;
+    font:inherit;font-weight:500;font-size:12px;line-height:1;font-variant-numeric:tabular-nums;}
+  /* The face is its own element so the icon can be sized independently of the
+     number; the gap above replaces the space that used to join them.
+
+     All three faces are DRAWN, not typed. As characters they could never match:
+     U+223F SINE WAVE is a math operator drawn about the math axis, so it occupies
+     roughly x-height, while the arrows span nearly the full ascender - the sine
+     read as crushed beside them at any shared font-size. They also all fell out
+     of the 28KB Latin subset of Quicksand to whatever system-ui resolved to, so
+     their relative metrics were the OS's choice rather than ours. As SVG they
+     share one cap height and one stroke weight by construction, on every
+     platform.
+
+     Height, not width, is what is pinned: each icon carries its own aspect in its
+     viewBox, so `width:auto` lets the wave be wider than the arrows without
+     either one being taller. The wave IS wider - a full period cannot be as narrow
+     as an arrow without turning into a zigzag - but only by about a third, not the
+     four fifths a two-unit-per-hump period would take. Narrow it further by
+     shrinking its viewBox width and the two hump widths in step (q2.25/4.5 and
+     t4.5), keeping the ratio, or the curve steepens instead of shortening. */
+  .chart-stat .stat-face{display:inline-flex;align-items:center;font-style:normal;line-height:1;}
+  .chart-stat .stat-face svg{height:.85em;width:auto;overflow:visible;}
+  /* A sampled window's average is a mean of the ~1500 runs charted, not of every run
+     in the range. The pill has no room to say so, and an accessible name alone
+     reaches only a screen reader - so mark it visibly and put the detail in the
+     title, which the dotted underline invites you to hover for.
+     The uptime pill deliberately does NOT take this outline: its coverage dips
+     below 99.9% on any restart or pause, so the marker would be on more often
+     than off and would stop reading as a caveat at all. Its note lives in the
+     title, the accessible name and the popover instead. */
+  .chart-stat.sampled{border-style:dashed;}
+  .chart-stat.sampled{cursor:help;}
   .chart-toggle:hover{opacity:1;border-color:var(--accent);color:var(--accent);}
   .chart-toggle[aria-pressed="false"]:not(:hover){color:color-mix(in srgb,var(--muted) 50%,transparent);}
   /* "na" = the chart has no data to show (e.g. no bufferbloat yet), so it stays
@@ -750,7 +817,10 @@
   .chart-toggle.na{opacity:.25;}
   .chart-toggle.na:hover{opacity:.4;border-color:var(--line2);color:var(--muted);}
   .chart-off{display:none!important;}
-  @media (max-width:600px){ .runs-bar{padding-right:30px;} .chart-toggles{gap:4px;} .chart-toggle{padding:0 6px;letter-spacing:.2px;} }
+  /* Narrow screens tighten both clusters identically - the averages carry more
+     glyphs than the toggles do, so leaving them on the wide padding is what would
+     force the extra wrap first. */
+  @media (max-width:600px){ .runs-bar{padding-right:30px;} .chart-toggles,.chart-stats{gap:4px;} .chart-toggle,.chart-stat{padding:0 6px;} .chart-toggle{letter-spacing:.2px;} }
   /* Manual refresh button, top-right of the Connection panel - same footprint
      as the bottom-right drag handle (24px box, 13px glyph), at the same corner inset. */
   /* padding:0 for the same reason as .chart-save: a <button> carries the UA's
@@ -865,7 +935,7 @@
   /* padding-right keeps the strip clear of the bottom-right corner tools (save-image
      button + drag handle), which float above it - without it the last pills scroll
      underneath them and can't be clicked. Matches .runs-bar's reserve. */
-  .targets{display:flex;flex-wrap:nowrap;gap:9px;margin-top:10px;overflow-x:auto;padding-bottom:0;padding-right:62px;scrollbar-width:thin;scrollbar-color:var(--line2) transparent;}
+  .targets{display:flex;flex-wrap:nowrap;gap:9px;margin-top:18px;overflow-x:auto;padding-bottom:0;padding-right:62px;scrollbar-width:thin;scrollbar-color:var(--line2) transparent;}
   .pill{background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:5px 12px;font-size:12px;}
   /* Status indicator: a small theme-coloured rounded square (matches the pill
      corners), not a circle. Colour set inline from --up/--warn/--down. */
@@ -967,6 +1037,10 @@
   .data-pop .row.sel .k,.data-pop .row.sel .v{color:var(--accent);}
   .data-pop .win-custom{margin-top:5px;padding:6px 7px 0;}
   .data-pop .win-custom input{width:100%;box-sizing:border-box;}
+  /* The uptime popover's coverage caveat. A sentence, so it needs a width to wrap
+     inside - the popover is otherwise as wide as its widest row. */
+  #uptimePop .cov-foot{margin-top:7px;padding:6px 7px 0;border-top:1px solid var(--line);
+    max-width:216px;font-size:11px;line-height:1.35;color:var(--muted);}
   .muted{color:var(--muted);}
   .legend{font-size:12px;color:var(--muted);margin-top:11px;}
   /* A transparent 1px border so the filled .btn and the outlined .btn.ghost/.danger
@@ -990,7 +1064,10 @@
   /* Running: stays pressed-in and swaps the RUN label for a spinner. The label is
      hidden but kept in flow so the button width doesn't change; the spinner overlays
      centred (inset:0 + margin:auto, so the spin animation's transform is free). */
-  .speed-run.running{transform:translateY(1px);}
+  /* Running button stays clickable (a click aborts the run): pressed-in look and
+     no hover-brighten, but a pointer cursor so it reads as clickable like RUN. */
+  .speed-run.running{transform:translateY(1px);cursor:pointer;}
+  .speed-run.running:hover{filter:none;}
   .speed-run .run-spin{display:none;color:var(--on-accent);}
   .speed-run.running .run-lbl{visibility:hidden;}
   .speed-run.running .run-spin{display:block;position:absolute;inset:0;margin:auto;}
@@ -1178,6 +1255,12 @@
        touch affordance for these belongs with a future arrange/tools mode. */
     /* Chart show/hide toggle buttons (24px tall). */
     .chart-toggle{min-height:44px;}
+    /* The average readouts sharing that row are NOT tap targets - they are matched
+       here purely so the runs bar stays one row of one height on touch; a 24px pill
+       sitting beside a 44px toggle reads as a broken layout, not as a hint that one
+       of them is inert. Growing the box invents no affordance: .chart-stat has no
+       cursor, hover or focus treatment to go with it. */
+    .chart-stat{min-height:44px;}
     /* Every text button: RUN (.speed-run), Save/Discard/Reset, Export/Import/Test, Delete,
        Show-all-runs/outages, and the pager Prev/Next - all .btn / .btn.ghost. */
     .btn{min-height:44px;}
@@ -1274,6 +1357,7 @@
   html:not(.round) .info.conn-off,
   html:not(.round) .chart-save,
   html:not(.round) .chart-toggle,
+  html:not(.round) .chart-stat,
   html:not(.round) .chart-win,
   html:not(.round) .win-rm,
   html:not(.round) .run-del,
@@ -1397,7 +1481,8 @@
           <span class="info" tabindex="0" data-tip="Run a speedtest when latency stays high without dropping (a brownout) - the bad moment a reconnect test would miss. Needs monitoring and Automatic on.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setStDegraded"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">On reconnect
-          <span class="info" tabindex="0" data-tip="Run a speedtest each time the connection comes back, as long as monitoring is on.
+          <span class="info" tabindex="0" data-tip="Run a speedtest when the connection comes back, as long as monitoring is on.
+• Spaced out so a flapping link can't run tests back to back: at least 15 minutes apart, or your 'Run every' interval if that is longer - it's read as how much data a test is worth to you, whether or not Automatic is on.
 • Works with Automatic off, but not outside your speedtest schedule windows.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setOnRecon"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Degraded above
@@ -1587,13 +1672,14 @@
           <span class="ctl"><input type="checkbox" id="setOoklaLoss"><span class="unit"></span></span></label>
         </div>
         <label class="srow" id="autoLocRow"><span class="lbl">Auto location
-          <span class="info" tabindex="0" data-tip="Centres the server search on where your connection actually leaves your ISP (the exit router found by traceroute, else your public IP). Turn it off to search a city instead.
-• It also reads off when you pin a server, because the search then centres on that server rather than on your exit.">i</span></span>
+          <span class="info" tabindex="0" data-tip="Picks where to test from by measurement. The cities your connection names - the exit router found by traceroute, your IP's geolocation, and where speedtest.net places you - each enter their closest servers into one ping race, and the city that answers fastest becomes the centre of the server search. Turn it off to search a city instead.
+• It also reads off when you pin a server, because the search then centres on that server rather than on the raced city.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setAutoLoc"><span class="unit"></span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Best of 3 servers
           <span class="info" tabindex="0" data-tip="Runs the test against your chosen server AND two more picked by ping, then keeps only the best result. The other two are thrown away.
 • The two extra servers are picked near the server you chose - or near your auto location when you have not chosen one - so the round always stays in the area you asked for.
-• Best result = highest score: download + upload, discounted by ping (about 1% of throughput per millisecond, topping out at 20ms). A near-tie on speed goes to the lower-ping server; a clearly faster server still wins. Ties break on ping, then jitter, then bufferbloat.
+• Best result = highest score: a capacity figure weighting download 70% and upload 30% relative to each other - not as raw Mbps, so it means the same on a symmetric line as on a 20:1 asymmetric one - then discounted by ping (about 1% per millisecond, topping out at 20ms). A server that measured a fifth of your real upload can't hide behind a big download number; a near-tie on speed goes to the lower-ping server; a clearly faster server still wins. Ties break on ping, then jitter, then bufferbloat.
+• The run that is kept is one real test, so its ping, jitter and bufferbloat are the winner's too. A round decided on throughput can store a much higher latency than the server you usually land on - that is the round changing hands, not your connection changing. Read latency and jitter from the charts below, which sample continuously and do not depend on who won.
 • Useful when one server is having a bad day and you'd rather not have it define your history.
 • Costs about 3x the time and 3x the data of a normal test.
 • A server that hasn't finished within 90 seconds is dropped and the next one is tried, so one stalled server can't hold up the round.
@@ -1601,13 +1687,16 @@
           <span class="ctl"><input type="checkbox" id="setSpeedBestOf"><span class="unit"></span></span></label>
         <div class="srow-wide" id="serverRow">
           <span class="lbl">Speedtest server
-            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table). Auto races every server about as close as the nearest (one per provider, your own ISP always included) and keeps the lowest ping.">i</span></span>
+            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table). Type a city instead and it becomes the centre Auto location uses when you switch it OFF - it moves where Auto searches, it does not pin a server.
+• With no city typed, Auto races the cities your connection points at - your ISP's exit, where your IP is registered, and wherever speedtest.net places you - and centres on whichever answers fastest, fresh on every test.
+• Inside that centre it fetches one list, pings every server about as close as the nearest (one per provider, your own ISP always included), and keeps the lowest ping.
+• The list in this box is only for browsing, centred on the first of those cities we have a coordinate for - so the server Auto is testing from need not be in it. Search its city to see it.">i</span></span>
           <div class="server-search">
             <input type="text" id="serverCity" placeholder="City or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
             <button class="btn" id="serverSearchBtn" type="button">Search</button>
           </div>
           <div class="server-select" id="serverSelectWrap">
-            <select id="setServer"><option value="">Auto (fastest)</option></select>
+            <select id="setServer"><option value="">Auto - fastest near you</option></select>
             <span class="sel-spin btn-spin" aria-hidden="true"></span>
           </div>
           <span class="muted" id="serverLoc" style="font-size:12px"></span>
@@ -1964,6 +2053,8 @@ Applies live and persists.">i</span></span>
               <button class="log-ic" id="logClear" type="button" title="Clear logs" aria-label="Clear logs"></button>
             </div>
             <pre class="log-window" id="logWindow" aria-live="polite" tabindex="0">Open this tab to load recent logs…</pre>
+            <div class="log-trunc" id="logTrunc" role="status" hidden></div>
+            <div class="log-stall" id="logStall" role="status" hidden>⚠&#xFE0E; Log stream stalled - the lines above are not live. Still retrying.</div>
           </div>
         </div>
       </div>
@@ -2022,7 +2113,7 @@ Turn it back on in Settings → Latency.">!</span>
 • Ping - round-trip delay to the test server (ms; lower is better).
 • Jitter - how much the ping wobbles (steadier is better).
 • Packet loss - share of data that didn't arrive (%; lower is better).
-• Bufferbloat - extra delay that builds up under load; what makes calls and games lag during a big download. High? Turn on SQM (Smart Queue Management: CAKE or fq_codel) on your router, or cap its speed just under your line's real speed.
+• Bufferbloat - extra delay that builds up under load; what makes calls and games lag during a big download. High? Turn on SQM (Smart Queue Management: CAKE or fq_codel) on your router, or cap its speed just under your line's real speed. Measured at the speed this test actually reached: if the server was the bottleneck rather than your line, your buffers never filled and this reads cleaner than your connection really is. The typical figure is the middle of the samples taken during the transfer; the second figure is the 95th percentile, the slow tail.
 
 The window button takes a duration (7d) or a date range typed how you like it - &quot;jul 1 to jul 8&quot;, &quot;since jul 1&quot;, &quot;yesterday&quot;, &quot;2026&quot;, &quot;9am to 5pm&quot;. It shows you the dates it read back before you apply them, and the charts zoom to whatever runs the range actually holds.">i</span>
       <span class="win-dd" id="speedWindow" style="margin-left:0"></span></span>
@@ -2040,9 +2131,19 @@ The window button takes a duration (7d) or a date range typed how you like it - 
     </div>
     <canvas id="speedChart" role="img" aria-label="Download and upload speed over time" style="height:200px;margin-top:8px"></canvas>
     <canvas id="qualityChart" role="img" aria-label="Ping and jitter over time" style="height:100px;margin-top:2px"></canvas>
-    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:150px;margin-top:2px"></canvas>
+    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:150px;margin-top:18px"></canvas>
     <div class="runs-bar">
       <button class="btn ghost" id="runsToggle" type="button" aria-expanded="false" aria-controls="runsSection">Show all runs ▾</button>
+      <!-- Averages over exactly the rows the charts to the right are drawing; painted by
+           paintSpdAvgs. role="img" + aria-label rather than a bare <span>: a plain span is
+           role=generic, and a name on a generic element is not reliably surfaced, so the
+           pill would be announced as the raw "AVG ↓ 48 MBPS" glyph run or skipped outright.
+           NOT <button>, no aria-pressed, no tabindex - these are readouts, and putting three
+           unactionable stops in the tab order between the runs button and the chart toggles
+           is a real cost to anyone driving this panel from the keyboard. The seeded "-"
+           matches what paintSpdAvgs writes for an empty range, so the bar never flashes
+           blank boxes before the first load lands. -->
+      <span class="chart-stats"><span class="chart-stat" id="spdAvgDn" role="img" aria-label="average download, no data in this range"><i class="stat-face"><svg viewBox="0 0 10 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 2v8m-3-3 3 3 3-3"/></svg></i><span class="stat-val">-</span></span><span class="chart-stat" id="spdAvgUp" role="img" aria-label="average upload, no data in this range"><i class="stat-face"><svg viewBox="0 0 10 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 10V2m-3 3 3-3 3 3"/></svg></i><span class="stat-val">-</span></span><span class="chart-stat" id="spdAvgPing" role="img" aria-label="average ping, no data in this range"><i class="stat-face"><svg viewBox="0 0 13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6q2.25-7 4.5 0t4.5 0"/></svg></i><span class="stat-val">-</span></span></span>
       <span class="chart-toggles" role="group" aria-label="Show or hide charts"><button type="button" class="chart-toggle" data-chart="speed" aria-pressed="true">Speed</button><button type="button" class="chart-toggle" data-chart="quality" aria-pressed="true">Quality</button><button type="button" class="chart-toggle" data-chart="bloat" aria-pressed="true">Bufferbloat</button></span>
       <button class="chart-save" type="button" data-chart-save="speed" title="Save this chart as an image" aria-label="Save this chart as an image"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="3.6"/></svg></button>
     </div>
@@ -2693,7 +2794,7 @@ function redrawCharts(){
   // message never came back. The speed charts already redraw from their own
   // cache unconditionally; latPoints keeps the latency one on the same footing.
   drawChart(latPlot ? latPlot.points : latPoints, latPlot ? latPlot.realPts : null);
-  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData);
+  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData); paintSpdAvgs();
   drawHeatmap();
 }
 let themeAcc='#5b9dff', themeAcc2='#a371f7'; // the theme's OWN accents (ignoring the UI-accent override)
@@ -2955,7 +3056,15 @@ const esc = s => String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&
 
 /* ---- power button ---- */
 let monitoring = true;
-function setPowerUI(on){ monitoring=on; syncNetinfoOffMark(); const b=$('powerBtn');
+function setPowerUI(on){
+  // Turning monitoring back on releases the panel: with no snapshot the render
+  // above stopped polling, so without this the panel stays on "not looked up yet"
+  // until something else happens to refresh it. Only on a CHANGE - this runs on
+  // every status poll (mirrors the netinfo_off hook in refreshStatus).
+  const resumed = on && !monitoring;
+  monitoring=on; syncNetinfoOffMark();
+  if(resumed) refreshNetinfo();
+  const b=$('powerBtn');
   b.classList.toggle('on',on); b.classList.toggle('off',!on);
   b.setAttribute('aria-pressed', String(on));
   b.setAttribute('aria-label', on ? 'Monitoring on, click to stop' : 'Monitoring stopped, click to start');
@@ -3264,7 +3373,7 @@ function upPctG(v){ return (v*100).toFixed(3)+'%'; }
 let uptimeCustomMins=parseInt(lsGet('uptimeCustomMins'))||0;
 let uptimeWindow=lsGet('uptimeWindow')||'7d';
 if(!['24h','7d','all','custom'].includes(uptimeWindow) || (uptimeWindow==='custom'&&uptimeCustomMins<1)) uptimeWindow='7d';
-let lastUptime=null, lastUptimeCustom=null;
+let lastUptime=null, lastUptimeCustom=null, lastUptimeCov=null, lastUptimeCustomCov=null;
 function upWinLabel(){ return uptimeWindow==='custom'?fmtWin(uptimeCustomMins):UP_LBL[uptimeWindow]; }
 function uptimeValue(s){
   if(uptimeWindow==='custom') return s.uptime_custom!=null?s.uptime_custom:lastUptimeCustom;
@@ -3273,15 +3382,63 @@ function uptimeValue(s){
   if(uptimeWindow==='24h'&&s.uptime_24h!=null) return s.uptime_24h; // flat-field fallbacks
   if(uptimeWindow==='7d'&&s.uptime_7d!=null) return s.uptime_7d;
   return null; }
+// How much of the selected window was actually monitored (0..1), or null when the
+// server didn't say. /api/status ships this beside every uptime figure, including
+// the custom window, because the ratio alone cannot distinguish a flawless day
+// from a day nobody watched: both arrive as 1.
+function uptimeCoverage(s){
+  if(uptimeWindow==='custom'){ const c=s.uptime_custom_coverage; return c!=null?c:lastUptimeCustomCov; }
+  const c=s.uptime_coverage||lastUptimeCov;
+  return (c&&c[uptimeWindow]!=null)?c[uptimeWindow]:null; }
+// The pill's honesty rule, in one place so the pill, its accessible name and the
+// popover rows cannot drift apart:
+//   coverage 0  -> there is no measurement; show "-", never "100.000%"
+//   coverage <1 -> there is one, but say how much of the window it covers
+// A window that observed nothing renders 100.000% without this, while /metrics in
+// the same second publishes no uptime series at all - two surfaces of one process
+// telling opposite stories. Reachable without any exotic setup: -latency=false
+// (the documented speedtest-only mode) and -ipv4=off -ipv6=off both leave coverage
+// permanently 0.
+function upCovNote(cv){
+  if(cv==null) return '';
+  if(cv<=0) return 'nothing was monitored in this window, so there is no uptime to report';
+  // FLOOR, and keep a decimal near the top. Rounding to whole percent let 99.5%
+  // through as "monitored 100% of this window; the rest was not monitored" - a
+  // sentence that contradicts itself and leaves the reader unable to tell a
+  // rounding artefact from a real gap. Flooring also means the figure never claims
+  // more coverage than there was.
+  if(cv<0.999){
+    const pct = Math.floor(cv*1000)/10;               // one decimal, floored
+    // "0%" would be the same lie in the other direction: something WAS watched, so
+    // say so rather than flooring it away. The cv<=0 branch above owns real zero.
+    // Whole percents are floored too - toFixed(0) rounds to nearest, which quietly
+    // re-broke the guarantee above for every x.5-x.9 (98.5 read as "99%").
+    const shown = pct < 1 ? '<1' : (pct >= 99 ? pct.toFixed(1) : String(Math.floor(pct)));
+    return `monitored ${shown}% of this window; the rest was not monitored (scheduled off, paused, or asleep)`;
+  };
+  return ''; }
+const upUnmeasured = cv => cv!=null && cv<=0;
+// The same note again, as a VISIBLE line at the foot of the popover. Until here the
+// caveat reached the eye through a title attribute alone, which phones do not show
+// and keyboard focus does not reliably surface - so a half-watched but flawless
+// window read as a plain 100.000%. The popover is already reachable by tap and by
+// keyboard, so one line there covers both. The wording stays upCovNote's, never a
+// paraphrase, and it is prefixed with the window it describes because the popover
+// lists several while the note says only "this window".
+function upCovFoot(cv,label){ const n=upCovNote(cv); return n?`<div class="cov-foot">${label}: ${n}</div>`:''; }
 function showUptimePop(anchor){
   hideDataPop(); // only one stats popover open at a time
-  const pop=$('uptimePop'), u=lastUptime||{};
-  const rows=[['24h',u['24h']],['7d',u['7d']],['all',u.all]];
+  const pop=$('uptimePop'), u=lastUptime||{}, uc=lastUptimeCov||{};
+  const rows=[['24h',u['24h'],uc['24h']],['7d',u['7d'],uc['7d']],['all',u.all,uc.all]];
   const lbl=Object.assign({}, UP_LBL);
-  if(uptimeCustomMins>0){ rows.push(['custom',lastUptimeCustom]); lbl.custom=fmtWin(uptimeCustomMins); }
+  if(uptimeCustomMins>0){ rows.push(['custom',lastUptimeCustom,lastUptimeCustomCov]); lbl.custom=fmtWin(uptimeCustomMins); }
   pop.innerHTML='<h4>Uptime</h4>'+
-    rows.map(([k,v])=>`<div class="row${k==='all'?' all':''}${k===uptimeWindow?' sel':''}" role="option" aria-selected="${k===uptimeWindow}" tabindex="-1" data-win="${k}"><span class="k">${lbl[k]}</span><span class="v">${v!=null?upPctG(v):'-'}</span></div>`).join('')+
-    '<div class="win-custom"><input id="uptimeCustomInput" placeholder="custom: 45m, 12h, 3d…" aria-label="Custom uptime window, e.g. 12h or 3d"></div>';
+    // Every row carries its own coverage: an unmonitored window reads "-" here too,
+    // so switching windows can never turn a dash into a confident 100.000%.
+    rows.map(([k,v,c])=>`<div class="row${k==='all'?' all':''}${k===uptimeWindow?' sel':''}" role="option" aria-selected="${k===uptimeWindow}" tabindex="-1" data-win="${k}" title="${upCovNote(c)}"><span class="k">${lbl[k]}</span><span class="v">${(v!=null&&!upUnmeasured(c))?upPctG(v):'-'}</span></div>`).join('')+
+    '<div class="win-custom"><input id="uptimeCustomInput" placeholder="custom: 45m, 12h, 3d…" aria-label="Custom uptime window, e.g. 12h or 3d"></div>'+
+    // The caveat for the window the pill is showing, spelled out under the input.
+    upCovFoot((rows.find(([k])=>k===uptimeWindow)||[])[2], lbl[uptimeWindow]);
   const inp=pop.querySelector('#uptimeCustomInput');
   if(uptimeWindow==='custom') inp.value=fmtWin(uptimeCustomMins);
   inp.addEventListener('keydown', e=>{ if(e.key!=='Enter') return; e.preventDefault(); const m=parseDur(inp.value); if(m>=1) chooseUptimeCustom(m); else inp.select(); });
@@ -3360,6 +3517,19 @@ const fget=(url,ms=15000,opts)=>fetch(url,{...opts,signal:AbortSignal.timeout(ms
 // leaving the previous data on screen under a possibly-changed range label. Reuses the undo
 // toast; callers gate on their sequence guard so only the newest in-flight request reports.
 function chartLoadFailed(what){ const tb=$('undoToast'); if(!tb) return; tb.textContent='Couldn’t load the '+what+' - showing the last data'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
+// A GET poller that hits the restore-reconcile window gets a 503 the server means
+// as "come back in a moment" (Retry-After:2, body "restoring a backup; try again
+// shortly"), not a real load failure. Recognise it - Retry-After header first, the
+// body as a fallback - so the chart pollers can swallow the toast and honour the
+// backoff. Pure/sync so it's unit-tested; never applied to POST/mutating requests.
+function isReconcile503(r, body){ return !!r && r.status===503 && ((r.headers && r.headers.get('Retry-After')!=null) || /restoring a backup/i.test(body||'')); }
+// Retry-After here is delta-seconds; clamp it (and default to the server's 2s when
+// it's absent or garbage) so a hostile header can't wedge the poll loop.
+function retryAfterMs(h){ const s=parseInt(h,10); return (s>0?Math.min(s,60):2)*1000; }
+// Set by a chart poller when isReconcile503 matches; consumed once by latPollMs /
+// speedPollMs so the very next poll waits Retry-After instead of the normal (up to
+// minute-long) cadence, then cleared.
+let latBackoffMs=0, speedBackoffMs=0;
 // Stale-data banner: a connectivity dashboard silently frozen on old data is
 // indistinguishable from "all good", so surface consecutive status-poll
 // failures (2+, to ride out a one-off hiccup or restart).
@@ -3380,6 +3550,11 @@ async function refreshStatus() {
   // Guard against overlapping polls: only the newest in-flight request gets to
   // touch the DOM/state, so a slow earlier response can't clobber fresher data.
   const my=++statusSeq;
+  // The speed selection as it stood when this poll LEFT. Picking a new span calls
+  // refreshSpeedChart(true), which bumps speedSeq synchronously, so comparing it
+  // on arrival tells us whether the panel we are about to paint is still the one
+  // the user is looking at (see spdSyncPlan).
+  const mySpeed=speedSeq;
   // Custom-window params: dataMins only when the data pill is on custom; upMins whenever
   // a custom uptime window is configured (so the popover's custom row stays accurate even
   // when another window is active - the uptime pill has no separate fetch like the data one).
@@ -3489,11 +3664,27 @@ async function refreshStatus() {
     ? `<span class="pill stat-net" title="DNS resolution time (cache-busted) from the last probe round">${sdot(dnsDot(s.dns_ms))} DNS ${s.dns_ms.toFixed(0)} ms</span>`
     : '';
   lastUptime = s.uptime || null; // for the popover, which renders from the last poll
+  lastUptimeCov = s.uptime_coverage || lastUptimeCov;
   if(s.uptime_custom!=null) lastUptimeCustom = s.uptime_custom;
-  const upv = uptimeValue(s);
+  if(s.uptime_custom_coverage!=null) lastUptimeCustomCov = s.uptime_custom_coverage;
+  const upv = uptimeValue(s), upcv = uptimeCoverage(s), upNote = upCovNote(upcv);
+  // A window with no measurement shows a dash, not a percentage - and the
+  // accessible name says so in words rather than reading out a number the pill
+  // isn't showing.
+  const upTxt = (upv==null || upUnmeasured(upcv)) ? '-' : upPct(upv);
+  const upAria = upUnmeasured(upcv)
+    ? `Uptime not measured over ${upWinLabel()}: ${upNote}, open uptime by window`
+    : `Uptime ${upTxt} over ${upWinLabel()}${upNote?', '+upNote:''}, open uptime by window`;
+  const upTitle = upNote || `Uptime over ${upWinLabel()} - click for other windows`;
   const upPill = (upv==null)
     ? `<span class="pill stat-up">${pulseIco} -</span>`
-    : `<span class="pill stat-up" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('uptimePop').hidden}" aria-label="Uptime ${upPct(upv)} over ${upWinLabel()}, open uptime by window" title="Uptime over ${upWinLabel()} - click for other windows">${pulseIco} ${upPct(upv)}</span>`;
+    // No dashed outline here, unlike the speed averages. The caveat is real - a
+    // partial window's percentage does not describe the whole of what it names -
+    // but coverage dips below 99.9% for ordinary reasons (a restart, a pause, the
+    // power button), so on most installs the marker is on more than it is off and
+    // stops reading as a warning. It stays in the title, the accessible name and
+    // the popover, which is where the caveat can be stated rather than hinted.
+    : `<span class="pill stat-up" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('uptimePop').hidden}" aria-label="${upAria}" title="${upTitle}">${pulseIco} ${upTxt}</span>`;
   const statPills = dnsPill+upPill+
     `<span class="pill stat-rt">${clockIco} ${fmtDur(s.runtime_seconds)}</span>`+
     `<span class="pill stat-data" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('dataPop').hidden}" aria-label="Speedtest data used ${bytesStr(dataBarValue(s))}, open usage breakdown" title="Click for usage breakdown by window">${dot('⇅')} ${bytesStr(dataBarValue(s))}</span>`;
@@ -3507,6 +3698,15 @@ async function refreshStatus() {
   // from the newest run INSIDE the span, so the whole panel describes one slice
   // of history rather than mixing today numbers with an old chart.
   if (s.speed && !speedFrozen()) setSpeedTiles(s.speed);
+  // The server the last run actually measured. It answers "which city did auto
+  // end up using?" from a poll the dashboard already makes, without the daemon
+  // remembering a race - and it stays true whether that server was raced,
+  // searched for, or pinned, because it reports a measurement rather than a
+  // rule. Only the scope note under the picker reads it.
+  if (s.speed && s.speed.server !== lastRunServer){
+    lastRunServer = s.speed.server || '';
+    if(serversLoaded) updateScopeNote();
+  }
   if (!!s.bridged_container !== bridgedContainer){ bridgedContainer=!!s.bridged_container; refreshNetinfo(); }
   // Connection info off freezes the panel below - re-render so the bubble appears
   // or clears the moment the setting changes, without waiting for a lookup.
@@ -3517,7 +3717,7 @@ async function refreshStatus() {
   // (fetched before the backend registered the run) - mirrors powerPending.
   // running=true still applies: it carries the server name once known.
   if(!(speedtestPending && !s.speedtest_running))
-    setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_auto_label);
+    setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_auto_label, s.speedtest_run_id);
   if (s.speed) lastSpeedTs = s.speed.ts;
   // A run that actually completed after the error supersedes it.
   if (speedRunErr && s.speed && s.speed.ts > speedRunErrSince) speedRunErr='';
@@ -3543,8 +3743,13 @@ async function refreshStatus() {
     // setSpeedtestRunning also writes this caption, and while a span is pinned
     // the branch above is skipped - so a SCHEDULED run would leave it reading
     // "Running speedtest..." for good. Hand it back to the pinned view once the
-    // run is over.
-    if(speedFrozen()) syncSpeedPanel(true);
+    // run is over - but only if this poll's view of the selection is still the
+    // current one, so a span picked while it was in flight is not overwritten
+    // with the span it left under.
+    if(speedFrozen()){
+      const plan=spdSyncPlan(mySpeed, speedSeq, speedLoadedFor, speedWindowQuery().q);
+      if(plan!=='skip') syncSpeedPanel(plan==='sync');
+    }
   }
   // Outages render from the paginated /api/events (see loadOutages), not here.
 }
@@ -3565,12 +3770,25 @@ function setupCanvas(c){ const dpr=(window.devicePixelRatio||1)*exportScale, w=c
 // An unmeasured direction (e.g. a download-only run does no upload) renders "-"
 // rather than a misleading "0 Mbps". bytes is the matching download_bytes/
 // upload_bytes, absent (undefined/null) when that direction did not run.
-function speedTileMbps(mbps, bytes){ return bytes==null ? '-' : Math.round(mbps)+' Mbps'; } // tiles round to whole Mbps; chart/table/CSV keep the decimal
+// mbpsText/pingText are the tiles' own number formatting, lifted out of them so the
+// range-average pills on the runs bar can render through the SAME helpers. They are
+// the only two speed formatters the panel has, and that is the point: a second
+// convention for "48 Mbps" a few hundred pixels below the Download card is exactly
+// the drift this prevents. null (no usable sample) renders as the house "-" rather
+// than "NaN Mbps" or a "0" that would read as a real measurement.
+function mbpsText(m){ return m==null ? '-' : Math.round(m)+' Mbps'; } // tiles round to whole Mbps; chart/table/CSV keep the decimal
+function pingText(p){ return p ? p.toFixed(1)+' ms' : '-'; }
+// The average pill rounds to whole milliseconds. pingText keeps its decimal
+// because it renders ONE measurement, where a tenth is a real distinction; a mean
+// over a window of runs does not have that resolution, and printing 22.1 implies
+// it does. Same "0 means not probed" rule.
+function pingAvgText(p){ return p ? Math.round(p)+' ms' : '-'; } // ping_ms==0 means "not probed" (matches /metrics gating); a real speedtest ping is never 0
+function speedTileMbps(mbps, bytes){ return bytes==null ? '-' : mbpsText(mbps); }
 function setSpeedTiles(sp){
   if(!sp) return;
   $('dl').textContent = speedTileMbps(sp.down_mbps, sp.download_bytes);
   $('ul').textContent = speedTileMbps(sp.up_mbps, sp.upload_bytes);
-  $('sp_ping').textContent = sp.ping_ms ? sp.ping_ms.toFixed(1)+' ms' : '-'; // ping_ms==0 means "not probed" (matches /metrics gating); a real speedtest ping is never 0
+  $('sp_ping').textContent = pingText(sp.ping_ms);
   $('sp_jitter').textContent = msStr(sp.jitter_ms);
   $('sp_loss').textContent = lossStr(sp.packet_loss);
   $('sp_bloat_dn').textContent = bloatDirText(sp.idle_ms, sp.loaded_down_ms);
@@ -3648,20 +3866,33 @@ document.addEventListener('click', e=>{
   if(b) saveChartImage(b.dataset.chartSave);
 });
 // --- Chart axes (Appearance > Chart customization) -------------------------
-// fmtAxisTime picks its format from the span being drawn: a clock time while the
-// window is measured in hours, a date once it spans days, a month once it spans
-// most of a year. Local time, like every other timestamp in the UI.
+// The axis label formats. Local time, like every other timestamp in the UI.
 const AXMON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-function fmtAxisTime(ts, spanSec){
-  const d=new Date(ts*1000), p2=n=>String(n).padStart(2,'0');
-  // Seconds below a quarter hour: the latency chart defaults to a 5 minute
-  // window and its shortest preset is 5m, so without this tier every label on
-  // the default view rounds to the same minute and reads as a repeated string.
-  if(spanSec<=15*60) return p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds());
-  if(spanSec<=36*3600) return p2(d.getHours())+':'+p2(d.getMinutes());
-  if(spanSec<=300*86400) return d.getDate()+' '+AXMON[d.getMonth()];
-  return AXMON[d.getMonth()]+' '+String(d.getFullYear()).slice(2);
+const AXF={
+  mon:  d=>AXMON[d.getMonth()]+' '+String(d.getFullYear()).slice(2),
+  day:  d=>d.getDate()+' '+AXMON[d.getMonth()],
+  min:  d=>String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+  sec:  d=>String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0'),
+  dmin: d=>d.getDate()+' '+AXMON[d.getMonth()]+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+};
+// axFmtLadder picks the format from the span being drawn - a clock time while
+// the window is measured in hours, a date once it spans days, a month once it
+// spans most of a year - and then lists the FINER formats that span may fall
+// back on. The span alone is not enough to keep labels apart, because it says
+// nothing about how many ticks are squeezed into it: seven ticks across a 3 day
+// window sit 12 hours apart, and a date-only label prints "27 Jul" twice in a
+// row. drawXAxis walks this ladder until neighbouring ticks read differently.
+// Seconds below a quarter hour: the latency chart defaults to a 5 minute window
+// and its shortest preset is 5m, so without that tier every label on the default
+// view rounds to the same minute.
+function axFmtLadder(spanSec){
+  if(spanSec<=15*60) return [AXF.sec];
+  if(spanSec<=36*3600) return [AXF.min, AXF.sec];
+  if(spanSec<=300*86400) return [AXF.day, AXF.dmin];
+  return [AXF.mon, AXF.day, AXF.dmin];
 }
+// The format a span picks before any fallback - the top of its ladder.
+function fmtAxisTime(ts, spanSec){ return axFmtLadder(spanSec)[0](new Date(ts*1000)); }
 // drawXAxis writes time labels along the bottom edge, using the same fitted
 // domain the series was plotted on. The end labels are pinned to the plot edges
 // rather than centred on their tick, so neither can clip off the canvas.
@@ -3671,12 +3902,47 @@ function fmtAxisTime(ts, spanSec){
 // widening the gap can never clip the labels.
 const AX_GAP = 10;
 const AX_PAD = AX_GAP + 16;
-function drawXAxis(x, pts, tKey, X, w, baseY, padL, padR){
+// tMode says how the CALLER spread its samples across the plot, which is what
+// decides the time sitting under a tick:
+//   'index' (the default) - even steps per sample, as xMap does for the three
+//       speed charts. The tick at an even x IS a sample, so it is labelled with
+//       the ACTUAL time of the sample nearest that spot and a long gap reads as
+//       a jump in the times rather than a blank stretch.
+//   'time' - x linear in TIME, as drawChart does for the latency chart. The time
+//       under a tick is read straight off the domain instead. Asking for the
+//       nearest sample here drops a time from the far side of a hole into the
+//       middle of that hole: with an 18h gap in a 1d window "26 Jul 04:34" was
+//       drawn at 44% of the width while its data plots at 82% - 8.2 hours of
+//       error - and every tick inside the hole snapped to the same edge sample,
+//       so the label repeated.
+// The two charts genuinely want different spacing, so this is a mode rather than
+// a conversion: a speedtest series is a handful of discrete runs that must all
+// stay visible, while the latency series is continuously sampled and its holes
+// ARE the subject - an 18h outage should read as 18h of width, not as one step.
+function drawXAxis(x, pts, tKey, X, w, baseY, padL, padR, tMode){
   if(!TC.xLab || !pts || pts.length<2) return;
-  const t0=pts[0][tKey], t1=pts[pts.length-1][tKey], span=Math.max(1, t1-t0);
-  const n=Math.max(2, Math.min(6, Math.floor((w-padL-padR)/105)));
-  const ts=[]; for(let i=0;i<=n;i++) ts.push(t0+span*i/n);
-  const lab=ts.map(t=>fmtAxisTime(t, span));
+  const N=pts.length, t0=pts[0][tKey], t1=pts[N-1][tKey], span=Math.max(1, t1-t0);
+  // Never offer more ticks than the series has distinct instants to put under
+  // them. Seven ticks over a 4 run window made several resolve to the same
+  // sample and the 1y preset read "21:21 | 21:21 | 21:21" - and the collision
+  // cull below only drops labels that physically OVERLAP, so duplicates that
+  // land far apart survived it. Distinct TIMES, not raw length, so repeated
+  // timestamps cannot buy a tick either.
+  const distinct=new Set(pts.map(p=>p[tKey])).size;
+  if(distinct<2) return; // no time range to describe
+  const fit=Math.max(2, Math.min(6, Math.floor((w-padL-padR)/105)));
+  const n=Math.max(1, Math.min(fit, distinct-1));
+  const xpos=i=>padL+(w-padL-padR)*i/n;
+  const nearIdx=px=>{ let bi=0,bd=1e9; for(let i=0;i<N;i++){ const d=Math.abs(X(pts[i][tKey])-px); if(d<bd){bd=d;bi=i;} } return bi; };
+  // The ends are pinned to the real first/last sample in both modes; only the
+  // interior ticks differ. In time mode xpos(i) is the exact inverse of the X()
+  // the caller plotted with, so the label is the time at that x exactly.
+  const ts=[]; for(let i=0;i<=n;i++) ts.push(i===0?t0 : i===n?t1
+    : tMode==='time' ? t0+(t1-t0)*i/n : pts[nearIdx(xpos(i))][tKey]);
+  // Walk the format ladder for this span until no two neighbouring ticks read alike.
+  const ladder=axFmtLadder(span); let fmt=ladder[0];
+  for(const f of ladder){ fmt=f; const l=ts.map(t=>f(new Date(t*1000))); if(l.every((s,i)=>i===0||s!==l[i-1])) break; }
+  const lab=ts.map(t=>fmt(new Date(t*1000)));
   // A clock-time window that crosses midnight repeats itself - a 1d window
   // starts and ends at the same time of day - so date-stamp the label where the
   // day actually turns over. Only that one label carries a date, which is
@@ -3699,7 +3965,7 @@ function drawXAxis(x, pts, tKey, X, w, baseY, padL, padR){
   // wider than a plain time, so the fixed per-tick estimate above under-measures - measure
   // the actual strings and drop overlaps rather than letting them overprint.
   const GAP=8;
-  const xat=i=> i===0?padL : i===n?w-padR : X(ts[i]);
+  const xat=i=> i===0?padL : i===n?w-padR : xpos(i);
   const lft=i=>{ const tw=x.measureText(lab[i]).width; return i===0?padL : i===n?(w-padR)-tw : xat(i)-tw/2; };
   const rgt=i=>{ const tw=x.measureText(lab[i]).width; return i===0?padL+tw : i===n?(w-padR) : xat(i)+tw/2; };
   const keep=[0]; let lastR=rgt(0); const rightEdge=lft(n);
@@ -3735,7 +4001,40 @@ let latPlot=null, spdPlot=null, qPlot=null, bloatPlot=null, latHover=-1, spdHove
 let pinnedRunTs=null;
 // The vertical cursor dropped on the stacked speed charts, shared across the three. sel=true
 // is the pinned selection (kept between hovers); false is the transient hover point.
-function drawCursor(x, hx, top, bot, sel){ x.save(); x.strokeStyle=TC.axis; x.globalAlpha=sel?.62:.45; x.setLineDash([3,3]); x.beginPath(); x.moveTo(hx,top); x.lineTo(hx,bot); x.stroke(); x.restore(); }
+// stackY is the canvas's own offset down the panel, and it exists so the dash
+// pattern CONTINUES across the three charts instead of restarting at each one.
+// They are separate canvases with a gap between them, so without it each chart
+// began a fresh dash and the shared cursor read as three aligned lines rather
+// than one line through a stack. Phase is all that is needed: offsetting the
+// pattern by where this canvas sits makes it identical to one drawn from the top
+// of the panel straight through.
+// lineWidth is set EXPLICITLY. Every other stroke property here is, and this one
+// was not, so the cursor inherited whatever the pass had last drawn with: the
+// speed and quality charts set lineWidth to TC.lw (the appearance slider,
+// default 2) for their data lines, while the bufferbloat chart draws bars with
+// fillRect and its caret with fill() and touches lineWidth not at all - leaving
+// the context reset value of 1. One shared cursor, two thicknesses. It also
+// moved with settings, since threshLine drops it back to 1, so turning on a
+// threshold thinned that chart's cursor too.
+//
+// A hairline, and deliberately NOT TC.lw: that slider sizes the data, and a
+// selection marker is chrome. It should not thicken because someone wanted
+// bolder speed lines, nor compete with the data it sits behind.
+function drawCursor(x, hx, top, bot, sel, stackY){ x.save(); x.strokeStyle=TC.axis; x.globalAlpha=sel?.62:.45; x.lineWidth=1; x.setLineDash([3,3]); x.lineDashOffset=(stackY||0)%6; x.beginPath(); x.moveTo(hx,top); x.lineTo(hx,bot); x.stroke(); x.restore(); }
+// Vertical extent of the selection cursor, shared by all three speed charts.
+//
+// The cursor marks ONE selected run across three stacked charts, so it has to be
+// one continuous line down the stack. Anchoring it to each chart's plot box made
+// it three different lengths, because those boxes reserve padding for their own
+// data and nothing else: the speed chart keeps 10px at the top so a line at the
+// ceiling is not clipped, the bufferbloat chart keeps 8px at the bottom for the
+// downward-clipping caret. Neither has anything to do with where a selection
+// marker belongs, and the bufferbloat one visibly stopped short of the floor.
+//
+// So it spans the whole canvas, and the only thing excluded is the x-axis label
+// strip on whichever chart is currently drawing it - running the dashes through
+// the timestamps would be worse than the inconsistency this replaces.
+const cursorSpan = (h, mine) => { return {top: 0, bot: h - (mine ? AX_PAD : 0)}; };
 // cursorX maps the pinned run to an x on a chart, or null when it's outside the window.
 function cursorX(points, X){ if(pinnedRunTs==null || !points.length) return null; const t=+pinnedRunTs; return (t>=points[0].ts && t<=points[points.length-1].ts) ? X(t) : null; }
 // speedFrozen is the whole live-versus-pinned rule: a span whose end has already
@@ -3880,7 +4179,8 @@ function drawChart(points, knownReal) {
     dflush();
   }
   latPlot = {points, X, Y, realPts};
-  if(drawAx) drawXAxis(x, points, 't', X, w, pad.t+H, pad.l, pad.r);
+  // 'time': X above maps x linearly in time, not by sample index (see drawXAxis).
+  if(drawAx) drawXAxis(x, points, 't', X, w, pad.t+H, pad.l, pad.r, 'time');
   // Last, so nothing paints over it: the offline bands are sized from the plot
   // width without being clipped, and on a sparse series one can reach into the
   // strip padR() reserves for this title.
@@ -3921,7 +4221,17 @@ async function refreshChart(force){
   const {q, live}=latWindowQuery();
   if(!force && !live && latLoadedFor===q && !latLoadedLive) return;
   const my=++chartSeq; let d;
-  try{ const r=await fget('api/series?'+q); if(!r.ok) throw 0; d=await r.json()||[]; }
+  try{
+    const r=await fget('api/series?'+q);
+    if(!r.ok){
+      // Expected, self-clearing reconcile 503: swallow the failure toast and back
+      // off Retry-After before the next poll rather than crying "load failed".
+      let body=''; try{ body=await r.text(); }catch(_){}
+      if(isReconcile503(r, body)){ if(my===chartSeq) latBackoffMs=retryAfterMs(r.headers.get('Retry-After')); return; }
+      throw 0;
+    }
+    d=await r.json()||[];
+  }
   catch(e){ if(my===chartSeq) chartLoadFailed('latency chart'); return; }
   if(my!==chartSeq) return;
   latLoadedFor=q; latLoadedLive=live; latPoints=d; drawChart(d); syncLatPanel();
@@ -3990,8 +4300,17 @@ function niceStep(v){ if(v<=0) return 1; const p=Math.pow(10,Math.floor(Math.log
 // stated on the window button and in its echo line, so nothing is lost by not
 // drawing the empty parts. Interior gaps are still real gaps - only the empty
 // lead-in and run-out are dropped.
-function xMap(points,padL,padR,w){ const t0=points[0].ts,t1=points[points.length-1].ts||t0+1;
-  return t=>padL+(t-t0)/(t1-t0||1)*(w-padL-padR); }
+// x-position by SAMPLE INDEX, not elapsed time: every sample sits an equal step
+// from the next, so a long gap between two readings no longer opens a wide blank
+// - the gap shows only in the time axis labels. A timestamp between samples (the
+// cursor, the axis ticks) interpolates its fractional index; samples are stored
+// time-sorted, so a binary search finds the bracketing pair.
+function xMap(points,padL,padR,w){ const n=points.length, W=w-padL-padR;
+  if(n<2) return ()=>padL;
+  const pos=i=>padL+i/(n-1)*W;
+  return t=>{ if(t<=points[0].ts) return pos(0); if(t>=points[n-1].ts) return pos(n-1);
+    let lo=0, hi=n-1; while(hi-lo>1){ const m=(lo+hi)>>1; if(points[m].ts<=t) lo=m; else hi=m; }
+    const dt=points[hi].ts-points[lo].ts; return pos(lo+(dt?(t-points[lo].ts)/dt:0)); }; }
 // One data point can't draw a line; duplicate it a second earlier so a single
 // reading stretches flat across the width instead of being an invisible dot.
 function spanOne(p){ return p.length===1 ? [{...p[0], ts:p[0].ts-1}, p[0]] : p; }
@@ -4025,6 +4344,109 @@ function spMeasured(p,key){
   if(key==='down_mbps') return p.download_bytes!=null && isNum(p[key]);
   if(key==='up_mbps') return p.upload_bytes!=null && isNum(p[key]);
   return isNum(p[key]);
+}
+// spdAverages reduces the rows the speed/quality charts are drawing - spdData, which
+// is whatever /api/speed returned for the current selection, so a rolling window and
+// a pinned span are both covered without asking which is in force - to one mean per
+// metric. A metric with no usable sample comes back null, which mbpsText/pingText
+// render as the house "-": never NaN, and never a 0 that would read as a real
+// reading of nothing.
+//
+// It takes the RAW rows, not the array drawSpeedChart plots. Those differ by exactly
+// one case, and it matters: spanOne pads a lone run into two points so the line has
+// width, and averaging that would count the only run in the range twice.
+//
+// down/up reuse spMeasured, the same byte-presence predicate the chart's fill, the
+// tooltip and the runs table gate on. So the average covers precisely the points the
+// area is drawn from: a direction that shows on screen as a gap cannot slip into the
+// number sitting beside it, and a download-only run still contributes its download
+// instead of being dropped whole or averaged in as a 0 Mbps upload.
+//
+// ping is gated on > 0 instead: ping_ms==0 is the "not probed" sentinel (the same
+// rule the Ping tile states), not a zero-latency sample. Averaged in as 0 it would
+// drag a 20 ms mean toward nothing and print an impossibly fast link.
+//
+// ON THE SERVER-SIDE THINNING, since a mean over pre-averaged buckets would be a
+// real trap: /api/speed does thin wide windows to ~1500 points, but it does it by
+// KEEPING WHOLE RUNS, not by averaging them together. It selects every k-th run by
+// rank and re-reads those rows intact (see store.SpeedHistoryBudget;
+// speedbucket_test.go asserts every point returned is a recorded run, because
+// click-to-row resolves a point's ts back to an actual run).
+// So there are no bucket aggregates here and no sample count to weight by - every
+// element is one genuine speedtest, and a plain mean over them is a plain mean over
+// real runs, not a mean of means.
+// The inaccuracy that IS left, stated plainly: past ~1500 buckets these rows are a
+// one-per-bucket SAMPLE of the runs in range, so this is the mean of the sampled
+// runs rather than of every run recorded in the window. That is the deliberate
+// trade. This number sits inches from the chart and has to agree with it; a true
+// average fetched from the server would print a figure the plotted line does not
+// support, and "subtly disagrees with the graph next to it" is a worse failure than
+// "is the mean of the points you can see".
+function spdAverages(rows){
+  let dn=0, dc=0, up=0, uc=0, pg=0, pc=0;
+  for(const p of rows||[]){
+    // Per METRIC, never per row - see above.
+    if(spMeasured(p,'down_mbps')){ dn+=p.down_mbps; dc++; }
+    if(spMeasured(p,'up_mbps')){ up+=p.up_mbps; uc++; }
+    if(isNum(p.ping_ms) && p.ping_ms>0){ pg+=p.ping_ms; pc++; }
+  }
+  return {down: dc?dn/dc:null, up: uc?up/uc:null, ping: pc?pg/pc:null};
+}
+// setSpdAvg writes one average pill. face is the visible prefix (uppercased by CSS,
+// so the attribute below keeps the unit's real casing while the pill shouts); name is
+// what a screen reader should hear instead of the glyph run.
+function setSpdAvg(id, name, txt, sampled, note){
+  const el=$(id); if(!el) return;
+  el.classList.toggle('sampled', !!sampled);
+  const v=el.querySelector('.stat-val');
+  // The caveat goes AFTER the value: "average download 50 Mbps (mean of ...)".
+  // Appending it to the name instead read as "average download (mean of ...) 50 Mbps",
+  // which puts a parenthesis between the thing and its number.
+  const label = txt==='-' ? name+', no data in this range' : name+' '+txt+(note||'');
+  // Write only on an actual change, but judge the two SEPARATELY. paintSpdAvgs is
+  // wired into the hover redraw path, which fires once per animation frame while the
+  // pointer is over a chart, so re-assigning identical values would dirty the node
+  // for style and layout every frame - that is why the guard exists.
+  //
+  // It used to gate both on the visible text, on the reasoning that the name was
+  // derived from the same txt and so could never be left behind. That stopped being
+  // true when the name gained the sampling caveat, which the visible text does not
+  // carry: a window that became a ~1500-run SAMPLE without its rounded average
+  // moving wrote nothing at all, so the pill went on describing a sample as the
+  // average across the whole range - and the same guard stranded a stale caveat when
+  // the window became complete again.
+  // Only the number is written, and still only on an actual change - the guard's
+  // whole purpose (see above) is that this runs once per animation frame while
+  // the pointer is over a chart. The icon is static markup: it is a constant per
+  // pill, so re-writing it every frame was work with no possible effect.
+  if(v && v.textContent!==txt) v.textContent=txt;
+  if(el.getAttribute('aria-label')!==label) el.setAttribute('aria-label', label);
+  // title too, so the caveat is reachable by hovering and not only by a screen
+  // reader; the pill itself has no room for it.
+  if(el.getAttribute('title')!==label) el.setAttribute('title', label);
+}
+// paintSpdAvgs refreshes the three readouts from whatever spdData currently holds.
+// Called from every path that repaints the speed charts rather than only from the
+// loader: spdData is replaced wholesale in exactly one place, so the loader alone
+// would in fact be sufficient today, but a stale average beside a fresh chart is the
+// failure this feature exists to avoid - wiring the redraws too means no future path
+// that swaps the array before repainting can quietly reintroduce it. Recomputed each
+// time rather than cached against the array: a cache would go stale the day someone
+// mutates spdData in place, and ~1500 additions is far inside one frame's budget.
+// spdSampled/spdTotal record whether the loaded window is the whole thing (see
+// refreshSpeedChart). A mean over a positional sample is not the mean of the
+// range: the stride keeps every Nth run, so any periodic pattern in the data can
+// alias, and the pills would state the aliased figure as fact.
+let spdSampled=false, spdTotal=0;
+function spdAvgNote(sampled,total,shown){
+  return sampled ? ` (mean of the ${shown} runs charted, of ${total} in range)` : '';
+}
+function paintSpdAvgs(){
+  const a=spdAverages(spdData);
+  const note=spdAvgNote(spdSampled,spdTotal,spdData.length);
+  setSpdAvg('spdAvgDn','average download',mbpsText(a.down),spdSampled,note);
+  setSpdAvg('spdAvgUp','average upload',mbpsText(a.up),spdSampled,note);
+  setSpdAvg('spdAvgPing','average ping',pingAvgText(a.ping),spdSampled,note);
 }
 function spdArea(x,points,X,Y,key,color,rgba,top,H,gradTop){
   const gt=gradTop!=null?gradTop:top;
@@ -4084,8 +4506,8 @@ function drawSpeedChart(points){
   if(TC.thrUp) threshLine(x,pad.l,w-pad.r,Y,chartThresh.up,maxV,TC.ul);
   spdPlot={points,X,Y,top:pad.t,bot:pad.t+H};
   if(mine) drawXAxis(x, points, 'ts', X, w, pad.t+H, pad.l, pad.r);
-  { const sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, pad.t, pad.t+H, true); }
-  if(spdHover>=0 && spdHover<points.length) drawCursor(x, X(points[spdHover].ts), pad.t, pad.t+H, false);
+  { const cs=cursorSpan(h,mine), sy=c.offsetTop, sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, cs.top, cs.bot, true, sy);
+    if(spdHover>=0 && spdHover<points.length) drawCursor(x, X(points[spdHover].ts), cs.top, cs.bot, false, sy); }
 }
 // Connection-quality chart: ping line + solid ±jitter band (ms).
 function drawQualityChart(points){
@@ -4122,21 +4544,98 @@ function drawQualityChart(points){
   if(TC.thrPing) threshLine(x,pad.l,w-pad.r,Y,chartThresh.ping,maxV,TC.ping);
   qPlot={points,X,top:pad.t,bot:bot};
   if(mine) drawXAxis(x, points, 'ts', X, w, bot, pad.l, pad.r);
-  { const sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, pad.t, bot, true); }
-  if(qHover>=0 && qHover<points.length) drawCursor(x, X(points[qHover].ts), pad.t, bot, false);
+  { const cs=cursorSpan(h,mine), sy=c.offsetTop, sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, cs.top, cs.bot, true, sy);
+    if(qHover>=0 && qHover<points.length) drawCursor(x, X(points[qHover].ts), cs.top, cs.bot, false, sy); }
 }
 // Bufferbloat strip: latency ADDED under load (loaded - idle) per direction, drawn as thin
 // DIVERGING bars about a centre zero line - upload above (teal), download below (gold). Each
-// run's bar is full colour from the centre up to the typical (median), with the worst above
-// it in a different (lighter) shade; a worst that goes OVER the viewable area caps with an
+// run's bar is full colour from the centre up to the typical (median), with the p95 tail above
+// it in a different (lighter) shade; a tail that goes OVER the viewable area caps with an
 // arrow triangle at the top. Same added-ms the cards, runs table, tooltip, and alert
 // thresholds use. A run needs an idle baseline, so runs without idle drop out. About 0.
+// bloatBins reduces a run of points to at most one drawn bar per pixel column.
+// Returns {px, dn, up, dnX, upX} - already positioned and already reduced - so the
+// draw loop is identical whether or not binning happened.
+//
+// The two statistics are chosen for what each mark means, and they are not the
+// same choice: the solid part is a LEVEL, so a column takes the median of its
+// runs and the trend line stays where the runs actually sat; the pale part is a
+// SPIKE, so a column takes the maximum and a single bad run inside a busy column
+// cannot be averaged out of existence by its neighbours.
+function bloatBins(points, f, X, barW){
+  const out=[];
+  const val=p=>({px:X(p.ts), dn:f.dDn(p), up:f.dUp(p), dnX:f.dDnX(p), upX:f.dUpX(p)});
+  if(points.length<2) return points.map(val);
+  const span=Math.abs(X(points[points.length-1].ts)-X(points[0].ts));
+  // Bin only once bars would collide: the threshold is the drawn width, so this
+  // never engages on a window the strip can already render honestly.
+  if(span<=0 || points.length<=span/Math.max(1,barW*1.25)) return points.map(val);
+  const med=a=>{ if(!a.length) return null; const s=[...a].sort((m,n)=>m-n), i=s.length>>1; return s.length%2?s[i]:(s[i-1]+s[i])/2; };
+  const mx=a=>a.length?Math.max(...a):null;
+  let bucket=[], bx=null;
+  const flush=()=>{ if(!bucket.length) return;
+    const g=k=>bucket.map(f[k]).filter(isNum);
+    out.push({px:bx, dn:med(g('dDn')), up:med(g('dUp')), dnX:mx(g('dDnX')), upX:mx(g('dUpX'))});
+    bucket=[]; };
+  for(const p of points){
+    const col=Math.round(X(p.ts));
+    if(bx===null) bx=col;
+    if(col!==bx){ flush(); bx=col; }
+    bucket.push(p);
+  }
+  flush();
+  return out;
+}
+
+// bloatCeiling is the axis top for the bufferbloat strip: fit the data, admit a
+// threshold only while it is near that data, and round to a stable step.
+//
+// A pure function because the rule is the interesting part and a canvas cannot be
+// asserted. Both halves earn their place. Without the threshold cap, a limit set
+// far above what a link does (200ms on a line that bloats 5-15ms) set the scale on
+// its own and flattened every bar into the baseline - the chart went blank to make
+// room for a line that would never be crossed. Without the rounding, the ceiling
+// was an arbitrary product of the data (23.4, then 24.1...) so the axis number
+// changed on every refresh even when nothing had.
+// The data half of the bufferbloat ceiling. BOTH inputs get a robust statistic,
+// because a maximum here is not a scale, it is whatever the worst single moment
+// was: the tails already used their median, but the typical values were reduced
+// with a plain max, so one run whose upload median hit 256ms set the axis to
+// 500 while every other bar in the window was around 8ms - 60x the level being
+// looked at, flattening the entire chart to read one spike that the caret was
+// going to mark anyway.
+//
+// p95 of the typicals rather than their median: the ceiling has to comfortably
+// CONTAIN normal bars, not sit in the middle of them. Median of the tails
+// rather than a higher quantile: tails are meant to poke out and clip - that is
+// what the caret and the tooltip are for.
+//
+// Both adapt, which is why this is a relative cap and not a fixed millisecond
+// limit. A link that genuinely bloats 300ms gets a 500ms axis and reads as bad;
+// a link that bloats 8ms gets an axis that can show 8ms.
+function bloatDataMax(typical, tails){
+  // Nothing below this is worth a whole axis - under ~20ms of added latency
+  // nothing is wrong, and a tighter scale would magnify noise into drama.
+  const floorMS = 20;
+  const q = (a, p) => { if(!a.length) return 0;
+    const s = [...a].sort((m,n) => m-n);
+    return s[Math.min(s.length-1, Math.max(0, Math.ceil(p*s.length)-1))]; };
+  return Math.max(floorMS, q(typical, 0.95), q(tails, 0.5));
+}
+function bloatCeiling(dataMax, thr){
+  // Within 2x of what the data actually reaches, a configured limit is worth
+  // seeing in scale; beyond that it describes a condition this link does not
+  // produce, and letting it own the axis destroys the resolution of everything
+  // that IS happening.
+  const nearFactor=2;
+  return niceStep(Math.max(dataMax, thr<=dataMax*nearFactor?thr:0)*1.06);
+}
 function drawBloatChart(points){
-  // Added latency per direction - median and per-run worst sample; null without idle.
+  // Added latency per direction - median and per-run p95 tail; null without idle.
   const dDn=p=>isNum(p.idle_ms)&&isNum(p.loaded_down_ms)?Math.max(0,p.loaded_down_ms-p.idle_ms):null;
   const dUp=p=>isNum(p.idle_ms)&&isNum(p.loaded_up_ms)?Math.max(0,p.loaded_up_ms-p.idle_ms):null;
-  const dDnX=p=>isNum(p.idle_ms)&&isNum(p.loaded_down_max_ms)?Math.max(0,p.loaded_down_max_ms-p.idle_ms):null;
-  const dUpX=p=>isNum(p.idle_ms)&&isNum(p.loaded_up_max_ms)?Math.max(0,p.loaded_up_max_ms-p.idle_ms):null;
+  const dDnX=p=>isNum(p.idle_ms)&&isNum(p.loaded_down_p95_ms)?Math.max(0,p.loaded_down_p95_ms-p.idle_ms):null;
+  const dUpX=p=>isNum(p.idle_ms)&&isNum(p.loaded_up_p95_ms)?Math.max(0,p.loaded_up_p95_ms-p.idle_ms):null;
   const has=points.some(p=>dDn(p)!=null||dUp(p)!=null);
   // Dim the Bufferbloat toggle when there's nothing to plot: the chart auto-hides
   // whatever the toggle says, so flag the control as not-applicable for now.
@@ -4157,13 +4656,20 @@ function drawBloatChart(points){
   const pad={l:padL(40),r:padR(10),t:0,b:mine?AX_PAD:8}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
   drawYTitle(x,"BLOAT (ms)",w,pad,H);
   // Robust ceiling shared by both directions: fit the typical (median) values and the
-  // MEDIAN of the per-run worsts (never the absolute max - one transient can't squash the
-  // rest; it clips to a caret, exact value in the tooltip), plus any threshold. Padded 18%.
-  const tmed=a=>{ if(!a.length) return 0; const s=[...a].sort((m,n)=>m-n), i=s.length>>1; return s.length%2?s[i]:(s[i-1]+s[i])/2; };
-  let typMax=20; for(const p of points){ const a=dDn(p), b=dUp(p); if(isNum(a)&&a>typMax)typMax=a; if(isNum(b)&&b>typMax)typMax=b; } // loop, not Math.max(...spread)
-  const maxV=Math.max(typMax,
-                          tmed(points.flatMap(p=>[dDnX(p),dUpX(p)]).filter(isNum)),
-                          TC.thrBdown?chartThresh.bloatDown||0:0, TC.thrBup?chartThresh.bloatUp||0:0)*1.06;
+  // MEDIAN of the per-run tails (never the absolute max - one transient can't squash the
+  // rest; it clips to a caret, exact value in the tooltip). Rounded to a nice step so the
+  // axis number is stable between refreshes instead of drifting with the data.
+  const dataMax=bloatDataMax(
+    points.flatMap(p=>[dDn(p),dUp(p)]).filter(isNum),
+    points.flatMap(p=>[dDnX(p),dUpX(p)]).filter(isNum));
+  // A threshold only raises the ceiling while it is NEAR the data. A limit set far
+  // above what this link does (200ms on a line that bloats 5-15ms) used to set the
+  // scale on its own and flatten every bar into the baseline - the chart went blank
+  // to make room for a line that was never going to be crossed. Past that it is drawn
+  // clipped at the top edge instead, which still says "your limit is above everything
+  // here" without spending the whole axis on it.
+  const thr=Math.max(TC.thrBdown?chartThresh.bloatDown||0:0, TC.thrBup?chartThresh.bloatUp||0:0);
+  const maxV=bloatCeiling(dataMax, thr);
   // Diverge about a centre zero line: upload above, download below, symmetric scale.
   const cen=pad.t+H/2, half=H/2-7, Yup=v=>cen-Math.min(v,maxV)/maxV*half, Ydn=v=>cen+Math.min(v,maxV)/maxV*half; // -7 leaves headroom for the (now larger) outlier caret
   x.font='11px ui-monospace,monospace'; x.textBaseline='alphabetic';
@@ -4172,42 +4678,67 @@ function drawBloatChart(points){
   if(TC.gridOn){ x.strokeStyle=TC.grid; for(const v of [maxV/2]) for(const yy of [Yup(v),Ydn(v)]){ x.beginPath(); x.moveTo(pad.l,yy); x.lineTo(w-pad.r,yy); x.stroke(); } }
   x.save(); x.strokeStyle=TC.axis; x.globalAlpha=.4; x.beginPath(); x.moveTo(pad.l,cen); x.lineTo(w-pad.r,cen); x.stroke(); x.restore();
   if(TC.yLab){ x.fillStyle=TC.axis; x.textAlign='left';
-    // Label each side with the AVERAGE bloat over the visible window, placed at its own
-    // height, instead of the axis max / a zero marker.
-    const mean=g=>{ let s=0,n=0; for(const p of points){ const v=g(p); if(isNum(v)){s+=v;n++;} } return n?s/n:null; };
-    const au=mean(dUp), ad=mean(dDn);
-    if(au!=null) x.fillText('↑'+au.toFixed(0),6,Yup(au)+3);
-    if(ad!=null) x.fillText('↓'+ad.toFixed(0),6,Ydn(ad)+3); }
+    // Label the midpoint gridlines with their value (maxV/2): a fixed, self-consistent
+    // scale reference. The number sits at its own height, so it reads as an axis scale
+    // and can never collide with its opposite the way a value-at-its-height label does
+    // once the spikes (which set maxV) dwarf the typical level.
+    const mid = maxV/2;
+    if(points.some(p=>isNum(dUp(p)))) x.fillText('↑'+mid.toFixed(0),6,Yup(mid)+3);
+    if(points.some(p=>isNum(dDn(p)))) x.fillText('↓'+mid.toFixed(0),6,Ydn(mid)+3); }
   // Thin diverging gradient bars, one per run: solid from the centre up to the typical
-  // (median), then fading out to the per-run worst; upload above the zero line, download
-  // below. The worst is clamped to the axis, and a worst that goes OVER the viewable area
+  // (median), then fading out to the per-run p95 tail; upload above the zero line, download
+  // below. The tail is clamped to the axis, and one that goes OVER the viewable area
   // caps with an arrow triangle at the top.
   // As thin as the original stems (~1.5px), only narrowing further if points get denser
   // than that so bars never overlap into a solid mass.
   const slot=(w-pad.l-pad.r)/Math.max(1,points.length), barW=Math.max(1,Math.min(1.6,slot));
-  for(const p of points){
-    const px=X(p.ts);
+  // Past roughly one bar per 2px the strip stops being readable: a 30-day window
+  // returns hundreds of runs into ~900px, the slot falls under the 1px floor, and
+  // adjacent bars touch into a solid block that shows density rather than level.
+  // Bin to pixel columns instead - the typical is the column's MEDIAN (a trend the
+  // eye can follow) and the tail its MAXIMUM (a spike must never be averaged away
+  // by its neighbours). Under the threshold nothing is binned and every run keeps
+  // its own bar, which is what a short window wants.
+  const drawPts=bloatBins(points,{dDn,dUp,dDnX,dUpX},X,barW);
+  for(const p of drawPts){
+    const px=p.px;
     const bar=(typ,wst,toY,solid,fade,up)=>{ if(!isNum(typ)) return;
       const t=Math.max(0,typ), mx=Math.max(t,isNum(wst)?wst:t), clip=mx>maxV, top=clip?maxV:mx, bx=px-barW/2;
-      // worst portion in the lighter shade (typical -> worst), then the typical in full colour
+      // tail portion in the lighter shade (typical -> p95), then the typical in full colour
       if(top>t){ const yT=toY(t), yE=toY(top); x.fillStyle=fade; x.fillRect(bx,Math.min(yT,yE),barW,Math.abs(yE-yT)); }
       if(t>0){ const yT=toY(t); x.fillStyle=solid; x.fillRect(bx,Math.min(cen,yT),barW,Math.abs(yT-cen)); }
       if(clip){ const s=up?-1:1, yE=toY(maxV); x.save(); x.fillStyle=fade; x.beginPath(); x.moveTo(px,yE+s*5.85); x.lineTo(px-3.3,yE); x.lineTo(px+3.3,yE); x.closePath(); x.fill(); x.restore(); } }; // caret ~50% larger than the prior 2.2/3.9
-    bar(dUp(p),dUpX(p),Yup,TC.bup,TC.bupFill,true);
-    bar(dDn(p),dDnX(p),Ydn,TC.bdown,TC.bdownFill,false);
+    bar(p.up,p.upX,Yup,TC.bup,TC.bupFill,true);
+    bar(p.dn,p.dnX,Ydn,TC.bdown,TC.bdownFill,false);
   }
   // Alert thresholds: upload above the centre, download below - same added-ms scale.
   if(TC.thrBup) threshLine(x,pad.l,w-pad.r,Yup,chartThresh.bloatUp,maxV,TC.bup);
   if(TC.thrBdown) threshLine(x,pad.l,w-pad.r,Ydn,chartThresh.bloatDown,maxV,TC.bdown);
   bloatPlot={points,X,top:pad.t,bot:bot};
   if(mine) drawXAxis(x, points, 'ts', X, w, bot, pad.l, pad.r);
-  { const sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, pad.t, bot, true); }
-  if(bloatHover>=0 && bloatHover<points.length) drawCursor(x, X(points[bloatHover].ts), pad.t, bot, false);
+  { const cs=cursorSpan(h,mine), sy=c.offsetTop, sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, cs.top, cs.bot, true, sy);
+    if(bloatHover>=0 && bloatHover<points.length) drawCursor(x, X(points[bloatHover].ts), cs.top, cs.bot, false, sy); }
 }
 let speedRange={kind:'win', mins:1440};
 let speedSeq=0; // only the newest in-flight speed poll repaints (see refreshStatus)
 let speedLoadedFor=''; // the query the data in spdData came from
 let speedLoadedLive=false; // and whether that load was of a still-live window
+// spdSyncPlan decides what a status poll may do to the pinned-span panel by the
+// time it lands. The poll is 3 seconds wide, so a selection made while one is in
+// flight would otherwise be repainted with the PREVIOUS window's numbers - the
+// poll calls syncSpeedPanel(true), and `true` is a claim about spdData that the
+// poll is in no position to make.
+//   seq !== curSeq  a newer speed request is already in flight; it owns the
+//                   panel and will paint it on arrival, so keep hands off.
+//   loadedFor !== wantQ  spdData belongs to a different query. Never paint it as
+//                   this range's numbers - say so and let the fetch finish. This
+//                   is the case a sequence check alone misses: a fetch that
+//                   FAILED leaves seq settled but spdData still stale.
+// Mirrors the statusSeq/chartSeq/speedSeq guards used by the fetchers themselves.
+function spdSyncPlan(seq, curSeq, loadedFor, wantQ){
+  if(seq!==curSeq) return 'skip';
+  return loadedFor===wantQ ? 'sync' : 'stale';
+}
 // speedWindowQuery resolves the selection against now. A rolling window keeps
 // sending ?mins= byte-for-byte as before; a span sends ?from/?to in unix
 // seconds, half-open.
@@ -4237,11 +4768,29 @@ async function refreshSpeedChart(force){
   const {q, live}=speedWindowQuery();
   if(!force && !live && speedLoadedFor===q && !speedLoadedLive) return;
   const my=++speedSeq; let d;
-  try{ const r=await fget('api/speed?'+q); if(!r.ok) throw 0; d=await r.json()||[]; }
+  let sampled=false, total=0;
+  try{
+    const r=await fget('api/speed?'+q);
+    if(!r.ok){
+      // Expected, self-clearing reconcile 503: swallow the failure toast and back
+      // off Retry-After before the next poll rather than crying "load failed".
+      let body=''; try{ body=await r.text(); }catch(_){}
+      if(isReconcile503(r, body)){ if(my===speedSeq) speedBackoffMs=retryAfterMs(r.headers.get('Retry-After')); return; }
+      throw 0;
+    }
+    // The server thins a window holding more than ~1500 runs and says so in these
+    // headers. Dropping them left the chart, the stat tiles and the average pills
+    // all describing a sample of the window with nothing on screen admitting it -
+    // and the pills are LABELLED as averages "across the range", which a sample's
+    // mean is not (see spdSampled).
+    sampled = r.headers.get('X-Sampled')==='true';
+    total = parseInt(r.headers.get('X-Total-Count')||'0',10)||0;
+    d=await r.json()||[];
+  }
   catch(e){ if(my===speedSeq) chartLoadFailed('speed chart'); return; }
   if(my!==speedSeq) return;
-  speedLoadedFor=q; speedLoadedLive=live; spdData=d;
-  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData);
+  speedLoadedFor=q; speedLoadedLive=live; spdData=d; spdSampled=sampled; spdTotal=total;
+  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData); paintSpdAvgs();
   syncSpeedPanel(true);
 }
 const speedPicker = winDropdown('speedWindow', 'speedWin',
@@ -4264,6 +4813,13 @@ function backToLive(){
 // change the control repaints before the fetch returns, and painting the old
 // window newest run as this range last run is a small lie that lasts a second.
 function syncSpeedPanel(fresh){
+  // The average pills belong to this same "say what the chart is showing" job, and
+  // this is the path a window change and the Live button both take. Note it is NOT
+  // gated on `fresh`: the pills describe spdData, and in the moment between a
+  // selection changing and its fetch landing the charts are still drawing the old
+  // range - so agreeing with them is correct, and blanking to "-" there would flash
+  // an empty average over a chart that is plainly showing runs.
+  paintSpdAvgs();
   const h2=$('speedWindow').parentNode;
   let live=h2.querySelector('.live-btn');
   if(speedFrozen()){
@@ -4319,9 +4875,9 @@ function nearestIdx(plot, mx){
 // far faster than 60fps, and a full chart redraw per event would be wasteful).
 let _rafLat=0, _rafSpd=0, _rafQ=0, _rafBloat=0;
 function redrawLat(){ if(_rafLat) return; _rafLat=requestAnimationFrame(()=>{ _rafLat=0; if(latPlot) drawChart(latPlot.points, latPlot.realPts); }); }
-function redrawSpd(){ if(_rafSpd) return; _rafSpd=requestAnimationFrame(()=>{ _rafSpd=0; drawSpeedChart(spdData); }); }
-function redrawQ(){ if(_rafQ) return; _rafQ=requestAnimationFrame(()=>{ _rafQ=0; drawQualityChart(spdData); }); }
-function redrawBloat(){ if(_rafBloat) return; _rafBloat=requestAnimationFrame(()=>{ _rafBloat=0; drawBloatChart(spdData); }); }
+function redrawSpd(){ if(_rafSpd) return; _rafSpd=requestAnimationFrame(()=>{ _rafSpd=0; drawSpeedChart(spdData); paintSpdAvgs(); }); }
+function redrawQ(){ if(_rafQ) return; _rafQ=requestAnimationFrame(()=>{ _rafQ=0; drawQualityChart(spdData); paintSpdAvgs(); }); }
+function redrawBloat(){ if(_rafBloat) return; _rafBloat=requestAnimationFrame(()=>{ _rafBloat=0; drawBloatChart(spdData); paintSpdAvgs(); }); }
 // Chart show/hide toggles (Speed / Quality / Bufferbloat), to the left of the drag
 // handle. Default all shown; state persists in localStorage. A hidden chart gets
 // .chart-off (display:none) and its draw fn skips it; Bloat still auto-hides on
@@ -4343,7 +4899,7 @@ document.querySelectorAll('.chart-toggle').forEach(b=> b.addEventListener('click
   h.has(k)?h.delete(k):h.add(k);
   lsSet('chartsHidden', JSON.stringify([...h]));
   applyChartVis();
-  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData);
+  drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData); paintSpdAvgs();
 }));
 applyChartVis();
 // Touch adapter: synthesizes the {clientX, clientY, currentTarget} shape the
@@ -4388,16 +4944,24 @@ function runTip(p){
   const line=(arrow,loaded,mx,bloat)=>{ if(!isNum(loaded)) return null;
     let s='loaded '+arrow+' '+num1(loaded)+' ms';
     if(bloat!=null){
-      // Both figures are ADDED bufferbloat (worst = loaded_max - idle), matching the chart's
-      // band + stem-top, instead of surfacing an idle-included loaded value as the "max".
+      // Both figures are ADDED bufferbloat, matching the chart's band + stem-top
+      // rather than surfacing an idle-included loaded value. The tail is the
+      // phase's p95, not its maximum: a maximum is a lost SYN retransmitted on
+      // the OS's fixed 1s timer about a third of the time, which describes the
+      // operating system rather than the link (see loadStat in lul.go).
       s+=' — bufferbloat +'+bloat.toFixed(0)+' ms typical';
-      if(isNum(mx)&&isNum(p.idle_ms)) s+=', +'+Math.max(0,mx-p.idle_ms).toFixed(0)+' ms worst';
+      if(isNum(mx)&&isNum(p.idle_ms)) s+=', +'+Math.max(0,mx-p.idle_ms).toFixed(0)+' ms p95';
     }
     return s; };
   const bb=[];
-  if(isNum(p.idle_ms)) bb.push('idle '+num1(p.idle_ms)+' ms');
-  const ul=line('↑',p.loaded_up_ms,p.loaded_up_max_ms,ud); if(ul) bb.push(ul); // upload first, matching the chart (up above 0)
-  const dl=line('↓',p.loaded_down_ms,p.loaded_down_max_ms,dd); if(dl) bb.push(dl);
+  // "idle baseline", not bare "idle": this is the only place the idle figure and the
+  // server ping appear in one readout, and they are different measurements against
+  // different targets (see the section comment above). Naming it a baseline says what
+  // it is - the thing loaded is subtracted from - rather than inviting a comparison
+  // with the Quality section's ping a few lines up.
+  if(isNum(p.idle_ms)) bb.push('idle baseline '+num1(p.idle_ms)+' ms');
+  const ul=line('↑',p.loaded_up_ms,p.loaded_up_p95_ms,ud); if(ul) bb.push(ul); // upload first, matching the chart (up above 0)
+  const dl=line('↓',p.loaded_down_ms,p.loaded_down_p95_ms,dd); if(dl) bb.push(dl);
   if(bb.length) h+='<div class="tt-sec"><span class="tt-h">Bufferbloat</span>'+bb.join('<br>')+'</div>';
   return h;
 }
@@ -4665,6 +5229,12 @@ $('heatmap').addEventListener('click', async e=>{
 });
 let outagesPage=1, outagesPerPage=10, outagesTotal=0;
 let outagesSeq=0; // only the newest in-flight outages poll repaints the table (see refreshStatus)
+// An outage row is deletable exactly when it's a closing 'up' event - the same
+// predicate the server enforces (ts=? AND type='up'). A repair can null an outage's
+// duration (has_duration=false, shown as '-') without changing that it still closes
+// a real outage the server will delete, so duration must NOT gate the affordance.
+// Shared by this table's render and the delete handler's confirm below.
+function outageDeletable(e){ return !!e && e.type==='up'; }
 async function loadOutages(){
   const my=++outagesSeq;
   let data; try{ data=await (await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`)).json(); }catch(e){ return; }
@@ -4672,24 +5242,28 @@ async function loadOutages(){
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(); } // page emptied
   $('events').innerHTML = ev.length ? ev.map(e=>`
-    <tr${outageSelDay&&fmtLocalDate(new Date(e.ts*1000))===outageSelDay?' class="ev-hl"':''}><td class="act">${e.type==='up'&&e.has_duration?`<button class="run-del" type="button" data-ts="${e.ts}" data-dur="${e.duration_s}" title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
+    <tr${outageSelDay&&fmtLocalDate(new Date(e.ts*1000))===outageSelDay?' class="ev-hl"':''}><td class="act">${outageDeletable(e)?`<button class="run-del" type="button" data-ts="${e.ts}"${e.has_duration?` data-dur="${e.duration_s}"`:''} title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
         <td>${fmtTime(e.ts)}</td>
         <td class="${e.type==='up'?'ev-up':'ev-down'}">${e.type==='up'?'Reconnected':'Link down'}</td>
         <td>${e.type==='up'&&e.has_duration?fmtDur(e.duration_s):'-'}</td></tr>`).join('')
     : '<tr><td class="muted" colspan="4">No events recorded yet.</td></tr>';
   updateOutagesPager();
 }
-// Per-outage delete (delegated - rows re-render each load). Only "Reconnected"
-// rows get the button: the outage's identity is its closing 'up' event, and the
-// server sweeps every "Link down" marker back to the previous recovery with it
-// (an outage can have several - monitor restarts re-detect it). An in-progress
-// outage (a trailing "Link down") can't be deleted. Refreshes everything derived
-// from outage events: this table, the heatmap, and the uptime pill. The latency
-// chart's red band stays - it draws from the raw probe samples, which deletion keeps.
+// Per-outage delete (delegated - rows re-render each load). Every "Reconnected"
+// row gets the button (see outageDeletable): the outage's identity is its closing
+// 'up' event, which is exactly what the server accepts (ts=? AND type='up') - with
+// a duration or not, so a repair-nulled outage (duration shown as '-') is deletable
+// too. The server sweeps every "Link down" marker back to the previous recovery
+// with it (an outage can have several - monitor restarts re-detect it). An
+// in-progress outage (a trailing "Link down") can't be deleted. Refreshes
+// everything derived from outage events: this table, the heatmap, and the uptime
+// pill. The latency chart's red band stays - it draws from the raw probe samples,
+// which deletion keeps.
 $('events').addEventListener('click', async e=>{
   const btn=e.target.closest('.run-del'); if(!btn) return;
   const ts=+btn.dataset.ts; if(!ts) return;
-  if(!confirm(`Delete this ${fmtDur(+btn.dataset.dur||0)} outage? It disappears from the outage list, heatmap, and uptime stats. This cannot be undone.`)) return;
+  // No data-dur on a repair-nulled outage - say "resolved outage", not "0s outage".
+  if(!confirm(`Delete this ${btn.dataset.dur?fmtDur(+btn.dataset.dur):'resolved'} outage? It disappears from the outage list, heatmap, and uptime stats. This cannot be undone.`)) return;
   const idx=[...$('events').querySelectorAll('.run-del')].indexOf(btn);
   btn.disabled=true;
   try{
@@ -4718,7 +5292,10 @@ const fmtLocalDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(
 // reads correctly on light and dark backgrounds. Three widely-spaced steps -
 // one outage, two, three-or-more - so the counts are tellable at a glance.
 const HM_W=[0,.32,.66,1];                                  // mix weight per level (0 = empty)
-const hmLevel = n => n<=0?0 : n===1?1 : n===2?2 : 3;       // outages that day
+// Fill level from the day's OUTAGE COUNT, not its duration - one 23h outage and
+// one 1s blip are both level 1. Documented that way in the README and pinned by
+// a test there, because the two have drifted apart before.
+const hmLevel = n => n<=0?0 : n===1?1 : n===2?2 : 3;
 function _rgb(h){ h=(h||'').replace('#',''); if(h.length===3) h=h.split('').map(c=>c+c).join(''); const n=parseInt(h,16)||0; return [(n>>16)&255,(n>>8)&255,n&255]; }
 function hmShade(w){ if(w<=0) return TC.hm0; const a=_rgb(TC.hm0), b=_rgb(TC.down);
   const m=a.map((c,i)=>Math.round(c+(b[i]-c)*w)); return `rgb(${m[0]},${m[1]},${m[2]})`; }
@@ -4739,25 +5316,64 @@ function drawHeatmap(){
   const el=$('heatmap'); if(!el) return; el.innerHTML='';
   const today=new Date(); today.setHours(0,0,0,0);
   const start=new Date(today); start.setDate(start.getDate()-365); start.setDate(start.getDate()-start.getDay());
+  // refreshHeatmap asks for days=366 - the cap web.go enforces - so no day
+  // before this one can ever have a row. The Sunday alignment above reaches up
+  // to 5 days further back, and those cells drew as clean fully-observed days:
+  // the exact false-clean square the disclosure below exists to prevent. They
+  // are week-column padding, not days the response describes, so they hold
+  // their grid slot and draw as nothing at all.
+  const oldest=new Date(today); oldest.setDate(oldest.getDate()-366);
   let n=0;
   for(let dt=new Date(start);dt<=today;dt.setDate(dt.getDate()+1)){
+    if(dt<oldest){
+      const pad=document.createElement('div'); pad.className='cell';
+      pad.style.visibility='hidden'; el.appendChild(pad); n++; continue;
+    }
     const key=fmtLocalDate(dt), rec=map[key], s=rec?rec.downtime_s:0;
+    // Observation disclosure. window_s is the day's seconds inside the requested
+    // range, observed_s how many of them the monitor actually watched. Without
+    // this a day nobody watched and a day watched end to end with a flawless link
+    // are the identical empty square - the heatmap's own version of the false
+    // 100% the coverage series exists to prevent on /metrics.
+    const winS = (rec && rec.window_s>0) ? rec.window_s : 0;
+    const obsS = (rec && rec.observed_s!=null) ? rec.observed_s : winS;
+    const dark = winS>0 && obsS<=0;    // watched none of it
+    const unobs = winS>0 && obsS<winS; // watched some but not all of it
+    const hasEv = !!(rec && (rec.outages>0 || rec.downtime_s>0));
     // Tint by outage count. A day crossed by an outage that STARTED the day
     // before has downtime_s>0 with outages=0 - still shade it as one event.
     const lvl=rec?hmLevel(Math.max(rec.outages, s>0?1:0)):0;
-    const cell=document.createElement('div'); cell.className='cell'; cell.style.background=hmShade(HM_W[lvl]);
-    // Only days with an outage get a tooltip and a click (jump to that day's
-    // events in the outages table); clean days are inert.
-    if(rec && (rec.outages>0 || rec.downtime_s>0)){
-      cell.dataset.tip = `${key}: ${rec.outages} outage(s), ${fmtDur(s)} down`;
-      cell.classList.add('ev'); cell.dataset.day=key;
-      // Keyboard access: an interactive cell must be focusable and announce itself
-      // (mouse/touch users get the same via the tooltip). Enter/Space activate it
-      // through the keydown handler below.
-      cell.tabIndex=0; cell.setAttribute('role','button');
-      cell.setAttribute('aria-label', `${key}: ${rec.outages} outage(s), ${fmtDur(s)} down. Activate to view events.`);
-      if(key===outageSelDay){ cell.classList.add('sel'); cell.setAttribute('aria-pressed','true'); }
-      else cell.setAttribute('aria-pressed','false');
+    // Observation is disclosed in the tooltip and the accessible name below, not
+    // in the fill: a day nobody watched is shaded like any other clean day, and
+    // `dark`/`unobs` only select the wording. A visual treatment for it was tried
+    // and deliberately dropped as over-engineering.
+    const cell=document.createElement('div'); cell.className='cell'; cell.style.backgroundColor=hmShade(HM_W[lvl]);
+    // Days with an outage get a tooltip and a click (jump to that day's events in
+    // the outages table). Days that were not fully monitored get the tooltip and an
+    // accessible name too, but stay non-interactive when they have no events -
+    // there is nothing for a click to open.
+    if(hasEv || unobs){
+      const parts=[];
+      if(hasEv) parts.push(`${rec.outages} outage(s), ${fmtDur(s)} down`);
+      if(dark) parts.push('not monitored');
+      else if(unobs) parts.push(`monitored ${fmtDur(obsS)} of ${fmtDur(winS)}`);
+      const what = parts.join(' · ');
+      cell.dataset.tip = `${key}: ${what}`;
+      if(hasEv){
+        cell.classList.add('ev'); cell.dataset.day=key;
+        // Keyboard access: an interactive cell must be focusable and announce itself
+        // (mouse/touch users get the same via the tooltip). Enter/Space activate it
+        // through the keydown handler below.
+        cell.tabIndex=0; cell.setAttribute('role','button');
+        cell.setAttribute('aria-label', `${key}: ${what}. Activate to view events.`);
+        if(key===outageSelDay){ cell.classList.add('sel'); cell.setAttribute('aria-pressed','true'); }
+        else cell.setAttribute('aria-pressed','false');
+      }else{
+        // role=img so the name is announced at all: a bare div with aria-label is
+        // skipped by screen readers.
+        cell.setAttribute('role','img');
+        cell.setAttribute('aria-label', `${key}: ${what}`);
+      }
     }
     el.appendChild(cell); n++;
   }
@@ -4798,17 +5414,74 @@ function speedtestRunText(server, isAuto, city){
   if(isAuto) return 'Finding the fastest server '+(city ? 'in '+esc(city) : 'near you')+'…';
   return 'Running speedtest…';
 }
-function setSpeedtestRunning(running, server, isAuto, city){
+// speedtestRunningNow mirrors the BACKEND's speedtest_running - a run started by
+// the schedule, by a reconnect, or in another tab, not just by this one. The
+// button's "click to stop" affordance has always been driven by it (see
+// refreshStatus), so the abort path has to read it too; see speedtestAbortable.
+let speedtestRunningNow=false;
+// The id of the run the button is currently offering to stop. A stop is DECIDED
+// here, when the operator can see the run, and delivered later - the confirm()
+// below blocks this tab (polling included) for as long as it takes to read. Send
+// the id with the request so the daemon stops the run that was meant, rather than
+// whichever one happens to hold the flag when the click finally arrives.
+let speedtestRunId=0;
+function setSpeedtestRunning(running, server, isAuto, city, runId){
+  speedtestRunningNow=!!running;
+  speedtestRunId=runId||0;
   const b=$('runSpeed');
-  b.disabled=running;
+  // Deliberately NOT disabled while running: a click has to fire so it can abort
+  // the run. The look is unchanged (see the .speed-run.running CSS).
   b.classList.toggle('running', running);
-  b.setAttribute('aria-label', running?'Speedtest running…':'Run a speedtest now');
+  // The stop offer waits for the run's id: the label and the click handler read
+  // the same predicate, so the button never advertises a stop the handler would
+  // refuse to send (see speedtestAbortable).
+  const lbl = !running ? 'Run a speedtest now'
+    : speedtestAbortable(speedtestPending, speedtestRunningNow, speedtestRunId)
+      ? 'Speedtest running - click to stop' : 'Speedtest starting…';
+  b.setAttribute('aria-label', lbl); b.title = lbl;
   if(running){ $('speedWhen').classList.remove('run-err'); $('speedWhen').innerHTML=speedtestRunText(server, isAuto, city); }
 }
 
+// Whether a click on the RUN button means "stop that". It must be exactly the
+// condition that made the button OFFER to stop, or the button lies: the offer is
+// shown for any running test, but the abort used to fire only for one this tab
+// had started. Clicking a scheduled or other-tab run therefore fell through to
+// the start path below, POSTed a second run, collected the backend's
+// already-running rejection, and left the original running - a stop button that
+// reported failure and stopped nothing.
+//
+// The id is part of the offer. A stop is delivered by id so the daemon stops the
+// run the operator decided about (see speedtestRunId above) - but this tab's own
+// optimistic paint has NO id until the poll answers, and an abort sent in that
+// window could only be the id-less kind, which stops "whatever is running now"
+// and can kill the NEXT run if the one that was meant ends first. So a run with
+// an unknown id is busy but not abortable: the button reads as starting and a
+// click does nothing until the id arrives.
+function speedtestBusy(pending, running){ return !!(pending || running); }
+function speedtestAbortable(pending, running, runId){ return speedtestBusy(pending, running) && runId>0; }
+
 let speedtestPending=false; // suppress a stale poll's not-running while the manual POST is in flight (see refreshStatus)
 $('runSpeed').addEventListener('click', async () => {
-  if($('runSpeed').disabled || speedtestPending) return;
+  // A click while a run is in flight aborts it, guarded by a confirm. A best-of-3
+  // keeps the best result already measured; an abort before the first result keeps
+  // nothing (the in-flight POST below returns and the status simply re-syncs).
+  if(speedtestAbortable(speedtestPending, speedtestRunningNow, speedtestRunId)){
+    // Captured BEFORE the dialog: that is the run the operator is deciding about.
+    const target=speedtestRunId;
+    if(!confirm('Stop the running speedtest?\n\nIf it’s a best-of-3, the best result measured so far is kept.')) return;
+    // Always by id - the predicate guaranteed one. An id-less abort stops
+    // "whatever is running now", which by delivery time can be a different run.
+    const q='?run='+encodeURIComponent(target);
+    try{ await fetch('api/speedtest/abort'+q,{method:'POST',headers:{'Content-Type':'application/json'}}); }catch(e){}
+    return;
+  }
+  // A run is in flight but its id has not arrived yet (the window between the
+  // optimistic paint below and the poll): there is nothing safe to stop, and
+  // falling through would POST a second run just to collect the daemon's
+  // already-running rejection. The button reads as starting in this state (see
+  // setSpeedtestRunning) - swallow the click.
+  if(speedtestBusy(speedtestPending, speedtestRunningNow)) return;
+  if($('runSpeed').disabled) return;
   // Instant feedback using the loaded settings; the poll then keeps it accurate.
   speedRunErr=''; speedRunErrSince=lastSpeedTs; // only a run newer than now clears the error
   speedtestPending=true;
@@ -4854,9 +5527,23 @@ const NETINFO_OFF_TIPS = {
        + 'Press the power button to resume.',
   },
 };
+// Why nothing will refresh the Connection panel on its own, or null when
+// something will. Automatic lookups need BOTH the connection-info setting and the
+// power button (main.go: EnabledFn = Monitoring() && NetinfoEnabled()), so there
+// are two ways to be frozen and both must be described the same way.
+//
+// This is ONE answer read by both places that care - the marker beside the panel
+// and the empty-panel message below. They used to decide separately, and only the
+// marker knew that pausing also stops the lookups: a paused monitor with nothing
+// cached drew a marker saying "not refreshing on its own" directly above a body
+// saying "gathering…", then re-polled every 3s forever for a lookup that was never
+// going to run. Same shape as speedtestAbortable - if two places describe one
+// condition, they eventually disagree.
+function netinfoIdleReason(off, mon){ return off ? 'setting' : (!mon ? 'paused' : null); }
+
 function syncNetinfoOffMark(){
   const m=$('netinfoOffMark'); if(!m) return; // may run before the panel exists
-  const why = netinfoOff ? NETINFO_OFF_TIPS.setting : (!monitoring ? NETINFO_OFF_TIPS.paused : null);
+  const why = NETINFO_OFF_TIPS[netinfoIdleReason(netinfoOff, monitoring)] || null;
   m.hidden = !why;
   if(!why) return;
   m.setAttribute('data-tip', why.tip);
@@ -4879,10 +5566,11 @@ async function refreshNetinfo(force) {
   const el=$('netinfo');
   syncNetinfoOffMark(); // one call, ahead of every return below
   if(!n||(!n.public_ip&&!n.error&&!n.dns_upstream)){
-    if(netinfoOff){
+    if(netinfoIdleReason(netinfoOff, monitoring)){
       // Nothing cached, and nothing coming: no automatic lookup will run, so the
       // fast poll below would spin every 3s forever waiting for a snapshot that
-      // is never fetched. Say why instead, and stop polling.
+      // is never fetched. Say why instead, and stop polling. The marker beside the
+      // panel carries which of the two reasons it is.
       el.innerHTML='<span class="muted">not looked up yet</span>';
       return;
     }
@@ -4965,7 +5653,8 @@ async function refreshNetinfo(force) {
     // Not an error - the app is working exactly as configured. It is the
     // READING that changed meaning, which nothing else on screen would say.
     warn.innerHTML='<span class="wi">⚠&#xFE0E;</span><span>Running in a <b>bridged container</b>, so these figures describe the '
-      +'container network, not this host: latency carries an extra hop and the exit path stops at the container gateway. '
+      +'container network, not this host: latency carries an extra hop, the exit path stops at the container gateway, and the '
+      +'<b>DNS provider</b> below is the resolver the container runtime supplied, not the one this host resolves through. '
       +'On Linux use <b>--network=host</b>. Docker Desktop on macOS or Windows cannot do that, so the readings there are always indirect.</span>';
     warn.classList.add('show');
   } else warn.classList.remove('show');
@@ -4978,10 +5667,29 @@ $('netinfoRefresh').addEventListener('click', async () => {
   try{ await refreshNetinfo(true); } finally{ b.classList.remove('spinning'); }
 });
 
-let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoLoc='', autoLabel='', autoDefaultLoc='', defaultSettings=null;
+let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoLoc='', autoLabel='', autoDefaultLoc='', lastRunServer='', defaultSettings=null;
 const shortPlace = s => s ? s.split(',').slice(0,2).join(',').trim() : '';
-const autoText = () => autoLabel ? `Auto - fastest in ${autoLabel}`
-  : autoDefaultLoc ? `Auto - fastest near ${autoDefaultLoc}` : 'Auto - fastest (near you)';
+// autoOptionText / autoScopeText are pure so the two most-read strings in this
+// panel are unit-tested rather than eyeballed. Only a SEARCHED city may be named
+// as auto's centre: with none, auto re-decides by racing the cities this
+// connection points at, fresh on every test and deliberately never cached, so
+// there is no city to name in advance. autoDefaultLoc is the BROWSING list's
+// centre - one of those candidates, but not necessarily the winner - and is
+// never allowed to stand in for auto's answer, which is what it used to do
+// while captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
+const autoOptionText = label => { return label ? `Auto - fastest in ${label}` : 'Auto - fastest near you'; };
+const autoScopeText = (what, label, listCentre, lastServer) => {
+  if(label) return `Auto picks ${what} in <b>${esc(label)}</b>.`;
+  let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - decided fresh on every test.`;
+  t += listCentre
+    ? ` The list here is for browsing, centred on <b>${esc(listCentre)}</b>; auto may test from a different city.`
+    : ' The list here is for browsing, centred on your connection’s own location; auto may test from a different city.';
+  // Past tense on purpose: it reports what the last run measured, which stays
+  // true however that server was chosen, rather than claiming a present centre.
+  if(lastServer) t += ` Your last test measured <b>${esc(lastServer)}</b>.`;
+  return t;
+};
+const autoText = () => autoOptionText(autoLabel);
 
 function updateScopeNote(){
   const el=$('serverLoc'), sel=$('setServer');
@@ -4997,11 +5705,7 @@ function updateScopeNote(){
     el.innerHTML=t; return;
   }
   const what = bestOf ? 'the 3 fastest servers' : 'the fastest server';
-  if(autoLabel){
-    el.innerHTML = `Auto picks ${what} in <b>${esc(autoLabel)}</b>.`;
-  } else if(autoDefaultLoc){
-    el.innerHTML = `Auto picks ${what} near your ISP's exit - <b>${esc(autoDefaultLoc)}</b>.`;
-  } else el.textContent=`Auto picks ${what} near your connection.`;
+  el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer);
 }
 function populateServers(list){
   const sel=$('setServer'); sel.innerHTML='';
@@ -5027,10 +5731,13 @@ async function fetchServers(opts){
   else if(opts.lat) u+=`?lat=${encodeURIComponent(opts.lat)}&lon=${encodeURIComponent(opts.lon)}`;
   setServerLoading(true);
   try{
-    const d=await (await fetch(u)).json();
+    // POST with a JSON content type, not a bare GET: the daemon requires both
+    // before it will reach out to Ookla/the geocoder, so a page on another site
+    // cannot aim this at someone's localhost (see handleSpeedtestServers).
+    const d=await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'}})).json();
     if(opts.id){ pendingServer=String(opts.id); autoLoc=''; autoLabel=''; } // pin a specific server (not a location scope)
     else if(opts.city){ autoLoc=`${d.lat},${d.lon}`; autoLabel=shortPlace(d.location); pendingServer=''; } // a fresh city search sets the auto scope, clearing any pinned server
-    else autoDefaultLoc=shortPlace(d.location||''); // default scope = ISP exit location (server-supplied)
+    else autoDefaultLoc=shortPlace(d.location||''); // centre of the BROWSING list only: the first candidate city auto would race that has a coordinate (see handleSpeedtestServers). NOT what auto picks, and never sent back to the daemon.
     populateServers(d.servers);
   }finally{ setServerLoading(false); }
 }
@@ -5672,8 +6379,21 @@ $('importBtn').addEventListener('click', async ()=>{
   // Config is the only category that REPLACES rather than merges - confirm it.
   if(c.includes('config') && !confirm('Importing config will overwrite your current settings. Continue?')) return;
   msg.textContent='Importing…';
-  try{ const text=await f.text();
-    const r=await fetch('api/import?'+c.map(x=>x+'=1').join('&'),{method:'POST',headers:{'Content-Type':'application/json'},body:text});
+  // A big restore takes minutes, and a second click would send the whole file again
+  // into a half-applied import. The button comes back in the finally below, whatever
+  // the outcome.
+  $('importBtn').disabled=true;
+  try{
+    // The File goes to fetch AS IS. f.text() first would materialise the entire
+    // backup as a JS string and then a second UTF-8 copy of it, which a default
+    // export (hundreds of MB) can turn into an out-of-memory tab - on a phone
+    // especially - while the server reads the body in bursts and never holds it
+    // whole. A Blob-backed body is streamed off disk with a known Content-Length,
+    // so the handler's size check reads exactly as before.
+    // The Content-Type stays explicit: a file picked from disk often has no type at
+    // all, and then fetch sends NO Content-Type and the handler answers 415. An
+    // explicit header overrides whatever type the File claims either way.
+    const r=await fetch('api/import?'+c.map(x=>x+'=1').join('&'),{method:'POST',headers:{'Content-Type':'application/json'},body:f});
     if(r.ok){ const d=await r.json(); msg.textContent='Imported - '+c.map(x=>x+': '+(d[x]||0)).join(', ')+'.';
       // Optional warnings ride along on a successful import (rows skipped, etc.) -
       // append them after the summary as cautions, not failures.
@@ -5703,6 +6423,7 @@ $('importBtn').addEventListener('click', async ()=>{
       } else { msg.textContent='Import failed: '+(raw.trim().slice(0,200)||('HTTP '+r.status)); }
     }
   }catch(e){ msg.textContent='Import failed: '+e.message; }
+  finally{ $('importBtn').disabled=false; }
 });
 // Outage detection only pauses when LATENCY probing is scheduled, so warn (here
 // and on the Alerts tab) when that's on AND a webhook is set - alerts would miss
@@ -6151,22 +6872,51 @@ function logLineClass(line){
   const m=/level=(\w+)/.exec(line), l=m?m[1].toLowerCase():'';
   return l==='error'?'lg-err':l==='warn'?'lg-warn':l==='debug'?'lg-dbg':'';
 }
-// Cheap change key for the log ring: count + last line. Enough to tell an
-// unchanged 2.5s poll from a real update without hashing all 4000 lines.
-// Each entry is {raw, masked}; the sig keys off raw (masked changes with it) so an
-// unchanged 2.5s poll is a cheap no-op. Accepts plain strings too (older callers).
-function logSig(lines){ lines=lines||[]; const n=lines.length, last=n?lines[n-1]:''; const s=(typeof last==='string')?last:(last&&last.raw||''); return n+'|'+s.length+':'+s; }
-let lastLogSig=null, logEntries=[], logMasked=true, logMaskInit=false;
+// The viewer holds a CURSOR into the server's ring and asks only for what
+// arrived since, so a poll costs what actually happened instead of the whole
+// buffer. logEpoch names the ring that issued the cursor: a restart reseeds the
+// ring from logs.txt with sequences starting at 0 again, so a cursor held across
+// one names a different line. When the epoch changes the server ignores the
+// cursor and answers with a tail, and this side replaces rather than appends.
+// LOG_VIEW_MAX keeps the same history the ring does, since the appended view
+// would otherwise grow without bound.
+const LOG_VIEW_MAX=4000;
+let logEntries=[], logMasked=true, logMaskInit=false, logPainted=false, logEpoch=null, logCursor=null;
+function logDivHTML(e){
+  return `<div class="${e.gap?'lg-gap':logLineClass(e.raw||'')}">${esc(logMasked?(e.masked||''):(e.raw||''))}</div>`;
+}
 // paintLogs renders the stored entries in the current mask state. Split from
 // renderLogs so the mask toggle can repaint instantly, with no server round-trip.
 function paintLogs(){
   const win=$('logWindow'); if(!win) return;
   const atBottom = win.scrollHeight-win.scrollTop-win.clientHeight < 30;
-  win.innerHTML = logEntries.length
-    ? logEntries.map(e=>`<div class="${logLineClass(e.raw||'')}">${esc(logMasked?(e.masked||''):(e.raw||''))}</div>`).join('')
-    : '<div class="muted">No log lines yet.</div>';
+  win.innerHTML = logEntries.length ? logEntries.map(logDivHTML).join('') : '<div class="muted">No log lines yet.</div>';
+  logPainted=true;
   if(atBottom) win.scrollTop=win.scrollHeight;
   syncLogScrollbar();
+}
+// appendLogs adds just the new lines to the DOM and drops as many off the front.
+// The old code rebuilt every div on every poll; with the poller running, each
+// poll logs its own request, so the "nothing moved, skip the repaint"
+// short-circuit could never fire in the one configuration that repaints.
+function appendLogs(added, trimmed){
+  const win=$('logWindow');
+  if(!win || !logPainted || !win.firstElementChild) return paintLogs();
+  const atBottom = win.scrollHeight-win.scrollTop-win.clientHeight < 30;
+  if(added.length) win.insertAdjacentHTML('beforeend', added.map(logDivHTML).join(''));
+  for(let i=0;i<trimmed && win.firstElementChild;i++) win.firstElementChild.remove();
+  if(atBottom) win.scrollTop=win.scrollHeight;
+  syncLogScrollbar();
+}
+// setLogStall shows/hides the note under the window. A failed poll used to be
+// swallowed whole: nothing was rendered and nothing was said, so a pane that had
+// already loaded kept its last payload on screen and read as live while the
+// stream was dead - and the header's staleness banner does not cover it, since
+// /api/status is a kilobyte and keeps succeeding where this fetch cannot.
+let logStalled=false;
+function setLogStall(on){
+  on=!!on; if(on===logStalled) return;
+  logStalled=on; const el=$('logStall'); if(el) el.hidden=!on;
 }
 // The download is server-generated (works over plain HTTP), so it carries the
 // current mask state so the file matches what you see.
@@ -6174,25 +6924,75 @@ function updateLogDownload(){ const a=$('logDownload'); if(a) a.setAttribute('hr
 // setLogMask flips the view between full and masked instantly and marks the state
 // user-owned so a later poll can't flip it back.
 function setLogMask(on){ logMasked=!!on; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; updateLogDownload(); paintLogs(); }
-function renderLogs(d){
+// logMerge decides what one /api/logs response does to the view, and is pure so
+// the rule can be tested on its own:
+//   'skip'    a delta that carried nothing - the steady state; take the cursor,
+//             touch nothing else.
+//   'append'  a delta from a cursor THIS ring issued, onto a view that already
+//             has lines in it (painted).
+//   'replace' anything else - the first load, a POST, or a response whose epoch
+//             is not the one the cursor came from. That last case is the one
+//             that matters: after a restart the ring is reseeded from logs.txt
+//             and sequence 3000 names a different line, so appending would
+//             splice an unrelated stretch of history onto the view and look
+//             perfectly normal doing it.
+function logMerge(d, delta, epoch, painted){
+  if(!delta || !painted || (d.epoch||null)!==epoch) return 'replace';
+  return ((d.lines&&d.lines.length)||d.dropped) ? 'append' : 'skip';
+}
+// logShownCount is the "shown" figure the truncation note discloses: how many
+// lines the pane holds once this response is applied. Only an append adds this
+// response's lines to what is rendered; a skip touches nothing, and taking the
+// response's line count there - always 0, a skip IS an empty delta - rewrote
+// the note to "the newest 0 of N" on every quiet poll.
+function logShownCount(mode, rendered, incoming){
+  if(mode==='append') return rendered+incoming;
+  return mode==='skip' ? rendered : incoming;
+}
+// renderLogs applies one /api/logs response. delta says the request carried the
+// cursor, so the response is what arrived since it; anything else (the first
+// load, a POST, an epoch change) is a full window and replaces the view.
+function renderLogs(d, delta){
   d=d||{};
   const on=$('setLogOn'); if(on && d.level) on.checked = (d.level!=='off');
   // Seed the mask from the persisted preference on first load only; after that the
   // local toggle is authoritative (a stale poll must not flip the view underneath).
   if(!logMaskInit && typeof d.redact==='boolean'){ logMasked=d.redact; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; updateLogDownload(); }
   const win=$('logWindow'); if(!win) return;
-  const lines=d.lines||[];
-  // The 2.5s poll usually returns an unchanged ring; rebuilding 4000 divs every
-  // cycle is pure waste and wipes any in-progress selection. Skip when nothing moved.
-  const sig=logSig(lines);
-  if(sig===lastLogSig) return;
+  const lines=d.lines||[], dropped=d.dropped||0;
+  // "painted" means there are rendered LINES to append to. An empty view is
+  // showing the placeholder, not log divs, so it has to be replaced whole -
+  // appending would leave the new lines sitting under "No log lines yet."
+  const mode=logMerge(d, delta, logEpoch, logPainted && logEntries.length>0);
+  // Say when the pane is a tail of a longer retained log. Driven off the entries
+  // actually rendered rather than off this response, because a delta poll carries
+  // only what is new while the pane holds everything accumulated since the load.
+  const tn=$('logTrunc');
+  if(tn && typeof d.buffered==='number'){
+    const note = logTruncNote(logShownCount(mode, logEntries.length, lines.length), d.buffered);
+    tn.textContent = note; tn.hidden = note==='';
+  }
+  // Nothing arrived since the cursor - the steady state now, not an error. Take
+  // the new cursor and leave the DOM, the scroll position and any selection alone.
+  if(mode==='skip'){ logCursor=d.next_seq; return; }
   // Don't repaint over a selection the user is dragging out to copy - defer to a
-  // later poll (which re-checks the sig) once it's released.
+  // later poll. The cursor is deliberately NOT advanced here, so the deferred
+  // lines come back on the next poll rather than being skipped.
   const sel=window.getSelection && window.getSelection();
   if(sel && !sel.isCollapsed && sel.anchorNode && win.contains(sel.anchorNode)) return;
-  lastLogSig=sig;
-  logEntries=lines;
-  paintLogs();
+  if(mode==='append'){
+    // The ring evicted lines while we were away. Mark the seam instead of
+    // splicing the two stretches together, which would read as one continuous log.
+    const added = dropped ? [{gap:true, raw:'… '+dropped+' older lines dropped …', masked:'… '+dropped+' older lines dropped …'}].concat(lines) : lines;
+    logEntries=logEntries.concat(added);
+    let trimmed=0;
+    if(logEntries.length>LOG_VIEW_MAX){ trimmed=logEntries.length-LOG_VIEW_MAX; logEntries=logEntries.slice(trimmed); }
+    appendLogs(added, trimmed);
+  } else {
+    logEntries=lines;
+    paintLogs();
+  }
+  logEpoch=d.epoch; logCursor=d.next_seq;
 }
 // The Copy/Download/Clear pills float over the log window's top-right - exactly where its
 // scrollbar appears once the log overflows. Measure the scrollbar (0 on overlay-scrollbar
@@ -6214,9 +7014,61 @@ window.addEventListener('resize', syncLogScrollbar);
 // The 2.5s poll and postLogs race freely, so only the newest response renders
 // (mirrors statusSeq/chartSeq) - otherwise a slow poll could repaint lines that
 // Clear just wiped. The poll uses fget so a dead path can't pin connection slots.
-let logsSeq=0;
-async function loadLogs(){ const my=++logsSeq; try{ const r=await fget('api/logs',5000); if(!r.ok) return; const d=await r.json(); if(my===logsSeq) renderLogs(d); }catch(_){ } }
-async function postLogs(body){ const my=++logsSeq; try{ const r=await fetch('api/logs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(!r.ok) return; const d=await r.json(); if(my===logsSeq) renderLogs(d); }catch(_){ } }
+// logBusy is the in-flight guard. setInterval fires regardless of whether the
+// previous poll finished, so on a slow link the browser used to sustain two
+// concurrent fetches of the same window - twice the demand, on the very link
+// being diagnosed, neither of them completing.
+let logsSeq=0, logBusy=false;
+async function loadLogs(){
+  if(logBusy) return;
+  logBusy=true;
+  const my=++logsSeq;
+  // The cursor is sent with the epoch it belongs to; the server ignores it and
+  // answers with a tail if that epoch is not the ring's, so a stale cursor can
+  // never select a wrong window.
+  const delta = logCursor!=null && logEpoch!=null;
+  const q = delta ? 'api/logs?since='+encodeURIComponent(logCursor)+'&epoch='+encodeURIComponent(logEpoch) : 'api/logs';
+  try{
+    const r=await fget(q,5000);
+    if(!r.ok){ if(my===logsSeq) setLogStall(true); return; } // a 5xx freezes the pane just as an abort does
+    const d=await r.json();
+    if(my===logsSeq){ setLogStall(false); renderLogs(d, delta); }
+  }
+  catch(_){ if(my===logsSeq) setLogStall(true); }
+  finally{ logBusy=false; }
+}
+// logPostAction decides what a POST's answer should do to the pane. A POST always
+// answers with a fresh WINDOW - the newest 500 lines - never a delta, so treating
+// every answer as a repaint threw away whatever scrollback the 2.5s deltas had
+// accumulated past that, up to the ring's 4000. Flipping the Redact-PII switch is
+// the worst case: it is a pure display change that setLogMask has already applied
+// locally with no round-trip, and the POST behind it then silently deleted most of
+// the history the operator was reading, taking the Copy button's contents with it.
+//
+// Only a clear needs the pane repainted, and a clear is exactly what rotates the
+// epoch - so the epoch is the signal, rather than "a POST happened".
+// logTruncNote states how much of the retained log the pane is showing. The server
+// caps a bare read at 500 lines while retaining up to 4000, and the response says
+// so in `limit`/`buffered` - which the viewer discarded, so the pane and the Copy
+// button presented the newest slice as though it were everything.
+function logTruncNote(shown, buffered){
+  return (buffered>shown) ? `Showing the newest ${shown} of ${buffered} retained lines - use Download for all of them.` : '';
+}
+function logPostAction(respEpoch, curEpoch){ return (respEpoch||null)!==curEpoch ? 'replace' : 'settings'; }
+async function postLogs(body){
+  const my=++logsSeq;
+  try{
+    const r=await fetch('api/logs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok) return;
+    const d=await r.json();
+    if(my!==logsSeq) return;
+    setLogStall(false);
+    if(logPostAction(d.epoch, logEpoch)==='replace'){ renderLogs(d, false); return; }
+    // Settings only: reflect what the server confirmed and leave the pane alone.
+    // Anything genuinely new arrives on the next delta poll.
+    const on=$('setLogOn'); if(on && d.level) on.checked = (d.level!=='off');
+  }catch(_){ }
+}
 $('setLogOn').addEventListener('change', ()=>{ postLogs({level:$('setLogOn').checked?'debug':'off'}); });
 $('setLogRedact').addEventListener('change', ()=>{ setLogMask($('setLogRedact').checked); postLogs({redact:$('setLogRedact').checked}); });
 $('logClear').addEventListener('click', ()=> postLogs({clear:true}));
@@ -6240,7 +7092,13 @@ $('logCopy').addEventListener('click', async ()=>{
   setTimeout(()=>{ if(msg.textContent==='Logs copied.'||msg.textContent.startsWith('Copy failed')) msg.textContent=''; }, 3000);
 });
 // Auto-refresh while the About tab is open and the page is visible.
-setInterval(()=>{ if(!document.hidden && $('setLogOn') && $('setLogOn').checked
+// Deliberately NOT gated on the log-level switch. That switch decides whether the
+// daemon PRODUCES lines; it says nothing about whether this tab's view is current.
+// Gating on it meant a tab with logging off never polled, so it never saw the epoch
+// change that a Clear in another tab produces and went on displaying - and copying -
+// lines the operator had already wiped. A poll with nothing new costs one small
+// conditional request.
+setInterval(()=>{ if(!document.hidden
   && $('drawer').classList.contains('open')
   && document.querySelector('.tabpane[data-tab="about"]').classList.contains('active')) loadLogs(); }, 2500);
 async function postAccess(body){
@@ -6284,7 +7142,7 @@ function labelInfoBubbles(){
 loadAccess(); loadSettings(); tick(); // the coachmark shows from refreshStatus, once the install id is known
 // Periodic refreshes skip while the tab is hidden (no point polling a dashboard
 // nobody is looking at); becoming visible again triggers an immediate catch-up.
-const vis = fn => () => { if(!document.hidden) fn(); };
+const vis = fn => () => { if(!document.hidden) return fn(); };
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) tick(); });
 // The browser knows the moment its own network returns - catch up immediately
 // instead of waiting out the polling cycles. (Server-side outages don't fire
@@ -6298,14 +7156,19 @@ setInterval(vis(refreshStatus), 3000);
 // cadence rather than the slowest: whatever delay is in flight when Live is
 // pressed has to be waited out before polling resumes, and a minute of that
 // reads as a frozen chart.
-function latPollMs(){ const r=latencyRange;
+// A pending reconcile-503 backoff (see isReconcile503) wins for one poll, then clears.
+function latPollMs(){ if(latBackoffMs){ const b=latBackoffMs; latBackoffMs=0; return b; }
+  const r=latencyRange;
   if(r.kind!=='win') return 6000;
   return r.mins<=120?6000 : r.mins<=1440?15000 : 60000; }
-function speedPollMs(){ const r=speedRange;
+function speedPollMs(){ if(speedBackoffMs){ const b=speedBackoffMs; speedBackoffMs=0; return b; }
+  const r=speedRange;
   if(r.kind!=='win') return 30000;
   return r.mins<=1440?30000:60000; }
-(function loopChart(){ setTimeout(()=>{ vis(refreshChart)(); loopChart(); }, latPollMs()); })();
-(function loopSpeed(){ setTimeout(()=>{ vis(refreshSpeedChart)(); loopSpeed(); }, speedPollMs()); })();
+// Await the poll before scheduling the next so a reconcile-503 backoff it parks is
+// in place when latPollMs/speedPollMs pick the next delay.
+(function loopChart(){ setTimeout(async ()=>{ await vis(refreshChart)(); loopChart(); }, latPollMs()); })();
+(function loopSpeed(){ setTimeout(async ()=>{ await vis(refreshSpeedChart)(); loopSpeed(); }, speedPollMs()); })();
 setInterval(vis(refreshHeatmap), 60000);
 setInterval(vis(refreshNetinfo), 60000);
 // Outages are infrequent; refresh on the same slow cadence, only while shown.

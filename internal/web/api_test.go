@@ -252,8 +252,10 @@ func TestNetinfoNilGuard(t *testing.T) {
 	if w := do(t, h, "GET", "/api/netinfo", ""); w.Code != http.StatusServiceUnavailable {
 		t.Errorf("GET /api/netinfo nil netinfo want 503, got %d", w.Code)
 	}
-	if w := do(t, h, "GET", "/api/speedtest/servers", ""); w.Code != http.StatusServiceUnavailable {
-		t.Errorf("GET /api/speedtest/servers nil netinfo want 503, got %d", w.Code)
+	// POST + JSON: the endpoint reaches out, so it refuses simple cross-site
+	// shapes before it gets as far as the nil guard (see handleSpeedtestServers).
+	if w := do(t, h, "POST", "/api/speedtest/servers", `{}`); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("POST /api/speedtest/servers nil netinfo want 503, got %d", w.Code)
 	}
 }
 
@@ -368,7 +370,11 @@ func TestImportExportRoundTrip(t *testing.T) {
 	if w := do(t, s2.Handler(), "POST", "/api/import?latency=1", `{"foo":1}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("non-export JSON want 400, got %d", w.Code)
 	}
-	w = do(t, s2.Handler(), "POST", "/api/import?latency=1", `{"pingularity_export":2,"latency":[]}`)
+	// Relative to exportSchema, not a literal: this asserts "one past whatever we
+	// currently write is refused", which stays true across bumps. Hardcoding the
+	// number made this test fail the moment the schema legitimately moved to 2.
+	future := `{"pingularity_export":` + itoa(exportSchema+1) + `,"latency":[]}`
+	w = do(t, s2.Handler(), "POST", "/api/import?latency=1", future)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "newer") {
 		t.Fatalf("newer-version import want 400/newer, got %d: %s", w.Code, w.Body)
 	}

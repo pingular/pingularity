@@ -1,7 +1,5 @@
 package netinfo
 
-import "strings"
-
 // iataPlace is a city plus its approximate centre coordinate. The coordinate is
 // only ever used to centre a nearby-server search (Ookla sorts by distance and
 // pings the closest handful), so city-level precision is plenty.
@@ -13,10 +11,16 @@ type iataPlace struct {
 // iataCity maps airport/city codes common in ISP router hostnames AND Cloudflare
 // PoP ("colo") codes to a city + coordinate. Deliberately a curated set of major
 // interconnection cities (where traffic hands off), not a full airport database -
-// it backs two things: the offline city fallback when RIPE IPmap has no answer,
-// and ColoCoord, which centres auto server-selection on the Cloudflare PoP when a
-// traceroute exit isn't available. Both true IATA codes (fra, lhr) and common ISP
-// abbreviations (tor, mtl). Lower-case keys; lookups are lower-cased.
+// it backs the offline city fallback when RIPE IPmap has no answer for a hop.
+// Both true IATA codes (fra, lhr) and common ISP abbreviations (tor, mtl).
+// Lower-case keys; lookups are lower-cased.
+//
+// It used to back ColoCoord as well, which centred the settings
+// server-browsing list on the Cloudflare PoP. That rung is gone: the PoP is the
+// one place live auto-select can never choose - it races the exit router, the
+// ISP geolocation and speedtest.net's own placement of our address (see
+// main.autoOrigins) - so centring the picker there offered a pool auto could
+// not pick from.
 var iataCity = map[string]iataPlace{
 	// North America
 	"yyz": {"Toronto", 43.65, -79.38}, "tor": {"Toronto", 43.65, -79.38},
@@ -101,16 +105,4 @@ var iataCity = map[string]iataPlace{
 	"bog": {"Bogota", 4.71, -74.07},
 	"lim": {"Lima", -12.05, -77.04},
 	"mex": {"Mexico City", 19.43, -99.13},
-}
-
-// ColoCoord maps a Cloudflare colo / IATA code (e.g. "YUL") to its city and
-// coordinate, so auto server-selection can centre on the network exit even when a
-// traceroute exit isn't available (containers, non-Linux hosts) but the Cloudflare
-// PoP is. ok is false for an unknown or coordinate-less code. Case-insensitive.
-func ColoCoord(colo string) (city string, lat, lon float64, ok bool) {
-	p, found := iataCity[strings.ToLower(strings.TrimSpace(colo))]
-	if !found || (p.Lat == 0 && p.Lon == 0) {
-		return "", 0, 0, false
-	}
-	return p.City, p.Lat, p.Lon, true
 }
