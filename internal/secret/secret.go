@@ -46,6 +46,20 @@ const keyName = "pingularity.key"
 
 const keySize = 32 // AES-256
 
+// ErrKeyPermsInsecure reports that an existing, valid key was loaded but its
+// file permissions could not be tightened AND the file is (or may be) group- or
+// world-accessible. New returns it alongside a USABLE Box: encrypting with a
+// loose-perm key still beats storing passwords in plaintext, but the caller
+// should warn loudly.
+var ErrKeyPermsInsecure = errors.New("secret: key file permissions could not be secured")
+
+// Seams for the perm-failure tests (os.Chmod failures are not portably
+// constructible in-process).
+var (
+	secureFile = osperm.SecureFile
+	permCheck  = osperm.GroupOrWorldAccessible
+)
+
 // Box seals and unseals secrets with a key held for the life of the process.
 type Box struct {
 	aead cipher.AEAD
@@ -70,13 +84,18 @@ func (b *Box) DeriveSubkey(label string) []byte {
 func New(dbPath string) (*Box, error) {
 	var key []byte
 	var err error
+	var permErr error // nil, or ErrKeyPermsInsecure with a usable key in hand
 	if dbPath == "" || dbPath == ":memory:" {
 		key = make([]byte, keySize)
 		if _, err = io.ReadFull(rand.Reader, key); err != nil {
 			return nil, fmt.Errorf("secret: generate ephemeral key: %w", err)
 		}
-	} else if key, err = loadOrCreateKey(filepath.Join(filepath.Dir(dbPath), keyName)); err != nil {
-		return nil, err
+	} else {
+		key, err = loadOrCreateKey(filepath.Join(filepath.Dir(dbPath), keyName))
+		if err != nil && !errors.Is(err, ErrKeyPermsInsecure) {
+			return nil, err
+		}
+		permErr = err
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -86,7 +105,7 @@ func New(dbPath string) (*Box, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secret: gcm: %w", err)
 	}
-	return &Box{aead: aead, key: key}, nil
+	return &Box{aead: aead, key: key}, permErr
 }
 
 // loadOrCreateKey reads the key file, or creates it if it does not yet exist.
@@ -116,8 +135,17 @@ func loadOrCreateKey(path string) ([]byte, error) {
 			return nil, fmt.Errorf("secret: %s is %d bytes, want %d - move it aside and re-enter your passwords", path, len(b), keySize)
 		}
 		// An existing key created before a umask fix (or copied in) may be too open.
-		if err := osperm.SecureFile(path); err != nil {
-			return nil, fmt.Errorf("secret: secure key: %w", err)
+		if err := secureFile(path); err != nil {
+			// We already hold a valid key. Discarding it here would drop the whole
+			// crypter and store iperf3 passwords in PLAINTEXT - strictly worse than a
+			// key we could not re-tighten. Proceed if the file is verifiably owner-only
+			// already; otherwise proceed in an explicit degraded mode (encrypted with a
+			// loose-perm key still beats plaintext), signalled to the caller.
+			accessible, known := permCheck(path)
+			if known && !accessible {
+				return b, nil // chmod was redundant; file is already 0600
+			}
+			return b, fmt.Errorf("%w (%s): %w", ErrKeyPermsInsecure, path, err)
 		}
 		return b, nil
 	}

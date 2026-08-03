@@ -203,3 +203,50 @@ func TestRunOnceClearsAdaptiveWhenThresholdsRemoved(t *testing.T) {
 		t.Fatalf("adaptive cadence stuck fast after thresholds cleared: %v, want 1h", got)
 	}
 }
+
+// Pins that a recovered link stops sampling at the fast adaptive cadence once
+// its measurable thresholds pass, even while an enabled loss threshold stays
+// permanently unmeasurable (e.g. a server that never supports the UDP probe).
+// The no-verdict branch used to leave lastUnhealthy latched from the original
+// breach, pinning up to 12x the base rate forever. The breach STREAK is
+// deliberately preserved: an unran check can neither clear a genuine breach
+// nor record the run green - only the cadence backs off. Contrast the sibling
+// TestRunOnceClearsAdaptiveWhenThresholdsRemoved, which covers the
+// cleared-thresholds path.
+func TestRunOnceUnmeasurableThresholdDoesNotPinAdaptiveCadenceAfterRecovery(t *testing.T) {
+	stats.ResetForTest()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	res := Result{DownloadMbps: 50, UploadMbps: 10, PingMS: 20, Server: "S", DownloadBytes: 1, UploadBytes: 1}
+	tester := testerFunc(func(context.Context) (Result, error) { return res, nil })
+	s := NewScheduler(tester, st, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.AdaptiveFn = func() bool { return true }
+	// A download floor the first run breaches, plus a loss limit no run can
+	// measure (PacketLoss stays nil - the probe is unsupported on this server).
+	s.ThresholdsFn = func() settings.Thresholds { return settings.Thresholds{DownMbps: 100, LossPct: 1} }
+
+	if _, err := s.RunOnce(context.Background(), "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.lastUnhealthy.Load() || s.curInterval() != adaptiveCap || s.consecBreach != 1 {
+		t.Fatalf("setup: breach should latch the fast cadence: unhealthy=%v interval=%v consec=%d",
+			s.lastUnhealthy.Load(), s.curInterval(), s.consecBreach)
+	}
+
+	// The link recovers; the loss threshold is still unmeasurable, so the run
+	// gets no verdict - but its MEASURABLE thresholds all passed.
+	res.DownloadMbps = 500
+	if _, err := s.RunOnce(context.Background(), "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	if s.lastUnhealthy.Load() || s.curInterval() != time.Hour {
+		t.Fatalf("cadence stayed pinned after a measured-clean no-verdict run: unhealthy=%v interval=%v, want false/1h",
+			s.lastUnhealthy.Load(), s.curInterval())
+	}
+	if s.consecBreach != 1 {
+		t.Fatalf("consecBreach = %d, want 1 (the streak must be preserved, not cleared, by an unran check)", s.consecBreach)
+	}
+}

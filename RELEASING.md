@@ -43,7 +43,11 @@ matrix (linux/windows/darwin × amd64/arm64, `CGO_ENABLED=0`) and publishes:
 - **winget** - GoReleaser pushes a manifest branch
   (`pingularity-<version>`) to the `pingular/winget-pkgs` fork. It does NOT
   open the upstream PR: the maintainer opens (and later merges) the PR from
-  that branch against `microsoft/winget-pkgs` by hand.
+  that branch against `microsoft/winget-pkgs` by hand. That community listing
+  is a parallel, best-effort track: what users actually install from is the
+  SELF-HOSTED winget source at `winget.pingularity.dev` (the `dl/` Worker in
+  the private pingularity.dev repo), which serves the same fork-branch data
+  and is updated at announce time - see "Update notifications" below.
 
 **Prerelease tags** (`v1.2.3-rc1`, `-beta`) exercise the pipeline without
 touching users: the GitHub release is marked pre-release, the brew cask and
@@ -78,25 +82,33 @@ workflow file.
 
 ## Update notifications
 
-The in-app badge polls `https://dl.pingularity.dev/latest.json` (see
+The in-app badge polls `https://update.pingularity.dev/latest.json` (see
 `internal/update/update.go`). It is **notify-only** and completely decoupled
 from the GoReleaser run - a release does **not** bump it.
 
 The feed is served by the `dl/` Cloudflare Worker in the private
 `pingular/pingularity.dev` repo, which also records privacy-preserving visitor
 analytics (unique installs per day, by country - see that repo's README). To
-announce a release, bump `LATEST_VERSION` in its `wrangler.toml` and
-`wrangler deploy`:
+announce a release, add the release's winget entry, bump `LATEST_VERSION` in
+its `wrangler.toml`, and `wrangler deploy` (all from that repo's `dl/`; full
+runbook in its README):
 
-```toml
-LATEST_VERSION = "1.2.3"
+```bash
+node update-winget-versions.mjs 1.2.3   # paste output into winget-versions.mjs
+# edit wrangler.toml: LATEST_VERSION = "1.2.3"
+node ../test/winget.test.mjs
+wrangler deploy
 ```
 
+The same deploy announces to BOTH channels: the update badge (latest.json) and
+the self-hosted winget source only ever advertise versions `<= LATEST_VERSION`,
+so ship-quietly and rollback-by-revert cover winget too.
+
 Installs pick it up within their daily poll and show the update badge; the
-button links to `install.pingularity.dev` - an owned redirect (served by the
-same Worker as the feed) that currently forwards to the GitHub Releases page
-and can be repointed at the website's install page later without stranding the
-link baked into old binaries. Because publishing and announcing are
+button links to `install.pingularity.dev` - an owned indirection (served by
+the same Worker as the feed) that serves the install page today, with the
+GitHub Releases 302 only as a no-page fallback; repointable without stranding
+the link baked into old binaries. Because publishing and announcing are
 separate:
 
 - **Ship quietly:** tag and release, verify the artifacts, and only then bump

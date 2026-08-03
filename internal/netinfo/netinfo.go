@@ -183,7 +183,13 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 	gen := m.nextGen()
 	prevIP := m.Get().PublicIP
 	i := m.fetchGen(ctx, gen)
-	if i.ExitUnavailable == "" {
+	// A changed public IP is a changed network: the last known exit answers for
+	// the OLD path, so do not carry it into this snapshot - publish with no exit
+	// (row hidden) until the retrace below lands on the new network. Carrying it
+	// forward and relying on the bust alone left the old router on display
+	// whenever the retrace failed, because a nil retrace patches nothing.
+	ipChanged := prevIP != "" && i.PublicIP != "" && prevIP != i.PublicIP
+	if i.ExitUnavailable == "" && !ipChanged {
 		i.Exit = m.snapshotExit() // carry the last known exit forward (no blank flicker)
 	}
 	m.mu.Lock()
@@ -204,7 +210,7 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 	// A changed public IP is a changed network (hotspot, new Wi-Fi): the cached
 	// exit answers for the OLD path, so bust it instead of serving it for up to
 	// the cache window.
-	if prevIP != "" && i.PublicIP != "" && prevIP != i.PublicIP {
+	if ipChanged {
 		m.traceMu.Lock()
 		// Only bust while this is still the newest published snapshot: an older,
 		// slower refresh detecting a now-superseded IP change must not wipe the

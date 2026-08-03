@@ -3,6 +3,7 @@ package secret
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -276,5 +277,57 @@ func TestLoadOrCreateKeyConcurrentStartsAgree(t *testing.T) {
 		if strings.Contains(e.Name(), ".tmp-") {
 			t.Errorf("leftover temp file after concurrent create: %s", e.Name())
 		}
+	}
+}
+
+// Pins that a redundant chmod failure on an already-0600 key must not disable
+// crypto: the key was read and is valid, and the perm check proves the file is
+// owner-only, so the failed tighten changed nothing worth stopping for.
+func TestReadPathKeepsWorkingKeyWhenPermsVerifiablySafe(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, keyName), bytes.Repeat([]byte{7}, keySize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func(sf func(string) error, pc func(string) (bool, bool)) { secureFile, permCheck = sf, pc }(secureFile, permCheck)
+	secureFile = func(string) error { return errors.New("operation not permitted") }
+	permCheck = func(string) (bool, bool) { return false, true } // verifiably owner-only
+	box, err := New(filepath.Join(dir, "x.db"))
+	if err != nil || box == nil {
+		t.Fatalf("New = (%v, %v), want a usable box and nil error", box, err)
+	}
+	sealed, err := box.Seal("pw")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if got, err := box.Unseal(sealed); err != nil || got != "pw" {
+		t.Fatalf("round trip = (%q, %v), want (\"pw\", nil)", got, err)
+	}
+}
+
+// Pins the degraded mode: a chmod-failing key that IS (or may be) readable by
+// others still yields a usable crypter alongside ErrKeyPermsInsecure -
+// encrypting with a loose-perm key beats plaintext. Before the fix New
+// returned (nil, err) here and the whole crypter was dropped to plaintext.
+func TestReadPathDegradesButKeepsCryptoWhenPermsLoose(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, keyName), bytes.Repeat([]byte{7}, keySize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func(sf func(string) error, pc func(string) (bool, bool)) { secureFile, permCheck = sf, pc }(secureFile, permCheck)
+	secureFile = func(string) error { return errors.New("operation not permitted") }
+	permCheck = func(string) (bool, bool) { return true, true } // group/world accessible
+	box, err := New(filepath.Join(dir, "x.db"))
+	if box == nil {
+		t.Fatalf("New returned no box (err=%v); a loose-perm but valid key must still encrypt", err)
+	}
+	if !errors.Is(err, ErrKeyPermsInsecure) {
+		t.Fatalf("err = %v, want ErrKeyPermsInsecure", err)
+	}
+	sealed, serr := box.Seal("pw")
+	if serr != nil {
+		t.Fatalf("Seal: %v", serr)
+	}
+	if got, uerr := box.Unseal(sealed); uerr != nil || got != "pw" {
+		t.Fatalf("round trip = (%q, %v), want (\"pw\", nil)", got, uerr)
 	}
 }

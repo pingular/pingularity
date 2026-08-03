@@ -258,16 +258,28 @@ func (p *program) run(ctx context.Context) {
 	// is the job, and a legible warning beats a dead daemon.
 	var setOpts []settings.Option
 	var sessionKey []byte // independent session-token secret bound to the key file (see web.Server.SessionKey)
-	if box, err := secret.New(p.cfg.DBPath); err != nil {
+	box, boxErr := secret.New(p.cfg.DBPath)
+	switch {
+	case box == nil: // real failure: no crypter at all -> plaintext (unchanged behavior)
 		// Straight to stderr, bypassing the log level: this runs before settings
 		// load, so the level is still "off" and a plain Error would be swallowed
 		// on every install - and this is a silent security degradation.
-		fmt.Fprintf(os.Stderr, "pingularity: WARNING: secret key unavailable; iperf3 passwords will be stored in the clear: %v\n", err)
-		err := err
+		fmt.Fprintf(os.Stderr, "pingularity: WARNING: secret key unavailable; iperf3 passwords will be stored in the clear: %v\n", boxErr)
+		err := boxErr
 		earlyLog = append(earlyLog, func() {
 			p.log.Error("secret key unavailable; iperf3 passwords will be stored in the clear", "err", err)
 		})
-	} else {
+	default: // box usable; boxErr may be secret.ErrKeyPermsInsecure
+		if boxErr != nil {
+			// A valid key was loaded but its file could not be tightened and may be
+			// readable by others. Encryption stays ON (strictly better than the old
+			// discard-to-plaintext), but say so loudly.
+			fmt.Fprintf(os.Stderr, "pingularity: WARNING: key file permissions could not be secured; encryption is ON but the key file may be readable by others: %v\n", boxErr)
+			err := boxErr
+			earlyLog = append(earlyLog, func() {
+				p.log.Warn("key file permissions could not be secured; encryption remains on", "err", err)
+			})
+		}
 		setOpts = append(setOpts, settings.WithCrypter(box))
 		// Derive the session-token signing secret from the same key file, so a
 		// DB-only copy (which has the bcrypt hash but not the key) can't forge a
@@ -607,7 +619,12 @@ func (p *program) run(ctx context.Context) {
 	sched.BreachStreakFn = set.BreachStreak  // debounce: alert only after N consecutive breaches
 	sched.AdaptiveFn = set.SpeedtestAdaptive // shorten the interval while the last run breached
 	sched.OnUnhealthy = func(sp store.SpeedSample, failures []string) {
-		notifier.SpeedThreshold(ctx, sp, failures)
+		// Own goroutine (like Outage's dispatch): RunOnce fires this inline on
+		// the scheduler Loop goroutine, and SpeedThreshold now retries transient
+		// webhook failures, so delivering in place would stall scheduling for
+		// the whole backoff. At most one alert per breaching run and runs are
+		// minutes apart, so these cannot pile up; spawn makes shutdown wait.
+		spawn(func() { notifier.SpeedThreshold(ctx, sp, failures) })
 	}
 	// Busy-defer: skip a scheduled run while the link is already moving data. Off ⇒
 	// don't sample at all; on ⇒ sample the busiest interface briefly and compare to
@@ -771,6 +788,7 @@ func (p *program) run(ctx context.Context) {
 	}
 	srv.DBPath = p.cfg.DBPath             // /metrics reports the on-disk DB size
 	srv.InContainer = containerized       // relax the loopback-only filter (unenforceable in a container)
+	srv.Bridged = util.BridgedContainer() // only a bridged container defeats the loopback test; host-net still enforces
 	srv.SessionKey = sessionKey           // key-file-bound secret folded into session-token MACs (see tokenKey)
 	srv.MetricsToken = p.cfg.MetricsToken // optional read-only scrape credential for /metrics
 	srv.Update = upd                      // update status on /api/status + powers the toggle
@@ -840,6 +858,11 @@ func seedKnownCounters() {
 		// Fires at most once per install; a nonzero value long after setup means
 		// history is being lost.
 		"speed.first_run_by_ping",
+		// One best-of candidate failed mid-round while the run carried on with
+		// the rest. Whole-run speed.fail.* never sees these, so before this
+		// counter a persistently dead nearby server was invisible unless it
+		// killed the entire round.
+		"speed.bestof_candidate_failed",
 		// A scheduled run dropped because another trigger (manual, reconnect,
 		// degraded) already held the single-flight. The slot is not retried, so a
 		// climbing rate explains gaps in an otherwise regular history.
@@ -872,7 +895,7 @@ func seedKnownCounters() {
 		names = append(names, "speed.fail."+stage)
 	}
 	for _, dest := range []string{"discord", "slack", "healthchecks", "generic", "heartbeat"} {
-		names = append(names, "notify."+dest+".ok", "notify."+dest+".fail")
+		names = append(names, "notify."+dest+".ok", "notify."+dest+".fail", "notify."+dest+".blocked")
 	}
 	stats.Seed(names...)
 }
@@ -1285,6 +1308,20 @@ func runCmd(args []string) error {
 	return s.Run()
 }
 
+// effectiveControlAction downgrades `restart` to `start` when the service is
+// known to be stopped. Only a POSITIVE stopped status does this: on any status
+// error (not installed, no permission, platform quirk) the original action
+// proceeds so the user sees the real error instead of a misleading start one.
+func effectiveControlAction(action string, s service.Service) string {
+	if action != "restart" {
+		return action
+	}
+	if st, err := s.Status(); err == nil && st == service.StatusStopped {
+		return "start"
+	}
+	return action
+}
+
 func controlCmd(action string, args []string) error {
 	// A deb/rpm install owns its own systemd unit that this CLI can't see:
 	// kardianos/service manages /etc/systemd/system/<name>.service, but packages
@@ -1356,8 +1393,25 @@ func controlCmd(action string, args []string) error {
 			fmt.Println("Aborted - service left in place.")
 			return nil
 		}
-		_ = service.Control(s, "stop") // best-effort: stop before removing
+		// Best-effort: stop before removing. Removal proceeds either way (the
+		// unit should go), but a CONFIRMED still-running service deserves a
+		// warning - the unit vanishes and the live process is orphaned with
+		// nothing left to manage it.
+		if serr := service.Control(s, "stop"); serr != nil {
+			st, sterr := s.Status()
+			if w := stopWarning(serr, st, sterr); w != "" {
+				fmt.Println(w)
+			}
+		}
 	}
+
+	// `restart` of a STOPPED service: the platform restart fails on its stop
+	// half (Windows: "The service has not been started"), which strands the
+	// one flow that needs it most - the documented Windows upgrade sequence
+	// (pingularity stop, winget upgrade, start the new binary), where a user
+	// typing restart instead of start hits a dead end with the service down.
+	// The intent of restart-when-stopped is unambiguous: make it run.
+	action = effectiveControlAction(action, s)
 
 	if err := service.Control(s, action); err != nil {
 		return err
@@ -1411,6 +1465,17 @@ func absDBArgs(args []string) []string {
 
 // confirmUninstall warns the user and asks for confirmation, unless a
 // -y/--yes/-f/--force flag is present (for scripted use).
+// stopWarning returns the operator warning to print when the best-effort stop
+// before uninstall failed, or "" when silence is right. It warns ONLY when the
+// service is confirmed still running, so an already-stopped unit (the common,
+// benign stop "failure" on Windows/launchd) stays quiet.
+func stopWarning(stopErr error, status service.Status, statusErr error) string {
+	if stopErr == nil || statusErr != nil || status != service.StatusRunning {
+		return ""
+	}
+	return fmt.Sprintf("Warning: could not stop the running service (%v); it may keep running after the unit is removed - stop it manually before or after uninstalling.", stopErr)
+}
+
 func confirmUninstall(args []string) bool {
 	for _, a := range args {
 		switch a {

@@ -222,10 +222,17 @@ func (n *Notifier) Outage(ctx context.Context, online bool, durationS int) {
 		msg = fmt.Sprintf("✅ Internet is back (down for %s)", util.HumanDur(durationS))
 		fields = map[string]any{"event": "link_up", "downtime_s": durationS}
 	}
-	// A permanent failure (blocked destination, non-transient 4xx) will fail the
-	// same way every attempt, so return on it instead of retrying: retrying would
-	// triple-count the fail/blocked counter, re-emit the same WARN into the log
-	// ring, and hold outageMu across the full backoff for nothing.
+	n.sendRetrying(ctx, msg, fields)
+}
+
+// sendRetrying delivers msg, retrying a transient failure with outageRetries
+// backoff; a permanent failure (blocked / non-transient 4xx) or ctx
+// cancellation stops early - it will fail the same way every attempt, and
+// retrying would multi-count the fail/blocked counter and re-emit the same
+// WARN into the log ring. Shared so a one-shot event alert (a transition, a
+// threshold breach) is not lost to a momentary hiccup. Ordering, when a caller
+// needs it (Outage's down-before-up), is the CALLER's lock to hold.
+func (n *Notifier) sendRetrying(ctx context.Context, msg string, fields map[string]any) {
 	if err := n.Send(ctx, msg, fields); err == nil || errors.Is(err, errPermanent) {
 		return
 	}
@@ -260,7 +267,10 @@ func (n *Notifier) SpeedThreshold(ctx context.Context, sp store.SpeedSample, fai
 	if sp.JitterMS != nil {
 		fields["jitter_ms"] = *sp.JitterMS
 	}
-	n.Send(ctx, msg, fields)
+	// A breach is a one-shot event exactly like a transition: retry a transient
+	// delivery failure or the alert is silently lost. No mutex - threshold
+	// alerts carry no inter-alert ordering requirement.
+	n.sendRetrying(ctx, msg, fields)
 }
 
 // Send delivers a message to the configured webhook, shaping the JSON body for

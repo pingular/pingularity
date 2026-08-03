@@ -791,7 +791,7 @@ func TestAccessPasswordRotationKeepsUsername(t *testing.T) {
 		t.Fatal("no session cookie from initial set")
 	}
 	// Password-only rotation (now a gated request): authenticate with the session.
-	rot := httptest.NewRequest("POST", "/api/access", strings.NewReader(`{"password":"second"}`))
+	rot := httptest.NewRequest("POST", "/api/access", strings.NewReader(`{"password":"second","current_password":"first"}`))
 	rot.Header.Set("Content-Type", "application/json")
 	rot.Host = "127.0.0.1:9000"
 	rot.AddCookie(cookie)
@@ -926,7 +926,7 @@ func TestAccessAuthToggleOffKeepsHash(t *testing.T) {
 	setPassword(t, s, "admin", "secret")
 	hashBefore := s.settings.AuthHash()
 
-	w := doSession(t, s, s.Handler(), "POST", "/api/access", `{"auth_enabled":false}`)
+	w := doSession(t, s, s.Handler(), "POST", "/api/access", `{"auth_enabled":false,"current_password":"secret"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST access: %d %s", w.Code, w.Body)
 	}
@@ -945,7 +945,7 @@ func TestAccessUsernameRenameKeepsHash(t *testing.T) {
 	setPassword(t, s, "admin", "secret")
 	hashBefore := s.settings.AuthHash()
 
-	w := doSession(t, s, s.Handler(), "POST", "/api/access", `{"username":"bob"}`)
+	w := doSession(t, s, s.Handler(), "POST", "/api/access", `{"username":"bob","current_password":"secret"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST access: %d %s", w.Code, w.Body)
 	}
@@ -1057,12 +1057,60 @@ func TestLocalOnlyContainerBypass(t *testing.T) {
 
 	var buf bytes.Buffer
 	container := newTestServerLog(t, &buf)
-	container.InContainer = true
+	container.InContainer, container.Bridged = true, true
 	if w := req(container); w.Code != http.StatusOK {
-		t.Errorf("containerized non-loopback request: %d, want 200 (local-only unenforceable)", w.Code)
+		t.Errorf("bridged container non-loopback request: %d, want 200 (local-only unenforceable)", w.Code)
 	}
-	if !strings.Contains(buf.String(), "cannot be enforced inside a container") {
-		t.Errorf("expected container warning in log, got: %s", buf.String())
+	if !strings.Contains(buf.String(), "cannot be enforced in a bridged container") {
+		t.Errorf("expected bridged-container warning in log, got: %s", buf.String())
+	}
+}
+
+// A host-networked container (InContainer but not Bridged) keeps loopback
+// meaningful, so local-only must still 403 a non-loopback peer; only a bridged
+// container may fall through unenforced.
+func TestLocalOnlyEnforcedInHostNetContainer(t *testing.T) {
+	req := func(s *Server) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/api/access", nil)
+		r.Host = "192.0.2.10" // an IP literal passes the DNS-rebinding guard
+		r.RemoteAddr = "192.0.2.1:1234"
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+
+	s := newTestServer(t)
+	s.InContainer, s.Bridged = true, false
+	if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
+		t.Fatalf("SetAccessLocalOnly: %v", err)
+	}
+	if w := req(s); w.Code != http.StatusForbidden {
+		t.Errorf("host-net container non-loopback request: %d, want 403 (loopback test is meaningful there)", w.Code)
+	}
+	s.Bridged = true
+	if w := req(s); w.Code != http.StatusOK {
+		t.Errorf("bridged container non-loopback request: %d, want 200 (warn-only)", w.Code)
+	}
+}
+
+// accessStatus must distinguish the stored toggle from whether the loopback
+// filter is actually live, exactly as auth_enabled vs auth_active.
+func TestAccessStatusReportsLocalOnlyEnforcement(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
+		t.Fatalf("SetAccessLocalOnly: %v", err)
+	}
+	s.Bridged = true
+	out := s.accessStatus(httptest.NewRequest("GET", "/api/access", nil))
+	if out["local_only"] != true || out["local_only_active"] != false {
+		t.Errorf("bridged: local_only=%v local_only_active=%v, want true/false (stored but not enforced)",
+			out["local_only"], out["local_only_active"])
+	}
+	s.Bridged = false
+	out = s.accessStatus(httptest.NewRequest("GET", "/api/access", nil))
+	if out["local_only"] != true || out["local_only_active"] != true {
+		t.Errorf("not bridged: local_only=%v local_only_active=%v, want true/true (enforced)",
+			out["local_only"], out["local_only_active"])
 	}
 }
 
@@ -1170,5 +1218,69 @@ func TestBcryptSemBoundsConcurrency(t *testing.T) {
 	wg.Wait()
 	if max > capN {
 		t.Fatalf("max concurrent bcrypt = %d, exceeds cap %d", max, capN)
+	}
+}
+
+// A live session must re-prove the current password before changing any
+// access-control setting; without it a hijacked/walk-up session takes over the
+// account (sets a new password, renames it, or disables login) knowing only
+// the session cookie.
+func TestAccessChangeRequiresCurrentPassword(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "orig")
+	h := s.Handler()
+
+	refused := []string{
+		`{"password":"pwned"}`,
+		`{"current_password":"wrong","password":"pwned"}`,
+		`{"username":"bob"}`,
+		`{"auth_enabled":false}`,
+	}
+	for _, body := range refused {
+		if w := doSession(t, s, h, "POST", "/api/access", body); w.Code != http.StatusForbidden {
+			t.Fatalf("POST %s: %d, want 403 without the current password", body, w.Code)
+		}
+	}
+	if !s.checkPassword("admin", "orig") || s.checkPassword("admin", "pwned") {
+		t.Fatal("a refused request must leave the stored credential untouched")
+	}
+	if s.settings.AuthUser() != "admin" || !s.settings.AuthActive() {
+		t.Fatalf("refused requests changed state: user=%q active=%v", s.settings.AuthUser(), s.settings.AuthActive())
+	}
+	if got := counter("web.stepup_fail"); got != 4 {
+		t.Fatalf("web.stepup_fail = %d, want 4", got)
+	}
+
+	// With the current password supplied, each change goes through.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"orig","password":"new2"}`); w.Code != http.StatusOK {
+		t.Fatalf("password change with step-up: %d %s", w.Code, w.Body)
+	}
+	if !s.checkPassword("admin", "new2") || s.checkPassword("admin", "orig") {
+		t.Fatal("step-up password change did not take")
+	}
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"new2","username":"bob"}`); w.Code != http.StatusOK {
+		t.Fatalf("rename with step-up: %d %s", w.Code, w.Body)
+	}
+	if got := s.settings.AuthUser(); got != "bob" {
+		t.Fatalf("username = %q, want bob", got)
+	}
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"new2","auth_enabled":false}`); w.Code != http.StatusOK {
+		t.Fatalf("toggle off with step-up: %d %s", w.Code, w.Body)
+	}
+	if s.settings.AuthActive() {
+		t.Fatal("auth_enabled:false with step-up did not disable auth")
+	}
+}
+
+// First-time setup has no current password to prove: with auth inactive the
+// step-up gate must stay open, or a fresh install could never set a password.
+func TestFirstTimePasswordSetupNeedsNoStepUp(t *testing.T) {
+	s := newTestServer(t)
+	if w := do(t, s.Handler(), "POST", "/api/access", `{"password":"secret"}`); w.Code != http.StatusOK {
+		t.Fatalf("first-time set: %d %s", w.Code, w.Body)
+	}
+	if !s.settings.AuthActive() {
+		t.Fatal("first-time password set did not activate auth")
 	}
 }

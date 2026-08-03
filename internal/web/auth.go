@@ -61,12 +61,12 @@ type failLimiter struct {
 	proxiedWarn            sync.Once // local-only on, but traffic arrives via a same-host proxy
 	rewriteWarn            sync.Once // proxy detected while no -allow-host is configured
 	containerLocalOnlyWarn sync.Once // local-only on but unenforceable inside a container
-	// Rate-limiter for the DNS-rebinding Host-rejection warning: a flood of crafted
-	// Hosts would otherwise fill the log ring with a warning per request. Emit at
-	// most once per rejectWarnEvery and report how many were suppressed meanwhile.
-	rejectMu      sync.Mutex
-	rejectLast    time.Time
-	rejectDropped int
+	// Rate-limiters for the pre-auth rejection warnings: a flood of crafted
+	// Hosts or non-loopback requests would otherwise fill the log ring with a
+	// warning per request. Each emits at most once per rejectWarnEvery and
+	// reports how many were suppressed meanwhile.
+	hostReject  logCoalescer // DNS-rebinding Host rejection
+	localReject logCoalescer // local-only non-loopback rejection
 	// The session-revocation epoch (bumped on logout, folded into token MACs) now
 	// lives in the settings store so it survives a restart - a logged-out token
 	// used to revalidate after a restart reset the old in-memory epoch to 0. See
@@ -84,21 +84,33 @@ func newFailLimiter() *failLimiter { return &failLimiter{fails: map[string]*fail
 // rejectWarnEvery bounds how often the Host-rejection warning is emitted.
 const rejectWarnEvery = time.Minute
 
+// logCoalescer emits at most one line per window and reports how many were
+// suppressed since the last emit, so a rejection flood can't fill the log ring.
+type logCoalescer struct {
+	mu      sync.Mutex
+	last    time.Time
+	dropped int
+}
+
+func (c *logCoalescer) allow(every time.Duration) (emit bool, suppressed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.last.IsZero() || time.Since(c.last) >= every {
+		suppressed = c.dropped
+		c.dropped = 0
+		c.last = time.Now()
+		return true, suppressed
+	}
+	c.dropped++
+	return false, 0
+}
+
 // rejectLog reports whether a Host-rejection warning should be emitted now (at
 // most once per rejectWarnEvery) and how many rejections were suppressed since
 // the last emitted line. This keeps a flood of rejected requests from filling the
 // log ring with one warning each.
 func (l *failLimiter) rejectLog() (emit bool, suppressed int) {
-	l.rejectMu.Lock()
-	defer l.rejectMu.Unlock()
-	if l.rejectLast.IsZero() || time.Since(l.rejectLast) >= rejectWarnEvery {
-		suppressed = l.rejectDropped
-		l.rejectDropped = 0
-		l.rejectLast = time.Now()
-		return true, suppressed
-	}
-	l.rejectDropped++
-	return false, 0
+	return l.hostReject.allow(rejectWarnEvery)
 }
 
 // blocked reports whether ip has exhausted its failure budget and is still in
@@ -280,16 +292,29 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// window is refused outright above, before any setting is consulted.
 		if s.settings.AccessLocalOnly() {
 			switch {
-			case s.InContainer:
+			case s.Bridged:
 				// A bridged container NATs every external request to the gateway, so
 				// the loopback test can't tell a local user from a LAN one - local-only
 				// is unenforceable here and would just lock the dashboard out. The
 				// published port (-p) and the login password are the real boundary.
+				// A host-networked container shares the host netns, so there the
+				// loopback test IS meaningful and falls through to enforcement below.
+				// Residual: util.BridgedContainer is deliberately narrow and reads a
+				// bridged container on a custom (non-172.16/12) subnet as not bridged;
+				// such a box enforces local-only and 403s the port-published gateway
+				// traffic - fail CLOSED (a lockout costs a restart; silently serving
+				// the LAN costs the protected thing).
 				s.logins.containerLocalOnlyWarn.Do(func() {
-					s.log.Warn("local-only access is on but cannot be enforced inside a container; the dashboard stays reachable - restrict it via how you publish the port (-p) and enable the login password")
+					s.log.Warn("local-only access is on but cannot be enforced in a bridged container; the dashboard stays reachable - restrict it via how you publish the port (-p) and enable the login password")
 				})
 			case !isLoopbackAddr(r.RemoteAddr):
-				s.log.Warn("request rejected: local-only access is on", "ip", clientIP(r), "path", r.URL.Path)
+				// Coalesced like the Host rejection above: every request is still
+				// refused, only the LOG line is throttled - a LAN flood would
+				// otherwise evict genuinely useful ring history one line at a time.
+				if emit, suppressed := s.logins.localReject.allow(rejectWarnEvery); emit {
+					s.log.Warn("request rejected: local-only access is on",
+						"ip", clientIP(r), "path", capForLog(r.URL.Path), "suppressed_since_last", suppressed)
+				}
 				http.Error(w, "access restricted to localhost", http.StatusForbidden)
 				return
 			case !hostAllowed(r.Host, nil):
@@ -739,10 +764,11 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.accessStatus(r))
 	case http.MethodPost:
 		var in struct {
-			LocalOnly   *bool  `json:"local_only"`
-			AuthEnabled *bool  `json:"auth_enabled"`
-			Username    string `json:"username"`
-			Password    string `json:"password"`
+			LocalOnly       *bool  `json:"local_only"`
+			AuthEnabled     *bool  `json:"auth_enabled"`
+			Username        string `json:"username"`
+			Password        string `json:"password"`
+			CurrentPassword string `json:"current_password"`
 		}
 		if err := decodeJSONBody(w, r, &in); err != nil {
 			return // response already written (415/400)
@@ -759,6 +785,22 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(u) > maxUsernameBytes {
 				http.Error(w, fmt.Sprintf("username too long: at most %d bytes", maxUsernameBytes), http.StatusBadRequest)
+				return
+			}
+		}
+		// Step-up: a live session must not be able to change access-control
+		// settings (password, username, login toggle, network scope) without
+		// re-proving the CURRENT password - otherwise a hijacked or walk-up
+		// session silently takes over the account. Only enforced once auth is
+		// active; first-time setup has no current password to prove.
+		// checkPassword burns bcrypt under the process-wide bcryptSem, so it
+		// can't be turned into a CPU-grind vector. Runs under s.importMu (held
+		// above), serialized against a restore reconcile like the mutations.
+		if s.settings.AuthActive() {
+			if in.CurrentPassword == "" || !s.checkPassword(s.settings.AuthUser(), in.CurrentPassword) {
+				stats.Inc("web.stepup_fail")
+				s.log.Warn("access change refused: current password missing or wrong", "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
+				http.Error(w, "current password is required to change access settings", http.StatusForbidden)
 				return
 			}
 		}
@@ -879,11 +921,12 @@ func (s *Server) accessStatus(r *http.Request) map[string]any {
 	active := s.settings.AuthActive()
 	authed := !active || s.authed(r)
 	out := map[string]any{
-		"local_only":   s.settings.AccessLocalOnly(),
-		"auth_enabled": s.settings.AuthEnabled(), // intent - drives the toggle
-		"auth_active":  active,                   // enforced - drives the overlay
-		"has_password": s.settings.HasPassword(),
-		"authed":       authed,
+		"local_only":        s.settings.AccessLocalOnly(),
+		"local_only_active": s.settings.AccessLocalOnly() && !s.Bridged, // enforced - mirrors auth_active
+		"auth_enabled":      s.settings.AuthEnabled(),                   // intent - drives the toggle
+		"auth_active":       active,                                     // enforced - drives the overlay
+		"has_password":      s.settings.HasPassword(),
+		"authed":            authed,
 	}
 	// The username, port, and LAN URLs feed the access-settings tab. This
 	// endpoint is reachable without a session (the overlay needs the flags

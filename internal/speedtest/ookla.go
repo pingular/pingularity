@@ -92,6 +92,16 @@ func (o *Ookla) logf(msg string, args ...any) {
 	}
 }
 
+// warnf is logf at Warn, for the few conditions that must reach the default
+// (Warn-threshold) ring: they change or degrade what becomes history, and the
+// 2026-08-02 incident proved Debug-only evidence explains nothing after the
+// fact.
+func (o *Ookla) warnf(msg string, args ...any) {
+	if o.Log != nil {
+		o.Log.Warn(msg, args...)
+	}
+}
+
 // bestOfServers is how many servers a best-of-N run measures. Each one is a full
 // sequential speedtest, so this multiplies both run time and data used.
 const bestOfServers = 3
@@ -489,16 +499,32 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// stalled one just finishes unpinged and loses the race. The measurement below
 	// runs on the original ctx (the full run budget), not selCtx.
 	selCtx, selCancel := context.WithTimeout(ctx, bestOfSelectionBudget)
-	targets, err := o.pickServers(selCtx, client, servers, id, want, pinned)
+	targets, sel, err := o.pickServers(selCtx, client, servers, id, want, pinned)
 	selCancel()
 	if err != nil {
 		return Result{}, err
 	}
 
+	// Identity snapshot before anything measures: a failed measurement's server
+	// object is off-limits afterwards (an abandoned transfer's goroutines still
+	// own it - see runTransfer), so the report's failure rows and the resume
+	// path's log label must never read srv fields after the fact.
+	targetIDs := make([]string, len(targets))
+	targetLabels := make([]string, len(targets))
+	for i, s := range targets {
+		targetIDs[i] = s.ID
+		targetLabels[i] = serverLabel(s)
+	}
+	// Per-candidate failure text for the selection report. firstErr keeps its
+	// existing job (the error the run returns when nothing measured); this map
+	// exists because every LATER candidate's error used to vanish entirely.
+	errByID := make(map[string]string, len(targets))
+
 	// Sequentially, always: two speedtests at once would saturate the link and
 	// each would measure the other's traffic as congestion.
 	var results []Result
 	var firstErr error
+	var spentDown, spentUp int64 // real bytes moved by FAILED candidates (their Results are discarded)
 	for i, srv := range targets {
 		// Report the server now so the UI can show it during the run.
 		if o.OnServer != nil {
@@ -514,6 +540,21 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
+			}
+			errByID[targetIDs[i]] = err.Error()
+			// A failed candidate's traffic was still spent - count it toward the
+			// run's data-used total (its Result never reaches `results`, so the
+			// success sum and this are disjoint; no double count).
+			spentDown += res.DownloadBytes
+			spentUp += res.UploadBytes
+			// Best-of rounds only: a failed want=1 target IS the run failing,
+			// and the scheduler's speed.fail.* already counts that - moving
+			// both counters for one event would bury the question this one
+			// answers (is a dead nearby server silently degrading rounds that
+			// otherwise succeed?). Within a round it counts every failed
+			// candidate, whether or not the round survives them.
+			if len(targets) > 1 {
+				stats.Inc("speed.bestof_candidate_failed")
 			}
 			// A dead server (or one that ate its own slice) shouldn't sink the run
 			// while targets remain; an expired OUTER budget means they'd all fail.
@@ -536,13 +577,21 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			// orphan outlives the wait, or the run budget is spent, or there is
 			// nothing left to try.
 			if errors.Is(err, errTransferAbandoned) {
-				if !o.resumeAfterAbandon(ctx, i, len(targets), serverLabel(srv), err) {
+				// The snapshot, NOT serverLabel(srv): the orphan's goroutines
+				// still own srv here (the fence above).
+				if !o.resumeAfterAbandon(ctx, i, len(targets), targetLabels[i], err) {
 					break
 				}
 				continue
 			}
 			if len(targets) > 1 {
-				o.logf("speedtest server failed, trying the next", "server", serverLabel(srv), "err", err)
+				// Warn, not Debug: a mid-round failure is degraded-but-continuing
+				// (the "iperf3 direction failed, partial result kept" bar) and the
+				// motivating incident showed Debug-only evidence is no evidence at
+				// the default level. Deliberate exception to the ~0-Warn-volume
+				// norm: a persistently dead nearby server will repeat this every
+				// round, and that is a condition worth seeing.
+				o.warnf("speedtest server failed, trying the next", "server", serverLabel(srv), "err", err)
 			}
 			continue
 		}
@@ -567,12 +616,17 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 
 	// Say so when the round refused to believe a direction: the guard changes
 	// which measurement becomes history, so it must never do that silently.
-	if badDown, badUp := implausibleDirections(results); badDown || badUp {
+	badDown, badUp := implausibleDirections(results)
+	if badDown || badUp {
 		stats.Inc("speed.implausible_direction")
 		for _, r := range results {
 			if (badDown && r.DownloadMbps > middleOf(results, func(x Result) float64 { return x.DownloadMbps })) ||
 				(badUp && r.UploadMbps > middleOf(results, func(x Result) float64 { return x.UploadMbps })) {
-				o.logf("best-of result not believed: a direction exceeds what the rest of the round measured",
+				// Warn: the guard changes which measurement becomes history
+				// (~once per 150 runs in the field), and it must be visible at
+				// the default level - the motivating incident's only trace was
+				// this line's Debug predecessor, which nothing captured.
+				o.warnf("best-of result not believed: a direction exceeds what the rest of the round measured",
 					"server", r.Server, "server_id", r.ServerID,
 					"down_mbps", r.DownloadMbps, "up_mbps", r.UploadMbps, "ping_ms", r.PingMS,
 					"mid_down_mbps", util.Round2(middleOf(results, func(x Result) float64 { return x.DownloadMbps })),
@@ -583,7 +637,8 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	}
 
 	win := bestIndex(results, dir)
-	if o.firstRunByPing(want) {
+	bootstrap := o.firstRunByPing(want)
+	if bootstrap {
 		win = lowestPingIndex(results)
 		stats.Inc("speed.first_run_by_ping")
 		o.logf("no speed history yet: deciding this round on ping alone, so an unverifiable "+
@@ -591,19 +646,50 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			"winner", results[win].Server, "ping_ms", results[win].PingMS, "servers", len(results))
 	}
 	best := results[win]
+	// Store the BELIEVED reading, not the verbatim one. The guard already held an
+	// implausible winning direction to the round middle for the DECISION above
+	// (believableCapacity); this caps what is STORED, so the chart, thresholds and
+	// data-used forecast can't read a number the round itself rejected. math.Min
+	// only ever lowers a value already above the middle, so an honest winner is
+	// untouched and the chosen server never changes (win is fixed above). The
+	// selection report keeps the raw reading plus CappedDirection, documenting
+	// why the speed row differs.
+	if badDown {
+		best.DownloadMbps = math.Min(best.DownloadMbps, middleOf(results, func(r Result) float64 { return r.DownloadMbps }))
+	}
+	if badUp {
+		best.UploadMbps = math.Min(best.UploadMbps, middleOf(results, func(r Result) float64 { return r.UploadMbps }))
+	}
 	if len(results) > 1 {
-		discarded := make([]string, 0, len(results)-1)
+		// One line per loser under the `server` key (logfilter masks by key;
+		// the old joined `discarded` attr leaked every loser's label in the
+		// masked form, and a joined list can only mask to one useless blob).
 		for i, r := range results {
 			if i != win {
-				discarded = append(discarded, r.Server)
+				o.logf("best-of result discarded", "server", r.Server, "server_id", r.ServerID)
 			}
 		}
 		o.logf("best-of run finished", "servers", len(results), "winner", best.Server,
 			"down_mbps", best.DownloadMbps, "up_mbps", best.UploadMbps,
 			"capacity_mbps", util.Round2(believableCapacity(best, dir, results)),
-			"score", util.Round2(roundScore(best, dir, results)), "discarded", strings.Join(discarded, " | "))
+			"score", util.Round2(roundScore(best, dir, results)))
 	}
-	best.DownloadBytes, best.UploadBytes = totalBytes(results)
+	// The selection report rides the winner Result to the Scheduler, which
+	// persists it next to the speed row. Built BEFORE the totalBytes overwrite
+	// below so each row keeps its candidate's own traffic (best is a copy, but
+	// ordering here keeps that independence obvious).
+	winReason := winReasonScore
+	switch {
+	case id != "" && want <= 1:
+		winReason = winReasonPinned
+	case want <= 1:
+		winReason = winReasonFastestRank
+	case bootstrap:
+		winReason = winReasonPingBoot
+	}
+	best.Selection = finishSelection(sel, results, errByID, dir, best.ServerID, winReason)
+	dn, up := totalBytes(results)
+	best.DownloadBytes, best.UploadBytes = dn+spentDown, up+spentUp
 	// Always name the server whose numbers are being returned. Without this a run
 	// whose last target failed would leave the mid-run label - a server that
 	// contributed nothing - showing as the current one.
@@ -758,8 +844,10 @@ func snapshotAutoLoc(fn func() (float64, float64, bool)) func() (float64, float6
 
 // pickServers chooses what a run measures. pre is the already-resolved pinned
 // server when the caller had to fetch it early to centre the list on it; nil
-// means resolve it here.
-func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, servers ookla.Servers, id string, want int, pre *ookla.Server) (ookla.Servers, error) {
+// means resolve it here. The second return is the selection report skeleton:
+// one row per considered candidate, identity and ranking snapshotted NOW
+// (the returned servers are pointers the measurement phase mutates).
+func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, servers ookla.Servers, id string, want int, pre *ookla.Server) (ookla.Servers, []CandidateReport, error) {
 	pinned := pre
 	if id != "" && pinned == nil {
 		for _, s := range servers {
@@ -771,12 +859,12 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		if pinned == nil { // not in the nearby list; fetch it directly
 			s, err := client.FetchServerByIDContext(ctx, id)
 			if err != nil {
-				return nil, fmt.Errorf("fetch server %s: %w", id, err)
+				return nil, nil, fmt.Errorf("fetch server %s: %w", id, err)
 			}
 			pinned = s
 		}
 		if want <= 1 {
-			return ookla.Servers{pinned}, nil
+			return ookla.Servers{pinned}, []CandidateReport{pinnedRow(pinned, true)}, nil
 		}
 	}
 
@@ -784,13 +872,22 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	if o.ISPFn != nil {
 		isp = o.ISPFn()
 	}
-	ranked := rankedServers(ctx, servers, isp)
+	ranked, rankPings := rankedServers(ctx, servers, isp)
+	// One Debug line per candidate - the phase had zero logging before the
+	// 2026-08-02 incident. Per-candidate rather than one joined line so the
+	// `server` key masks correctly (logfilter masks by key).
+	for i, s := range ranked {
+		o.logf("speedtest candidate ranked", "server", serverLabel(s), "server_id", s.ID,
+			"rank", i+1, "distance_km", util.Round1(s.Distance), "ping_ms", util.Round1(f64v(rankPings[s.ID])))
+	}
+	sel := candidateRows(ranked, rankPings)
 
 	if want <= 1 {
 		if len(ranked) == 0 {
-			return nil, fmt.Errorf("no speedtest servers available")
+			return nil, nil, fmt.Errorf("no speedtest servers available")
 		}
-		return ookla.Servers{ranked[0]}, nil
+		sel[0].Selected = true
+		return ookla.Servers{ranked[0]}, sel, nil
 	}
 
 	out := make(ookla.Servers, 0, want)
@@ -807,9 +904,25 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		out = append(out, s)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("no speedtest servers available")
+		return nil, nil, fmt.Errorf("no speedtest servers available")
 	}
-	return out, nil
+	// Mark the targets in the report; a pin that was never in the ranked list
+	// gets its own unranked row at the front (RankOrder 0).
+	chosen := make(map[string]bool, len(out))
+	for _, s := range out {
+		chosen[s.ID] = true
+	}
+	inRanked := false
+	for i := range sel {
+		if pinned != nil && sel[i].ServerID == pinned.ID {
+			inRanked = true
+		}
+		sel[i].Selected = chosen[sel[i].ServerID]
+	}
+	if pinned != nil && !inRanked {
+		sel = append([]CandidateReport{pinnedRow(pinned, true)}, sel...)
+	}
+	return out, sel, nil
 }
 
 // ooklaTransfer is one direction's library transfer. The two implementations are
@@ -1058,7 +1171,11 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			return e
 		})
 		if err != nil {
-			return Result{}, fmt.Errorf("download: %w", err)
+			// Carry the safely-tallied bytes out with the error: the traffic was
+			// really spent (and lands on the user's bill) whether or not the
+			// measurement survived. Orphaned transfers' live bytes are already
+			// excluded by the !finished guards above.
+			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("download: %w", err)
 		}
 	}
 	if dir != "down" {
@@ -1080,7 +1197,9 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			return e
 		})
 		if err != nil {
-			return Result{}, fmt.Errorf("upload: %w", err)
+			// As above: the download that preceded this failed upload moved real
+			// bytes; they travel out with the error.
+			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w", err)
 		}
 	}
 
@@ -1296,7 +1415,7 @@ func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
 	}
 	// cand may alias sorted's backing array (the under-cap path); take a copy
 	// before the append/overwrite below can write through into the caller's
-	// slice. fastestServer passes a private copy today, but that's its
+	// slice. rankedServers passes a private copy today, but that's its
 	// business, not a contract.
 	cand = append(ookla.Servers(nil), cand...)
 	for _, s := range cand {
@@ -1352,18 +1471,6 @@ func sponsorMatchesISP(sponsor, isp string) bool {
 	return false
 }
 
-// fastestServer pings the candidate servers concurrently and returns the
-// lowest-latency one (like speedtest.net's auto-select), falling back to the
-// nearest if none respond. isp ("" = unknown) grants the user's own ISP's
-// server a guaranteed lane in the race.
-func fastestServer(ctx context.Context, servers ookla.Servers, isp string) *ookla.Server {
-	ranked := rankedServers(ctx, servers, isp)
-	if len(ranked) == 0 {
-		return nil
-	}
-	return ranked[0]
-}
-
 // rankedServers pings the auto-select candidates concurrently and returns them
 // best-first: successfully pinged servers by ascending latency, then any that
 // never answered, still in candidate (nearest-first) order. That trailing group
@@ -1372,24 +1479,47 @@ func fastestServer(ctx context.Context, servers ookla.Servers, isp string) *ookl
 //
 // Best-of-N reads ranks 2 and 3 straight off this list: the pings already
 // happened to choose rank 1, so the extra servers cost nothing to identify.
-func rankedServers(ctx context.Context, servers ookla.Servers, isp string) ookla.Servers {
+func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64) {
 	if len(servers) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Sort a copy so the caller's slice order is untouched.
 	sorted := append(ookla.Servers(nil), servers...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Distance < sorted[j].Distance })
 	cand := autoCandidates(sorted, isp)
 
+	// The explicit per-server ranking outcome, for the selection report. The
+	// Latency FIELD cannot carry it: the library assigns the ~10-sample mean
+	// only on success, and a failed ranking ping leaves whatever the list
+	// fetch wrote there - often a stale positive echo sample - so "Latency>0"
+	// cannot distinguish answered from unanswered. The SORT below still keys
+	// on the field exactly as it always has (stale values included): ranking
+	// order is behavior, this capture is observability.
+	pings := make([]*float64, len(cand))
 	var wg sync.WaitGroup
-	for _, s := range cand {
+	for i, s := range cand {
 		wg.Add(1)
-		go func(s *ookla.Server) {
+		go func(i int, s *ookla.Server) {
 			defer wg.Done()
-			_ = s.PingTestContext(ctx, nil) // sets s.Latency
-		}(s)
+			// The per-sample callback is the only honest success signal: the
+			// library can return a nil error WITHOUT collecting a single sample
+			// (every measured echo failing at transport level after a good
+			// warm-up), leaving Latency untouched at its stale fetch-echo
+			// value - so "err == nil && Latency > 0" would record a one-shot
+			// echo as an answered ten-sample ranking ping.
+			sampled := false
+			err := s.PingTestContext(ctx, func(time.Duration) { sampled = true }) // sets s.Latency on success
+			if err == nil && sampled && s.Latency > 0 {
+				ms := pingMSOf(s.Latency)
+				pings[i] = &ms
+			}
+		}(i, s)
 	}
 	wg.Wait()
+	rankPings := make(map[string]*float64, len(cand))
+	for i, s := range cand {
+		rankPings[s.ID] = pings[i]
+	}
 
 	out := append(ookla.Servers(nil), cand...)
 	// Stable so unpinged servers keep their nearest-first order among themselves.
@@ -1404,7 +1534,7 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) ookla
 			return false
 		}
 	})
-	return out
+	return out, rankPings
 }
 
 // serverLabel is the human name for a server, as stored on the run.

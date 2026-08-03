@@ -298,22 +298,6 @@ func TestAvailableCongestionControl(t *testing.T) {
 	}
 }
 
-func TestIsAuthErr(t *testing.T) {
-	for _, s := range []string{"test authorization failed", "iperf3: error - test authorization failed", "Authentication failed"} {
-		if !isAuthErr(errors.New(s)) {
-			t.Errorf("expected auth error: %q", s)
-		}
-	}
-	for _, s := range []string{"the server is busy", "no data transferred", "connection refused", ""} {
-		if isAuthErr(errors.New(s)) {
-			t.Errorf("expected NOT auth error: %q", s)
-		}
-	}
-	if isAuthErr(nil) {
-		t.Error("nil must not be an auth error")
-	}
-}
-
 // iperfServerName is the display name for both the live status and the recorded run:
 // "iperf3: <label>" (engine + friendly name, no address), falling back to the host.
 func TestIperfServerName(t *testing.T) {

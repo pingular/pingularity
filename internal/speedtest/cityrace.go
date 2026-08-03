@@ -358,6 +358,9 @@ func unionCityCandidates(pools []ookla.Servers) (ookla.Servers, map[*ookla.Serve
 // best-of is) rather than by staleness - note that the adaptive scheduler can
 // clamp the SCHEDULED cadence down to one minute, so a trigger gate alone does
 // not bound it either.
+//
+// test seam: production enters via candidateOrigins + raceOrigins separately
+// (see the call sites); this composed wrapper is intentionally test-only.
 func (o *Ookla) raceCities(ctx context.Context) (Origin, bool) {
 	return o.raceOrigins(ctx, o.candidateOrigins())
 }
@@ -392,6 +395,7 @@ func (o *Ookla) raceOrigins(ctx context.Context, origins []Origin) (Origin, bool
 	// fetch there must leave the run uncentred rather than centre on it.
 	if !anyAnchored(origins) {
 		stats.Inc("speed.cityrace_unanchored")
+		o.logf("auto city race skipped: no anchored origin")
 		return origins[0], true
 	}
 	runCtx := ctx // kept unshadowed so the select below can tell the two deaths apart

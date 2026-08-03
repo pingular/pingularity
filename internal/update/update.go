@@ -27,7 +27,7 @@ import (
 // latestURL is the public JSON endpoint serving {"version":"X.Y.Z", ...}.
 // CHANGE ME to wherever you publish the latest version. It MUST be public (not
 // behind Cloudflare Access) and should be CDN-cached. See the deploy notes.
-const latestURL = "https://dl.pingularity.dev/latest.json"
+const latestURL = "https://update.pingularity.dev/latest.json"
 
 // releasesURL is where the "View release" button points. Hardcoded, not taken
 // from the endpoint response, so a tampered file can't redirect the link. An

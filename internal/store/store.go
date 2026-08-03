@@ -105,6 +105,27 @@ CREATE TABLE IF NOT EXISTS speed (
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
+CREATE TABLE IF NOT EXISTS speed_servers (
+    run_ts INTEGER NOT NULL,              -- joins speed.ts (no FK anywhere in this schema; cascades are manual)
+    server_id TEXT,
+    server TEXT,                          -- "Sponsor, Name" label, as on speed.server
+    distance_km REAL,
+    rank_order INTEGER,                   -- 1-based ping-race rank; 0 = never ranked (a pin resolved outside the list)
+    rank_ping_ms REAL,                    -- ranking ping (library mean); NULL when the ranking ping went unanswered
+    selected INTEGER NOT NULL,            -- became a measurement target
+    measured INTEGER NOT NULL,            -- produced a result
+    error TEXT,                           -- failure text; selected+unmeasured+EMPTY = never attempted (the app writes '', not NULL)
+    down_mbps REAL, up_mbps REAL, ping_ms REAL, ping_best_ms REAL, jitter_ms REAL,
+    download_bytes INTEGER, upload_bytes INTEGER, -- this candidate's OWN traffic (speed.download_bytes is the round total)
+    capacity_mbps REAL,                   -- raw weighted-geomean capacity
+    believed_capacity_mbps REAL,          -- capacity after the implausibility guard
+    capped_direction TEXT,                -- direction(s) the guard held down for this row: down|up|down,up
+    score REAL,                           -- what the winner decision compared
+    winner INTEGER NOT NULL,
+    win_reason TEXT                       -- score|ping_bootstrap|fastest_ranked|pinned
+);
+CREATE INDEX IF NOT EXISTS idx_speed_servers_ts ON speed_servers(run_ts);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1143,7 +1164,7 @@ func (s *Store) firstQuorumRecovery(ctx context.Context, after, before int64) (i
 			SELECT MIN(sec) FROM (
 				SELECT ts AS sec FROM samples WHERE ts > ? AND ts <= ?
 				GROUP BY ts, `+famExpr+`
-				HAVING SUM(success) * 2 > COUNT(*))`, lo, hi).Scan(&rec); err != nil {
+				HAVING SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 2 > COUNT(*))`, lo, hi).Scan(&rec); err != nil {
 			return 0, false, err
 		}
 		s.recMu.Lock()
@@ -2108,7 +2129,7 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 			SELECT (ts / ?) * ? AS bts,
 			       `+famExpr+` AS fam,
 			       MIN(CASE WHEN success = 1`+latFilter+` THEN latency_ms END) AS lat,
-			       CASE WHEN SUM(success) * 2 > COUNT(*) THEN 1 ELSE 0 END AS fam_online
+			       CASE WHEN SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 2 > COUNT(*) THEN 1 ELSE 0 END AS fam_online
 			FROM samples
 			WHERE ts >= ?`+upper+`
 			GROUP BY bts, fam
@@ -2341,6 +2362,136 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 	return err
 }
 
+// SpeedServerRow is one candidate's row of a run's server-selection report
+// (table speed_servers): who was considered, what was measured, how it scored,
+// and why the winner won. Written once per run right after the speed row;
+// exists so a surprising winner is explainable from the DB alone at any log
+// level. Pointer fields are NULL when unmeasured, mirroring SpeedSample.
+type SpeedServerRow struct {
+	RunTS      int64    `json:"run_ts"` // joins speed.ts
+	ServerID   string   `json:"server_id"`
+	Server     string   `json:"server"`
+	DistanceKM float64  `json:"distance_km"`
+	RankOrder  int64    `json:"rank_order"`
+	RankPingMS *float64 `json:"rank_ping_ms,omitempty"`
+	Selected   bool     `json:"selected"`
+	Measured   bool     `json:"measured"`
+	Err        string   `json:"error,omitempty"`
+
+	DownMbps      float64  `json:"down_mbps"`
+	UpMbps        float64  `json:"up_mbps"`
+	PingMS        float64  `json:"ping_ms"`
+	PingBestMS    *float64 `json:"ping_best_ms,omitempty"`
+	JitterMS      *float64 `json:"jitter_ms,omitempty"`
+	DownloadBytes int64    `json:"download_bytes"`
+	UploadBytes   int64    `json:"upload_bytes"`
+
+	CapacityMbps         float64 `json:"capacity_mbps"`
+	BelievedCapacityMbps float64 `json:"believed_capacity_mbps"`
+	CappedDirection      string  `json:"capped_direction,omitempty"`
+	Score                float64 `json:"score"`
+	Winner               bool    `json:"winner"`
+	WinReason            string  `json:"win_reason,omitempty"`
+}
+
+const speedServerCols = `run_ts, server_id, server, distance_km, rank_order, rank_ping_ms,
+	selected, measured, error, down_mbps, up_mbps, ping_ms, ping_best_ms, jitter_ms,
+	download_bytes, upload_bytes, capacity_mbps, believed_capacity_mbps, capped_direction,
+	score, winner, win_reason`
+
+// InsertSpeedServers persists one run's selection report. One transaction so a
+// run's rows land all-or-nothing - a partial report would read as "the other
+// candidates were never considered", which is exactly the ambiguity the table
+// exists to remove.
+func (s *Store) InsertSpeedServers(ctx context.Context, rows []SpeedServerRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		recordDBErr(err)
+		return err
+	}
+	defer tx.Rollback()
+	for _, r := range rows {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO speed_servers (`+speedServerCols+`)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.RunTS, r.ServerID, r.Server, r.DistanceKM, r.RankOrder, ptrArg(r.RankPingMS),
+			util.B2I(r.Selected), util.B2I(r.Measured), r.Err,
+			r.DownMbps, r.UpMbps, r.PingMS, ptrArg(r.PingBestMS), ptrArg(r.JitterMS),
+			r.DownloadBytes, r.UploadBytes, r.CapacityMbps, r.BelievedCapacityMbps, r.CappedDirection,
+			r.Score, util.B2I(r.Winner), r.WinReason); err != nil {
+			recordDBErr(err)
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		recordDBErr(err)
+		return err
+	}
+	return nil
+}
+
+// SpeedRunExists reports whether a speed row with this exact ts exists - the
+// read API's "was there ever such a run" check, distinct from "the run has no
+// selection report" (which is normal for pre-feature and iperf3 history).
+func (s *Store) SpeedRunExists(ctx context.Context, ts int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE ts = ?`, ts).Scan(&n)
+	if err != nil {
+		recordDBErr(err)
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// SpeedServers returns one run's selection report rows in rank order (the
+// unranked pin row first). Empty is a normal answer, not an error: runs
+// restored from pre-feature backups, iperf3 runs, and runs whose report
+// insert failed all have a speed row with no companions.
+func (s *Store) SpeedServers(ctx context.Context, runTS int64) ([]SpeedServerRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+speedServerCols+` FROM speed_servers WHERE run_ts = ? ORDER BY rank_order`, runTS)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpeedServerRow
+	for rows.Next() {
+		var r SpeedServerRow
+		// Floats through NullFloat64 + nzFinite/ptrFinite, TEXT through
+		// NullString, for the same reason scanSpeed does it: one NULL or ±Inf
+		// row - and an imported backup CAN carry NULL in any nullable column -
+		// must not wedge every read of the run's report. The speed table
+		// learned this the hard way (see its exportTables notNull comment).
+		var serverID, server, errText, cappedDir, winReason sql.NullString
+		var dist, rankPing, down, up, ping, pingBest, jitter, capacity, believed, score sql.NullFloat64
+		var rank, downB, upB, sel, meas, win sql.NullInt64
+		if err := rows.Scan(&r.RunTS, &serverID, &server, &dist, &rank, &rankPing,
+			&sel, &meas, &errText, &down, &up, &ping, &pingBest, &jitter,
+			&downB, &upB, &capacity, &believed, &cappedDir,
+			&score, &win, &winReason); err != nil {
+			recordDBErr(err)
+			return nil, err
+		}
+		r.ServerID, r.Server, r.Err = serverID.String, server.String, errText.String
+		r.CappedDirection, r.WinReason = cappedDir.String, winReason.String
+		r.DistanceKM, r.DownMbps, r.UpMbps, r.PingMS = nzFinite(dist), nzFinite(down), nzFinite(up), nzFinite(ping)
+		r.CapacityMbps, r.BelievedCapacityMbps, r.Score = nzFinite(capacity), nzFinite(believed), nzFinite(score)
+		r.RankPingMS, r.PingBestMS, r.JitterMS = ptrFinite(rankPing), ptrFinite(pingBest), ptrFinite(jitter)
+		r.RankOrder, r.DownloadBytes, r.UploadBytes = rank.Int64, downB.Int64, upB.Int64
+		r.Selected, r.Measured, r.Winner = sel.Int64 != 0, meas.Int64 != 0, win.Int64 != 0
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	return out, nil
+}
+
 // ResolvedOutagesSince returns the number of outages that resolved after since
 // and their total downtime in seconds. An outage resolves with an 'up' event
 // carrying its duration; one still ongoing has no 'up' yet and isn't counted
@@ -2462,7 +2613,7 @@ func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
 	// dns and pauses were both absent, and pauses is the one that matters: it is
 	// the uptime denominator, so a row left behind changes the numbers while being
 	// invisible to any count.
-	for _, t := range []string{"samples", "dns", "speed", "events", "pauses", "pauses_quarantine", "settings"} {
+	for _, t := range []string{"samples", "dns", "speed", "speed_servers", "events", "pauses", "pauses_quarantine", "settings"} {
 		var n int64
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t).Scan(&n); err != nil {
 			return nil, err
@@ -2704,8 +2855,26 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 // serialized, so ts is effectively unique; a same-second collision would delete
 // both, consistent with ts-as-identity everywhere else.
 func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM speed WHERE ts = ?`, ts)
+	// One transaction with the run's selection report (speed_servers has no FK;
+	// the cascade is manual): a run deleted without its report rows would leave
+	// candidates explaining a run that no longer exists. The returned count
+	// stays the SPEED rows removed - the caller's "was there a run" signal.
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `DELETE FROM speed WHERE ts = ?`, ts)
+	if err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM speed_servers WHERE run_ts = ?`, ts); err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
@@ -3616,6 +3785,18 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		}
 		total += n
 	}
+	// The selection reports ride the speed retention (their run_ts IS speed.ts;
+	// no FK anywhere, so the cascade is manual). Keyed on its own column with
+	// both arms of the same cut - cutoff and future horizon - rather than a
+	// join to speed: a crash between the two DELETEs leaves only bounded
+	// orphans that the next hourly pass removes by the same rule.
+	if res, err := s.db.ExecContext(ctx, `DELETE FROM speed_servers WHERE run_ts < ? OR run_ts > ?`,
+		speedBefore.Unix(), horizon); err != nil {
+		recordDBErr(err)
+		return total, err
+	} else if n, err := res.RowsAffected(); err == nil {
+		total += n
+	}
 	// Events (outage transitions) prune as WHOLE outages: a 'down' older than the
 	// cutoff whose paired 'up' is at/after it straddles the boundary, so keep it -
 	// deleting only the 'down' would orphan the 'up' and split one outage into
@@ -3730,7 +3911,9 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 	case "latency":
 		tables = []string{"samples", "dns"}
 	case "speed":
-		tables = []string{"speed"}
+		// The selection reports go with their runs (manual cascade, no FKs):
+		// rows kept here would describe runs the operator just deleted.
+		tables = []string{"speed", "speed_servers"}
 	case "downtime":
 		// Both tables, for the same reason the export ships them as one category
 		// (see dataCategories): `events` holds the outages, `pauses` holds the spans
@@ -3843,7 +4026,36 @@ var exportTables = map[string]struct {
 		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes"},
 		realCols: []string{"down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms", "packet_loss",
 			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms"}},
+	// The per-run selection reports ride the speed category (they are the
+	// speed rows' explanations - see SpeedServerRow). Merged by (run_ts,
+	// server_id): one row per candidate per run, so a re-import is idempotent
+	// like the other time-series tables. Deliberately INCLUDED in export,
+	// unlike pauses_quarantine: this table explains history, and a backup that
+	// restores runs without their explanations silently loses the very data
+	// the table exists to preserve.
+	"speed_servers": {cols: []string{"run_ts", "server_id", "server", "distance_km", "rank_order", "rank_ping_ms",
+		"selected", "measured", "error", "down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms",
+		"download_bytes", "upload_bytes", "capacity_mbps", "believed_capacity_mbps", "capped_direction",
+		"score", "winner", "win_reason"},
+		keyCols: []string{"run_ts", "server_id"},
+		// server_id/server join and label the row everywhere; a crafted row
+		// without them must be skipped, not inserted as NULL (the speed table's
+		// own lesson - see its notNull comment; the NullString scan is the
+		// second belt).
+		notNull: []string{"server_id", "server", "selected", "measured", "winner"},
+		intCols: []string{"run_ts", "rank_order", "selected", "measured", "download_bytes", "upload_bytes", "winner"},
+		realCols: []string{"distance_km", "rank_ping_ms", "down_mbps", "up_mbps", "ping_ms", "ping_best_ms",
+			"jitter_ms", "capacity_mbps", "believed_capacity_mbps", "score"},
+		rowSane: speedServerRowSane},
 	"settings": {cols: []string{"key", "value"}, keyCols: nil, notNull: []string{"key", "value"}},
+}
+
+// speedServerRowSane rejects selection-report rows that cannot join a run: a
+// row without a plausible run_ts would be unreachable garbage (every read is
+// keyed by run ts) that only Prune's future-horizon arm could ever remove.
+func speedServerRowSane(row map[string]any) bool {
+	ts, ok := row["run_ts"].(int64)
+	return ok && ts > 0
 }
 
 // settingsExportDeny lists settings keys never included in an export - things
@@ -4198,7 +4410,15 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 		// (DELETE ... WHERE ts < cutoff) and the event-derived uptime math.
 		var tsKey int64
 		hasTS := false
-		if tsv, ok := r["ts"]; ok {
+		tsv, ok := r["ts"]
+		if !ok {
+			// speed_servers keys its time by run_ts - the one keyed time-series
+			// table whose column is not literally "ts". Same sanity and flood
+			// rules, or a crafted backup packs unbounded rows at one run_ts and
+			// escapes the cap this block exists for.
+			tsv, ok = r["run_ts"]
+		}
+		if ok {
 			// ts is float64 from a JSON import but int64 from a direct
 			// export->import; accept both numeric forms, reject anything else.
 			var f float64

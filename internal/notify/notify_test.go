@@ -472,3 +472,56 @@ func TestHeartbeatClientRedirects(t *testing.T) {
 		t.Error("redirect to link-local/metadata should be refused")
 	}
 }
+
+// Pins that a threshold alert survives a transient webhook failure - the
+// property Outage already has. A breach is a one-shot event exactly like a
+// transition: with no retry, a 503 at the wrong instant dropped the alert
+// permanently.
+func TestSpeedThresholdRetriesTransientFailure(t *testing.T) {
+	stats.ResetForTest()
+	old := outageRetries
+	outageRetries = []time.Duration{time.Millisecond}
+	defer func() { outageRetries = old }()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(503) // transient: retry
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	n := New(func() string { return srv.URL }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	n.SpeedThreshold(context.Background(), store.SpeedSample{DownMbps: 5, UpMbps: 1, PingMS: 20}, []string{"download 5 < 100 Mbps"})
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("webhook received %d requests, want 2 (one transient failure, one retry)", got)
+	}
+	if got := stats.Lifetime().Counters["notify.generic.ok"]; got != 1 {
+		t.Errorf("notify.generic.ok = %d, want 1", got)
+	}
+}
+
+// A permanent failure (non-transient 4xx) must not be retried: it will fail
+// the same way every attempt, and retrying would multi-count the counters and
+// re-emit the same warn.
+func TestSpeedThresholdDoesNotRetryPermanentFailure(t *testing.T) {
+	stats.ResetForTest()
+	old := outageRetries
+	outageRetries = []time.Duration{time.Millisecond}
+	defer func() { outageRetries = old }()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(400)
+	}))
+	defer srv.Close()
+	n := New(func() string { return srv.URL }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	n.SpeedThreshold(context.Background(), store.SpeedSample{DownMbps: 5, UpMbps: 1, PingMS: 20}, []string{"download 5 < 100 Mbps"})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("webhook received %d requests, want exactly 1 (permanent failures are not retried)", got)
+	}
+}

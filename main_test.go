@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"runtime"
@@ -9,8 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kardianos/service"
+
 	"github.com/pingular/pingularity/internal/logbuf"
 	"github.com/pingular/pingularity/internal/logfilter"
+	"github.com/pingular/pingularity/internal/stats"
 )
 
 // nonLoopbackListen decides whether the "reachable on the network with auth
@@ -99,5 +103,51 @@ func TestBuildLoggerCapturesRawAndMasked(t *testing.T) {
 	// stdout/journald always gets the full line.
 	if !strings.Contains(stdout.String(), "203.0.113.7") {
 		t.Errorf("stdout should carry full detail: %s", stdout.String())
+	}
+}
+
+// Pins that uninstall warns exactly when a running process would be orphaned
+// by removing the unit, and never cries wolf: an already-stopped unit (the
+// common, benign stop "failure" on Windows/launchd) and an unknowable status
+// both stay quiet.
+func TestStopWarning(t *testing.T) {
+	stopErr := errors.New("The service has not been started")
+	cases := []struct {
+		name      string
+		stopErr   error
+		status    service.Status
+		statusErr error
+		warn      bool
+	}{
+		{"clean stop", nil, service.StatusStopped, nil, false},
+		{"still running", stopErr, service.StatusRunning, nil, true},
+		{"already stopped", stopErr, service.StatusStopped, nil, false},
+		{"status unknown", stopErr, service.StatusRunning, errors.New("scm unavailable"), false},
+	}
+	for _, c := range cases {
+		got := stopWarning(c.stopErr, c.status, c.statusErr)
+		if (got != "") != c.warn {
+			t.Errorf("%s: stopWarning = %q, want warning=%v", c.name, got, c.warn)
+		}
+	}
+}
+
+// Pins that every blocked-destination series exists at 0 before its first
+// event, so Prometheus rate()/increase() can see the first block after a
+// restart - the F7 invariant seedKnownCounters exists to hold. A blocked
+// destination is an SSRF-relevant misconfiguration; its first occurrence is
+// exactly the step that must not be invisible.
+func TestSeedsBlockedCounters(t *testing.T) {
+	stats.ResetForTest()
+	seedKnownCounters()
+	got := stats.Lifetime().Counters
+	for _, dest := range []string{"discord", "slack", "healthchecks", "generic", "heartbeat"} {
+		name := "notify." + dest + ".blocked"
+		v, ok := got[name]
+		if !ok {
+			t.Errorf("%s not seeded; its first increment is invisible to rate()", name)
+		} else if v != 0 {
+			t.Errorf("%s seeded at %d, want 0", name, v)
+		}
 	}
 }

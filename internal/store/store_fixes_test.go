@@ -183,6 +183,43 @@ func TestQuorumRequiresStrictMajority(t *testing.T) {
 	}
 }
 
+// Pins that a samples row whose success is far outside {0,1} (large enough that
+// SUM(success) would overflow int64) no longer makes firstQuorumRecovery and
+// Series fail with SQL "integer overflow"; the poisoned rows read as offline,
+// consistent with the `success = 1` predicate the rest of each query already
+// uses.
+func TestQuorumReadSurvivesOutOfRangeSuccess(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	big := int64(1) << 62 // 2^62; two of these in one (ts,family) group make SUM overflow 2^63
+	ts := now.Add(-100 * time.Second).Unix()
+	for _, tgt := range []string{"a", "b"} {
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO samples (ts,target,latency_ms,success,family) VALUES (?,?,?,?,?)`, ts, tgt, 10.0, big, "ipv4"); err != nil {
+			t.Fatalf("seed poisoned sample: %v", err)
+		}
+	}
+	// firstQuorumRecovery must not error (pre-fix: SQL logic error: integer
+	// overflow) and two non-1 successes are not a quorum.
+	rec, ok, err := st.firstQuorumRecovery(ctx, now.Add(-200*time.Second).Unix(), now.Unix())
+	if err != nil {
+		t.Fatalf("firstQuorumRecovery overflowed on out-of-range success: rec=%d ok=%v err=%v", rec, ok, err)
+	}
+	if ok {
+		t.Fatalf("two non-1 successes are not a quorum, got ok=true rec=%d", rec)
+	}
+	// Series must not error and the bucket reads offline.
+	pts, err := st.Series(ctx, now.Add(-200*time.Second), time.Time{}, 1, nil)
+	if err != nil {
+		t.Fatalf("Series overflowed on out-of-range success: %v", err)
+	}
+	for _, p := range pts {
+		if p.Online {
+			t.Fatalf("bucket with only out-of-range successes must read offline, got %+v", p)
+		}
+	}
+}
+
 // UptimeSince clamps summed downtime to the window: overlapping outage pieces (a
 // completed outage plus an orphaned down->down gap) can exceed the window, and
 // the `if downtime > window` guard must floor the fraction at 0, never negative.

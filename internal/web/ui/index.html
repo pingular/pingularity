@@ -1887,10 +1887,16 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
                 <span class="info" tabindex="0" data-tip="Set or change the login password (up to 72 bytes - the bcrypt limit; accented, CJK, or emoji characters count as several bytes). Leave blank to keep the current one. Applied on Save. Forgot it? Run pingularity reset-auth on the host to clear it and disable auth.">i</span></span>
               <input type="password" id="authPass" autocomplete="new-password" placeholder="Set a password" maxlength="72">
             </div>
+            <div class="afield" id="curPassField" style="display:none">
+              <span class="lbl">Current password
+                <span class="info" tabindex="0" data-tip="While a login is active, changing ANY access setting requires re-entering the current password - so a stolen or walk-up session cannot quietly take over the account.">i</span></span>
+              <input type="password" id="authCurPass" autocomplete="current-password" placeholder="Required to change access" maxlength="72">
+            </div>
           </div>
         </div>
         <div class="access-urls" id="accessUrls"></div>
         <div class="warn-bubble" id="localOnlyWarn"><span class="wi">⚠&#xFE0E;</span><span>Turning off <b>Network access</b> from another device will <b>cut your own access</b> once you Save - do it from the machine running Pingularity.</span></div>
+        <div class="warn-bubble" id="localOnlyContainerNote"><span class="wi">⚠&#xFE0E;</span><span><b>Local-only cannot be enforced in this container</b> - the dashboard stays reachable from the network. Restrict it via how you publish the port (<span class="mono">-p</span>) and require a login.</span></div>
         <div class="access-foot" id="accessFoot">
           <button class="btn ghost" id="logoutBtn" type="button">Log out</button>
           <span class="muted" id="resetHint">Forgot the password? Run <span class="mono">pingularity reset-auth</span> on the host to clear it and disable auth.</span>
@@ -2130,8 +2136,8 @@ The window button takes a duration (7d) or a date range typed how you like it - 
       <div class="card"><div class="label">↑ Bufferbloat</div><div class="value" id="sp_bloat_up">-</div></div>
     </div>
     <canvas id="speedChart" role="img" aria-label="Download and upload speed over time" style="height:200px;margin-top:8px"></canvas>
-    <canvas id="qualityChart" role="img" aria-label="Ping and jitter over time" style="height:100px;margin-top:2px"></canvas>
-    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:150px;margin-top:18px"></canvas>
+    <canvas id="qualityChart" role="img" aria-label="Ping and jitter over time" style="height:102px"></canvas>
+    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:168px"></canvas>
     <div class="runs-bar">
       <button class="btn ghost" id="runsToggle" type="button" aria-expanded="false" aria-controls="runsSection">Show all runs ▾</button>
       <!-- Averages over exactly the rows the charts to the right are drawing; painted by
@@ -3197,7 +3203,7 @@ async function requestCloseDrawer(){
   if(document.activeElement===$('setIperfAddr')) $('setIperfAddr').blur();
   if(formSnapshot() !== savedBody){
     if(!confirm('You have unsaved changes. Discard them?')) return;   // keep the drawer open
-    serversLoaded=false; const ok=await loadSettings(); loadAccess(); $('authPass').value=''; $('settingsMsg').textContent='';   // revert form + access to server truth
+    serversLoaded=false; const ok=await loadSettings(); loadAccess(); $('authPass').value=''; $('authCurPass').value=''; $('settingsMsg').textContent='';   // revert form + access to server truth
     // If the refetch failed, don't silently close over the discarded edits (a later
     // open would baseline them as saved) - keep the drawer open and dirty, and say so.
     if(!ok){ $('settingsMsg').textContent='Could not reach the server - your changes were NOT discarded. Try again.'; return; }
@@ -4003,11 +4009,13 @@ let pinnedRunTs=null;
 // is the pinned selection (kept between hovers); false is the transient hover point.
 // stackY is the canvas's own offset down the panel, and it exists so the dash
 // pattern CONTINUES across the three charts instead of restarting at each one.
-// They are separate canvases with a gap between them, so without it each chart
-// began a fresh dash and the shared cursor read as three aligned lines rather
-// than one line through a stack. Phase is all that is needed: offsetting the
-// pattern by where this canvas sits makes it identical to one drawn from the top
-// of the panel straight through.
+// They are separate canvases, so without it each chart began a fresh dash and
+// the shared cursor read as three aligned lines rather than one line through a
+// stack. The canvases sit FLUSH: the spacing that groups the charts (2px inside
+// the speed/quality pair, 18px before bufferbloat) lives INSIDE each canvas as
+// its pad.t, not as CSS margin - a margin is a strip no canvas can paint, and
+// the cursor visibly broke across it. Phase plus flush canvases make the line
+// identical to one drawn from the top of the panel straight through.
 // lineWidth is set EXPLICITLY. Every other stroke property here is, and this one
 // was not, so the cursor inherited whatever the pass had last drawn with: the
 // speed and quality charts set lineWidth to TC.lw (the appearance slider,
@@ -4520,7 +4528,7 @@ function drawQualityChart(points){
   const oneRun=points.length===1, realRuns=points.length;
   points=spanOne(points);
   const mine=TC.xLab && axisWorthDrawing(realRuns) && spdAxisOwner(points)==='qualityChart';
-  const pad={l:padL(40),r:padR(10),t:0,b:mine?AX_PAD:0}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
+  const pad={l:padL(40),r:padR(10),t:2,b:mine?AX_PAD:0}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
   drawYTitle(x,"PING (ms)",w,pad,H);
   const env=points.map(p=>isNum(p.ping_ms)?p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0):NaN).filter(isNum);
   const maxV=Math.max(10, ...(env.length?env:[10]))*1.2, Y=v=>pad.t+(1-v/maxV)*H;
@@ -4653,7 +4661,7 @@ function drawBloatChart(points){
   const realRuns=points.length;
   points=spanOne(points);
   const mine=TC.xLab && axisWorthDrawing(realRuns) && spdAxisOwner(points)==='bloatChart';
-  const pad={l:padL(40),r:padR(10),t:0,b:mine?AX_PAD:8}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
+  const pad={l:padL(40),r:padR(10),t:18,b:mine?AX_PAD:8}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
   drawYTitle(x,"BLOAT (ms)",w,pad,H);
   // Robust ceiling shared by both directions: fit the typical (median) values and the
   // MEDIAN of the per-run tails (never the absolute max - one transient can't squash the
@@ -6596,7 +6604,7 @@ let saveInFlight=false;
     // fails: postAccess has already shown the error, and we must not clear the
     // typed password, POST the settings, or close the drawer as if it saved.
     if(!await postAccess(accessBody())) return;
-    $('authPass').value=''; // access (incl. any password) applied - safe to clear
+    $('authPass').value=''; $('authCurPass').value=''; // access (incl. any password) applied - safe to clear
     const r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(r.ok){ applySettings(await r.json());
       lsSet('theme', document.documentElement.dataset.theme); lsSet('brightness', parseInt($('setBrightness').value)||100); lsSet('fade', parseInt($('setFade').value)||100);
@@ -6617,7 +6625,7 @@ let saveInFlight=false;
 
 // Discard: throw away unsaved edits (reload saved values) and close the drawer.
 $('discardSettings').addEventListener('click', async () => {
-  serversLoaded=false; const ok=await loadSettings(); loadAccess(); $('authPass').value='';
+  serversLoaded=false; const ok=await loadSettings(); loadAccess(); $('authPass').value=''; $('authCurPass').value='';
   // A failed refetch leaves the discarded edits in the form; don't close over them
   // (the next open would baseline them as saved) - keep the drawer open and say so.
   if(!ok){ $('settingsMsg').textContent='Could not reach the server - your changes were NOT discarded. Try again.'; return; }
@@ -6722,6 +6730,10 @@ async function loadAccess(){
   $('setNetAccess').checked=!a.local_only;
   accessSavedLocalOnly=!!a.local_only; // the warn bubble is for PENDING cut-offs only, not the already-saved state
   $('localOnlyWarn').classList.remove('show');
+  // local_only_active is the ENFORCED state (mirrors auth_active): in a bridged
+  // container the loopback filter is inert, so tell the operator the truth
+  // instead of letting the saved toggle claim a restriction that isn't there.
+  $('localOnlyContainerNote').classList.toggle('show', !!a.local_only && !a.local_only_active);
   accessLanUrls=a.lan_urls||[]; accessPort=a.port||'9000';
   renderAccessUrls();
   $('setAuthEnabled').checked=!!a.auth_enabled;
@@ -6729,6 +6741,9 @@ async function loadAccess(){
   $('loginUser').value=a.user||'admin';   // prefill the login overlay with the real username
   accessHasPassword=!!a.has_password;
   $('logoutBtn').style.display = a.auth_active ? '' : 'none';
+  // Step-up: with auth ACTIVE the server refuses access changes without the
+  // current password, so surface the field exactly when it is required.
+  $('curPassField').style.display = a.auth_active ? '' : 'none';
   // The recovery hint only matters once a password exists; hide the whole
   // footer (rule included) when neither it nor Log out has anything to say.
   $('resetHint').style.display = a.has_password ? '' : 'none';
@@ -6742,7 +6757,10 @@ async function loadAccess(){
 // "Require login" toggle.
 function updateAuthFields(){
   const on=$('setAuthEnabled').checked;
-  document.querySelectorAll('.access-grid .afield').forEach(f=>f.classList.toggle('disabled', !on));
+  // curPassField is exempt: while auth is ACTIVE the server demands the current
+  // password even for the save that turns login off, so it must stay usable
+  // whatever the pending toggle says.
+  document.querySelectorAll('.access-grid .afield:not(#curPassField)').forEach(f=>f.classList.toggle('disabled', !on));
   $('authUser').disabled = !on;
   $('authPass').disabled = !on;
   // Recomputed here (not just at load) so flipping "Require login" on shows
@@ -6758,7 +6776,8 @@ function accessBody(){ return {
   local_only:   !$('setNetAccess').checked,   // toggle is inverted: on = network-reachable
   auth_enabled: $('setAuthEnabled').checked,
   username:     $('authUser').value.trim(),
-  password:     $('authPass').value,   // "" = keep current
+  password:     $('authPass').value,          // "" = keep current
+  current_password: $('authCurPass').value,   // step-up proof; ignored while auth is inactive
 }; }
 let accessLanUrls=[], accessPort='9000', accessSavedLocalOnly=false, accessHasPassword=false;
 // Copy without the async Clipboard API when it isn't available: the dashboard is

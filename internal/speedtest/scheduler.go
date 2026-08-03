@@ -448,6 +448,7 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	// verdict; alerting happens below.
 	var failures []string
 	thresholdsActive, judged := false, false
+	measuredClean := false // no verdict, but every threshold the run COULD measure passed
 	if s.ThresholdsFn != nil {
 		if t := s.ThresholdsFn(); t.Any() {
 			thresholdsActive = true
@@ -475,6 +476,9 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 					s.log.Debug("speedtest thresholds", "healthy", false, "failures", failures)
 				case thresholdsUnmeasured(sp, t):
 					// Unknown, not green: leave Healthy nil and the streak alone.
+					// But every threshold this run COULD measure passed - evidence
+					// for the cadence (below), even though it is not a verdict.
+					measuredClean = true
 					s.log.Debug("speedtest thresholds passed what was measurable, but an enabled check had no inputs; recording no verdict")
 				default:
 					judged = true
@@ -504,6 +508,16 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		s.log.Error("speedtest store", "err", err)
 		return sp, fmt.Errorf("speedtest: persist result: %w", err)
 	}
+	// The run's selection report, keyed to the row just written (sp.TS, never a
+	// second clock read - the next second would detach the rows from their run).
+	// nil is the normal case for every engine but Ookla. Non-fatal on error: the
+	// run itself is durable, and a lost report costs explainability, not
+	// history. The ctx.Err() gate above already covers shutdown for both writes.
+	if res.Selection != nil {
+		if err := s.store.InsertSpeedServers(ctx, selectionRows(sp.TS, res.Selection)); err != nil {
+			s.log.Error("speedtest selection store", "err", err)
+		}
+	}
 	// Debounced alerting: fire only once a breach has persisted for the configured
 	// number of consecutive runs, so a single blip doesn't page. The counter only
 	// moves when thresholds are active; a recovered run resets it. Streak of 1
@@ -531,9 +545,20 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 			s.consecBreach = 0
 		}
 	case thresholdsActive:
-		// Active thresholds, but this run measured none of the quantities they
-		// cover. Leave the breach streak untouched: a genuine breach still stands,
-		// and a run we could not judge must neither clear it nor be recorded green.
+		// Active thresholds, but no verdict this run. Leave the breach streak
+		// untouched: a genuine breach still stands, and a run we could not judge
+		// must neither clear it nor be recorded green.
+		//
+		// A permanently-unmeasurable enabled check (e.g. a loss limit against a
+		// server that never supports the UDP probe) must not pin the fast cadence
+		// forever after one real breach, though. When the MEASURABLE thresholds
+		// all passed this run, back the adaptive cadence off - the same principle
+		// as the cleared-thresholds reset below - while leaving the breach streak
+		// untouched (an unran check can neither clear a genuine breach nor record
+		// the run green).
+		if measuredClean {
+			s.lastUnhealthy.Store(false)
+		}
 	default:
 		// No active thresholds this run: reset the breach state. lastUnhealthy and
 		// consecBreach update only here, and curInterval keys off lastUnhealthy -
@@ -828,4 +853,26 @@ func thresholdsMeasurable(sp store.SpeedSample, t settings.Thresholds) bool {
 		return true
 	}
 	return false
+}
+
+// selectionRows converts a winner's selection report for persistence - the
+// same field-by-field seam RunOnce uses for Result -> store.SpeedSample. It
+// lives HERE, not in selection.go: the Scheduler is the package's only store
+// client, and the engine files stay persistence-free.
+func selectionRows(runTS int64, rep *SelectionReport) []store.SpeedServerRow {
+	rows := make([]store.SpeedServerRow, 0, len(rep.Candidates))
+	for _, c := range rep.Candidates {
+		rows = append(rows, store.SpeedServerRow{
+			RunTS: runTS, ServerID: c.ServerID, Server: c.Server, DistanceKM: c.DistanceKM,
+			RankOrder: int64(c.RankOrder), RankPingMS: c.RankPingMS,
+			Selected: c.Selected, Measured: c.Measured, Err: c.Err,
+			DownMbps: c.DownMbps, UpMbps: c.UpMbps, PingMS: c.PingMS,
+			PingBestMS: c.PingBestMS, JitterMS: c.JitterMS,
+			DownloadBytes: c.DownloadBytes, UploadBytes: c.UploadBytes,
+			CapacityMbps: c.CapacityMbps, BelievedCapacityMbps: c.BelievedCapacityMbps,
+			CappedDirection: c.CappedDirection, Score: c.Score,
+			Winner: c.Winner, WinReason: c.WinReason,
+		})
+	}
+	return rows
 }

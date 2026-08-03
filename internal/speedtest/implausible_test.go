@@ -1,6 +1,13 @@
 package speedtest
 
-import "testing"
+import (
+	"context"
+	"io"
+	"log/slog"
+	"testing"
+
+	ookla "github.com/showwin/speedtest-go/speedtest"
+)
 
 // rr builds a Result with the fields the guard and the score read.
 func rr(name string, down, up, ping float64) Result {
@@ -131,5 +138,52 @@ func TestImplausibleLeavesSingleServerScoringUntouched(t *testing.T) {
 	r := rr("solo", 45, 151, 40)
 	if got, want := roundScore(r, "both", nil), resultScore(r, "both"); got != want {
 		t.Errorf("solo score = %v, want the unguarded %v", got, want)
+	}
+}
+
+// Pins that a winner whose own direction the round rejected is STORED at the
+// round middle, not verbatim - the guard used to cap only the DECISION
+// (believableCapacity feeds scoring), so the raw 151 landed in history, the
+// chart, and threshold eval even though the round itself refused to believe
+// it. The selection report keeps the raw reading plus CappedDirection, which
+// documents WHY the stored speed row differs.
+func TestRunReasonStoresTheBelievedWinningDirectionNotTheVerbatimOne(t *testing.T) {
+	requireQuiet(t)
+	stubServerList(t)
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		switch srv.ID {
+		case "1": // wins on its genuine 900 download; its 151 upload is rejected
+			return Result{Server: "s1", ServerID: "1", DownloadMbps: 900, UploadMbps: 151, PingMS: 5}, nil
+		case "2":
+			return Result{Server: "s2", ServerID: "2", DownloadMbps: 700, UploadMbps: 49, PingMS: 5}, nil
+		}
+		return Result{Server: "s3", ServerID: "3", DownloadMbps: 300, UploadMbps: 48, PingMS: 5}, nil
+	})
+	o := NewOokla()
+	o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	o.BestOfFn = func() bool { return true }
+	o.PriorDataFn = func() bool { return true }
+
+	res, err := o.RunReason(context.Background(), "manual")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ServerID != "1" {
+		t.Fatalf("winner = %s, want 1 (the cap must never change which server wins)", res.ServerID)
+	}
+	if res.UploadMbps != 49 {
+		t.Errorf("stored UploadMbps = %v, want 49 (the round middle the guard believed, not the verbatim 151)", res.UploadMbps)
+	}
+	if res.DownloadMbps != 900 {
+		t.Errorf("stored DownloadMbps = %v, want 900 (the honest direction must be untouched)", res.DownloadMbps)
+	}
+	// The report still shows the raw reading and names the cap, so the stored
+	// row's difference is explained rather than silent.
+	raw := selCandidate(t, res.Selection, "1")
+	if raw.UpMbps != 151 {
+		t.Errorf("report row UpMbps = %v, want the raw 151", raw.UpMbps)
+	}
+	if raw.CappedDirection != "up" {
+		t.Errorf("report row CappedDirection = %q, want up", raw.CappedDirection)
 	}
 }
