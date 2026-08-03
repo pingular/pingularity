@@ -681,7 +681,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	winReason := winReasonScore
 	switch {
 	case id != "" && want <= 1:
-		winReason = winReasonPinned
+		winReason = WinReasonPinned
 	case want <= 1:
 		winReason = winReasonFastestRank
 	case bootstrap:
@@ -1918,6 +1918,12 @@ type ServerInfo struct {
 	Name       string  `json:"name"`
 	Country    string  `json:"country"`
 	DistanceKM float64 `json:"distance_km"`
+	// Lat/Lon are deliberately not serialized: they exist so the browse
+	// handler can centre a list fetch on a server (the last auto run's), and
+	// the response shape stays exactly what the UI and demo already speak.
+	// 0,0 when the Ookla record's coordinate strings don't parse (serverCoord).
+	Lat float64 `json:"-"`
+	Lon float64 `json:"-"`
 }
 
 // ListOoklaServers returns the Ookla servers the API reports for a location,
@@ -1941,9 +1947,10 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 	}
 	out := make([]ServerInfo, 0, len(servers))
 	for _, s := range servers {
+		lat, lon, _ := serverCoord(s)
 		out = append(out, ServerInfo{
 			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
-			Country: s.Country, DistanceKM: s.Distance,
+			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
@@ -1957,5 +1964,6 @@ func GetOoklaServer(ctx context.Context, id string) (ServerInfo, error) {
 	if err != nil {
 		return ServerInfo{}, err
 	}
-	return ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance}, nil
+	lat, lon, _ := serverCoord(srv)
+	return ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance, Lat: lat, Lon: lon}, nil
 }

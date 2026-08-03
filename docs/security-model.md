@@ -28,13 +28,15 @@ least that covers them:
 
 - **The data directory.** `/var/lib/pingularity` (or the platform equivalent)
   is created and locked down at startup (`0700`, owner only; on Windows a
-  protected ACL granting only SYSTEM and Administrators). Whatever account the
-  service runs as has to own it.
+  protected ACL granting only the service account, SYSTEM, and Administrators -
+  which collapses to SYSTEM + Administrators when the service runs as
+  LocalSystem). Whatever account the service runs as has to own it.
 - **The exit-path traceroute.** The Connection panel traces where your traffic
   leaves your ISP. On Linux that uses a raw ICMP socket when it is permitted
-  (root, `CAP_NET_RAW`, or a suitable `ping_group_range`), and falls back to an
-  unprivileged ICMP datagram socket when it is not. The feature degrades rather
-  than failing, but the full trace wants the privilege.
+  (root or `CAP_NET_RAW`), and falls back to the unprivileged ICMP datagram
+  socket when it is not - which is the path a widened `ping_group_range`
+  permits. The feature degrades rather than failing, but the full trace wants
+  the privilege.
 
 Nothing else needs it, so most channels drop root entirely and grant only the
 raw-socket capability. Where each one lands:
@@ -128,13 +130,15 @@ in front of it:
 
 Two things worth knowing about the filter:
 
-- **In a container it is off, because it cannot work.** A bridged container
-  NATs every external request to the gateway, so the loopback test cannot tell
-  a local user from a LAN one, and enforcing it would lock you out of your own
-  dashboard. So it defaults off there, and **if you turn it on anyway it is
-  ignored rather than enforced**: the Access tab still shows it as on, but no
-  request is refused. Do not rely on it inside a container. The real boundary
-  there is how you publish the port (`-p`) and the login password. The daemon
+- **In a bridged container it is off, because it cannot work.** A bridged
+  container NATs every external request to the gateway, so the loopback test
+  cannot tell a local user from a LAN one, and enforcing it would lock you out
+  of your own dashboard. So it defaults off there, and **if you turn it on
+  anyway it is ignored rather than enforced**: the Access tab still shows it as
+  on, but no request is refused. Do not rely on it in a bridged container - the
+  real boundary there is how you publish the port (`-p`) and the login
+  password. A `--network=host` container sees real peer addresses, so the
+  filter enforces there exactly as it does natively. The daemon
   says so in the log.
 - **A same-host reverse proxy passes it.** Traffic arriving through a proxy on
   the same machine looks local, because it is. The filter cannot block a remote

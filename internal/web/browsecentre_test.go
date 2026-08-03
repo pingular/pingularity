@@ -11,15 +11,17 @@ import (
 	"github.com/pingular/pingularity/internal/speedtest"
 )
 
-// THE PICKER MUST NOT POINT AT A CITY AUTO CANNOT CHOOSE. This handler used to
-// run its own cascade - exit coordinate, else the Cloudflare PoP - and the PoP
-// rung fired on any missing exit COORDINATE, not only where a traceroute could
-// not run. On a residential link whose last hop RIPE cannot place, that centred
-// the list on a distant PoP while every city auto races was domestic; the two
-// pools are disjoint, so the server auto actually tests from could not be found
-// in the picker at any scroll position, and the panel captioned it "near your
-// ISP's exit".
-func TestBrowseListCentresOnACityAutoWouldRace(t *testing.T) {
+// THE FALLBACK CENTRE MUST BE A CITY AUTO COULD CHOOSE. This pins the
+// FALLBACK path only - the nil store below confines the handler to it; the
+// primary path (centring on the last auto run's server) is pinned in
+// lastruncentre_test.go. Historically this handler ran its own cascade - exit
+// coordinate, else the Cloudflare PoP - and the PoP rung fired on any missing
+// exit COORDINATE, not only where a traceroute could not run. On a residential
+// link whose last hop RIPE cannot place, that centred the list on a distant
+// PoP while every city auto races was domestic; the two pools are disjoint, so
+// the server auto actually tests from could not be found in the picker at any
+// scroll position, and the panel captioned it "near your ISP's exit".
+func TestBrowseFallbackCentresOnACityAutoWouldRace(t *testing.T) {
 	var gotLat, gotLon float64
 	old := listOoklaServers
 	listOoklaServers = func(_ context.Context, lat, lon float64) ([]speedtest.ServerInfo, error) {

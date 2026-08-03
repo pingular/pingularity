@@ -64,7 +64,10 @@ const (
 	winReasonScore       = "score"          // best-of: highest roundScore (with tie-breaks)
 	winReasonPingBoot    = "ping_bootstrap" // best-of with no speed history: lowest ping decided
 	winReasonFastestRank = "fastest_ranked" // want=1 auto: head of the ping-ranked list
-	winReasonPinned      = "pinned"         // user-pinned single target: no contest ran
+	// Exported: the web browse-centring reads this back out of persisted
+	// speed_servers rows to skip pinned runs, and a compile-time tie beats two
+	// copies of the literal drifting apart.
+	WinReasonPinned = "pinned" // user-pinned single target: no contest ran
 )
 
 // candidateRows snapshots the ranked list into report rows, in rank order.

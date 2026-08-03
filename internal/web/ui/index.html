@@ -3710,8 +3710,16 @@ async function refreshStatus() {
   // searched for, or pinned, because it reports a measurement rather than a
   // rule. Only the scope note under the picker reads it.
   if (s.speed && s.speed.server !== lastRunServer){
+    const hadRun = lastRunServer !== '';
+    const wasLoaded = serversLoaded;
     lastRunServer = s.speed.server || '';
-    if(serversLoaded) updateScopeNote();
+    // A NEW run may have landed in a different city, so a default browse list
+    // centred on the previous run is no longer known-true: drop the past-tense
+    // claim (the fallback wording stays true either way) and refetch on the
+    // next tab visit. The initial ''->server transition invalidates nothing -
+    // a list fetched before it already had this run in the store.
+    if (hadRun && !autoLoc){ autoCentreLastRun=false; serversLoaded=false; }
+    if (wasLoaded) updateScopeNote();
   }
   if (!!s.bridged_container !== bridgedContainer){ bridgedContainer=!!s.bridged_container; refreshNetinfo(); }
   // Connection info off freezes the panel below - re-render so the bubble appears
@@ -5675,21 +5683,26 @@ $('netinfoRefresh').addEventListener('click', async () => {
   try{ await refreshNetinfo(true); } finally{ b.classList.remove('spinning'); }
 });
 
-let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoLoc='', autoLabel='', autoDefaultLoc='', lastRunServer='', defaultSettings=null;
+let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoLoc='', autoLabel='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
 const shortPlace = s => s ? s.split(',').slice(0,2).join(',').trim() : '';
 // autoOptionText / autoScopeText are pure so the two most-read strings in this
 // panel are unit-tested rather than eyeballed. Only a SEARCHED city may be named
 // as auto's centre: with none, auto re-decides by racing the cities this
 // connection points at, fresh on every test and deliberately never cached, so
 // there is no city to name in advance. autoDefaultLoc is the BROWSING list's
-// centre - one of those candidates, but not necessarily the winner - and is
-// never allowed to stand in for auto's answer, which is what it used to do
-// while captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
+// centre. When the daemon centred it on the last auto run's server (d.centre
+// 'last_run' -> autoCentreLastRun) it may be NAMED as where auto last landed -
+// in the past tense, remembering for display what selection re-decides - but a
+// fallback centre (a candidate city, before any auto run exists) is never
+// allowed to stand in for auto's answer, which is what it used to do while
+// captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
 const autoOptionText = label => { return label ? `Auto - fastest in ${label}` : 'Auto - fastest near you'; };
-const autoScopeText = (what, label, listCentre, lastServer) => {
+const autoScopeText = (what, label, listCentre, lastServer, centredOnLastRun) => {
   if(label) return `Auto picks ${what} in <b>${esc(label)}</b>.`;
   let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - decided fresh on every test.`;
-  t += listCentre
+  if(centredOnLastRun && listCentre)
+    t += ` The list here is for browsing, centred on <b>${esc(listCentre)}</b>, where your last auto test ran.`;
+  else t += listCentre
     ? ` The list here is for browsing, centred on <b>${esc(listCentre)}</b>; auto may test from a different city.`
     : ' The list here is for browsing, centred on your connection’s own location; auto may test from a different city.';
   // Past tense on purpose: it reports what the last run measured, which stays
@@ -5713,7 +5726,7 @@ function updateScopeNote(){
     el.innerHTML=t; return;
   }
   const what = bestOf ? 'the 3 fastest servers' : 'the fastest server';
-  el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer);
+  el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
 function populateServers(list){
   const sel=$('setServer'); sel.innerHTML='';
@@ -5745,7 +5758,7 @@ async function fetchServers(opts){
     const d=await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'}})).json();
     if(opts.id){ pendingServer=String(opts.id); autoLoc=''; autoLabel=''; } // pin a specific server (not a location scope)
     else if(opts.city){ autoLoc=`${d.lat},${d.lon}`; autoLabel=shortPlace(d.location); pendingServer=''; } // a fresh city search sets the auto scope, clearing any pinned server
-    else autoDefaultLoc=shortPlace(d.location||''); // centre of the BROWSING list only: the first candidate city auto would race that has a coordinate (see handleSpeedtestServers). NOT what auto picks, and never sent back to the daemon.
+    else { autoDefaultLoc=shortPlace(d.location||''); autoCentreLastRun = d.centre==='last_run'; } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
     populateServers(d.servers);
   }finally{ setServerLoading(false); }
 }
