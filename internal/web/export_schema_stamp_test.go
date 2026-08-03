@@ -22,10 +22,15 @@ func TestExportStampsTheVersionTheFileNeeds(t *testing.T) {
 	}{
 		{"config=1", 1, ""},
 		{"latency=1", 1, ""},
-		{"speed=1", 1, ""},
-		{"config=1&latency=1&speed=1", 1, ""},
-		{"downtime=1", exportSchema, "pauses"},
-		{"config=1&downtime=1", exportSchema, "pauses"},
+		// The speed category carries speed_servers (the v3 key) since the
+		// selection reports landed, so any speed export stamps 3.
+		{"speed=1", exportSchema, "speed_servers"},
+		{"config=1&latency=1&speed=1", exportSchema, "speed_servers"},
+		// pauses is the v2 key; without a v3 key in the file these stamp
+		// exactly 2 - the version the FILE needs, not the newest this build
+		// knows (that distinction is this test's whole point).
+		{"downtime=1", 2, "pauses"},
+		{"config=1&downtime=1", 2, "pauses"},
 	}
 	for _, tc := range cases {
 		s := newTestServer(t)
@@ -43,16 +48,19 @@ func TestExportStampsTheVersionTheFileNeeds(t *testing.T) {
 		if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
 			t.Fatalf("%s: decode export: %v", tc.query, err)
 		}
-		// The version must track the v2-only key, both ways: absent -> 1 so v1
-		// readers keep their downgrade path, present -> past what they accept.
-		var hasPauses bool
-		for _, c := range env.Categories {
-			if c == "pauses" {
-				hasPauses = true
+		// The version must track the deciding key, both ways: absent -> the
+		// older stamp so older readers keep their downgrade path, present ->
+		// past what they accept.
+		if tc.carries != "" {
+			var has bool
+			for _, c := range env.Categories {
+				if c == tc.carries {
+					has = true
+				}
 			}
-		}
-		if hasPauses != (tc.carries == "pauses") {
-			t.Fatalf("%s: fixture drift: pauses in categories = %v", tc.query, hasPauses)
+			if !has {
+				t.Fatalf("%s: fixture drift: %s not in categories %v", tc.query, tc.carries, env.Categories)
+			}
 		}
 		if env.Version != tc.want {
 			t.Errorf("%s: pingularity_export=%d, want %d (categories %v): a file without v2-only data "+

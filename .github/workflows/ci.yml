@@ -39,6 +39,16 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      - name: dead code
+        # With tests as entry points (-test) the legitimate test seams
+        # (raceCities, bestResult, resultScore, stats.ResetForTest, ...) are
+        # reachable and only truly-orphaned functions fail the gate.
+        run: |
+          out=$(go run golang.org/x/tools/cmd/deadcode@v0.48.0 -test ./...)
+          if [ -n "$out" ]; then
+            echo "dead code found:"; echo "$out"; exit 1
+          fi
+
       - name: build
         run: go build ./...
 

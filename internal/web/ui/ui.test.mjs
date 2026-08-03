@@ -1961,29 +1961,42 @@ test('drawCursor: still dashed, still phase-shifted, still dimmer when not selec
   assert.equal(a.ops[a.ops.length - 1], 'restore');
 });
 
-// THE GAPS BETWEEN THE THREE CHARTS CARRY MEANING. Speed and quality are two
-// line charts sharing one x axis and read as a pair, so they sit tight together.
-// Bufferbloat is a different kind of chart - diverging about a centre zero, with
-// its own scale - and the wider gap is what says so.
+// THE GAPS BETWEEN THE THREE CHARTS CARRY MEANING - AND LIVE INSIDE THE
+// CANVASES. Speed and quality are two line charts sharing one x axis and read
+// as a pair, so they sit tight together; bufferbloat is a different kind of
+// chart - diverging about a centre zero, with its own scale - and the wider
+// gap is what says so.
 //
-// This exists because that grouping was once flattened to a uniform 2px while
-// chasing an unrelated goal (making the selection cursor read as one continuous
-// line down the stack). Uniformity looked like an improvement in the diff and
-// was a regression on screen. The cursor's continuity is handled by dash PHASE
-// (drawCursor's stackY), which is independent of the gap - so spacing is free to
-// express grouping, and no future tidy-up should trade it away again.
-test('the chart stack spaces bufferbloat apart from the speed/quality pair', () => {
-  const gap = id => {
+// Two failed shapes, both pinned against here. (1) The grouping was once
+// flattened to a uniform 2px while chasing cursor continuity - uniformity
+// looked like an improvement in the diff and was a regression on screen, so
+// the spacing itself must stay (bufferbloat clearly apart, the pair joined).
+// (2) The spacing then lived as CSS margin-top on the canvases - but a margin
+// is a strip NO canvas can paint, so the shared selection cursor visibly broke
+// across the 18px before bufferbloat; dash phase (drawCursor's stackY) aligns
+// the pattern across canvases but cannot draw in a gap between them. So the
+// spacing lives INSIDE each canvas as its plot pad.t, the canvases sit flush,
+// and the full-canvas cursor runs through the spacing unbroken. Grouping and
+// continuity, both.
+test('the chart stack spaces bufferbloat apart, inside the canvases', () => {
+  // No dead strips: the stacked pair below the speed chart must carry no
+  // margin, or the cursor breaks there again.
+  for (const id of ['qualityChart', 'bloatChart']) {
     const tag = html.match(new RegExp(`<canvas id="${id}"[^>]*>`))[0];
-    const m = tag.match(/margin-top:(\d+)px/);
-    assert.ok(m, `${id} has no explicit margin-top; the stack spacing is deliberate`);
+    assert.ok(!/margin/.test(tag),
+      `${id} has a CSS margin - a strip the cursor cannot paint: ${tag}`);
+  }
+  // The grouping spacing, now as in-canvas top padding on the chart plots.
+  const padT = fn => {
+    const m = script.match(new RegExp(`spdAxisOwner\\(points\\)==='${fn}';\\r?\\n\\s*const pad=\\{[^}]*t:(\\d+)`));
+    assert.ok(m, `${fn}: pad literal not found beside its axis-owner line`);
     return Number(m[1]);
   };
-  const quality = gap('qualityChart'), bloat = gap('bloatChart');
+  const quality = padT('qualityChart'), bloat = padT('bloatChart');
   assert.ok(quality <= 4,
-    `quality sits ${quality}px under speed; the pair must stay visually joined`);
+    `quality reserves ${quality}px under speed; the pair must stay visually joined`);
   assert.ok(bloat >= 12,
-    `bufferbloat sits only ${bloat}px under quality - it reads as part of the pair above it`);
+    `bufferbloat reserves only ${bloat}px under quality - it reads as part of the pair above it`);
   assert.ok(bloat > quality * 3,
     'the break before bufferbloat must be clearly larger than the one inside the pair');
 });

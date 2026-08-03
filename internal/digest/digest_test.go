@@ -605,3 +605,26 @@ func TestUnmeasuredDirectionRendersAbsent(t *testing.T) {
 		t.Error("webhook must include median_down_mbps when download was measured")
 	}
 }
+
+// A transient settings-read failure must not be taken for a never-armed
+// install: the never-armed branch ARMS the watermark to now, overwriting a
+// real (possibly-due) watermark it simply could not load, and the pending
+// digest period is dropped rather than delayed. With no in-memory copy to
+// fall back on (a fresh process), the tick must skip and retry next poll.
+func TestReadErrorDoesNotArm(t *testing.T) {
+	m, st, fs := newManager(t)
+	t0 := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return t0 }
+	// A real watermark two periods in the past (a digest would be due).
+	m.setLastSent(context.Background(), t0.Add(-48*time.Hour))
+	// Simulate a transient store read failure + a fresh process (no in-memory copy).
+	st.Close()
+	m.lastSentMem = time.Time{}
+	m.tick(context.Background())
+	if fs.calls != 0 {
+		t.Fatalf("must not send on a read error; got %d", fs.calls)
+	}
+	if !m.lastSentMem.IsZero() {
+		t.Fatalf("read error must not arm the watermark (lastSentMem=%v); arming drops the pending digest period", m.lastSentMem)
+	}
+}

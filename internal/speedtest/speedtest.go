@@ -35,6 +35,14 @@ type Result struct {
 	LoadedUpMS      *float64
 	LoadedDownP95MS *float64
 	LoadedUpP95MS   *float64
+
+	// Selection is how this winner was chosen: every candidate considered,
+	// measured, scored, and why this one won (see SelectionReport). Set only
+	// by the Ookla engine's winner Result; nil for iperf3 (no server
+	// selection) and every plain-Run fake. Engine->Scheduler handoff only:
+	// Result is never JSON-marshalled and never leaves the package boundary
+	// except as store.SpeedSample, which this deliberately does not join.
+	Selection *SelectionReport
 }
 
 // Tester runs one measurement. Implemented by Ookla and Iperf.

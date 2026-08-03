@@ -41,6 +41,12 @@ var piiKeys = map[string]bool{
 	"handoff":     true, // peering/transit hop rDNS name on the path out
 	"handoff_asn": true, // peering/transit ASN on the path out (network identifier)
 	"server":      true, // speedtest server "<Sponsor>, <Name>" (reveals metro + ISP)
+	// Pre-existing mask gaps closed with the 2026-08 selection-observability
+	// work: both carry the same "<Sponsor>, <Name>" (or raced-city) labels as
+	// `server`, and the best-of promotion to Warn moved them into the default,
+	// disk-persisted ring where an unmasked value would otherwise live forever.
+	"winner":       true, // best-of winning server label
+	"winner_label": true, // city-race winning origin label (a place name)
 }
 
 // Capture formats every record twice - once with full detail, once with PII

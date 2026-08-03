@@ -74,3 +74,49 @@ func TestRunReasonCarriesOnPastAStalledServer(t *testing.T) {
 		t.Errorf("winner = %q, want srv2 (the best of the two healthy servers)", res.Server)
 	}
 }
+
+// Pins the ownership fence on the abandoned path: after a transfer is
+// abandoned RunReason must name the server from its pre-measure snapshot,
+// never from the orphan-owned srv - the orphan's goroutines still own the
+// object ("the caller must read no field of either", runTransfer), and a
+// library bump that mutates Sponsor/Name mid-transfer would turn the label
+// read into a data race. The mutating goroutine here plays that future
+// library; the race detector is the assertion.
+func TestResumeAfterAbandonDoesNotReadTheOrphanedServersLabel(t *testing.T) {
+	requireQuiet(t)
+	stubServerList(t)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		if srv.ID == "1" {
+			// The orphan: keeps writing srv fields after the abandoned return,
+			// exactly as runTransfer's contract warns.
+			go func() {
+				defer close(done)
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+						srv.Sponsor = fmt.Sprintf("mutated-%d", i)
+					}
+				}
+			}()
+			return Result{}, fmt.Errorf("download: %w: %w", errTransferAbandoned, context.Canceled)
+		}
+		return Result{Server: "srv" + srv.ID, ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 10, PingMS: 10}, nil
+	})
+
+	o := NewOokla()
+	o.BestOfFn = func() bool { return true }
+	res, err := o.RunReason(context.Background(), "manual")
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatalf("RunReason: %v", err)
+	}
+	if res.Server == "" {
+		t.Fatal("the run must still return a winner from the healthy servers")
+	}
+}

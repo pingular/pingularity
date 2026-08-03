@@ -1222,3 +1222,65 @@ func TestRoundDNSInflightDiscardedAfterToggleOff(t *testing.T) {
 		t.Fatalf("the discarded probe still inserted %d dns row(s)", n)
 	}
 }
+
+// Pins that a monitor which is paused (EnabledFn -> false, so round() never
+// runs) still drains its pending-transition buffer, because Run retries it in
+// the loop head and not only inside round(). Without the loop-head flush a
+// transition buffered before a pause sat unwritten for the whole pause and was
+// lost outright if the daemon restarted first - a permanent gap in outage
+// history (a missing 'down' cannot be reconstructed later). The pre-loop
+// initial round is also gated off by EnabledFn=false, so the loop-head flush
+// is the sole path under test.
+func TestPausedMonitorFlushesPendingEvents(t *testing.T) {
+	stats.ResetForTest()
+	m, st := newTestMonitor(t, 2, 1)
+	m.prober = prober.New(nil, time.Second)
+	m.DNSFn = func() bool { return false }
+	m.EnabledFn = func() bool { return false }
+	m.IntervalFn = func() time.Duration { return time.Hour }
+	m.bufferPendingEvent(time.Unix(100, 0), "down", -1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); m.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && eventCount(t, st, "down") == 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if got := eventCount(t, st, "down"); got != 1 {
+		t.Fatalf("pending 'down' not flushed while paused: eventCount = %d, want 1", got)
+	}
+}
+
+// Pins that a round whose ctx is already cancelled (shutdown) must not advance
+// the FSM or fire OnTransition, even with badStreak primed one short of the
+// threshold - cancelled dials read as a total outage, and confirming them
+// would fabricate a LINK DOWN (plus a down-alert and a doomed event write) on
+// the way out.
+func TestShutdownCancelledRoundDoesNotConfirmOutage(t *testing.T) {
+	stats.ResetForTest()
+	m, _ := newTestMonitor(t, 2, 1)
+	m.prober = prober.New(nil, time.Second) // empty targets: a non-Skipped down result
+	m.DNSFn = func() bool { return false }
+	var transitions int
+	m.OnTransition = func(bool, int) { transitions++ }
+	m.online = true
+	m.badStreak = 1 // one short of downAfter=2
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.round(ctx)
+
+	if !m.online {
+		t.Fatal("a cancelled round confirmed a phantom outage (online flipped false)")
+	}
+	if transitions != 0 {
+		t.Fatalf("OnTransition fired %d times on a cancelled round, want 0", transitions)
+	}
+	if got := stats.Lifetime().Counters["monitor.downs"]; got != 0 {
+		t.Fatalf("monitor.downs = %d, want 0", got)
+	}
+}

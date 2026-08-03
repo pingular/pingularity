@@ -61,9 +61,14 @@ func TestExportDeclaresTheVersionThatIncludesPauses(t *testing.T) {
 			"and walks straight past the key, restoring the outages without the observation spans and reporting success",
 			env.Version, lastSchemaWithoutPauses)
 	}
-	// The envelope must also agree with the constant the importer compares against.
-	if env.Version != exportSchema {
-		t.Errorf("envelope says %d but exportSchema is %d", env.Version, exportSchema)
+	// The envelope must stamp the version PAUSES needs (2) - and since v3
+	// exists it must specifically not inflate a pauses-only file to the newest
+	// constant, or rolled-back v2-readers lose a backup they fully understand.
+	if env.Version != 2 {
+		t.Errorf("envelope says %d for a pauses-only export; want exactly 2 (the version the file needs)", env.Version)
+	}
+	if env.Version > exportSchema {
+		t.Errorf("envelope says %d but this build's exportSchema is only %d", env.Version, exportSchema)
 	}
 	var sawPauses bool
 	for _, c := range env.Categories {

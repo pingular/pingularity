@@ -273,7 +273,7 @@ Collected here so you do not have to work them out from the source.
   measurements, or how you use the app is sent anywhere. There is no analytics
   SDK, no usage beacon, and no payload in any request that we send back to
   ourselves. The only request the daemon makes to us is the daily **update
-  check** - a plain GET to `dl.pingularity.dev` for the current version number.
+  check** - a plain GET to `update.pingularity.dev` for the current version number.
   It carries no identifier, no version, and no data about your install: the
   request has an empty body and no query string, and the newer-or-not comparison
   happens entirely on your machine. Like any HTTP fetch it reveals the

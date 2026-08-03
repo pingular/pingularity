@@ -266,18 +266,6 @@ func isTransientIperfErr(err error) bool {
 	return false
 }
 
-// isAuthErr reports whether an iperf3 failure is the server rejecting our credentials.
-// It's the cue to try flipping the RSA padding: a padding mismatch (patched OAEP client
-// vs unpatched PKCS#1 server, or the reverse) surfaces the same message as a genuinely
-// wrong password, so both look like an auth failure here.
-func isAuthErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "authorization failed") || strings.Contains(s, "authentication failed")
-}
-
 // withRetry runs attempt up to 1+retries times, re-running only while the error is
 // transient and ctx is still live, pausing iperfRetryDelay between tries. It returns
 // the final attempt's error (nil on success).

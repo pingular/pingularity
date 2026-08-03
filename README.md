@@ -101,11 +101,32 @@ service (data untouched).
 ### Windows
 
 ```powershell
-winget install pingular.pingularity
+irm https://install.pingularity.dev/winget.ps1 | iex
 ```
 
-winget places `pingularity.exe` on `PATH`; run `pingularity install` from an
-elevated prompt to register the Windows service and start it.
+One paste from **any** PowerShell. The script elevates itself (one UAC click),
+updates a too-old winget first (fresh Windows images ship one that fails zip
+installs silently), points winget at the maintainer-hosted package source
+(`winget.pingularity.dev` - so installs and upgrades never wait on app-store
+moderation), installs under `Program Files`, and registers + starts the
+Windows service. Re-running the same paste later **updates**: it stops the
+service, upgrades, and starts it again. Prefer to run the steps yourself?
+This is what it does, from an **elevated** PowerShell:
+
+```powershell
+winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements
+winget install pingular.pingularity -s pingularity --scope machine
+& "$env:ProgramFiles\WinGet\Links\pingularity.exe" install    # registers the Windows service and starts it
+```
+
+The `source add` is one-time (re-running it just reports the source already
+exists). `--scope machine` matters - it installs under `Program Files`, where
+the Windows service expects its binary; keep it on upgrades too. The last line
+spells out the exe's path because winget adds `pingularity` to the PATH of
+*new* shells only - from your next terminal onward, plain `pingularity` works.
+If the install fails silently right after "Successfully verified installer
+hash", your winget is outdated: update **App Installer** in the Microsoft
+Store and re-run.
 
 > **Downloaded a raw binary in a browser?** macOS Gatekeeper or Windows
 > SmartScreen may block it as "unidentified". Clear the quarantine flag once and
@@ -178,7 +199,13 @@ working `iperf3` and is otherwise identical - same non-root uid 65532, same
   your data and env file are preserved, and the running service is restarted
   onto the new binary automatically.
 - **Homebrew** - `brew upgrade pingularity`, then `sudo pingularity restart`.
-- **winget** - `winget upgrade pingular.pingularity`, then restart the service.
+- **winget** - re-run the one-shot
+  (`irm https://install.pingularity.dev/winget.ps1 | iex`), or by hand from an
+  elevated PowerShell, in this order: `pingularity stop`, then
+  `winget upgrade pingular.pingularity -s pingularity --scope machine`, then
+  `pingularity start`. Stop first - winget cannot replace a running
+  service's binary - and keep `--scope machine`, or winget reinstalls into
+  your user profile and the service loses its program.
 - **Docker** - `docker pull ghcr.io/pingular/pingularity`, then `docker rm -f
   pingularity` and re-run it (the named volume carries your data across).
 - **tarball** - Linux won't let you overwrite a *running* program file
@@ -216,7 +243,7 @@ per-user data dir - `~/.config/pingularity/` on Linux (`$XDG_CONFIG_HOME`
 honoured), `~/Library/Application Support/pingularity/` on macOS - with a
 temp-dir path as the last resort when there is no home directory at all.
 Any flags you *do* pass to `install` are persisted into the service definition.
-Manage with `pingularity stop | restart | status | uninstall`.
+Manage with `pingularity start | stop | restart | status | uninstall`.
 
 Alongside the database sit `logs.txt` (the log viewer's ring, so it survives a
 restart) and **`pingularity.key`** (0600) - the key that encrypts the one secret
@@ -505,7 +532,7 @@ Below that:
 > | reverse DNS | router/host IPs, for names | connection refresh |
 > | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup | when a speedtest runs, and when the Server settings tab is opened or a city is searched |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
-> | **dl.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on |
+> | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on |
 >
 > The six **connection refresh** and **exit discovery** rows are the ones that
 > carry your public IP. They stop when monitoring is paused, and the
@@ -548,7 +575,15 @@ and persist across restarts:
   when a round is decided on throughput, those columns can jump because the round
   changed hands, not because your connection did. It is not averaged across
   servers - that would describe a test that never happened - so read latency and
-  jitter from the charts, which sample continuously and do not depend on who won. Each server gets 90
+  jitter from the charts, which sample continuously and do not depend on who won.
+  One guard runs before the comparison: when one server reports a direction far
+  beyond what the rest of the round agrees on (buffer absorption at the server,
+  not your line), that reading is **held to what the round agrees on** - for the
+  decision and for what lands in history - so a speed you never had can't set a
+  record or pass a threshold. And every round keeps its receipts: which servers
+  were ranked, raced, measured, or failed, each one's numbers, and why the
+  winner won - stored next to the run (`GET /api/speed/runs/servers?ts=`) and
+  summarised in the logs. Each server gets 90
   seconds before it is dropped and the next is tried, so a stalled server can't
   hold up the round; a whole round budgets 6 minutes of work (3 servers x 90s, plus 90s to pick them), under a 7-minute hard ceiling. It costs roughly **3x
   the time and data** of a normal test, so only the runs worth being thorough
@@ -587,15 +622,22 @@ and persist across restarts:
   **Network access** decides whether other devices can reach the dashboard /
   API / `/metrics`, or only this machine - a live loopback filter, so remote
   clients get 403. It starts **off on native installs** (localhost-only until
-  you flip it) and **on in Docker**, where container networking hides who a
-  request really came from, so the filter cannot be enforced - publish the port
-  narrowly and use the login password instead. The tab shows the **reachable
+  you flip it) and **on in Docker**. In a *bridged* container the network hides
+  who a request really came from, so there the filter cannot be enforced -
+  publish the port narrowly and use the login password instead (the API reports
+  the difference as `local_only` vs `local_only_active`, and the tab says so). A
+  `--network=host` container sees real peer addresses, so local-only is enforced
+  there exactly as on a native install. The tab shows the **reachable
   address(es)** with port plus a static-IP hint. **Require login** (off by
   default) gates
   everything behind a password: browsers get a login form + session cookie,
   while API clients and Prometheus use HTTP Basic with the same credentials
   (passwords are capped at 72 bytes, the bcrypt limit). Failed logins are
-  recorded (with source IP) in the log and rate-limited per client. Forgot the
+  recorded (with source IP) in the log and rate-limited per client. Once a
+  login is active, changing **any** Access setting - password, username, the
+  login toggle, or Network access - requires re-entering the **current
+  password** (API callers send `current_password`), so a stolen or walked-up
+  browser session cannot quietly take over the account. Forgot the
   password? Run `pingularity reset-auth` on the host to clear it. **Local-only
   cannot block a same-host reverse proxy** (cloudflared, nginx): it delivers
   internet visitors as loopback connections, so pair any proxy with login.
@@ -955,7 +997,8 @@ pingularity_current_outage_seconds > 300
 # Speedtests failing by stage, per hour (server_fetch / ping / download / …)
 sum(rate(pingularity_speed_failures_total[1h])) * 3600
 
-# Webhook deliveries failing or SSRF-blocked - counters appear once a webhook is set
+# Webhook deliveries failing or SSRF-blocked - series exist at 0 from startup,
+# so the first event is a visible 0->1 step for rate()/increase()
 rate(pingularity_notification_failures_total[15m]) > 0
 rate(pingularity_notification_blocked_total[15m]) > 0
 
@@ -1010,6 +1053,11 @@ constant memory.
 - `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail)
 - `GET /api/speed/runs.csv` - all runs as CSV
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
+- `GET /api/speed/runs/servers?ts=` - the server-selection report for one
+  best-of run (`ts` = the run's unix seconds): every candidate that was ranked,
+  raced, measured, or failed - each with its own numbers, the capacity the
+  round believed, any direction it refused to believe, and the rule that made
+  the winner win
 - `GET /api/speed/usage` - cumulative data used per window
 - `GET /api/speedtest/servers?city=` - list Ookla servers (near a city or you)
 - `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable (POST
@@ -1018,7 +1066,7 @@ constant memory.
   per day (how much of it was in range and how much was actually monitored)
 - `GET /api/netinfo` - connection info (IP/ISP/DNS); `POST` forces a full refresh
 - `GET|POST /api/settings` - read / update live settings
-- `GET|POST /api/access` - read / update access controls (local-only, auth, password)
+- `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout
 - `POST /api/speedtest` - run a speedtest now
 - `POST /api/speedtest/abort[?run=…]` - stop a speedtest in flight. A bare POST

@@ -342,3 +342,59 @@ func TestIsInternalTraceTarget(t *testing.T) {
 		}
 	}
 }
+
+// Pins that a confirmed public-IP change followed by a FAILED retrace must not
+// leave the previous network's exit router on display: refresh() used to carry
+// the old exit into the new snapshot BEFORE the IP-change bust, and a nil
+// retrace never cleared it, so the Connection panel showed a router from the
+// wrong network until the next full refresh. On an IP change the snapshot now
+// publishes with no exit (row hidden) until a trace on the NEW network lands.
+// Sibling assertions guard the other directions: a same-IP refresh still
+// carries the exit forward (no flicker), and a successful retrace still
+// publishes the new network's exit (no over-nil'ing).
+func TestRefreshDropsStaleExitOnIPChangeWhenRetraceFails(t *testing.T) {
+	oldV4, oldV6 := ipv4Client, ipv6Client
+	defer func() { ipv4Client, ipv6Client = oldV4, oldV6 }()
+	traceOK := false
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		if traceOK {
+			// Same shape as the single-flight test: private hop then an
+			// unparseable one (public, no ASN) - a successful discovery with no
+			// network lookups.
+			return []tHop{{TTL: 1, IP: "10.0.0.1"}, {TTL: 2, IP: "not-an-ip"}}, nil
+		}
+		return nil, errors.New("no raw socket")
+	})
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.http = canned(404, "")
+	m.ExitTargetFn = func() string { return "1.1.1.1" }
+
+	// Establish network A, then plant its (previously traced) exit.
+	ipv4Client, ipv6Client = canned(200, "198.51.100.7"), canned(500, "")
+	m.Refresh(context.Background())
+	m.traceMu.Lock()
+	m.exit = &ExitInfo{Name: "network-a-router", IP: "203.0.113.9"}
+	m.tracedFor, m.attemptedFor, m.traceAt = "1.1.1.1", "1.1.1.1", time.Now()
+	m.traceMu.Unlock()
+
+	// Same network: the carry-forward keeps A's exit on display (no flicker).
+	m.Refresh(context.Background())
+	if got := m.Get().Exit; got == nil || got.Name != "network-a-router" {
+		t.Fatalf("same-IP refresh must carry the exit forward, got %+v", got)
+	}
+
+	// The network changes and the retrace FAILS: A's router must not survive.
+	ipv4Client = canned(200, "203.0.113.77")
+	m.Refresh(context.Background())
+	if got := m.Get().Exit; got != nil {
+		t.Errorf("IP change with failed retrace left the OLD network's exit on display: %+v", got)
+	}
+
+	// The network changes again and the retrace SUCCEEDS: the new exit shows.
+	traceOK = true
+	ipv4Client = canned(200, "192.0.2.55")
+	m.Refresh(context.Background())
+	if got := m.Get().Exit; got == nil {
+		t.Error("IP change with successful retrace must publish the new network's exit, got nil")
+	}
+}

@@ -138,8 +138,19 @@ func (m *Manager) tick(ctx context.Context) {
 	if m.pendingSince.After(now) {
 		m.pendingSince = time.Time{}
 	}
-	last := m.lastSent(ctx)
-	if m.lastSentMem.After(last) {
+	last, err := m.lastSent(ctx)
+	if err != nil {
+		if m.lastSentMem.IsZero() {
+			// Transient settings-read failure with no in-memory watermark to fall
+			// back on: this is indistinguishable from a real, possibly-due
+			// watermark we simply could not load. Arming to now would overwrite
+			// it and DROP a digest period, so skip this tick and retry on the
+			// next poll.
+			m.Log.Warn("digest read state", "err", err)
+			return
+		}
+		last = m.lastSentMem // read failed but we have a valid in-memory watermark
+	} else if m.lastSentMem.After(last) {
 		last = m.lastSentMem // a prior setLastSent write may have failed; trust memory
 	}
 	if last.IsZero() {
@@ -397,17 +408,18 @@ func fmtMed(v *float64, format string) string {
 	return fmt.Sprintf(format, *v)
 }
 
-func (m *Manager) lastSent(ctx context.Context) time.Time {
+// lastSent reads the persisted watermark. A zero time with a nil error means
+// GENUINELY unset (never-armed); a read failure returns the error instead, so
+// tick can tell "no watermark exists" from "a real, possibly-due watermark we
+// could not load" - arming on the latter would overwrite it and DROP a period.
+func (m *Manager) lastSent(ctx context.Context) (time.Time, error) {
 	all, err := m.Store.AllSettings(ctx)
 	if err != nil {
-		// On a read error, return zero (re-arm) rather than risk a spurious send;
-		// at worst one digest is delayed.
-		m.Log.Warn("digest read state", "err", err)
-		return time.Time{}
+		return time.Time{}, fmt.Errorf("read digest state: %w", err)
 	}
 	n, err := strconv.ParseInt(all[keyLastSent], 10, 64)
 	if err != nil || n <= 0 {
-		return time.Time{}
+		return time.Time{}, nil // genuinely unset -> never-armed
 	}
 	t := time.Unix(n, 0)
 	if t.After(m.clock()) {
@@ -415,9 +427,9 @@ func (m *Manager) lastSent(ctx context.Context) time.Time {
 		// before NTP fixed it) would block every digest until real time caught
 		// up; treat it as unarmed so tick re-arms from now.
 		m.Log.Warn("digest last-sent is in the future; re-arming", "last_sent", t)
-		return time.Time{}
+		return time.Time{}, nil
 	}
-	return t
+	return t, nil
 }
 
 func (m *Manager) setLastSent(ctx context.Context, t time.Time) {

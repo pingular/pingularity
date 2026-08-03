@@ -468,6 +468,12 @@ func (m *Monitor) Run(ctx context.Context) error {
 		// record replays its OWN span, so a store that stays down for hours does not
 		// inflate the stretch it eventually records.
 		held = retryHeldGaps(ctx, m, held)
+		// Same contract for buffered transition events: retry every iteration, not
+		// only in round() - round() is gated behind probing(), so a pause would
+		// otherwise strand a buffered 'down'/'up' for its whole duration (and lose
+		// it outright if the daemon restarts first). A no-op when the buffer is
+		// empty, and safe on a cancelled ctx (the insert fails, the record is kept).
+		m.flushPendingEvents(ctx)
 		booked, p := m.bookUnobservedGap(ctx, lastWall, wallNow, !pauseSpanStart.IsZero(), lastInterval,
 			wallNow.Sub(lastWall))
 		if p != nil {
@@ -648,13 +654,14 @@ func unobservedGap(prev, now time.Time, threshold time.Duration) int64 {
 // booked as downtime and as never-watched at once. bookUnobservedGap now measures
 // how far the monotonic clock actually moved and deducts exactly that; see
 // unobservedInOutage.
-// Returns whether a gap was seen, and whether the wall ANCHOR may advance past
-// it. The second value exists because the pause row can fail to write: the caller
-// re-anchors on every iteration, so advancing after a failed write dropped the
-// interval permanently - those dark hours stayed in the observed denominator and
-// were credited as healthy for as long as the data was kept. Holding the anchor
-// makes the next iteration re-offer a gap that still covers the failed stretch,
-// and pause spans are merged on read, so a retry that overlaps costs nothing.
+// Returns whether a gap was seen, and the measured-but-unwritten observation
+// gap when its row could not be persisted (nil when there was no gap, a pause
+// is open, or the row landed on the first flushGap). The caller queues the
+// pending record in `held` and replays it via retryHeldGaps; the wall anchor
+// ALWAYS advances, because the span travels with the record - advancing loses
+// nothing. (Holding the anchor instead was the old behavior, and it made each
+// retry recompute a longer span from the stale anchor, annexing time the
+// monitor had genuinely been watching.)
 //
 // monoAdvance is how far the MONOTONIC clock moved across [prev, now]; the caller
 // owns that subtraction (Run passes now.Sub(prev) on values straight from
@@ -1015,6 +1022,16 @@ func (m *Monitor) round(ctx context.Context) {
 	m.flushPendingEvents(ctx)
 
 	res := m.prober.Probe(ctx, time.Now())
+	// A round raced by shutdown measured nothing real: cancelled dials read as
+	// all-failed targets (NOT Skipped), and confirming them would fabricate a
+	// LINK DOWN - an FSM flip, a down-alert, a monitor.downs bump and a doomed
+	// event write - as the daemon exits. Checked AFTER Probe deliberately, so a
+	// ctx cancelled DURING the probe (whose results are cancellation artifacts)
+	// is caught too. Treat it as an observation gap, exactly like Skipped below.
+	if ctx.Err() != nil {
+		m.resetStreaks()
+		return
+	}
 	// A skipped round measured nothing (the last enabled family flipped to
 	// "off" between Run's probing() gate and the Probe call). Treat it as
 	// idle, not failed: advancing the FSM here would confirm a false outage

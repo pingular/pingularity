@@ -143,6 +143,12 @@ type Server struct {
 	// IP and must not lock the dashboard out. Set by main before Serve.
 	InContainer bool
 
+	// Bridged is true only for a container that does NOT share the host netns
+	// (util.BridgedContainer): there the loopback filter cannot tell a local user
+	// from a LAN one. A host-networked container has Bridged=false and enforces
+	// local-only normally. Set by main before Serve.
+	Bridged bool
+
 	// DBPath is the on-disk database path, used only for its size on /metrics.
 	// Set by main before Serve; empty (or ":memory:") skips the gauge.
 	DBPath string
@@ -192,8 +198,9 @@ type Server struct {
 	// aggTTL instead of on every status poll.
 	aggMu   sync.Mutex
 	aggAt   time.Time
-	aggBusy bool   // a recompute is in flight; others serve the stale cache
-	aggGen  uint64 // bumped by invalidators; an in-flight recompute that started before the bump can't re-stamp aggAt
+	aggBusy bool          // a recompute is in flight; others serve the stale cache
+	aggWait chan struct{} // non-nil while a recompute owns the cold fill; closed on completion so cold callers wait rather than launch a duplicate scan
+	aggGen  uint64        // bumped by invalidators; an in-flight recompute that started before the bump can't re-stamp aggAt
 	// One Observation per window, ratio and coverage together: the cache cannot
 	// hold a ratio whose coverage was dropped on the way in (it used to hold two
 	// parallel store.Uptime values, and only /metrics ever read the second).
@@ -234,28 +241,46 @@ const aggTTL = 30 * time.Second
 // totals/averages), recomputing only when the cache has expired.
 func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp int64, usage store.DataUsage) {
 	s.aggMu.Lock()
-	fresh := !s.aggAt.IsZero() && time.Since(s.aggAt) < aggTTL
-	// Serve the cache when fresh, or when stale but another caller is already
-	// recomputing - a slightly stale value beats serializing concurrent
-	// /api/status and /metrics behind the slow DB scans below. But never serve
-	// the never-filled cold cache (aggAt still zero): its zero Uptime{} would
-	// publish a spurious 0% uptime to a /metrics scrape racing the first
-	// recompute at startup. In that case fall through and scan ourselves (a rare
-	// redundant scan at cold start; the aggGen guard keeps the re-stamp honest).
-	if (fresh || s.aggBusy) && !s.aggAt.IsZero() {
-		defer s.aggMu.Unlock()
-		return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+	for {
+		fresh := !s.aggAt.IsZero() && time.Since(s.aggAt) < aggTTL
+		// Serve the cache when fresh, or when stale but another caller is already
+		// recomputing - a slightly stale value beats serializing concurrent
+		// /api/status and /metrics behind the slow DB scans below. But never serve
+		// the never-filled cold cache (aggAt still zero): its zero Uptime{} would
+		// publish a spurious 0% uptime to a /metrics scrape racing the first
+		// recompute at startup. Instead, if a recompute already owns the cold fill,
+		// WAIT for it rather than launch a duplicate scan - a /readyz stampede at
+		// cold start otherwise piles goroutines onto the small SQLite pool, each
+		// running the same full-table scans and delaying the first fill.
+		if (fresh || s.aggBusy) && !s.aggAt.IsZero() {
+			defer s.aggMu.Unlock()
+			return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+		}
+		if s.aggBusy { // cold AND a recompute owns it: wait for it, then re-check
+			w := s.aggWait
+			s.aggMu.Unlock()
+			<-w
+			s.aggMu.Lock()
+			continue
+		}
+		break // cold and unowned: this goroutine owns the recompute
 	}
 	// This goroutine owns the recompute; run the scans without the lock so other
 	// callers keep serving the cache. Always release ownership, even on a scan
 	// panic - else the guard's recover() leaves aggBusy stuck true and freezes
-	// the cache for the rest of the process.
+	// the cache for the rest of the process (and cold waiters would block on the
+	// never-closed channel).
 	s.aggBusy = true
+	s.aggWait = make(chan struct{})
 	gen := s.aggGen // if an invalidation lands during the scan, don't re-stamp aggAt with pre-invalidation data
 	s.aggMu.Unlock()
 	defer func() {
 		s.aggMu.Lock()
 		s.aggBusy = false
+		if s.aggWait != nil {
+			close(s.aggWait)
+			s.aggWait = nil
+		}
 		s.aggMu.Unlock()
 	}()
 	// Detached, bounded context: the cache is shared, so one caller disconnecting
@@ -317,6 +342,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/speed", s.handleSpeedHistory)
 	mux.HandleFunc("/api/speed/runs", s.handleSpeedRuns)
 	mux.HandleFunc("/api/speed/runs/delete", s.handleSpeedRunDelete)
+	mux.HandleFunc("/api/speed/runs/servers", s.handleSpeedRunServers)
 	mux.HandleFunc("/api/speed/runs.csv", s.handleSpeedRunsCSV)
 	mux.HandleFunc("/api/speed/usage", s.handleSpeedUsage)
 	mux.HandleFunc("/api/notify/test", s.handleNotifyTest)
@@ -1263,6 +1289,41 @@ func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 		runs = []store.SpeedSample{}
 	}
 	writeJSON(w, map[string]any{"runs": runs, "total": total})
+}
+
+// handleSpeedRunServers serves one run's server-selection report (table
+// speed_servers): who was considered, what each measured, how each scored, and
+// why the winner won. GET /api/speed/runs/servers?ts=<unix>. In production the
+// DB often sits inside a Docker volume the operator cannot open, so this is
+// the report's only reachable surface. 404 means no such RUN; a run that
+// exists but has no rows (pre-feature history, an old backup, an iperf3 run)
+// answers 200 with an empty list - a missing explanation is normal, a missing
+// run is the error. Distinct from /api/speedtest/servers, the server-BROWSE
+// endpoint: that one lists pinnable servers, this one explains a past run.
+func (s *Server) handleSpeedRunServers(w http.ResponseWriter, r *http.Request) {
+	ts, err := strconv.ParseInt(r.URL.Query().Get("ts"), 10, 64)
+	if err != nil || ts <= 0 {
+		http.Error(w, "bad ts", http.StatusBadRequest)
+		return
+	}
+	rows, err := s.store.SpeedServers(r.Context(), ts)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	if len(rows) == 0 {
+		ok, err := s.store.SpeedRunExists(r.Context(), ts)
+		if err != nil {
+			s.internalError(w, err)
+			return
+		}
+		if !ok {
+			http.Error(w, "no such run", http.StatusNotFound)
+			return
+		}
+		rows = []store.SpeedServerRow{}
+	}
+	writeJSON(w, map[string]any{"ts": ts, "servers": rows})
 }
 
 // engineCSV reports the backend that produced a run, mapping a legacy empty
@@ -2344,6 +2405,13 @@ var dataCategories = []struct{ cat, key, table string }{
 	{"latency", "latency", "samples"},
 	{"latency", "dns", "dns"},
 	{"speed", "speed", "speed"},
+	// The speed category spans two tables the way latency and downtime do:
+	// speed holds the runs, speed_servers holds each run's server-selection
+	// report (who was considered, measured, scored - the run's explanation).
+	// Written after "speed" so a restore lands the runs before their
+	// explanations; both merge by key, so order only matters for config
+	// staying last.
+	{"speed", "speed_servers", "speed_servers"},
 	{"downtime", "downtime", "events"},
 	// The downtime category spans two tables, the way latency spans samples + dns:
 	// the outage transitions AND the pause spans that say which wall seconds were
@@ -2398,10 +2466,18 @@ var importReconcileHook func()
 // higher, so stamping 2 is exactly what converts that silent downgrade into its
 // "update before restoring it" error.
 //
+// It went to 3 when the speed category gained `speed_servers` - each run's
+// server-selection report. Not load-bearing the way pauses is (dropping it
+// skews no number), but the table exists to keep runs explainable after the
+// fact, and a restore that silently sheds the explanations while keeping the
+// runs defeats that on the quiet. Per the contract above, new data an older
+// build would silently drop bumps the version; files without the key still
+// stamp 2 or 1 and restore everywhere.
+//
 // minExportSchema is the oldest we still read: bumping the writer must not orphan
 // the backups already on disk.
 const (
-	exportSchema    = 2
+	exportSchema    = 3
 	minExportSchema = 1
 )
 
@@ -2411,12 +2487,16 @@ const (
 // requirement rather than exportSchema is what keeps a pauses-less backup
 // restorable on the builds that predate pauses (the roll-back path).
 func exportSchemaFor(keys []string) int {
+	v := 1
 	for _, k := range keys {
-		if k == "pauses" { // the key the schema went to 2 for (see exportSchema)
-			return 2
+		switch k {
+		case "speed_servers": // the key the schema went to 3 for (see exportSchema)
+			return 3
+		case "pauses": // ... and to 2 for
+			v = 2
 		}
 	}
-	return 1
+	return v
 }
 
 // handleExport streams selected categories as a downloadable JSON file.
