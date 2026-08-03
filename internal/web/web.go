@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,8 +119,9 @@ type Server struct {
 
 	// AutoOriginsFn enumerates the candidate cities auto server-selection races
 	// - main's autoOrigins, the same closure the tester gets, so the two cannot
-	// drift. The settings server-BROWSING list centres on the first of them
-	// carrying a coordinate. Asking main rather than re-deriving it here IS the
+	// drift. The settings server-BROWSING list centres on the last auto run's
+	// server and FALLS BACK to the first of these carrying a coordinate (see
+	// lastAutoRunServerID). Asking main rather than re-deriving it here IS the
 	// repair: this handler used to run its own cascade and the two agreed on
 	// nothing. Nil leaves the list uncentred, which is the unanchored candidate
 	// and an honest answer.
@@ -1843,6 +1845,8 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 
 	var lat, lon float64
 	var locName string
+	var centre string                   // "last_run" when centred on the last auto run's server
+	var centreSrv *speedtest.ServerInfo // that server; guaranteed into the list below
 	if city := strings.TrimSpace(r.URL.Query().Get("city")); city != "" {
 		var err error
 		lat, lon, locName, err = geocode(ctx, city)
@@ -1860,7 +1864,21 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "invalid lat/lon", http.StatusBadRequest)
 			return
 		}
-		// With no explicit coordinate, centre the default list on the first
+		// With no explicit coordinate, centre the default list where auto last
+		// LANDED: the server the most recent auto run measured, its own
+		// selection report proving it was chosen by the race and not a pin.
+		// This remembers for DISPLAY only - the race stays uncached and
+		// re-decides every run (speedtest.raceCities) and nothing here feeds
+		// back into selection - but it upgrades the browse guarantee from "a
+		// city the race would consider" to "the city it last chose", and the
+		// last-used server is always findable in the list (prepended below if
+		// the pool around its own coordinate omits it - Ookla pools really do
+		// that). Stale only until the next auto run - a reconnect triggers one
+		// - and the panel words it in the past tense rather than pretending a
+		// present centre.
+		//
+		// With no qualifying run (fresh install, iperf3/pre-feature history, a
+		// longtime pin, or the ID lookup failing), fall back to the first
 		// candidate city auto-select would race that carries a coordinate: the
 		// exit router when RIPE placed it, else the ISP geolocation of our
 		// public IP (main.autoOrigins, via speedtest.FirstAnchoredOrigin).
@@ -1878,18 +1896,39 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 		// not be found in the picker at all. The PoP is gone from this list
 		// because it is the one centre the race can never choose.
 		//
-		// Still a BROWSING list: it deliberately does NOT reproduce live
-		// auto-select, which RACES these candidates per run (see
-		// speedtest.raceCities) and can land on a different one. Racing here
-		// would spend a list fetch per city and a round of pings at other
-		// people's servers every time the settings pane opens, to reorder a list
-		// the user is about to pick from by hand. So the guarantee is the weaker
-		// one, and the panel says so: the centre is always a city the race would
-		// CONSIDER, never one it could not choose, and the server auto tests
-		// from need not appear here - search its city to see it.
-		if lat == 0 && lon == 0 && s.AutoOriginsFn != nil {
-			if org, ok := speedtest.FirstAnchoredOrigin(s.AutoOriginsFn()); ok {
-				lat, lon, locName = org.Lat, org.Lon, org.Label
+		// Still a BROWSING list either way: it deliberately does NOT race -
+		// that would spend a list fetch per city and a round of pings at other
+		// people's servers every time the settings pane opens, to reorder a
+		// list the user is about to pick from by hand. Two accepted edges keep
+		// the last-run path honest rather than perfect, both self-healing on
+		// the next auto run: a run whose report insert failed (or imported
+		// history without reports) is skipped, so "your last auto test" can
+		// name the newest EXPLAINABLE run rather than the newest run; and a
+		// run auto-selected inside a since-cleared searched-city scope still
+		// counts as auto, because the report records how the winner won, not
+		// the scope it won under. On the FALLBACK the guarantee degrades to
+		// the old, weaker one, and the panel words it so: the centre is a city
+		// the race would consider, never one it could not choose, and the
+		// server auto tests from need not appear here - search its city to
+		// see it.
+		if lat == 0 && lon == 0 {
+			if id, ok := s.lastAutoRunServerID(ctx); ok {
+				// Sub-budget: the by-ID lookup hits a different Ookla backend
+				// than the list fetch, and a differential stall there must not
+				// starve the fetch this handler exists for - the centring is
+				// worth less than the list it centres.
+				idCtx, cancelID := context.WithTimeout(ctx, 6*time.Second)
+				srv, err := getOoklaServer(idCtx, id)
+				cancelID()
+				if err == nil && (srv.Lat != 0 || srv.Lon != 0) {
+					lat, lon, locName = srv.Lat, srv.Lon, srv.Name+", "+srv.Country
+					centre, centreSrv = "last_run", &srv
+				}
+			}
+			if centre == "" && s.AutoOriginsFn != nil {
+				if org, ok := speedtest.FirstAnchoredOrigin(s.AutoOriginsFn()); ok {
+					lat, lon, locName = org.Lat, org.Lon, org.Label
+				}
 			}
 		}
 	}
@@ -1902,7 +1941,56 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 	if list == nil {
 		list = []speedtest.ServerInfo{}
 	}
-	writeJSON(w, map[string]any{"servers": list, "location": locName, "lat": lat, "lon": lon})
+	// The point of last-run centring is that the last-used server is findable
+	// here; Ookla pools are arbitrary enough that even a list fetched around
+	// the server's own coordinate can omit it, so make that unconditional.
+	if centreSrv != nil && !slices.ContainsFunc(list, func(si speedtest.ServerInfo) bool { return si.ID == centreSrv.ID }) {
+		pre := *centreSrv
+		pre.DistanceKM = 0 // distance to the centre, which is this server
+		list = append([]speedtest.ServerInfo{pre}, list...)
+	}
+	writeJSON(w, map[string]any{"servers": list, "location": locName, "lat": lat, "lon": lon, "centre": centre})
+}
+
+// lastAutoRunServerID finds the server the most recent AUTO-selected Ookla run
+// measured, for centring the default browse list. A run qualifies only when
+// its own selection report (speed_servers) shows a winner that was not pinned
+// - a pinned one-off centring the browse list on the pin's city is the exact
+// confusion this path exists to remove, so runs without rows (pre-feature
+// history, imports, iperf3) are skipped rather than trusted. The scan is
+// bounded: a longtime-pinned instance takes the anchored-origin fallback
+// instead of walking its whole history.
+func (s *Server) lastAutoRunServerID(ctx context.Context) (string, bool) {
+	const scanRuns = 12
+	if s.store == nil {
+		return "", false
+	}
+	runs, err := s.store.SpeedRuns(ctx, scanRuns, 0)
+	if err != nil {
+		return "", false
+	}
+	for _, run := range runs {
+		if run.ServerID == "" || (run.Engine != "" && run.Engine != "ookla") {
+			continue
+		}
+		rows, err := s.store.SpeedServers(ctx, run.TS)
+		if err != nil {
+			return "", false
+		}
+		for _, row := range rows {
+			if !row.Winner {
+				continue
+			}
+			if row.WinReason == speedtest.WinReasonPinned {
+				break // a pinned run: keep looking for the last AUTO one
+			}
+			if row.ServerID == "" {
+				break // an imported report missing the ID can centre nothing
+			}
+			return row.ServerID, true
+		}
+	}
+	return "", false
 }
 
 // geocodeClient caps the Nominatim fetch like netinfo's lookup clients: an
@@ -1913,6 +2001,10 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 // assert WHAT COORDINATE this handler centres on without opening a socket at
 // Ookla, and that coordinate is the whole defect this handler was fixed for.
 var listOoklaServers = speedtest.ListOoklaServers
+
+// getOoklaServer resolves the last auto run's server for the browse centring
+// above; a seam for the same reason listOoklaServers is.
+var getOoklaServer = speedtest.GetOoklaServer
 
 var geocodeClient = &http.Client{
 	Timeout:       10 * time.Second,

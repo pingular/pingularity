@@ -1,9 +1,14 @@
 # iperf3-enabled image variant. Same prebuilt, CAP_NET_RAW-stamped pingularity
-# binary as the default Dockerfile, but the final stage is debian:12-slim + iperf3
+# binary as the default Dockerfile, but the final stage is debian:13-slim + iperf3
 # so the opt-in iperf3 speedtest engine has a binary to exec. The default image
-# is distroless/static-debian12 with NO package manager, so iperf3 can never be
+# is distroless/static-debian13 with NO package manager, so iperf3 can never be
 # present there; this variant exists only for users who select the iperf3 engine.
 # See Dockerfile for the default (lean, iperf-free) image.
+#
+# The base must ship iperf3 >= 3.17: IperfVersion in internal/speedtest warns on
+# every older build (the 3.17 authentication-padding change), so a base that apt-
+# installs less than that makes the image flag its own binary. trixie carries 3.18;
+# bookworm's 3.12 is why the base can never fall back a Debian generation.
 #
 # Multi-arch works exactly like the default image: goreleaser (dockers_v2) stages
 # the per-platform binaries - linux/amd64/pingularity, linux/arm64/pingularity -
@@ -13,11 +18,11 @@
 # stays on $BUILDPLATFORM so it still runs natively without emulation.
 #
 # Both FROM lines are pinned by digest (alongside the tag) so Dependabot's docker
-# ecosystem can bump them; the debian:12-slim digest is kept identical to the one
+# ecosystem can bump them; the debian:13-slim digest is kept identical to the one
 # in the default Dockerfile so the two bases stay in lock-step.
 
 # --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
-FROM --platform=$BUILDPLATFORM debian:12-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS setcap
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS setcap
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -34,7 +39,7 @@ COPY $TARGETPLATFORM/pingularity /pingularity
 RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data
 
 # --- final image: debian-slim carrying iperf3 + the capped binary ---
-FROM debian:12-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 # iperf3 gives the opt-in engine a binary to exec (pingularity looks it up on PATH
 # via exec.LookPath; the debian package installs /usr/bin/iperf3, pulling libiperf0
 # as a dependency). ca-certificates + tzdata are bundled by the distroless/static

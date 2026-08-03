@@ -43,6 +43,15 @@ const (
 	maxBody       = 64 << 10        // the real file is <1KB; cap so a garbage body can't bloat memory
 )
 
+// firstPollRetry schedules the checks before the FIRST success. A fresh
+// install's poll is what makes it visible on the fleet dashboard, and the
+// daily cadence turned one unlucky boot - the feed briefly unreachable in the
+// seconds after startup - into a whole day of invisibility. Retry on a short
+// ladder instead, settling at hourly until the first success (an install
+// during an outage appears when the line comes back); after that the daily
+// cadence owns the schedule. Bounded and tiny: one <1KB GET per step.
+var firstPollRetry = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour}
+
 // semverRE matches a leading MAJOR.MINOR.PATCH, ignoring an optional "v" prefix
 // and any pre-release/build suffix. Used both to validate and to parse.
 var semverRE = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)`)
@@ -130,6 +139,7 @@ func (c *Checker) CheckNow() {
 func (c *Checker) Loop(ctx context.Context) {
 	t := time.NewTimer(startupDelay)
 	defer t.Stop()
+	attempts := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -138,9 +148,29 @@ func (c *Checker) Loop(ctx context.Context) {
 			c.checkOnce(ctx)
 		case <-t.C:
 			c.checkOnce(ctx)
-			t.Reset(checkInterval)
+			t.Reset(c.nextInterval(&attempts))
 		}
 	}
+}
+
+// nextInterval picks the delay before the next scheduled check: the
+// firstPollRetry ladder while a release build with checking enabled has never
+// succeeded, the daily cadence otherwise. A disabled toggle or a dev build
+// never fetches, so retrying fast there would spin for nothing - they wait the
+// daily tick (and the toggle's kick re-checks immediately on enable anyway).
+func (c *Checker) nextInterval(attempts *int) time.Duration {
+	if !c.enabled() || !isRelease(c.current) {
+		return checkInterval
+	}
+	c.mu.RLock()
+	succeeded := !c.checked.IsZero()
+	c.mu.RUnlock()
+	if succeeded {
+		return checkInterval
+	}
+	d := firstPollRetry[min(*attempts, len(firstPollRetry)-1)]
+	*attempts++
+	return d
 }
 
 // checkOnce performs one best-effort poll. Any failure leaves the cached

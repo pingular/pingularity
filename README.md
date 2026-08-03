@@ -164,7 +164,17 @@ The image is multi-arch (amd64 + arm64). Two flags matter:
   host and the VM - it still does not expose the host's own interfaces or
   anything below L4, so the raw-ICMP traceroute behind the **Exit** panel and
   true native-host parity remain unavailable. Even with it turned on, the
-  readings describe the VM's path rather than your machine's. Run Pingularity
+  readings describe the VM's path rather than your machine's. Speedtest numbers
+  are capped the same way: the VM's traffic leaves through a user-space network
+  proxy that terminates every connection and re-opens it from the host, so on a
+  fast link the measured throughput can sit well below what the machine gets
+  natively. A small VM compounds it - the Ookla engine sizes its parallel
+  streams from the CPUs it can see, and VM defaults are often just 2. Giving
+  the VM more cores and memory (Docker Desktop: **Settings -> Resources**;
+  colima: `colima start --cpu 6 --memory 8`) wins back the streams and some
+  headroom, but the proxy ceiling stays. All of
+  this applies to every VM-backed runtime, not only Docker Desktop: colima,
+  OrbStack, Rancher Desktop, and Podman machine share the design. Run Pingularity
   natively on macOS or Windows if you want the measurements to match the host.
   (The dashboard's container notice is raised for a *bridged* container, which is
   the case it can detect; it does not detect Docker Desktop's host-networking
@@ -293,8 +303,9 @@ consequences worth knowing before you need them:
 
 One static binary runs a handful of independent goroutine loops that share a
 SQLite store and a live settings controller. Nothing else is required - the UI,
-web font, and favicon are embedded; the only outbound calls are the probes
-themselves plus optional enrichment (geo/ISP/exit) and speedtests.
+web font, and favicon are embedded; outbound calls are the probes themselves,
+optional enrichment (geo/ISP/exit), speedtests, and the update check - the
+full inventory is the outbound-calls table below.
 
 ```mermaid
 flowchart TB
@@ -532,7 +543,7 @@ Below that:
 > | reverse DNS | router/host IPs, for names | connection refresh |
 > | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup | when a speedtest runs, and when the Server settings tab is opened or a city is searched |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
-> | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on |
+> | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on (until the first check succeeds: retried at 1m/5m/15m, then hourly) |
 >
 > The six **connection refresh** and **exit discovery** rows are the ones that
 > carry your public IP. They stop when monitoring is paused, and the
@@ -854,7 +865,7 @@ self-describing):
   per background worker (`scheduler`, `pruner`, `netinfo`, `update-check`,
   `heartbeat`, `digest`): `up` is 1 while its loop runs and 0 once it stops or gives
   up after repeated panics; `restarts_total` climbing means it's thrashing
-- `pingularity_stat_total{stat="monitor.pending_events"}` /
+- `pingularity_stat{stat="monitor.pending_events"}` (a gauge) /
   `pingularity_stat_total{stat="monitor.event_dropped"}` - the outage-persistence
   retry queue's depth (0 = healthy) and a counter of transitions dropped for good
   when the DB stayed unwritable past the buffer cap (each drop leaves a gap in
@@ -1059,7 +1070,9 @@ constant memory.
   round believed, any direction it refused to believe, and the rule that made
   the winner win
 - `GET /api/speed/usage` - cumulative data used per window
-- `GET /api/speedtest/servers?city=` - list Ookla servers (near a city or you)
+- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; by
+  default centred where auto last tested, else near you; JSON content-type like
+  the other network-side-effect endpoints)
 - `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable (POST
   with an `application/json` content-type, like the other network-side-effect endpoints)
 - `GET /api/heatmap?days=366` - per-day downtime, plus `window_s`/`observed_s`
@@ -1165,7 +1178,7 @@ flowchart LR
   events --> log["recent outages"]
 ```
 
-**The store is five independent time-series tables** (plus a key/value settings
+**The store is seven independent time-series tables** (plus a key/value settings
 table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
 
 ```mermaid
@@ -1191,6 +1204,10 @@ erDiagram
     int  ts
     int  duration_s "unobserved span: paused, scheduled-off, or process-down"
   }
+  pauses_quarantine {
+    int  ts "pause rows held aside by clock repair, returned if the clock corrects"
+    int  duration_s
+  }
   speed {
     int  ts
     real down_mbps
@@ -1200,6 +1217,14 @@ erDiagram
     real packet_loss
     int  healthy
     text server
+  }
+  speed_servers {
+    int  run_ts "joins speed.ts: each run's server-selection report"
+    text server_id
+    real rank_ping_ms
+    real score
+    int  winner
+    text win_reason
   }
   settings {
     text key

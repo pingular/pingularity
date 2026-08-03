@@ -1676,7 +1676,7 @@ test('autoOptionText names a searched city, never the browse centre', () => {
   assert.ok(!/Miami|Montreal/.test(F.autoOptionText('')));
 });
 
-test('the scope note never credits the browse centre to auto', () => {
+test('a fallback browse centre is never credited to auto', () => {
   const t = F.autoScopeText('the fastest server', '', 'Miami', '');
   assert.ok(/races the cities/.test(t), t);
   assert.ok(/for browsing/.test(t), t);
@@ -1697,6 +1697,22 @@ test('with no browse centre the sentence is still true', () => {
   assert.ok(!/<b>/.test(t), t);
 });
 
+// THE CENTRE MAY BE NAMED AS WHERE AUTO LAST LANDED - past tense, and only
+// when the daemon says so (centre 'last_run': the browse list was centred on
+// the last auto run's server). A fallback centre keeps the weaker "may test
+// from a different city" wording: before any auto run there is nothing to
+// remember, and crediting a candidate city to auto is the old defect back.
+test('last-run centring is named in the past tense, fallback centring is not', () => {
+  const t = F.autoScopeText('the fastest server', '', 'Newtown, QC', 'Example ISP, Newtown', true);
+  assert.ok(/centred on <b>Newtown, QC<\/b>, where your last auto test ran/.test(t), t);
+  assert.ok(!/different city/.test(t), t);
+  const f = F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Newtown', false);
+  assert.ok(/auto may test from a different city/.test(f), f);
+  assert.ok(!/last auto test ran/.test(f), f);
+  // The flag without a centre has nothing to name; the sentence must not dangle.
+  assert.ok(!/last auto test ran/.test(F.autoScopeText('the fastest server', '', '', '', true)));
+});
+
 // Reports what the last run MEASURED, in the past tense, so it stays true
 // however that server was chosen - and it is the honest answer to "which city
 // did auto use?" without the daemon remembering a race.
@@ -1709,6 +1725,8 @@ test('the last measured server is reported, and only when there is one', () => {
 test('the panel escapes place names the daemon supplies', () => {
   assert.ok(F.autoScopeText('x', '', '<img src=x>', '').includes('&lt;img'));
   assert.ok(F.autoScopeText('x', '<img src=y>', '', '').includes('&lt;img'));
+  // The past-tense branch interpolates a server-derived place of its own.
+  assert.ok(F.autoScopeText('x', '', '<img src=z>', '', true).includes('&lt;img'));
 });
 
 // A 30-day window returns hundreds of runs into ~900px. Below one bar per ~2px

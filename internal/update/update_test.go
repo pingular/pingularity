@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestUpdateRequestSendsNoIdentifyingData locks the privacy guarantee of the
@@ -228,5 +229,42 @@ func TestDisabledNeverAvailableNorFetches(t *testing.T) {
 	}
 	if st.Enabled {
 		t.Error("Status.Enabled should reflect the toggle")
+	}
+}
+
+// Pins that the schedule retries fast until the FIRST successful check, then
+// settles to the daily cadence: a fresh install's poll is what makes it
+// visible on the fleet dashboard, and a single failed boot-time check used to
+// mean a full day of invisibility. Disabled toggles and dev builds never
+// fetch, so they must wait the daily tick rather than spin the ladder.
+func TestNextIntervalRetriesFastUntilFirstSuccess(t *testing.T) {
+	c := New("1.2.3", nil, nil)
+	attempts := 0
+	// Never succeeded: walk the ladder, then hold at its last rung.
+	want := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour, time.Hour}
+	for i, w := range want {
+		if got := c.nextInterval(&attempts); got != w {
+			t.Fatalf("attempt %d: nextInterval = %v, want %v", i, got, w)
+		}
+	}
+	// First success flips it to the daily cadence for good.
+	c.mu.Lock()
+	c.checked = time.Now()
+	c.mu.Unlock()
+	if got := c.nextInterval(&attempts); got != checkInterval {
+		t.Fatalf("after first success: nextInterval = %v, want %v", got, checkInterval)
+	}
+
+	// Disabled: no fetches happen, so no fast ladder either.
+	off := New("1.2.3", func() bool { return false }, nil)
+	a2 := 0
+	if got := off.nextInterval(&a2); got != checkInterval {
+		t.Fatalf("disabled: nextInterval = %v, want %v (must not spin a ladder it never uses)", got, checkInterval)
+	}
+	// Dev build: same reasoning.
+	dev := New("dev", nil, nil)
+	a3 := 0
+	if got := dev.nextInterval(&a3); got != checkInterval {
+		t.Fatalf("dev build: nextInterval = %v, want %v", got, checkInterval)
 	}
 }

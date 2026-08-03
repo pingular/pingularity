@@ -792,8 +792,10 @@ func (p *program) run(ctx context.Context) {
 	srv.SessionKey = sessionKey           // key-file-bound secret folded into session-token MACs (see tokenKey)
 	srv.MetricsToken = p.cfg.MetricsToken // optional read-only scrape credential for /metrics
 	srv.Update = upd                      // update status on /api/status + powers the toggle
-	// The settings server-browsing list centres on the same candidates auto
-	// races, so the picker can never point at a city the race would not choose.
+	// The settings server-browsing list centres where auto last landed, and
+	// before any auto run exists it falls back to these same candidates - so
+	// the picker starts from cities the race would consider and then follows
+	// what it actually chose (web.lastAutoRunServerID).
 	srv.AutoOriginsFn = tester.OriginsFn
 	srv.Logs = p.ring // backs the About-tab log viewer (/api/logs)
 	srv.OnLogClear = func() {
