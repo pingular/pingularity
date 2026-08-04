@@ -22,12 +22,15 @@ import (
 // prepend below makes "the last-used server is in the list" unconditional.
 
 type lastRunFixture struct {
-	st      *store.Store
-	askedID string
-	gotLat  float64
-	gotLon  float64
-	list    []speedtest.ServerInfo
-	getErr  error
+	st         *store.Store
+	askedID    string
+	gotKeyword string
+	gotLat     float64
+	gotLon     float64
+	list       []speedtest.ServerInfo // what the coordinate fetch (fallback path) returns
+	searchList []speedtest.ServerInfo // what the name search (last-run path) returns
+	getErr     error
+	searchErr  error
 }
 
 func newLastRunFixture(t *testing.T) *lastRunFixture {
@@ -45,9 +48,18 @@ func newLastRunFixture(t *testing.T) *lastRunFixture {
 		if f.getErr != nil {
 			return speedtest.ServerInfo{}, f.getErr
 		}
-		return speedtest.ServerInfo{ID: id, Sponsor: "Example ISP", Name: "Newtown, QC", Country: "Canada", Lat: 45.5, Lon: -73.57}, nil
+		// Country deliberately empty: the real by-ID endpoint omits it on
+		// sparse records, and the UI must cope (serverOptionText).
+		return speedtest.ServerInfo{ID: id, Sponsor: "Example ISP", Name: "Newtown, QC", Country: ""}, nil
 	}
 	t.Cleanup(func() { getOoklaServer = oldGet })
+
+	oldSearch := searchOoklaServers
+	searchOoklaServers = func(_ context.Context, keyword string) ([]speedtest.ServerInfo, error) {
+		f.gotKeyword = keyword
+		return f.searchList, f.searchErr
+	}
+	t.Cleanup(func() { searchOoklaServers = oldSearch })
 
 	oldList := listOoklaServers
 	listOoklaServers = func(_ context.Context, lat, lon float64) ([]speedtest.ServerInfo, error) {
@@ -89,7 +101,7 @@ type browseBody struct {
 
 func (f *lastRunFixture) ask(t *testing.T) browseBody {
 	t.Helper()
-	f.askedID, f.gotLat, f.gotLon = "", -1, -1
+	f.askedID, f.gotKeyword, f.gotLat, f.gotLon = "", "", -1, -1
 	s := &Server{
 		netinfo: stubNetInfo{},
 		store:   f.st,
@@ -116,30 +128,41 @@ func (f *lastRunFixture) ask(t *testing.T) browseBody {
 func TestBrowseListCentresOnLastAutoRun(t *testing.T) {
 	f := newLastRunFixture(t)
 	f.seedRun(t, 1000, "777", "ookla", "fastest_ranked")
-	// The pool around the server's own coordinate omitting the server itself is
-	// real Ookla behaviour, so the stub list reproduces it.
-	f.list = []speedtest.ServerInfo{{ID: "888", DistanceKM: 3}}
+	// The search is the coordinate ORACLE: the measured server's own row -
+	// matched by ID among same-named cities worldwide - supplies the real
+	// catalog coordinates the metro fetch centres on. The stray same-name row
+	// carries decoy coordinates that must not win.
+	f.searchList = []speedtest.ServerInfo{
+		{ID: "555", Name: "Newtown, QC", Lat: 33.2, Lon: -97.5, DistanceKM: 3600},
+		{ID: "777", Name: "Newtown, QC", Lat: 45.4, Lon: -73.6, DistanceKM: 297},
+	}
+	// The metro fetch around those coordinates omitting the server itself is
+	// unlikely but possible, so the stub reproduces it to pin the prepend.
+	f.list = []speedtest.ServerInfo{{ID: "888", Name: "Oldtown Heights, QC", DistanceKM: 6}}
 
 	body := f.ask(t)
 	if f.askedID != "777" {
 		t.Fatalf("resolved server %q, want the last auto run's 777", f.askedID)
 	}
-	if f.gotLat != 45.5 || f.gotLon != -73.57 {
-		t.Errorf("centred the list on %v,%v; want the last-run server's own coordinate, not the exit origin", f.gotLat, f.gotLon)
+	if f.gotKeyword != "Newtown, QC" {
+		t.Errorf("searched for %q, want the server's NAME label - never its by-ID coordinates, which the endpoint backfills with the caller's own position", f.gotKeyword)
+	}
+	if f.gotLat != 45.4 || f.gotLon != -73.6 {
+		t.Errorf("metro fetch centred on %v,%v; want the measured server's OWN row's coordinates - not the decoy's, not the origin's", f.gotLat, f.gotLon)
 	}
 	if body.Centre != "last_run" {
 		t.Errorf("centre = %q, want last_run so the panel can word it in the past tense", body.Centre)
 	}
-	if body.Location != "Newtown, QC, Canada" {
-		t.Errorf("location = %q, want the last-run server's place", body.Location)
+	if body.Location != "Newtown, QC" {
+		t.Errorf("location = %q, want the server's name label alone (its by-ID country can be empty - a trailing comma here was shipped once)", body.Location)
 	}
 	if len(body.Servers) != 2 || body.Servers[0].ID != "777" || body.Servers[0].DistanceKM != 0 {
 		t.Errorf("servers = %+v, want the last-used server prepended at distance 0", body.Servers)
 	}
 
-	// When the pool does contain the server, nothing is prepended: the
+	// When the metro fetch does contain the server, nothing is prepended: the
 	// guarantee is presence, not position.
-	f.list = []speedtest.ServerInfo{{ID: "888", DistanceKM: 3}, {ID: "777", DistanceKM: 5}}
+	f.list = []speedtest.ServerInfo{{ID: "888", Name: "Oldtown Heights, QC", DistanceKM: 6}, {ID: "777", Name: "Newtown, QC", DistanceKM: 9}}
 	body = f.ask(t)
 	n := 0
 	for _, srv := range body.Servers {
@@ -180,18 +203,29 @@ func TestBrowseListSkipsRunsAutoDidNotChoose(t *testing.T) {
 	}
 }
 
-// An Ookla hiccup on the ID lookup degrades to the fallback centre instead of
-// failing the browse fetch - the list is worth more than its centring.
+// An Ookla hiccup on the ID lookup or the name search degrades to the fallback
+// centre instead of failing the browse fetch - the list is worth more than its
+// centring. An empty search result is the same degradation: a list of nothing
+// explains nothing.
 func TestBrowseListLookupFailureFallsBack(t *testing.T) {
-	f := newLastRunFixture(t)
-	f.seedRun(t, 1000, "777", "ookla", "fastest_ranked")
-	f.getErr = errors.New("ookla unreachable")
+	for name, breakIt := range map[string]func(*lastRunFixture){
+		"id lookup fails":   func(f *lastRunFixture) { f.getErr = errors.New("ookla unreachable") },
+		"name search fails": func(f *lastRunFixture) { f.searchErr = errors.New("ookla unreachable") },
+		"own row not found": func(f *lastRunFixture) {
+			f.searchList = []speedtest.ServerInfo{{ID: "999", Name: "Newtown, QC", Lat: 45.4, Lon: -73.6}}
+		},
+		"own row uncharted": func(f *lastRunFixture) { f.searchList = []speedtest.ServerInfo{{ID: "777", Name: "Newtown, QC"}} },
+	} {
+		f := newLastRunFixture(t)
+		f.seedRun(t, 1000, "777", "ookla", "fastest_ranked")
+		breakIt(f)
 
-	body := f.ask(t)
-	if f.gotLat != 12.34 || f.gotLon != -76.54 {
-		t.Errorf("centred on %v,%v; want the exit origin fallback", f.gotLat, f.gotLon)
-	}
-	if body.Centre != "" || body.Location != "Oldtown, XX" {
-		t.Errorf("centre = %q location = %q, want a plain fallback response", body.Centre, body.Location)
+		body := f.ask(t)
+		if f.gotLat != 12.34 || f.gotLon != -76.54 {
+			t.Errorf("%s: centred on %v,%v; want the exit origin fallback", name, f.gotLat, f.gotLon)
+		}
+		if body.Centre != "" || body.Location != "Oldtown, XX" {
+			t.Errorf("%s: centre = %q location = %q, want a plain fallback response", name, body.Centre, body.Location)
+		}
 	}
 }

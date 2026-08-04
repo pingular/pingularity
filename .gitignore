@@ -27,3 +27,4 @@ deploy.sh
 # part of the product. They are real git worktrees, so an unguarded `git add -A`
 # commits them as embedded repositories.
 .claude/
+/compose.yaml

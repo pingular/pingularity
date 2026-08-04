@@ -185,9 +185,9 @@ func TestParseCymruASN(t *testing.T) {
 }
 
 // pickCymruASN must deterministically return the most-specific prefix's origin
-// AS. The real-world shape (eBOX): an address covered by AS1403's /22 and AS26480's
-// /19 aggregate, returned by Cymru in random order - the /22 (AS1403) is the
-// operative origin and must win regardless of record order.
+// AS. The real-world shape (eBOX): an address covered by both AS1403's /22 and
+// AS26480's /19 aggregate, returned by Cymru in random order - the /22
+// (AS1403) is the operative origin and must win regardless of record order.
 func TestPickCymruASN(t *testing.T) {
 	specific := "1403 | 66.254.60.0/22 | CA | arin | 2003-05-13"
 	aggregate := "26480 | 66.254.32.0/19 | CA | arin | 2003-05-13"

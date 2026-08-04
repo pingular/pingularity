@@ -53,6 +53,7 @@ const DEFS = {
   speedtestBusy: 'function speedtestBusy',
   speedtestAbortable: 'function speedtestAbortable',
   autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
+  serverOptionText: 'const serverOptionText',
   bloatBins: 'function bloatBins', bloatCeiling: 'function bloatCeiling',
   bloatDataMax: 'function bloatDataMax', cursorSpan: 'const cursorSpan',
   drawCursor: 'function drawCursor',
@@ -1720,6 +1721,19 @@ test('the last measured server is reported, and only when there is one', () => {
   assert.ok(/last test measured <b>Example ISP, Oldtown<\/b>/.test(
     F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Oldtown')));
   assert.ok(!/last test measured/.test(F.autoScopeText('the fastest server', '', 'Oldtown', '')));
+});
+
+// A dropdown row survives the fields the daemon cannot promise: the by-ID
+// resolve returns an empty country on sparse Ookla records (measured - it
+// shipped as "EBOX - Montréal, QC," with a dangling comma), and a 0 distance
+// means unknown, not adjacent, so no "(0 km)".
+test('a server row renders without a dangling comma or a bogus 0 km', () => {
+  assert.equal(F.serverOptionText({sponsor:'EBOX', name:'Montréal, QC', country:'', distance_km:0}),
+    'EBOX - Montréal, QC');
+  assert.equal(F.serverOptionText({sponsor:'Bell Canada', name:'Scarborough, ON', country:'Canada', distance_km:4.2}),
+    'Bell Canada - Scarborough, ON, Canada (4 km)');
+  assert.equal(F.serverOptionText({sponsor:'EBOX', name:'Montréal, QC', country:'Canada', distance_km:297}),
+    'EBOX - Montréal, QC, Canada (297 km)');
 });
 
 test('the panel escapes place names the daemon supplies', () => {

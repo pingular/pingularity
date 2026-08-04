@@ -1690,7 +1690,7 @@
             <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table). Type a city instead and it becomes the centre Auto location uses when you switch it OFF - it moves where Auto searches, it does not pin a server.
 • With no city typed, Auto races the cities your connection points at - your ISP's exit, where your IP is registered, and wherever speedtest.net places you - and centres on whichever answers fastest, fresh on every test.
 • Inside that centre it fetches one list, pings every server about as close as the nearest (one per provider, your own ISP always included), and keeps the lowest ping.
-• The list in this box is only for browsing, centred on the first of those cities we have a coordinate for - so the server Auto is testing from need not be in it. Search its city to see it.">i</span></span>
+• The list in this box is only for browsing: it shows the city of the server your last auto test used (that server is always in it), or before any auto run, a city the race would consider.">i</span></span>
           <div class="server-search">
             <input type="text" id="serverCity" placeholder="City or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
             <button class="btn" id="serverSearchBtn" type="button">Search</button>
@@ -5728,11 +5728,16 @@ function updateScopeNote(){
   const what = bestOf ? 'the 3 fastest servers' : 'the fastest server';
   el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
+// serverOptionText renders one dropdown row. The daemon's by-ID resolve can
+// return an empty country (Ookla's by-ID endpoint omits it on sparse records -
+// measured), and a 0 distance means unknown, not adjacent - so both render as
+// absent rather than as a dangling comma or a bogus "(0 km)".
+const serverOptionText = s => { return `${s.sponsor} - ${s.name}`+(s.country?`, ${s.country}`:'')+(s.distance_km?` (${Math.round(s.distance_km)} km)`:''); };
 function populateServers(list){
   const sel=$('setServer'); sel.innerHTML='';
   const auto=document.createElement('option'); auto.value=''; auto.textContent=autoText(); sel.appendChild(auto);
   for(const s of (list||[])){ const o=document.createElement('option'); o.value=s.id;
-    o.textContent=`${s.sponsor} - ${s.name}, ${s.country}`+(s.distance_km?` (${Math.round(s.distance_km)} km)`:''); sel.appendChild(o); }
+    o.textContent=serverOptionText(s); sel.appendChild(o); }
   applyPendingServer(); updateScopeNote();
 }
 // setServerLoading toggles the dropdown's spinner overlay while the Ookla list
