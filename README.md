@@ -692,7 +692,7 @@ Notification recipes (set the **webhook URL** to):
 |---|---|---|
 | **Discord / Slack** | the channel's incoming-webhook URL | shaped automatically |
 | **Gotify** | `https://gotify.example/message?token=APP_TOKEN` | uses `title` / `message` / `priority` |
-| **ntfy** | `https://ntfy.sh/your-topic` (or self-hosted) | delivers the JSON body; for a clean title/priority, route ntfy through Apprise |
+| **ntfy** | `https://ntfy.sh/your-topic` (or self-hosted) | spoken natively: the alert text arrives as the notification body with title, priority (1-5, mapped from severity), and an emoji tag. ntfy.sh is auto-detected; for ntfy on your own domain set **Webhook format: ntfy** in the Alerts tab |
 | **Apprise** → email, Telegram, Pushover, Gotify, ntfy, … | run the Apprise API server, point at `http://apprise:8000/notify/your-key` | one gateway to 100+ services; uses `title` / `body` / `type` |
 
 For **email, Telegram, or Pushover**, the simple path is Apprise: run the Apprise
@@ -744,6 +744,11 @@ Out-of-range numeric flags are rejected at startup (and at `pingularity
 install`) rather than silently adjusted.
 
 ## Metrics (optional)
+
+> **Grafana users:** there is an official importable dashboard (latency
+> heatmap, speed/bufferbloat history, outage annotations, a multi-instance
+> fleet view) and a ready-made alert-rules file - see
+> [docs.pingularity.dev/grafana](https://docs.pingularity.dev/grafana/).
 
 A Prometheus endpoint is exposed at `GET /metrics` if you already run a
 Prometheus/Grafana stack and want to scrape Pingularity - but nothing external is
@@ -863,8 +868,12 @@ self-describing):
   before writes start failing
 - `pingularity_worker_up{worker}` / `pingularity_worker_restarts_total{worker}` -
   per background worker (`scheduler`, `pruner`, `netinfo`, `update-check`,
-  `heartbeat`, `digest`): `up` is 1 while its loop runs and 0 once it stops or gives
-  up after repeated panics; `restarts_total` climbing means it's thrashing
+  `heartbeat`, `digest`, and `settings-retry` when a failed settings load armed
+  it): `up` is 1 while its loop runs and 0 once it dies - gives up after
+  repeated panics, or the process shuts down. A one-shot worker that COMPLETES
+  its job (settings-retry succeeding) removes its series instead of reporting
+  0, so `worker_up == 0` alerts match only real deaths; `restarts_total`
+  climbing means it's thrashing
 - `pingularity_stat{stat="monitor.pending_events"}` (a gauge) /
   `pingularity_stat_total{stat="monitor.event_dropped"}` - the outage-persistence
   retry queue's depth (0 = healthy) and a counter of transitions dropped for good
@@ -876,7 +885,9 @@ self-describing):
   `200` with missing/stale series is directly alertable). Paired with
   `pingularity_metrics_collector_success{collector}` / `_errors_total{collector}` /
   `_duration_seconds{collector}` / `_last_success_timestamp_seconds{collector}` for
-  the `targets` / `aggregates` / `speed` reads
+  the `targets` / `aggregates` / `speed` / `uptime_floor` reads (`aggregates`
+  tracks the LAST refresh attempt, so a store that fails after the cache once
+  warmed still reads 0)
 - **Well-named families** (Prometheus-conventional, one quantity + labels each,
   emitted alongside the generic `stat_total` below): `pingularity_probe_rounds_total`,
   `pingularity_probe_failures_total{reason}`, `pingularity_dns_attempts_total`,
@@ -884,14 +895,18 @@ self-describing):
   `pingularity_outage_duration_seconds_total`, `pingularity_speed_runs_total{trigger}`,
   `pingularity_speed_failures_total{stage}`, `pingularity_notification_deliveries_total{destination}`
   / `_failures_total{destination}` / `_blocked_total{destination}`,
-  `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`
+  `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`,
+  `pingularity_database_prune_duration_seconds_total`,
+  `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
+  `pingularity_probe_blips_total`, `pingularity_login_failures_total`,
+  `pingularity_rate_limit_trips_total`
 - `pingularity_stat_total{stat}` / `pingularity_stat{stat}` - the internal
   **operational** registry, keyed by a `stat` label. These are two families: the
   **counters** `pingularity_stat_total{stat}` (monotonic totals + float sums;
   query with `rate()` / `increase()`) and the **gauges** `pingularity_stat{stat}`
-  (point-in-time high-water marks like `monitor.blip_streak_max`; this family
-  appears only once a gauge has recorded something - a perfectly healthy
-  install has none). Together they
+  (point-in-time values: high-water marks like `monitor.blip_streak_max`, the
+  probe/DNS freshness timestamps, and the per-worker `worker.<name>.up` flags -
+  so the family is present on every install from boot). Together they
   cover probe rounds (`monitor.rounds` - the liveness denominator - and
   `monitor.bad_rounds`), the probe-failure taxonomy (`probe.fail.<class>` -
   timeout/refused/dns/…), the DNS-resolve failure taxonomy (`dns.fail.<class>`),
@@ -902,7 +917,12 @@ self-describing):
   stage** (`speed.fail.<stage>` - server_fetch/ping/download/…), exit-discovery
   traces and geo lookups (`netinfo.trace_ok` / `netinfo.trace_fail` /
   `netinfo.ipmap_*`), webhook delivery (`.ok` / `.fail` / `.blocked` per
-  destination), DB health (`db.*`), and security signals (`web.login_fail`,
+  destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
+restore refused rather than silently dropped), the /metrics self-disclosures
+(`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's
+sign that the target-series view was truncated or a normalized label collided),
+notification-queue loss (`notify.outage_dropped`), and security signals
+(`web.login_fail`, `web.stepup_fail`,
   `web.limiter_trips`). Always-on and monotonic. Product-usage counters (which
   settings change, dashboard loads) are **not recorded at all** - those
   emitters were removed; the `promStat` allowlist stays only as a guard so a
@@ -985,7 +1005,9 @@ pingularity_uptime_ratio{window="30d"} < 0.999
 # p95 anchor latency over 5m (from the histogram)
 histogram_quantile(0.95, rate(pingularity_probe_latency_seconds_bucket[5m]))
 
-# A background worker died, or the scrape returned incomplete data (DB failing)
+# A background worker died, or the scrape returned incomplete data (DB failing).
+# A worker that FINISHED its job (the one-shot settings-retry succeeding) removes
+# its series instead of reporting 0, so this matches only real deaths.
 pingularity_worker_up == 0
 pingularity_metrics_data_valid == 0
 

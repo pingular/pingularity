@@ -200,6 +200,7 @@ type Server struct {
 	// aggTTL instead of on every status poll.
 	aggMu   sync.Mutex
 	aggAt   time.Time
+	aggOK   bool          // last refresh attempt's outcome; collector health tracks attempts, not cache warmth
 	aggBusy bool          // a recompute is in flight; others serve the stale cache
 	aggWait chan struct{} // non-nil while a recompute owns the cold fill; closed on completion so cold callers wait rather than launch a duplicate scan
 	aggGen  uint64        // bumped by invalidators; an in-flight recompute that started before the bump can't re-stamp aggAt
@@ -303,6 +304,7 @@ func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp in
 	// stops a transient SpeedAvgBytes failure from stamping zero averages in for
 	// the whole TTL. Log it - a failing local DB would otherwise look like empty
 	// data.
+	s.aggOK = e1 == nil && e2 == nil && e3 == nil
 	if err := errors.Join(e1, e2, e3); err != nil {
 		s.log.Warn("aggregate refresh failed; serving previous values", "err", err)
 	} else {
@@ -2151,6 +2153,7 @@ type settingsDTO struct {
 	SpeedtestEnabled         *bool   `json:"speedtest_enabled"`
 	SpeedtestOnReconnect     *bool   `json:"speedtest_on_reconnect"`
 	IPv6Mode                 *string `json:"ipv6_mode"`
+	WebhookFormat            *string `json:"webhook_format"`
 	ExitTarget               *string `json:"exit_target"`
 	// Adaptive / event-driven speedtesting.
 	SpeedtestAdaptive   *bool    `json:"speedtest_adaptive"`
@@ -2246,6 +2249,7 @@ func dtoFrom(v settings.Values) settingsDTO {
 		SpeedtestEnabled:         ptr(v.SpeedtestEnabled),
 		SpeedtestOnReconnect:     ptr(v.SpeedtestOnReconnect),
 		IPv6Mode:                 ptr(v.IPv6Mode),
+		WebhookFormat:            ptr(v.WebhookFormat),
 		ExitTarget:               ptr(v.ExitTarget),
 		SpeedtestAdaptive:        ptr(v.SpeedtestAdaptive),
 		SpeedtestOnDegraded:      ptr(v.SpeedtestOnDegraded),
@@ -2369,6 +2373,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			SpeedtestEnabled:     in.SpeedtestEnabled,
 			SpeedtestOnReconnect: in.SpeedtestOnReconnect,
 			IPv6Mode:             in.IPv6Mode,
+			WebhookFormat:        in.WebhookFormat,
 			ExitTarget:           in.ExitTarget,
 			SpeedtestAdaptive:    in.SpeedtestAdaptive,
 			SpeedtestOnDegraded:  in.SpeedtestOnDegraded,
@@ -3706,13 +3711,47 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		stats.Inc("web.metrics_targets_capped")
 		targets = targets[:metricsMaxTargets]
 	}
+	// Label normalization (96-byte truncation, control-byte stripping) is
+	// many-to-one over raw names, and duplicate label sets in one exposition
+	// are dropped by Prometheus with a per-sample warning. One series per
+	// LABEL: first target wins (LatestPerTarget's order is stable), later
+	// colliders are skipped and disclosed on the collision counter.
+	{
+		seen := make(map[string]bool, len(targets))
+		kept := make([]store.TargetLatency, 0, len(targets))
+		for _, tr := range targets {
+			lbl := promTargetLabel(tr.Target)
+			if seen[lbl] {
+				stats.Inc("web.metrics_label_collisions")
+				continue
+			}
+			seen[lbl] = true
+			kept = append(kept, tr)
+		}
+		targets = kept
+	}
 	aStart := time.Now()
 	uptime, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
 	aggDur := time.Since(aStart)
 	s.aggMu.Lock()
-	aggValid := !s.aggAt.IsZero() // false only when every aggregate scan has failed since startup
+	// Warmth alone is not health: once the cache filled a single time, aggAt
+	// stays non-zero forever, so it must be paired with the LAST refresh
+	// attempt's outcome or the collector reads green while every refresh
+	// fails and the served numbers age without bound.
+	aggValid := !s.aggAt.IsZero() && s.aggOK
 	s.aggMu.Unlock()
 	s.collResult("aggregates", aggValid)
+
+	// UptimeFloor is a store read like any other collector's: accounted, timed,
+	// and folded into metrics_data_valid, so its failure can never be a silent
+	// 200 with a missing series.
+	fStart := time.Now()
+	floor, ferr := s.store.UptimeFloor(ctx, s.settings.DowntimeRetention())
+	floorDur := time.Since(fStart)
+	if ferr != nil {
+		s.log.Warn("metrics read failed; uptime floor omitted from this scrape", "op", "uptime_floor", "err", ferr)
+	}
+	s.collResult("uptime_floor", ferr == nil)
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	fmt.Fprintln(w, "# HELP pingularity_build_info Build metadata; constant 1, version and Go toolchain in the labels.")
@@ -3863,7 +3902,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "pingularity_uptime_ratio{window=\"%s\"} %g\n", promLabel(n.Window), n.Obs.Ratio())
 		}
 	}
-	if floor, e := s.store.UptimeFloor(ctx, s.settings.DowntimeRetention()); e == nil && floor > 0 {
+	if ferr == nil && floor > 0 {
 		fmt.Fprintln(w, "# HELP pingularity_uptime_since_timestamp_seconds Earliest time the uptime figures can vouch for (unix seconds): the later of first observation and the outage-retention horizon. The 'all' window reaches back only to here.")
 		fmt.Fprintln(w, "# TYPE pingularity_uptime_since_timestamp_seconds gauge")
 		fmt.Fprintf(w, "pingularity_uptime_since_timestamp_seconds %d\n", floor)
@@ -3927,7 +3966,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintln(w, "# HELP pingularity_speed_info Last speedtest's backend engine (in the label); value is constant 1.")
 		fmt.Fprintln(w, "# TYPE pingularity_speed_info gauge")
-		fmt.Fprintf(w, "pingularity_speed_info{engine=\"%s\"} 1\n", promLabel(engine))
+		fmt.Fprintf(w, "pingularity_speed_info{engine=\"%s\"} 1\n", promTargetLabel(engine))
 		if sp.Healthy != nil { // the in-app threshold verdict, so alerts reuse it instead of re-encoding thresholds
 			fmt.Fprintln(w, "# HELP pingularity_speed_healthy Last speedtest passed its configured thresholds (1/0); absent when no thresholds are configured or the run measured nothing they cover.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_healthy gauge")
@@ -4099,6 +4138,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Update-check state: the same facts the dashboard badge shows, so "an
+	// update has been pending for a week" and "the feed has been unreachable
+	// for days" (the firewalled-install signature) are alertable. Absent
+	// entirely when the checker is off or unwired; the freshness timestamp is
+	// absent until a poll has SUCCEEDED - a 0 would read as 1970-stale.
+	if s.Update != nil {
+		if ust := s.Update.Status(); ust.Enabled {
+			fmt.Fprintln(w, "# HELP pingularity_update_available A newer release is available (1) or not (0).")
+			fmt.Fprintln(w, "# TYPE pingularity_update_available gauge")
+			fmt.Fprintf(w, "pingularity_update_available %d\n", util.B2I(ust.Available))
+			if ust.CheckedUnix > 0 {
+				fmt.Fprintln(w, "# HELP pingularity_update_check_timestamp_seconds When the release feed was last successfully polled (unix seconds).")
+				fmt.Fprintln(w, "# TYPE pingularity_update_check_timestamp_seconds gauge")
+				fmt.Fprintf(w, "pingularity_update_check_timestamp_seconds %d\n", ust.CheckedUnix)
+			}
+		}
+	}
+
 	// Collector health for this scrape (F4): whether each store read succeeded, how
 	// long it took, cumulative errors, and last-success time. metrics_data_valid is 1
 	// only when every read this scrape succeeded - so a DB failure that would
@@ -4108,7 +4165,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		ok   bool
 		dur  time.Duration
 	}
-	colls := []coll{{"targets", terr == nil, targetsDur}, {"aggregates", aggValid, aggDur}, {"speed", serr == nil, speedDur}}
+	colls := []coll{{"targets", terr == nil, targetsDur}, {"aggregates", aggValid, aggDur}, {"speed", serr == nil, speedDur}, {"uptime_floor", ferr == nil, floorDur}}
 	s.collMu.Lock()
 	errsCopy, okCopy := map[string]int64{}, map[string]int64{}
 	for k, v := range s.collErrs {
@@ -4140,21 +4197,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "pingularity_metrics_collector_last_success_timestamp_seconds{collector=\"%s\"} %d\n", c.name, ts)
 		}
 	}
-	dataValid := terr == nil && aggValid && serr == nil
+	dataValid := terr == nil && aggValid && serr == nil && ferr == nil
 	fmt.Fprintln(w, "# HELP pingularity_metrics_data_valid 1 when every store read on this scrape succeeded; 0 when any failed (series may be missing or stale despite the 200).")
 	fmt.Fprintln(w, "# TYPE pingularity_metrics_data_valid gauge")
 	fmt.Fprintf(w, "pingularity_metrics_data_valid %d\n", util.B2I(dataValid))
 
-	writeNamedStats(w)
-	writeLatencyHistograms(w)
-	writeStatMetrics(w)
+	// One snapshot for the whole exposition: three writers reading three
+	// separate snapshots let a counter disagree with its own back-compat
+	// duplicate inside a single scrape.
+	snap := stats.Lifetime()
+	writeNamedStats(w, snap)
+	writeLatencyHistograms(w, snap)
+	writeStatMetrics(w, snap)
 }
 
 // writeLatencyHistograms emits the probe/DNS RTT distributions as Prometheus
 // histograms (cumulative _bucket + _sum + _count), so a rule can compute p95/p99
 // and see spikes that fall between scrapes - which the last-value latency gauge loses.
-func writeLatencyHistograms(w io.Writer) {
-	snap := stats.Lifetime()
+func writeLatencyHistograms(w io.Writer, snap stats.Snap) {
 	for _, h := range []struct{ key, name, help string }{
 		{"probe.latency", "pingularity_probe_latency_seconds", "Anchor round-trip latency distribution (seconds), per successful target probe."},
 		{"dns.latency", "pingularity_dns_latency_seconds", "DNS resolve-time distribution (seconds), per successful DNS probe."},
@@ -4178,8 +4238,7 @@ func writeLatencyHistograms(w io.Writer) {
 // internal registry (F8): pingularity_stat_total mixes counts, seconds and ms sums
 // under one name, which the Prometheus naming conventions discourage. These give each
 // real quantity its own family + labels; the generic stat_total stays for back-compat.
-func writeNamedStats(w io.Writer) {
-	snap := stats.Lifetime()
+func writeNamedStats(w io.Writer, snap stats.Snap) {
 	acc := make(map[string]float64, len(snap.Counters)+len(snap.Floats))
 	for k, v := range snap.Counters {
 		acc[k] = float64(v)
@@ -4197,8 +4256,6 @@ func writeNamedStats(w io.Writer) {
 		{"monitor.outage_s_sum", "pingularity_outage_duration_seconds_total", "Cumulative observed outage duration (seconds).", 1},
 		{"monitor.blips", "pingularity_probe_blips_total", "Sub-threshold connectivity blips that did not reach an outage.", 1},
 		{"dns.attempts", "pingularity_dns_attempts_total", "DNS resolve probes attempted.", 1},
-		{"speed.duration_s_sum", "pingularity_speed_run_duration_seconds_sum", "Sum of speedtest run durations (seconds).", 1},
-		{"speed.duration_n", "pingularity_speed_run_duration_seconds_count", "Count of timed speedtest runs.", 1},
 		{"db.prune_count", "pingularity_database_prunes_total", "Database prune passes completed.", 1},
 		{"db.prune_ms_sum", "pingularity_database_prune_duration_seconds_total", "Cumulative database prune time (seconds).", 0.001},
 		{"web.login_fail", "pingularity_login_failures_total", "Failed dashboard login attempts.", 1},
@@ -4208,6 +4265,43 @@ func writeNamedStats(w io.Writer) {
 			fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %g\n", m.name, m.help, m.name, m.name, v*m.scale)
 		}
 	}
+	// Speedtest run durations: a _sum/_count pair is a (quantile-less) summary,
+	// and typing it as two standalone counters puts reserved suffixes on the
+	// wrong TYPE (promtool lints it). Sample names are unchanged, so existing
+	// queries keep working; the pair is seeded, so the family exists from boot.
+	if sum, ok := acc["speed.duration_s_sum"]; ok {
+		if n, ok2 := acc["speed.duration_n"]; ok2 {
+			fmt.Fprintln(w, "# HELP pingularity_speed_run_duration_seconds Speedtest run durations: _sum is cumulative seconds, _count is timed runs.")
+			fmt.Fprintln(w, "# TYPE pingularity_speed_run_duration_seconds summary")
+			fmt.Fprintf(w, "pingularity_speed_run_duration_seconds_sum %g\n", sum)
+			fmt.Fprintf(w, "pingularity_speed_run_duration_seconds_count %g\n", n)
+		}
+	}
+
+	// Notification delivery latency: per-destination summary in seconds. The
+	// registry keys stay raw ms sums (notify.<dest>.lat_ms_sum, back-compat in
+	// stat_total); this is the queryable form - "webhook got slow" is
+	// rate(_sum)/rate(_count).
+	{
+		var dests []string
+		for k := range acc {
+			if d := strings.TrimSuffix(strings.TrimPrefix(k, "notify."), ".lat_ms_sum"); d != k && strings.HasPrefix(k, "notify.") {
+				if _, ok := acc["notify."+d+".lat_n"]; ok {
+					dests = append(dests, d)
+				}
+			}
+		}
+		if len(dests) > 0 {
+			sort.Strings(dests)
+			fmt.Fprintln(w, "# HELP pingularity_notification_delivery_duration_seconds Notification delivery time per destination: _sum is cumulative seconds, _count is timed deliveries.")
+			fmt.Fprintln(w, "# TYPE pingularity_notification_delivery_duration_seconds summary")
+			for _, d := range dests {
+				fmt.Fprintf(w, "pingularity_notification_delivery_duration_seconds_sum{destination=\"%s\"} %g\n", promLabel(d), acc["notify."+d+".lat_ms_sum"]*0.001)
+				fmt.Fprintf(w, "pingularity_notification_delivery_duration_seconds_count{destination=\"%s\"} %g\n", promLabel(d), acc["notify."+d+".lat_n"])
+			}
+		}
+	}
+
 	// Labeled families: keys "<prefix><labelvalue>" -> metric{label="labelvalue"}.
 	emitFamily := func(prefix, name, label, help string) {
 		var keys []string
@@ -4231,7 +4325,9 @@ func writeNamedStats(w io.Writer) {
 	emitFamily("speed.fail.", "pingularity_speed_failures_total", "stage", "Speedtest failures by stage.")
 
 	// Background-worker health. worker.<name>.restarts is a counter (acc); worker.<name>.up
-	// is a gauge (snap.Gauges): 1 while the loop runs, 0 once it returns or gives up.
+	// is a gauge (snap.Gauges): 1 while the loop runs, 0 on death (give-up,
+	// shutdown) - and REMOVED when a one-shot worker completes its job, so
+	// worker_up==0 alerts match only real deaths (see spawnLoop in main.go).
 	var upLines, restartLines []string
 	for k, v := range snap.Gauges {
 		if n := strings.TrimSuffix(strings.TrimPrefix(k, "worker."), ".up"); n != k && strings.HasPrefix(k, "worker.") {
@@ -4245,7 +4341,7 @@ func writeNamedStats(w io.Writer) {
 	}
 	if len(upLines) > 0 {
 		sort.Strings(upLines)
-		fmt.Fprintln(w, "# HELP pingularity_worker_up Background worker running (1) or stopped/given-up (0), by worker.")
+		fmt.Fprintln(w, "# HELP pingularity_worker_up Background worker running (1) or dead (0: gave up or shut down); a one-shot worker that completed its job is removed rather than 0, by worker.")
 		fmt.Fprintln(w, "# TYPE pingularity_worker_up gauge")
 		for _, l := range upLines {
 			fmt.Fprint(w, l)
@@ -4315,8 +4411,7 @@ func writeNamedStats(w io.Writer) {
 // float sums) under pingularity_stat_total, and gauges under pingularity_stat.
 // The registry is always-on and never drained, so these are honest Prometheus
 // counters.
-func writeStatMetrics(w io.Writer) {
-	snap := stats.Lifetime()
+func writeStatMetrics(w io.Writer, snap stats.Snap) {
 	totals := make(map[string]float64, len(snap.Counters)+len(snap.Floats))
 	for k, v := range snap.Counters {
 		if promStat(k) {
@@ -4367,8 +4462,16 @@ func promStat(name string) bool {
 		strings.HasPrefix(name, "worker."), // background-worker up/restarts
 		strings.HasPrefix(name, "db."):
 		return true
-	case name == "web.login_fail" || name == "web.limiter_trips":
-		return true // security signals an operator wants (failed logins, throttle trips)
+	case strings.HasPrefix(name, "import."):
+		// Import/restore repair counters: recorded expressly for /metrics
+		// visibility (a repair that drops rows must not be silent).
+		return true
+	case name == "web.login_fail" || name == "web.limiter_trips",
+		name == "web.stepup_fail", // security signal, sibling of login_fail
+		// The /metrics self-disclosures: targets silently capped or dropped
+		// on label collision - the operator's only sign their view shrank.
+		name == "web.metrics_targets_capped", name == "web.metrics_label_collisions":
+		return true
 	default:
 		// Product/usage analytics never belong on the operator's endpoint. Those
 		// emitters are gone, but the guard stays: any unclassified namespace - a

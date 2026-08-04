@@ -53,6 +53,7 @@ const (
 	keyThreshBloatUp     = "thresh_bloat_up_ms"   // max upload bufferbloat (added ms under load); 0 = off
 	keyAlertOnOutage     = "alert_on_outage"      // notify on link down/up
 	keyWebhookURL        = "webhook_url"          // generic alert webhook ("" = off)
+	keyWebhookFormat     = "webhook_format"       // webhook payload shape: ""/"auto" = detect by host, "ntfy", "generic"
 	keyHeartbeatURL      = "heartbeat_url"        // dead-man's-switch ping URL ("" = off)
 	keyDigestFreq        = "digest_freq"          // periodic summary cadence: off|daily|weekly
 	keySchedLatEnabled   = "sched_lat_enabled"    // gate latency probing to its windows
@@ -232,6 +233,7 @@ type Values struct {
 	ThreshBloatUpMS   float64
 	AlertOnOutage     bool   // notify the webhook when the link goes down/up
 	WebhookURL        string // generic alert webhook ("" = disabled)
+	WebhookFormat     string // payload shape override: ""/"auto" = detect by host, "ntfy", "generic"
 	HeartbeatURL      string // dead-man's-switch ping URL ("" = disabled)
 	DigestFreq        string // periodic summary cadence: "off" | "daily" | "weekly"
 
@@ -775,6 +777,9 @@ func overlay(v Values, m map[string]string) Values {
 	if val, ok := m[keyWebhookURL]; ok {
 		v.WebhookURL = val
 	}
+	if val, ok := m[keyWebhookFormat]; ok {
+		v.WebhookFormat = val
+	}
 	if val, ok := m[keyHeartbeatURL]; ok {
 		v.HeartbeatURL = val
 	}
@@ -918,6 +923,7 @@ func (c *Controller) ExitTarget() string      { return c.get().ExitTarget }
 func (c *Controller) Monitoring() bool        { return c.get().Monitoring }
 func (c *Controller) AlertOnOutage() bool     { return c.get().AlertOnOutage }
 func (c *Controller) WebhookURL() string      { return c.get().WebhookURL }
+func (c *Controller) WebhookFormat() string   { return c.get().WebhookFormat }
 func (c *Controller) HeartbeatURL() string    { return c.get().HeartbeatURL }
 func (c *Controller) AccessLocalOnly() bool   { return c.get().AccessLocalOnly }
 func (c *Controller) AuthEnabled() bool       { return c.get().AuthEnabled }
@@ -1140,6 +1146,7 @@ type Patch struct {
 	ThreshBloatUpMS      *float64
 	AlertOnOutage        *bool
 	WebhookURL           *string
+	WebhookFormat        *string
 	HeartbeatURL         *string
 	DigestFreq           *string
 	SchedLatEnabled      *bool
@@ -1205,6 +1212,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.ThreshBloatUpMS, p.ThreshBloatUpMS)
 	setIf(&v.AlertOnOutage, p.AlertOnOutage)
 	setIf(&v.WebhookURL, p.WebhookURL)
+	setIf(&v.WebhookFormat, p.WebhookFormat)
 	setIf(&v.HeartbeatURL, p.HeartbeatURL)
 	setIf(&v.DigestFreq, p.DigestFreq)
 	setIf(&v.SchedLatEnabled, p.SchedLatEnabled)
@@ -1322,6 +1330,7 @@ func formKeys(v Values) map[string]string {
 		keyIperfMSS:          strconv.Itoa(v.IperfMSS),
 		keyAlertOnOutage:     b2s(v.AlertOnOutage),
 		keyWebhookURL:        v.WebhookURL,
+		keyWebhookFormat:     v.WebhookFormat,
 		keyHeartbeatURL:      v.HeartbeatURL,
 		keyDigestFreq:        v.DigestFreq,
 		keySchedLatEnabled:   b2s(v.SchedLatEnabled),
@@ -1516,6 +1525,13 @@ func normalize(v Values) Values {
 	case "on", "off", "auto":
 	default:
 		v.IPv6Mode = "auto"
+	}
+	// Webhook format override: an unknown value falls back to hostname
+	// detection rather than silently mis-shaping deliveries.
+	switch v.WebhookFormat {
+	case "", "auto", "ntfy", "generic":
+	default:
+		v.WebhookFormat = ""
 	}
 	// Auto-picker location: keep only a usable "lat,lon" pair (finite, in range).
 	// ParseFloat accepts "NaN"/"Inf", which would centre the Ookla server picker
