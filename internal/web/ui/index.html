@@ -1830,6 +1830,9 @@
             <button class="btn" id="testWebhook" type="button">Test</button>
           </div>
         </div>
+        <label class="srow"><span class="lbl">Webhook format
+          <span class="info" tabindex="0" data-tip="How the alert is shaped for the receiver. Automatic recognizes Discord, Slack, ntfy.sh, and Healthchecks from the address; pick ntfy for a self-hosted ntfy server on your own domain (title, priority, and icon arrive properly instead of a JSON blob), or plain JSON to force the generic payload.">i</span></span>
+          <span class="ctl"><select id="setWebhookFormat"><option value="">Automatic</option><option value="ntfy">ntfy</option><option value="generic">plain JSON</option></select><span class="unit"></span></span></label>
         <div class="notif-inline">
           <label class="srow"><span class="lbl">Alert on outage
             <span class="info" tabindex="0" data-tip="Send a webhook alert whenever the link goes down and when it comes back.">i</span></span>
@@ -3830,6 +3833,21 @@ function chartSaveTargets(kind){
     return c && !c.classList.contains('chart-off') && c.style.display!=='none' && c.clientHeight>0;
   });
 }
+// spdExportAvgSegments builds the averages header drawn into a saved speed
+// image: the same numbers the on-screen pills show, as [text, colourKey]
+// segments so the drawer stays dumb. Keys resolve against TC - 'axis' for
+// labels and the sampled-mean note, 'fg' for values, 'dl'/'ul' for the
+// direction arrows so they wear the colours of the lines they summarize.
+function spdExportAvgSegments(a, note){
+  // 'icon:ping' is the UI's wave glyph (chart-stat pill), stroked by the
+  // drawer as a Path2D in the ping line's colour - the arrows and the wave
+  // each wear the colour of the series they summarize.
+  const segs=[['\u2193 ','dl'], [mbpsText(a.down),'fg'],
+    ['   \u2191 ','ul'], [mbpsText(a.up),'fg'],
+    ['   ','axis'], ['icon:ping','ping'], [pingAvgText(a.ping),'fg']];
+  if(note) segs.push([note,'axis']);
+  return segs;
+}
 function saveChartImage(kind){
   const ids=chartSaveTargets(kind);
   if(!ids.length) return;
@@ -3853,12 +3871,44 @@ function saveChartImage(kind){
     const cs=ids.map(id=>$(id)).filter(c=>c.width>0&&c.height>0);
     if(!cs.length) return;
     const w=Math.max(...cs.map(c=>c.width)), h=cs.reduce((a,c)=>a+c.height,0), pad=Math.round(16*total);
+    // The on-screen averages pills sit outside the canvases, so the export
+    // repeats them as a band UNDER the charts - a PNG has no panel around it
+    // to say what the lines average to. Latency has no such pills; only
+    // speed does.
+    const segs=kind==='latency'?null:spdExportAvgSegments(spdAverages(spdData), spdAvgNote(spdSampled,spdTotal,spdData.length));
+    const bandH=segs?Math.round(32*total):0;
     const out=document.createElement('canvas');
-    out.width=w+pad*2; out.height=h+pad*2;
+    out.width=w+pad*2; out.height=h+pad*2+bandH;
     const g=out.getContext('2d');
     g.fillStyle=panelBg(); g.fillRect(0,0,out.width,out.height);
     let y=pad;
     for(const c of cs){ g.drawImage(c, pad, y); y+=c.height; }
+    if(segs){
+      g.font=Math.round(9.5*total)+'px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+      g.textBaseline='middle';
+      // Centred and sitting low in its band, small and slightly faded, so the
+      // caption reads as a footer under the charts rather than competing with
+      // them.
+      g.globalAlpha=0.72;
+      const fpx=9.5*total, iconW=Math.round(13*fpx/12)+Math.round(3*total);
+      const segW=seg=>seg[0]==='icon:ping'?iconW:g.measureText(seg[0]).width;
+      const textW=segs.reduce((a,seg)=>a+segW(seg),0);
+      let x=Math.max(pad, Math.round((out.width-textW)/2));
+      const cy=y+Math.round(bandH*0.72);
+      for(const [t,k] of segs){
+        if(t==='icon:ping'){
+          const sc=fpx/12;
+          g.save(); g.translate(x, cy-fpx*0.5); g.scale(sc,sc);
+          g.strokeStyle=TC[k]||TC.fg; g.lineWidth=1.5; g.lineCap='round'; g.lineJoin='round';
+          g.stroke(new Path2D('M2 6q2.25 -7 4.5 0t4.5 0'));
+          g.restore();
+          x+=iconW;
+          continue;
+        }
+        g.fillStyle=TC[k]||TC.fg; g.fillText(t,x,cy); x+=g.measureText(t).width;
+      }
+      g.globalAlpha=1;
+    }
     const name='pingularity-'+kind+'-'+fmtLocalDate(new Date())+'.png';
     out.toBlob(b=>{
       if(!b){ const tb=$('undoToast'); if(tb){ tb.textContent='Could not export image'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); } return; }
@@ -5699,12 +5749,12 @@ const shortPlace = s => s ? s.split(',').slice(0,2).join(',').trim() : '';
 const autoOptionText = label => { return label ? `Auto - fastest in ${label}` : 'Auto - fastest near you'; };
 const autoScopeText = (what, label, listCentre, lastServer, centredOnLastRun) => {
   if(label) return `Auto picks ${what} in <b>${esc(label)}</b>.`;
-  let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - decided fresh on every test.`;
+  let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - the location is chosen fresh when the next test runs.`;
   if(centredOnLastRun && listCentre)
-    t += ` The list here is for browsing, centred on <b>${esc(listCentre)}</b>, where your last auto test ran.`;
+    t += ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b> where your last auto test ran - not where the next one will.`;
   else t += listCentre
-    ? ` The list here is for browsing, centred on <b>${esc(listCentre)}</b>; auto may test from a different city.`
-    : ' The list here is for browsing, centred on your connection’s own location; auto may test from a different city.';
+    ? ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b>; auto may test from a different city.`
+    : ' The list here is only for browsing, centred on your connection’s own location; auto may test from a different city.';
   // Past tense on purpose: it reports what the last run measured, which stays
   // true however that server was chosen, rather than claiming a present centre.
   if(lastServer) t += ` Your last test measured <b>${esc(lastServer)}</b>.`;
@@ -5906,6 +5956,7 @@ const FIELDS=[
   ['setThreshConsec','thresh_consecutive','int',1],
   ['setAlertOutage','alert_on_outage','bool'],
   ['setWebhook','webhook_url','text'],
+  ['setWebhookFormat','webhook_format','val'],
   ['setHeartbeat','heartbeat_url','text'],
   ['setDigestFreq','digest_freq','val'],
 ];

@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,7 +32,11 @@ import (
 // Notifier posts alerts to the webhook returned by URLFn (read live, so the URL
 // can change at runtime). A nil/empty URL disables delivery.
 type Notifier struct {
-	URLFn    func() string
+	URLFn func() string
+	// FormatFn returns the Alerts tab's "Webhook format" override ("" or
+	// "auto" = detect from the hostname; "ntfy"/"generic" force the shape).
+	// Optional: nil means auto.
+	FormatFn func() string
 	log      *slog.Logger
 	client   *http.Client
 	outageMu sync.Mutex // serializes Outage delivery so a flap's down/up can't arrive out of order
@@ -287,12 +292,27 @@ func (n *Notifier) Send(ctx context.Context, message string, fields map[string]a
 		n.log.Debug("notify skipped: no webhook configured", "event", fields["event"])
 		return nil // not configured: a deliberate no-op, not a failure
 	}
+	format := ""
+	if n.FormatFn != nil {
+		format = n.FormatFn()
+	}
+	// Per-destination-class delivery accounting (never the URL/host itself);
+	// the class also picks the payload shape, so the override changes both.
+	class := destClass(url, format)
 	if ssrfBlocked(url) {
-		stats.Inc("notify." + classifyDest(url) + ".blocked")
-		n.log.Warn("notify blocked", "dest", classifyDest(url), "reason", "link-local/metadata destination")
+		stats.Inc("notify." + class + ".blocked")
+		n.log.Warn("notify blocked", "dest", class, "reason", "link-local/metadata destination")
 		return fmt.Errorf("notify: destination blocked (link-local/metadata): %w", errPermanent)
 	}
-	body := payloadFor(url, message, fields)
+	var body []byte
+	if class == "ntfy" {
+		// ntfy speaks headers, not JSON: the message is the body, and the
+		// polish rides X-Title/X-Priority/X-Tags. alertMeta's 1-5 priority is
+		// ntfy's own scale, so it maps verbatim.
+		body = []byte(message)
+	} else {
+		body = payloadFor(class, message, fields)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		// Scrub: webhook URLs are bearer secrets and *url.Error prints the full URL.
@@ -300,9 +320,15 @@ func (n *Notifier) Send(ctx context.Context, message string, fields map[string]a
 		n.log.Error("notify build request", "err", err)
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	// Per-destination-class delivery accounting (never the URL/host itself).
-	class := classifyDest(url)
+	if class == "ntfy" {
+		title, typ, prio := alertMeta(fields)
+		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+		req.Header.Set("X-Title", title)
+		req.Header.Set("X-Priority", strconv.Itoa(prio))
+		req.Header.Set("X-Tags", ntfyTags(typ))
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	start := time.Now()
 	resp, err := n.client.Do(req)
 	stats.AddF("notify."+class+".lat_ms_sum", util.DurMS(time.Since(start)))
@@ -352,19 +378,36 @@ func classifyDest(rawurl string) string {
 		return "slack"
 	case strings.Contains(host, "hc-ping"), strings.Contains(host, "healthchecks"):
 		return "healthchecks"
+	case strings.Contains(host, "ntfy"):
+		return "ntfy"
 	}
 	return "generic"
 }
 
-// payloadFor builds a JSON body suited to the destination. Discord wants
-// {"content"}, Slack wants {"text"}; everything else gets a rich payload.
-func payloadFor(url, message string, fields map[string]any) []byte {
-	host := hostOf(url)
+// destClass resolves the delivery class: an explicit format override (the
+// Alerts tab's "Webhook format" select) wins outright - the operator knows
+// what's on the other end better than a hostname guess can, and a self-hosted
+// ntfy on an arbitrary domain is exactly the case the guess cannot cover.
+// "auto"/"" fall through to the hostname heuristic.
+func destClass(rawurl, format string) string {
+	switch format {
+	case "ntfy", "generic":
+		return format
+	}
+	return classifyDest(rawurl)
+}
+
+// payloadFor builds a JSON body suited to the destination CLASS (destClass,
+// so a format override shapes the payload too, not just the counters).
+// Discord wants {"content"}, Slack wants {"text"}; everything else gets a
+// rich payload. ntfy never reaches here - it is not JSON at all (see the
+// ntfy branch in Send).
+func payloadFor(class, message string, fields map[string]any) []byte {
 	var v map[string]any
-	switch {
-	case strings.Contains(host, "discord.com") || strings.Contains(host, "discordapp.com"):
+	switch class {
+	case "discord":
 		v = map[string]any{"content": message}
-	case strings.Contains(host, "hooks.slack.com"):
+	case "slack":
 		v = map[string]any{"text": message}
 	default:
 		title, typ, prio := alertMeta(fields)
@@ -400,6 +443,20 @@ func alertMeta(fields map[string]any) (title, typ string, priority int) {
 		return "Connectivity digest", "info", 2
 	}
 	return "Pingularity", "info", 3
+}
+
+// ntfyTags maps the Apprise notification type onto ntfy's emoji shortcodes,
+// so the phone notification carries the right glyph without any JSON.
+func ntfyTags(typ string) string {
+	switch typ {
+	case "failure":
+		return "rotating_light"
+	case "success":
+		return "white_check_mark"
+	case "warning":
+		return "warning"
+	}
+	return "information_source"
 }
 
 func hostOf(rawurl string) string {

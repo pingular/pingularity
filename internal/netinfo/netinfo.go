@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pingular/pingularity/internal/stats"
 )
 
 // DNSEntry is a single DNS server, who operates it, and where it is.
@@ -197,6 +199,7 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 	// one that returns after a newer snapshot already landed must not overwrite it.
 	if m.claimPublish(gen) {
 		m.info = i
+		markFresh(i)
 	}
 	m.mu.Unlock()
 	m.log.Info("netinfo refreshed", "ip", i.PublicIP, "isp", i.ISP)
@@ -244,6 +247,17 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 			m.info.Exit = ex
 		}
 		m.mu.Unlock()
+	}
+}
+
+// markFresh stamps the freshness gauge for a published snapshot whose lookup
+// chain succeeded. netinfo.last_ok_ts is the /metrics answer to "is the
+// Connection panel stale?" - a box whose lookups keep failing serves old
+// ISP/exit data indistinguishably without it (the counters say lookups fail,
+// only the timestamp says since when). Matches dns.last_ok_ts's convention.
+func markFresh(i Info) {
+	if i.Error == "" {
+		stats.Set("netinfo.last_ok_ts", time.Now().Unix())
 	}
 }
 

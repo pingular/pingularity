@@ -171,12 +171,24 @@ func (p *program) run(ctx context.Context) {
 	// A clean return means the worker honored ctx and exited, so do not restart.
 	spawnLoop := func(name string, fn func()) {
 		spawn(func() {
-			// Worker health on /metrics: up=1 while this loop is running, cleared to 0
-			// when it returns or gives up; restarts counts panic-recoveries. A worker
+			// Worker health on /metrics: up=1 while this loop is running; on exit the
+			// terminal write below distinguishes completion (series removed) from
+			// death (the alertable 0); restarts counts panic-recoveries. A worker
 			// that dies (up=0) or thrashes (restarts climbing) is then alertable.
 			stats.Set("worker."+name+".up", 1)
 			stats.Seed("worker." + name + ".restarts")
-			defer stats.Set("worker."+name+".up", 0)
+			// Terminal state: a worker that COMPLETED its job (clean return
+			// with the process still live - settings-retry succeeding) removes
+			// its up gauge entirely, so the documented worker_up==0 alert
+			// matches only real deaths: the give-up path below and shutdown.
+			completed := false
+			defer func() {
+				if completed {
+					stats.Delete("worker." + name + ".up")
+				} else {
+					stats.Set("worker."+name+".up", 0)
+				}
+			}()
 			backoff := time.Second
 			// maxWorkerRestarts is meant to catch a THRASHING worker (rapid crash loop),
 			// not a worker that panics rarely over a long uptime. A run that lasted this
@@ -199,6 +211,7 @@ func (p *program) run(ctx context.Context) {
 					return false
 				}()
 				if !panicked || ctx.Err() != nil {
+					completed = !panicked && ctx.Err() == nil
 					return
 				}
 				if time.Since(start) >= healthyRun {
@@ -523,6 +536,7 @@ func (p *program) run(ctx context.Context) {
 
 	// Alert delivery (webhook) + dead-man's-switch heartbeat.
 	notifier := notify.New(set.WebhookURL, p.log)
+	notifier.FormatFn = set.WebhookFormat // the Alerts tab's payload-shape override
 	spawnLoop("heartbeat", func() { p.runHeartbeat(ctx, set) })
 
 	// Periodic health digest (off/daily/weekly) to the same webhook. Deliberately
@@ -830,7 +844,8 @@ func (p *program) run(ctx context.Context) {
 // runPruner deletes old data once at startup and hourly thereafter. Latency
 // samples, speed history, and outages each use their own retention window; a
 // window of 0 keeps that data forever.
-// seedKnownCounters initializes the fixed, known operational counters (and the
+// seedKnownCounters initializes the fixed, known operational counters, the
+// float sums behind exported duration families (via stats.SeedF), and the
 // enumerable failure/trigger families) to 0 at startup, so a first event after a
 // restart reads as a 0->1 step that rate()/increase() can see - a series that only
 // springs into existence at 1 hides its first increment from Prometheus (F7). Only
@@ -886,7 +901,23 @@ func seedKnownCounters() {
 		"db.err", "db.busy", "db.io_err", "db.disk_full", "db.corrupt", "db.prune_count",
 		"db.prune_skipped_clock",
 		"web.login_fail", "web.limiter_trips", "web.metrics_targets_capped",
+		// The /metrics label-collision disclosure and the step-up security
+		// counter (sibling of login_fail); both alert-worthy first events.
+		"web.metrics_label_collisions", "web.stepup_fail",
+		// An unobserved stretch dropped for good (the retried sibling above
+		// eventually lands; this one is the loss) and the OTHER speedtest
+		// panic counter - transfer_panic and transport_panic are distinct.
+		"monitor.unobserved_gap_dropped", "speed.transport_panic",
+		// Import/restore repairs: rows the importer refused, disclosed on
+		// /metrics rather than silently absent from history.
+		"import.event_duration_dropped", "import.pause_dropped",
+		// The summary count for run durations (its float sum is seeded below).
+		"speed.duration_n",
 	}
+	// Float sums behind exported duration families: absent-until-first-event
+	// means the family itself is missing from scrapes, hiding the first
+	// outage/run/prune from rate() exactly like an unseeded counter would.
+	stats.SeedF("monitor.outage_s_sum", "speed.duration_s_sum", "db.prune_ms_sum")
 	for _, cls := range []string{"timeout", "refused", "net_unreachable", "host_unreachable", "dns", "other"} {
 		names = append(names, "probe.fail."+cls, "dns.fail."+cls)
 	}
@@ -896,8 +927,9 @@ func seedKnownCounters() {
 	for _, stage := range []string{"server_list", "server_fetch", "no_servers", "ping", "na", "download", "upload", "bidir", "other"} {
 		names = append(names, "speed.fail."+stage)
 	}
-	for _, dest := range []string{"discord", "slack", "healthchecks", "generic", "heartbeat"} {
-		names = append(names, "notify."+dest+".ok", "notify."+dest+".fail", "notify."+dest+".blocked")
+	for _, dest := range []string{"discord", "slack", "healthchecks", "ntfy", "generic", "heartbeat"} {
+		names = append(names, "notify."+dest+".ok", "notify."+dest+".fail", "notify."+dest+".blocked", "notify."+dest+".lat_n")
+		stats.SeedF("notify." + dest + ".lat_ms_sum")
 	}
 	stats.Seed(names...)
 }

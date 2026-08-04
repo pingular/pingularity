@@ -19,7 +19,7 @@ import (
 )
 
 func TestPayloadForDiscord(t *testing.T) {
-	b := payloadFor("https://discord.com/api/webhooks/123/abc", "hello", map[string]any{"event": "test"})
+	b := payloadFor("discord", "hello", map[string]any{"event": "test"})
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
@@ -33,7 +33,7 @@ func TestPayloadForDiscord(t *testing.T) {
 }
 
 func TestPayloadForSlack(t *testing.T) {
-	b := payloadFor("https://hooks.slack.com/services/T/B/X", "hi", nil)
+	b := payloadFor("slack", "hi", nil)
 	var m map[string]any
 	json.Unmarshal(b, &m)
 	if m["text"] != "hi" {
@@ -45,7 +45,7 @@ func TestPayloadForSlack(t *testing.T) {
 }
 
 func TestPayloadForGeneric(t *testing.T) {
-	b := payloadFor("https://ntfy.sh/mytopic", "msg", map[string]any{"event": "link_down"})
+	b := payloadFor("generic", "msg", map[string]any{"event": "link_down"})
 	var m map[string]any
 	json.Unmarshal(b, &m)
 	// Generic carries the text under every common key so chat (text/content),
@@ -87,7 +87,8 @@ func TestClassifyDest(t *testing.T) {
 		"https://hc-ping.com/uuid":               "healthchecks",
 		"https://healthchecks.example.org/ping":  "healthchecks",
 		"https://api.telegram.org/botX/send":     "generic",
-		"https://ntfy.sh/mytopic":                "generic",
+		"https://ntfy.sh/mytopic":                "ntfy",
+		"https://ntfy.example.com/alerts":        "ntfy",
 		"http://127.0.0.1:9911/hook":             "generic",
 	}
 	for in, want := range cases {
@@ -523,5 +524,64 @@ func TestSpeedThresholdDoesNotRetryPermanentFailure(t *testing.T) {
 	n.SpeedThreshold(context.Background(), store.SpeedSample{DownMbps: 5, UpMbps: 1, PingMS: 20}, []string{"download 5 < 100 Mbps"})
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("webhook received %d requests, want exactly 1 (permanent failures are not retried)", got)
+	}
+}
+
+// NTFY IS SPOKEN NATIVELY: the message is the plain-text body and the polish
+// rides headers - title, alertMeta's 1-5 priority verbatim (it is ntfy's own
+// scale), and an emoji tag per severity. No JSON blob on anyone's phone.
+func TestNtfyDeliveryShape(t *testing.T) {
+	stats.ResetForTest()
+	var got *http.Request
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r
+		body, _ = io.ReadAll(r.Body)
+	}))
+	defer srv.Close()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	n := New(func() string { return srv.URL + "/alerts" }, log)
+	// The override: an arbitrary self-hosted domain the hostname guess cannot
+	// place, forced to ntfy by the Alerts tab's format select.
+	n.FormatFn = func() string { return "ntfy" }
+	if err := n.Send(context.Background(), "Internet down at home", map[string]any{"event": "link_down"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if string(body) != "Internet down at home" {
+		t.Errorf("ntfy body must be the bare message, got %q", body)
+	}
+	if ct := got.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("content-type = %q, want text/plain", ct)
+	}
+	if got.Header.Get("X-Title") != "Internet down" || got.Header.Get("X-Priority") != "5" || got.Header.Get("X-Tags") != "rotating_light" {
+		t.Errorf("ntfy headers wrong: title=%q prio=%q tags=%q",
+			got.Header.Get("X-Title"), got.Header.Get("X-Priority"), got.Header.Get("X-Tags"))
+	}
+	if stats.Lifetime().Counters["notify.ntfy.ok"] != 1 {
+		t.Error("delivery not counted under the ntfy destination")
+	}
+}
+
+// The override cuts BOTH ways: forcing "generic" on a recognizable host must
+// deliver the rich JSON, not the host's chat shape.
+func TestFormatOverrideForcesGeneric(t *testing.T) {
+	stats.ResetForTest()
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+	}))
+	defer srv.Close()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	n := New(func() string { return srv.URL }, log)
+	n.FormatFn = func() string { return "generic" }
+	if err := n.Send(context.Background(), "msg", map[string]any{"event": "link_up"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("forced-generic body is not JSON: %q", body)
+	}
+	if m["title"] != "Internet restored" || m["text"] != "msg" {
+		t.Errorf("forced-generic payload wrong: %v", m)
 	}
 }

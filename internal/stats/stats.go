@@ -3,7 +3,9 @@
 // cycles.
 //
 // One always-on, monotonic registry: records only add up; nothing subtracts or
-// clears (outside tests). It feeds the local Prometheus /metrics endpoint, which
+// clears (outside tests), with a single sanctioned removal: Delete, for a
+// completed worker's up gauge (a finished job must stop reporting at all
+// rather than read as dead forever). It feeds the local Prometheus /metrics endpoint, which
 // never leaves the box.
 //
 // Names are "<subsystem>.<metric>" with optional label suffixes, e.g.
@@ -103,6 +105,31 @@ func SetMax(name string, v int64) {
 	mu.Unlock()
 }
 
+// Delete removes a gauge outright. The one sanctioned use is a completed
+// worker's up gauge: 0 must keep meaning "died" for alerting, so a worker that
+// finished its job removes its series instead. Counters are never deletable -
+// monotonicity is the registry's contract.
+func Delete(name string) {
+	mu.Lock()
+	delete(gauges, name)
+	mu.Unlock()
+}
+
+// SeedF creates each named float accumulator at 0 if it does not exist yet -
+// the AddF twin of Seed, for the duration sums behind exported families that
+// would otherwise be absent entirely until their first event.
+func SeedF(names ...string) {
+	mu.Lock()
+	for _, n := range names {
+		if validName(n) {
+			if _, ok := floats[n]; !ok {
+				floats[n] = 0
+			}
+		}
+	}
+	mu.Unlock()
+}
+
 // Seed creates each named counter at 0 if it does not exist yet, leaving any that
 // already have a value untouched. Called once at startup for the fixed, known
 // counters so their series appear immediately - a first event after a restart then
@@ -166,7 +193,7 @@ func snapshot(c map[string]int64, f map[string]float64, g map[string]int64, h ma
 		s.Gauges[k] = v
 	}
 	for k, v := range h { // deep-copy each histogram's slices so the caller can't mutate live state
-		cp := Histogram{Bounds: v.Bounds, Counts: append([]uint64(nil), v.Counts...), Sum: v.Sum, Count: v.Count}
+		cp := Histogram{Bounds: append([]float64(nil), v.Bounds...), Counts: append([]uint64(nil), v.Counts...), Sum: v.Sum, Count: v.Count}
 		s.Histos[k] = cp
 	}
 	return s

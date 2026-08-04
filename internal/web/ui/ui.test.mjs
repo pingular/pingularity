@@ -54,6 +54,7 @@ const DEFS = {
   speedtestAbortable: 'function speedtestAbortable',
   autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
   serverOptionText: 'const serverOptionText',
+  spdExportAvgSegments: 'function spdExportAvgSegments',
   bloatBins: 'function bloatBins', bloatCeiling: 'function bloatCeiling',
   bloatDataMax: 'function bloatDataMax', cursorSpan: 'const cursorSpan',
   drawCursor: 'function drawCursor',
@@ -1705,7 +1706,11 @@ test('with no browse centre the sentence is still true', () => {
 // remember, and crediting a candidate city to auto is the old defect back.
 test('last-run centring is named in the past tense, fallback centring is not', () => {
   const t = F.autoScopeText('the fastest server', '', 'Newtown, QC', 'Example ISP, Newtown', true);
-  assert.ok(/centred on <b>Newtown, QC<\/b>, where your last auto test ran/.test(t), t);
+  assert.ok(/centred on <b>Newtown, QC<\/b> where your last auto test ran - not where the next one will/.test(t), t);
+  // The disclaimer is the point: toggling auto on shows the LAST run's city for
+  // browsing, but the note must not read as where the NEXT test will go (it is
+  // raced fresh each run, so no city is known until the test runs).
+  assert.ok(/chosen fresh when the next test runs/.test(t), t);
   assert.ok(!/different city/.test(t), t);
   const f = F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Newtown', false);
   assert.ok(/auto may test from a different city/.test(f), f);
@@ -1734,6 +1739,32 @@ test('a server row renders without a dangling comma or a bogus 0 km', () => {
     'Bell Canada - Scarborough, ON, Canada (4 km)');
   assert.equal(F.serverOptionText({sponsor:'EBOX', name:'Montréal, QC', country:'Canada', distance_km:297}),
     'EBOX - Montréal, QC, Canada (297 km)');
+});
+
+// THE SAVED IMAGE CARRIES THE AVERAGES THE SCREEN SHOWS. A PNG leaves the app
+// with no pills above it, so the export header repeats them: same reducer
+// (spdAverages), same formatters, arrows in the colours of the lines they
+// summarize, the house '-' for no-data, and the sampled-mean note when the
+// window was thinned.
+test('the saved speed image carries the on-screen averages', () => {
+  const segs = F.spdExportAvgSegments({down: 486.6, up: 120.7, ping: 13.6}, '');
+  const text = segs.map((s) => s[0]).join('');
+  assert.ok(/487 Mbps/.test(text), text);
+  assert.ok(/121 Mbps/.test(text), text);
+  assert.ok(/14 ms/.test(text), text);
+  assert.ok(!/avg/.test(text), 'no avg label: the band is values-only');
+  assert.equal(segs.find((s) => s[0].includes('\u2193'))[1], 'dl');
+  assert.equal(segs.find((s) => s[0].includes('\u2191'))[1], 'ul');
+  const wave = segs.find((s) => s[0] === 'icon:ping');
+  assert.ok(wave, 'the ping value is introduced by the wave icon, not a text label');
+  assert.equal(wave[1], 'ping');
+  assert.ok(!/ping /.test(text), text);
+  const empty = F.spdExportAvgSegments({down: null, up: null, ping: null}, '').map((s) => s[0]).join('');
+  assert.ok(!/NaN|null|0 Mbps/.test(empty), empty);
+  assert.ok(/-/.test(empty), empty);
+  const noted = F.spdExportAvgSegments({down: 1, up: 1, ping: 1}, ' (mean of the 500 runs charted, of 1200 in range)');
+  assert.equal(noted[noted.length - 1][1], 'axis');
+  assert.ok(/mean of the 500/.test(noted[noted.length - 1][0]));
 });
 
 test('the panel escapes place names the daemon supplies', () => {
