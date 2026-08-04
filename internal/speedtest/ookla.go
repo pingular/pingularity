@@ -1918,17 +1918,25 @@ type ServerInfo struct {
 	Name       string  `json:"name"`
 	Country    string  `json:"country"`
 	DistanceKM float64 `json:"distance_km"`
-	// Lat/Lon are deliberately not serialized: they exist so the browse
-	// handler can centre a list fetch on a server (the last auto run's), and
-	// the response shape stays exactly what the UI and demo already speak.
-	// 0,0 when the Ookla record's coordinate strings don't parse (serverCoord).
+	// Lat/Lon are not serialized: they carry the catalog's REGISTERED server
+	// coordinates so the browse handler can centre a metro fetch on a server
+	// it trusts. Filled by the list/search fetches, whose values proved real;
+	// GetOoklaServer leaves them zero - its endpoint backfills the caller's
+	// own position on sparse records and must never centre anything.
 	Lat float64 `json:"-"`
 	Lon float64 `json:"-"`
 }
 
 // ListOoklaServers returns the Ookla servers the API reports for a location,
 // nearest first. Non-zero lat/lon returns servers near that coordinate (a city
-// search, like speedtest.net's "change server"); otherwise near the caller's IP.
+// search, like speedtest.net's "change server"); otherwise near the caller's
+// IP. Rows carry real registered coordinates and distances - but note Ookla
+// registers many metro servers at their city's canonical centre point, so a
+// fetch centred exactly there reads 0 km for that whole cohort (the UI
+// suppresses the label; the stable sort keeps Ookla's order for the ties)
+// while differently-registered neighbours keep real distances. An earlier
+// comment here claimed the API rewrites positions to the query point - wrong:
+// the identical coordinates were the canonical registrations themselves.
 func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, error) {
 	uc := &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent}
 	if lat != 0 || lon != 0 {
@@ -1953,7 +1961,33 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
+	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
+	return out, nil
+}
+
+// SearchOoklaServers returns the servers whose catalog entry matches a keyword
+// (Ookla matches name and sponsor substrings, worldwide), nearest first, with
+// real registered coordinates on every row. The browse handler uses it as a
+// COORDINATE ORACLE: it finds the last-run server's own row by ID and centres
+// the ordinary metro fetch on that row's coordinates - never as the list
+// itself, because a city-name cohort collapses to a single row whenever the
+// measured server wears a suburb's name tag (measured: an Ottawa-scoped run
+// landing on "Nepean, ON", a one-server name).
+func SearchOoklaServers(ctx context.Context, keyword string) ([]ServerInfo, error) {
+	uc := &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent, Keyword: keyword}
+	servers, err := newOoklaClient(uc).FetchServerListContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ServerInfo, 0, len(servers))
+	for _, s := range servers {
+		lat, lon, _ := serverCoord(s)
+		out = append(out, ServerInfo{
+			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
+			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
 	return out, nil
 }
 
@@ -1964,6 +1998,11 @@ func GetOoklaServer(ctx context.Context, id string) (ServerInfo, error) {
 	if err != nil {
 		return ServerInfo{}, err
 	}
-	lat, lon, _ := serverCoord(srv)
-	return ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance, Lat: lat, Lon: lon}, nil
+	// NOTE the endpoint behind this (api/ios-config.php) is only trustworthy
+	// for identity fields (ID, sponsor, name). Measured on server 1993: it
+	// returned an empty country and - worse - the CALLER'S own geolocated
+	// coordinates in the server's lat/lon attributes, so nothing here may
+	// treat its position or distance as the server's. The browse handler
+	// centres by the Name label through SearchOoklaServers instead.
+	return ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance}, nil
 }

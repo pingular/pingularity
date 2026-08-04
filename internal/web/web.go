@@ -1801,8 +1801,9 @@ func (s *Server) handleIperfCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSpeedtestServers returns Ookla servers for the picker. With ?city=<name>
-// it geocodes the city and returns servers near it; otherwise servers near the
-// caller's own location.
+// it geocodes the city and returns servers near it; otherwise the city of the
+// server the last auto run used (see the default branch below), falling back to
+// the first coordinate-carrying candidate city, else the caller's own location.
 func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) {
 	// POST + application/json, for the same reason handleIperfCheck demands them
 	// ("body-less POST: CSRF guard"): this handler REACHES OUT - to Ookla, and to
@@ -1871,11 +1872,23 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 		// re-decides every run (speedtest.raceCities) and nothing here feeds
 		// back into selection - but it upgrades the browse guarantee from "a
 		// city the race would consider" to "the city it last chose", and the
-		// last-used server is always findable in the list (prepended below if
-		// the pool around its own coordinate omits it - Ookla pools really do
-		// that). Stale only until the next auto run - a reconnect triggers one
-		// - and the panel words it in the past tense rather than pretending a
-		// present centre.
+		// last-used server is always findable in the list (prepended below in
+		// the rare case the metro fetch around it omits it). Stale only until the
+		// next auto run - a reconnect triggers one - and the panel words it in
+		// the past tense rather than pretending a present centre.
+		//
+		// The centring must never trust the by-ID record's coordinates: that
+		// endpoint backfills the CALLER'S own geolocation into a server's
+		// lat/lon when its record is sparse (measured - a "Montréal, QC"
+		// server came back carrying this machine's position), which once
+		// centred the list on the operator while the caption named the
+		// server's city. Instead the server's name is searched and its OWN
+		// row - matched by ID, which disambiguates same-named cities
+		// worldwide for free - supplies real catalog coordinates, and the
+		// ordinary metro fetch runs around those. The search result is only
+		// that coordinate oracle, never the list: a name cohort collapses to
+		// one row when the measured server wears a suburb's name tag
+		// (measured: an Ottawa-scoped run landing on "Nepean, ON").
 		//
 		// With no qualifying run (fresh install, iperf3/pre-feature history, a
 		// longtime pin, or the ID lookup failing), fall back to the first
@@ -1920,9 +1933,22 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 				idCtx, cancelID := context.WithTimeout(ctx, 6*time.Second)
 				srv, err := getOoklaServer(idCtx, id)
 				cancelID()
-				if err == nil && (srv.Lat != 0 || srv.Lon != 0) {
-					lat, lon, locName = srv.Lat, srv.Lon, srv.Name+", "+srv.Country
-					centre, centreSrv = "last_run", &srv
+				if err == nil && srv.Name != "" {
+					// Its own sub-budget too: a stalled search must leave the
+					// coordinate fetch time to run, or a hang here turns the
+					// whole browse into a 502.
+					searchCtx, cancelSearch := context.WithTimeout(ctx, 8*time.Second)
+					found, err := searchOoklaServers(searchCtx, srv.Name)
+					cancelSearch()
+					if err == nil {
+						for i := range found {
+							if found[i].ID == srv.ID && (found[i].Lat != 0 || found[i].Lon != 0) {
+								lat, lon, locName = found[i].Lat, found[i].Lon, srv.Name
+								centre, centreSrv = "last_run", &srv
+								break
+							}
+						}
+					}
 				}
 			}
 			if centre == "" && s.AutoOriginsFn != nil {
@@ -1942,8 +1968,8 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 		list = []speedtest.ServerInfo{}
 	}
 	// The point of last-run centring is that the last-used server is findable
-	// here; Ookla pools are arbitrary enough that even a list fetched around
-	// the server's own coordinate can omit it, so make that unconditional.
+	// here; a metro fetch around its own registered coordinates should always
+	// include it, but the guarantee is cheap to make unconditional, so it is.
 	if centreSrv != nil && !slices.ContainsFunc(list, func(si speedtest.ServerInfo) bool { return si.ID == centreSrv.ID }) {
 		pre := *centreSrv
 		pre.DistanceKM = 0 // distance to the centre, which is this server
@@ -2005,6 +2031,11 @@ var listOoklaServers = speedtest.ListOoklaServers
 // getOoklaServer resolves the last auto run's server for the browse centring
 // above; a seam for the same reason listOoklaServers is.
 var getOoklaServer = speedtest.GetOoklaServer
+
+// searchOoklaServers fetches the browse list by city-name keyword for the
+// last-run path (real per-server distances, untrusted coordinates avoided);
+// a seam for the same reason listOoklaServers is.
+var searchOoklaServers = speedtest.SearchOoklaServers
 
 var geocodeClient = &http.Client{
 	Timeout:       10 * time.Second,
