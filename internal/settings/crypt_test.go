@@ -431,7 +431,7 @@ func (failSealCrypter) Unseal(s string) (string, error) { return s, nil }
 // If sealing a password fails, the save must ABORT - not fall through and write the
 // password in the clear. mutate returns the error before touching the store or the
 // live values, so nothing is persisted and the in-memory config is unchanged.
-// Regression for C-33 (sealServers used to `continue` past a Seal error).
+// sealServers used to `continue` past a Seal error, persisting the rest.
 func TestSealFailureAbortsSave(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {

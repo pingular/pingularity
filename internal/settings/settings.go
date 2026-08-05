@@ -115,7 +115,7 @@ const (
 	MinIperfDur     = 1
 	MaxIperfDur     = 30
 	MinIperfStreams = 1
-	MaxIperfStreams = 8
+	MaxIperfStreams = 32
 
 	MaxOoklaConnections = 16 // ceiling for Ookla parallel connections; 0 = library default
 	MaxIperfOmit        = 5

@@ -64,6 +64,7 @@ const DEFS = {
   upCovFoot: 'function upCovFoot', logTruncNote: 'function logTruncNote',
   outageDeletable: 'function outageDeletable',
   isReconcile503: 'function isReconcile503', retryAfterMs: 'function retryAfterMs',
+  pkcs1FlagUsable: 'function pkcs1FlagUsable', pkcs1BoxState: 'function pkcs1BoxState',
 };
 const NAMES = Object.keys(DEFS);
 const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
@@ -256,7 +257,7 @@ const PS = new Function(extract('function newIperfServer') + '\n' + extract('fun
 
 test('newIperfServer: fresh server defaults to auto IP, default route, auth off', () => {
   assert.deepEqual(PS.newIperfServer('NAS', '10.0.0.5'),
-    { label: 'NAS', addr: '10.0.0.5', orig_addr: '', bind: '', ipver: 'auto', auth: false, username: '', rsa_key: '', pkcs1: false, has_password: false, password: '' });
+    { label: 'NAS', addr: '10.0.0.5', orig_addr: '', bind: '', ipver: 'auto', auth: false, username: '', rsa_key: '', pkcs1: false, has_password: false, orig_has_password: false, password: '' });
 });
 
 // --- chart line gaps ---
@@ -2122,4 +2123,119 @@ test('every built-in theme meets WCAG AA for its normal-size text tokens', () =>
   }
   assert.deepEqual(failures, [],
     `theme text below WCAG AA 4.5:1:\n  ${failures.join('\n  ')}`);
+});
+
+// The legacy-RSA-padding toggle is gated on what the LOCAL iperf3 can actually
+// send, and both edges are real upstream behavior, verified against esnet/iperf:
+// the flag arrives in 3.17, and 3.20 marks it server-only so a 3.20+ client
+// refuses to start with it ("some option you are trying to set is server only").
+// Offering the toggle outside that window turns a well-meant tick into a run that
+// never connects, which is exactly the confusion this gate exists to prevent.
+test('pkcs1FlagUsable spans only [3.17, 3.20)', () => {
+  const { pkcs1FlagUsable } = F;
+  assert.equal(pkcs1FlagUsable(316), false, '3.16 has no such flag - PKCS#1 is already its default');
+  assert.equal(pkcs1FlagUsable(317), true, '3.17 introduced the client-settable flag');
+  assert.equal(pkcs1FlagUsable(318), true);
+  assert.equal(pkcs1FlagUsable(319), true, '3.19 is the last client-settable build');
+  assert.equal(pkcs1FlagUsable(320), false, '3.20 made it server-only; a client rejects it outright');
+  assert.equal(pkcs1FlagUsable(321), false);
+  assert.equal(pkcs1FlagUsable(0), true, 'undetectable version must not disable the operator\'s choice');
+});
+
+// Disabling the toggle when the flag is unusable stops it being turned ON, but a
+// server SAVED with it on (ticked under a 3.17-3.19 build, or before the host's
+// iperf3 was upgraded past 3.20) keeps sending the flag - and a disabled checkbox
+// cannot be unticked, so the only remaining cure was deleting the server and
+// losing its stored password. Locked against turning on, never against turning off.
+test('an already-on legacy-padding toggle stays clearable on a build that cannot send it', () => {
+  const { pkcs1BoxState } = F;
+  for (const [vnum, ver] of [[321, '3.21'], [320, '3.20'], [316, '3.16']]) {
+    const off = pkcs1BoxState(vnum, ver, false);
+    assert.equal(off.disabled, true, `${ver}: an unusable flag must not be tickable`);
+    assert.ok(off.note.length > 0, `${ver}: a locked toggle must say why`);
+    const on = pkcs1BoxState(vnum, ver, true);
+    assert.equal(on.disabled, false, `${ver}: a saved-on flag must stay clearable`);
+    assert.match(on.note, /off/i, `${ver}: the note must tell the operator to turn it off`);
+    assert.notEqual(on.note, off.note, `${ver}: on-and-broken is not the same message as unavailable`);
+  }
+  const ok = pkcs1BoxState(318, '3.18', true);
+  assert.equal(ok.disabled, false, '3.18 can send the flag');
+  assert.equal(ok.note, '', 'a usable flag needs no note');
+  assert.equal(pkcs1BoxState(0, '', false).disabled, false, 'an undetectable build locks nothing');
+});
+
+// Leaving a saved-on toggle enabled is only half the rule: the moment it is
+// unticked, the reason to leave it enabled is gone. Without a re-gate the box
+// stays clickable on a build that cannot send the flag, and the note still reads
+// "turn this off" for a flag that is already off - so it can be ticked straight
+// back on and every run to that server fails before it connects. This drives the
+// real DOM function through the transition, not just the pure rule.
+test('unticking the legacy-padding toggle re-locks it and drops the stale note', () => {
+  const els = {
+    setIperfPKCS1: { checked: true, disabled: false, closest: () => ({ classList: { toggle() {} } }) },
+    iperfPKCS1Note: { textContent: '', classList: { add() {}, remove() {} } },
+  };
+  const gate = new Function('$', 'iperfVersion',
+    extract('function iperfVerNum') + '\n' + extract('function pkcs1FlagUsable') + '\n'
+    + extract('function pkcs1BoxState') + '\n' + extract('function applyPKCS1Gate')
+    + '\nreturn applyPKCS1Gate;')(id => els[id], '3.21');
+
+  gate();  // a server saved with the flag on, opened on a 3.21 host
+  assert.equal(els.setIperfPKCS1.disabled, false, 'a saved-on flag must stay clearable');
+  assert.match(els.iperfPKCS1Note.textContent, /^Turn this off/);
+
+  els.setIperfPKCS1.checked = false;  // the operator unticks it; the change listener re-gates
+  gate();
+  assert.equal(els.setIperfPKCS1.disabled, true, 'once off, it must not be tickable again');
+  assert.match(els.iperfPKCS1Note.textContent, /^Unavailable/,
+    'the note must stop telling the operator to turn off a flag that is already off');
+});
+
+// The transition above only happens if something calls the gate on change.
+test('the legacy-padding toggle re-gates on change', () => {
+  assert.match(script, /\$\('setIperfPKCS1'\)\.addEventListener\('change', applyPKCS1Gate\)/,
+    'no change listener: the gate is computed once and never revisited');
+});
+
+// The address/password warning is scoped to the edit that raised it. Save, Done,
+// Load defaults and a discarded change all close the editor and re-render, so the
+// render is where the message dies - otherwise reopening Settings claims a
+// password needs re-entering after it was successfully saved.
+test('an edit-scoped iperf message cannot outlive its editor', () => {
+  const render = script.slice(script.indexOf('function renderIperfServers()'));
+  const body = render.slice(0, render.indexOf('\nfunction '));
+  assert.match(body, /if\(iperfEditingId==null\) \$\('iperfMsg'\)\.textContent='';/,
+    'renderIperfServers does not clear the edit message when no editor is open');
+  assert.ok(body.indexOf("if(iperfEditingId==null)") < body.indexOf("if(need)"),
+    'the clear must come BEFORE the list status line, or it wipes it');
+});
+
+// opacity on a label multiplies into everything inside it, including the help
+// tooltip - which is body-size text that then fails contrast. .srow.dep-off has
+// carried an escape for this all along; the server editor's own field layout
+// gained the same greying and needs the same escape.
+test('a greyed field does not grey the tooltip it contains', () => {
+  assert.match(html, /\.ie-field\.dep-off \.ie-lbl:has\(\.info:hover\),\.ie-field\.dep-off \.ie-lbl:has\(\.info:focus\)\{opacity:1;/,
+    'no full-opacity escape for an open tooltip inside a dimmed .ie-field');
+});
+
+// The note element the gate writes into must exist, or the explanation silently
+// goes nowhere and the toggle just looks broken.
+test('the PKCS1 gate has a note element and a disabled style', () => {
+  assert.match(html, /id="iperfPKCS1Note"/, 'gate note element missing from the markup');
+  assert.match(html, /\.ie-field\.dep-off/, 'no greying rule for a disabled .ie-field toggle');
+});
+
+// The saved iperf3 password is filed under the SAVED address, so mapIperfServer
+// must remember what the record actually holds (orig_has_password) separately
+// from the live flag. Without that the address handler could only latch the flag
+// off: typing the original address back left the UI insisting on a retype for a
+// password that was still perfectly reachable.
+test('mapIperfServer remembers the saved-password state independently', () => {
+  const m = PS.mapIperfServer({ addr: '10.0.0.5', has_password: true });
+  assert.equal(m.has_password, true);
+  assert.equal(m.orig_has_password, true, 'saved state must survive edits to the live flag');
+  assert.equal(m.orig_addr, '10.0.0.5', 'the address the password is filed under');
+  const fresh = PS.mapIperfServer({ addr: '10.0.0.6' });
+  assert.equal(fresh.orig_has_password, false);
 });

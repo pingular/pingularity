@@ -405,6 +405,7 @@
      the pill from anywhere on the line. .ctl:hover is spatial (the pill element itself). */
   .ctl:has(>input[type=checkbox]:not(:disabled)):hover{border-color:var(--accent);}
   .ctl:has(>input[type=checkbox]:disabled){opacity:.5;cursor:default;}
+  .ie-field.dep-off .ie-lbl,.ie-field.dep-off .ctl{opacity:.5;} /* same greying as .srow.dep-off, for the iperf3 server editor's own field layout */
   .srow.dep-off .lbl,.srow.dep-off .ctl{opacity:.5;} /* dependent control greyed out (e.g. DNS needs latency probing, Degraded/Busy need their toggles) */
   /* The (i) help bubble is a .lbl descendant, so the dim above would composite the
      OPEN bubble down to 50% too. While the (i) is hovered/focused, swap the label's
@@ -412,6 +413,7 @@
      the bubble (which sets its own colours) renders at full contrast. Same trick
      as the Access fields (.afield.disabled) further down. */
   .srow.dep-off .lbl:has(.info:hover),.srow.dep-off .lbl:has(.info:focus){opacity:1;color:color-mix(in srgb,var(--fg) 50%,transparent);}
+  .ie-field.dep-off .ie-lbl:has(.info:hover),.ie-field.dep-off .ie-lbl:has(.info:focus){opacity:1;color:color-mix(in srgb,var(--fg) 50%,transparent);} /* same escape for the server editor: opacity on the label multiplies into the tooltip it contains, dropping 12.5px help text under 4.5:1 */
   /* Keyboard focus only. Not :focus-visible: Chrome flags a checkbox as focus-visible
      even after a MOUSE click, which left the pill highlighted once clicked. Gate on a
      real keyboard-nav flag instead (set on Tab, cleared on pointer); hover handles cursor-on. */
@@ -1555,7 +1557,7 @@
                 <span class="info" tabindex="0" data-tip="Which local source to test from, for hosts with more than one uplink. Blank = default route.
 • A source IP (e.g. 192.168.1.20, or 2001:db8::5) binds the socket to that address (--bind).
 • An interface name (e.g. eth0) binds to that device (--bind-dev, needs a recent iperf3 and usually root).">i</span></span>
-              <input type="text" id="setIperfBind" placeholder="source IP or interface name" maxlength="255" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
+              <input type="text" id="setIperfBind" placeholder="source IP or interface" maxlength="255" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
             <label class="ie-field"><span class="ie-lbl">Authentication
                 <span class="info" tabindex="0" data-tip="Use iperf3 RSA auth so only you can test a server that's exposed to the internet.
 • Set the server up with --rsa-private-key-path and --authorized-users-path.">i</span></span>
@@ -1574,12 +1576,14 @@
 • iperf3 needs it in the clear at test time, so it can't be hashed like your login. The key lives in pingularity.key, beside the database.
 • Never included in a backup export.
 • Leave it blank to keep the password already saved.">i</span></span>
-                <input type="password" id="setIperfPassword" placeholder="iperf3 password" maxlength="255" autocomplete="new-password"></label>
+                <input type="password" id="setIperfPassword" placeholder="leave blank to keep" maxlength="255" autocomplete="new-password"></label>
               <label class="ie-field"><span class="ie-lbl">Legacy RSA padding
                   <span class="info" tabindex="0" data-tip="Forces the legacy RSA padding (--use-pkcs1-padding) on for this server.
 • Needed only for a pre-3.17 iperf3 server that requires PKCS#1 padding.
+• Your OWN iperf3 must be able to send it: the flag arrived in 3.17 and became server-only in 3.20, so only a local 3.17-3.19 build can use this.
 • There's no automatic fallback: without it, authentication to such a server fails outright - Pingularity never silently downgrades your padding.">i</span></span>
                 <span class="ctl"><input type="checkbox" id="setIperfPKCS1"><span class="unit"></span></span></label>
+              <div class="info-note hidden" id="iperfPKCS1Note"></div>
             </div>
           </div>
         </div>
@@ -1590,10 +1594,12 @@
           <span class="ctl"><input type="number" id="setIperfDur" min="1" max="30" step="1"><span class="unit">sec</span></span></label>
         <label class="srow iperf-opt"><span class="lbl">Parallel streams
           <span class="info" tabindex="0" data-tip="Parallel TCP streams.
-• More streams fill a fast or high-latency link better than one does.
-• One stream often under-reads.
+• More streams fill a fast or high-latency link better than one does: a single stream is limited by its own congestion window, so it measures that window rather than the line.
+• 8 suits a 500 Mbps-1 Gbps link; 1 often under-reads badly.
+• Past about 12 the differences are mostly run-to-run noise.
+• Keep it FIXED once chosen - changing it shifts every later number, so your history stops comparing like with like.
 • Raise it cautiously: weak servers struggle.">i</span></span>
-          <span class="ctl"><input type="number" id="setIperfStreams" min="1" max="8" step="1"><span class="unit"></span></span></label>
+          <span class="ctl"><input type="number" id="setIperfStreams" min="1" max="32" step="1"><span class="unit"></span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Parallel connections
           <span class="info" tabindex="0" data-tip="Parallel Ookla connections.
 • More connections fill a fast or high-latency link better.
@@ -4403,7 +4409,7 @@ function chartDot(x,cx,cy,color){ x.beginPath(); x.arc(cx,cy,3,0,Math.PI*2); x.f
 // spMeasured reports whether a run actually measured this direction. A direction-only
 // or partial iperf3 run leaves the untested direction's byte count absent while its
 // throughput stays 0; drawing that 0 would read as a real "0 Mbps" reading rather than
-// "not tested" (audit F-06). Byte presence is the same measured-signal the tiles use.
+// "not tested". Byte presence is the same measured-signal the tiles use.
 // Whether a point counts as "measured" for the fill/area gate. The speed directions
 // require their byte field, so a keep-partial run's 0-filled direction shows a gap
 // rather than a zero-valley. Any other keyed series - the bufferbloat bands, keyed
@@ -6072,7 +6078,7 @@ function applySettings(s){
   // iperf3 when it's missing (forced to Ookla here and on every change); the note
   // appears when the user's chosen engine is iperf3 but unavailable (updateEngineUI).
   iperfAvailable = s.iperf3_available !== false;
-  iperfVersion = s.iperf3_version || ''; // "" when absent/unparseable; drives the version note (F-03)
+  iperfVersion = s.iperf3_version || ''; // "" when absent/unparseable; drives the version note
   iperfInContainer = s.containerized === true; // picks the "how to enable iperf3" note: package vs -iperf image
   iperfWanted = (s.speed_engine==='iperf3');
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable;
@@ -6108,6 +6114,43 @@ function applySettings(s){
 // updateEngineUI shows the controls that belong to the selected engine: the
 // Ookla server picker + auto-location + data estimate for Ookla, the iperf3
 // server field for iperf3 (the rest of the speedtest knobs apply to both).
+// pkcs1FlagUsable reports whether THIS host's iperf3 can send --use-pkcs1-padding.
+// The window is [3.17, 3.20): the flag did not exist before 3.17 (PKCS#1 was the
+// default there, so forcing it is moot), and 3.20 reclassified it as server-only -
+// a 3.20+ client exits with "some option you are trying to set is server only"
+// before it ever connects. vnum is major*100+minor; 0 means the version could not
+// be detected, where we do not second-guess the operator.
+function pkcs1FlagUsable(vnum){ return vnum===0 || (vnum>=317 && vnum<320); }
+// What the legacy-padding toggle should look like for a given local iperf3.
+// Pure so the rule is pinned by test rather than buried in DOM code.
+// major.minor -> a comparable integer; 0 when the version could not be read.
+function iperfVerNum(){ const m=/^(\d+)\.(\d+)/.exec(iperfVersion||''); return m?(+m[1])*100+(+m[2]):0; }
+function pkcs1BoxState(vnum, ver, checked){
+  if(pkcs1FlagUsable(vnum)) return { disabled:false, note:'' };
+  // Locked against turning it ON, never against turning it OFF. A server saved
+  // with it on - ticked under a 3.17-3.19 build, or before this host's iperf3
+  // moved past 3.20 - still sends the flag on every run, and a disabled checkbox
+  // cannot be unticked: the operator would be left deleting the server (and its
+  // stored password) to escape a message telling them it cannot work.
+  if(checked) return { disabled:false, note: vnum>=320
+    ? 'Turn this off: iperf3 '+ver+' on this host treats --use-pkcs1-padding as server-only and refuses to start with it, so every test to this server fails before it connects.'
+    : 'Turn this off: iperf3 '+ver+' on this host predates the flag and already uses PKCS#1 padding, so sending it only makes the run fail.' };
+  return { disabled:true, note: vnum>=320
+    ? 'Unavailable: iperf3 '+ver+' on this host treats --use-pkcs1-padding as server-only and refuses to run with it. Only a pre-3.17 SERVER needs this, and reaching one needs a local 3.17-3.19 build.'
+    : 'Unavailable: iperf3 '+ver+' on this host predates the flag - it already uses PKCS#1 padding, so nothing needs forcing.' };
+}
+// Applies that state to the DOM. Called both when the engine panel refreshes and
+// whenever the editor loads a different server, because the answer depends on
+// what THAT server has saved, not only on the local build.
+function applyPKCS1Gate(){
+  const box=$('setIperfPKCS1'), pn=$('iperfPKCS1Note');
+  if(!box||!pn) return;
+  const st = pkcs1BoxState(iperfVerNum(), iperfVersion, box.checked);
+  box.disabled = st.disabled;
+  box.closest('.ie-field')?.classList.toggle('dep-off', st.disabled);
+  if(st.note){ pn.textContent = st.note; pn.classList.remove('hidden'); }
+  else { pn.classList.add('hidden'); pn.textContent=''; }
+}
 function updateEngineUI(){
   const iperf = $('setSpeedEngine').checked;
   // Warn when the user wants iperf3 but the binary is missing - the toggle is forced
@@ -6120,12 +6163,12 @@ function updateEngineUI(){
     : 'iperf3 isn’t installed on this host. Install the <code>iperf3</code> package first. Works best on Linux.');
   $('iperfMissingNote').classList.toggle('hidden', !(iperfWanted && !iperfAvailable));
   // Show the detected iperf3 version (and its capability caveat) when the engine is
-  // selected and installed - presence on PATH isn't the same as a capable build (F-03).
+  // selected and installed - presence on PATH isn't the same as a capable build.
   // Only warn when the DETECTED build actually lacks a capability - not for every version.
   // The unambiguous bidirectional result arrived in iperf3 3.11 and the current RSA auth
   // padding in 3.17, so a build at/after 3.17 clears both and the caveat (which cites those
   // very thresholds) would just be noise. Parse major.minor -> a comparable integer.
-  { const m=/^(\d+)\.(\d+)/.exec(iperfVersion||''), vnum=m?(+m[1])*100+(+m[2]):0;
+  { const vnum=iperfVerNum();
     const oldBidir=vnum>0&&vnum<311, oldPadding=vnum>0&&vnum<317, note=$('iperfVersionNote');
     if(iperf && iperfVersion && (oldBidir||oldPadding)){
       const lacks=oldBidir
@@ -6134,6 +6177,13 @@ function updateEngineUI(){
       note.innerHTML='<span class="wi">&#8505;&#xFE0E;</span>Detected <code>iperf3 '+esc(iperfVersion)+'</code> on this host - it '+lacks+', so some options may be rejected. A newer build is recommended.';
       note.classList.remove('hidden');
     } else { note.classList.add('hidden'); }
+    // The legacy-padding toggle is only usable on a LOCAL iperf3 in [3.17, 3.20):
+    // the flag did not exist before 3.17 (and PKCS#1 was the default there anyway,
+    // so it is moot), and 3.20 reclassified it as server-only - a 3.20+ client
+    // refuses to start with it ("some option you are trying to set is server only"),
+    // turning a well-meant tick into a run that never connects. Gate it where the
+    // fact is known instead of emitting a flag the local binary will reject.
+    applyPKCS1Gate();
   }
   $('iperfServerRow').classList.toggle('hidden', !iperf);
   document.querySelectorAll('.iperf-opt').forEach(el=>el.classList.toggle('hidden', !iperf)); // iperf3-only params
@@ -6220,10 +6270,10 @@ function refreshIperfDots(){
 }
 // A fresh saved server: path defaults to the OS route + auto IP family, auth off.
 // orig_addr is the address its saved password is keyed to ('' until first saved).
-function newIperfServer(label,addr){ return {label:label||'',addr:addr||'',orig_addr:'',bind:'',ipver:'auto',auth:false,username:'',rsa_key:'',pkcs1:false,has_password:false,password:''}; }
+function newIperfServer(label,addr){ return {label:label||'',addr:addr||'',orig_addr:'',bind:'',ipver:'auto',auth:false,username:'',rsa_key:'',pkcs1:false,has_password:false,orig_has_password:false,password:''}; }
 // Map one server from the API (password withheld; has_password flag instead). orig_addr
 // records the stored address so a later rename knows the saved password can't follow.
-function mapIperfServer(t){ t=t||{}; return {label:t.label||'',addr:t.addr||'',orig_addr:t.addr||'',bind:t.bind||'',ipver:t.ipver||'auto',auth:!!t.auth,username:t.username||'',rsa_key:t.rsa_key||'',pkcs1:!!t.pkcs1,has_password:!!t.has_password,password:''}; }
+function mapIperfServer(t){ t=t||{}; return {label:t.label||'',addr:t.addr||'',orig_addr:t.addr||'',bind:t.bind||'',ipver:t.ipver||'auto',auth:!!t.auth,username:t.username||'',rsa_key:t.rsa_key||'',pkcs1:!!t.pkcs1,has_password:!!t.has_password,orig_has_password:!!t.has_password,password:''}; }
 function activeIperfServer(){ return iperfServers.find(s=>s._id===iperfActiveId)||null; }
 function editingIperfServer(){ return iperfServers.find(s=>s._id===iperfEditingId)||null; }
 // Lenient client check (the backend + tester validate strictly): non-empty, not
@@ -6256,6 +6306,11 @@ function renderIperfServers(){
   list.innerHTML = iperfServers.length ? iperfServers.map(iperfCardHTML).join('')
     : '<div class="iperf-card-empty">No servers saved yet - add one to run iperf3 tests.</div>';
   $('iperfAddBtn').disabled = iperfServers.length>=12;
+  // The message under the list is scoped to an open edit - the address/password
+  // warning above all. With no editor open there is no such edit, so it must not
+  // survive Save, Done, a discarded change or Load defaults, each of which closes
+  // the editor and re-renders. The list's own status line is set immediately below.
+  if(iperfEditingId==null) $('iperfMsg').textContent='';
   const need = $('setSpeedEngine').checked && !iperfServers.length;
   if(need) $('iperfMsg').textContent='Add a server to run iperf3 tests.';
   else if($('iperfMsg').textContent==='Add a server to run iperf3 tests.') $('iperfMsg').textContent='';
@@ -6277,12 +6332,14 @@ function renderIperfEditor(){
   else iperfLoadedId=null;
 }
 function loadIperfEditor(s){
+  $('iperfMsg').textContent='';   // the address warning belongs to the edit that raised it
   $('iperfEditTitle').textContent = (s.label||s.addr) ? 'Edit '+(s.label||s.addr) : 'New server';
   $('setIperfLabel').value=s.label||''; $('setIperfAddr').value=s.addr||'';
   $('setIperfIPVer').value=s.ipver||'auto'; $('setIperfBind').value=s.bind||'';
   $('setIperfAuth').checked=!!s.auth; $('setIperfUsername').value=s.username||'';
   $('setIperfRSAKey').value=s.rsa_key||''; $('setIperfPassword').value=s.password||''; $('setIperfPKCS1').checked=!!s.pkcs1;
-  $('setIperfPassword').placeholder = s.has_password ? 'leave blank to keep saved password' : 'iperf3 password';
+  $('setIperfPassword').placeholder = s.has_password ? 'leave blank to keep' : 'iperf3 password';
+  applyPKCS1Gate();  // depends on what THIS server has saved, not just the local build
   updateIperfAuthRows();
 }
 // Fold the editor inputs back onto the server being edited (address is applied live).
@@ -6328,6 +6385,11 @@ $('iperfAddBtn').addEventListener('click', ()=>{
   $('iperfEditor').scrollIntoView({block:'nearest'}); $('setIperfAddr').focus({preventScroll:true});
 });
 $('iperfEditDone').addEventListener('click', ()=>{ captureIperfEditor(); iperfEditingId=null; renderIperfServers(); });
+// Re-gate on every tick. The toggle is left ENABLED when a saved server already
+// has the flag on, so it can be turned off on a build that cannot send it - but
+// the moment it is off, the reason to leave it enabled is gone: without this it
+// could be ticked straight back on, and the note would still read "turn this off".
+$('setIperfPKCS1').addEventListener('change', applyPKCS1Gate);
 // Renaming the open server's label: update its card live (don't reload the editor).
 $('setIperfLabel').addEventListener('input', ()=>{
   const s=editingIperfServer(); if(!s) return;
@@ -6380,9 +6442,17 @@ $('setIperfAddr').addEventListener('change', ()=>{
   // The saved password is keyed to the stored address (orig_addr); if we've moved off it
   // and no new password was typed, it can't follow - prompt for re-entry rather than lose
   // it silently. (Renaming back to orig_addr restores the match, so no warning then.)
-  if(s.has_password && !$('setIperfPassword').value && next!==s.orig_addr){
-    s.has_password=false; $('setIperfPassword').placeholder='iperf3 password';
-    $('iperfMsg').textContent='Address changed - re-enter this server’s password to keep authentication.';
+  // The stored password is filed under the SAVED address, so it only follows an
+  // address that still matches. Recompute (never latch): typing the original
+  // address back makes the saved password reachable again, and the prompt must
+  // go with it.
+  const pwFollows = s.orig_has_password && next===s.orig_addr;
+  s.has_password = pwFollows;
+  if(!$('setIperfPassword').value){
+    $('setIperfPassword').placeholder = pwFollows ? 'leave blank to keep' : 'iperf3 password';
+    if(s.orig_has_password && !pwFollows){
+      $('iperfMsg').textContent='You changed the address - the saved password is stored under the old one, so re-enter it (or change the address back) before saving.';
+    }
   }
 });
 async function loadSettings(){ try{ applySettings(await (await fetch('api/settings')).json()); return true; }catch(e){ return false; } }

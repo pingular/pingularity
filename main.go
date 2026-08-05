@@ -1289,7 +1289,7 @@ func defaultSettings(cfg config.Config, containerized bool) settings.Values {
 		IperfDirection:     "both",         // iperf3 directions (both|down|up|bidir), independent of Ookla
 		IperfRetries:       1,              // iperf3: retry a failed direction once, independent of Ookla
 		IperfDur:           5,              // iperf3 seconds per direction
-		IperfStreams:       1,              // iperf3 parallel TCP streams (1 = single stream)
+		IperfStreams:       8,              // iperf3 parallel TCP streams: one stream measures its own congestion window, not the link (measured 116 vs 268 Mbps, 1 vs 8, on a ~350 Mbps path)
 		IperfOmit:          1,              // iperf3 warm-up seconds discarded (skip TCP slow-start)
 		IperfUDP:           true,           // iperf3 packet-loss/jitter UDP pass on by default
 		IperfWindow:        0,              // iperf3 TCP window/socket-buffer KB (0 = OS auto-tune)

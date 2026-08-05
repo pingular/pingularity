@@ -1,6 +1,6 @@
 name: iperf integration
 
-# WHY THIS WORKFLOW EXISTS (audit finding F-12)
+# WHY THIS WORKFLOW EXISTS
 # ------------------------------------------------------------------------------
 # Every committed iperf3 test stubs the child process through the exec seam
 # (internal/speedtest/iperf.go: iperfExec) and feeds back canned -J/--json bodies.

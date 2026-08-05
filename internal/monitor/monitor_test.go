@@ -1111,7 +1111,7 @@ func TestPendingEventRetryLandsExactlyOnce(t *testing.T) {
 // A DNS probe whose lookup fails because the monitor is shutting down (its round
 // ctx is cancelled) must be neutral: no "dns down" warning and no dns.fail.* bump,
 // so a normal stop can't log a phantom resolver outage or poison the recovered
-// counters. Regression for C-64.
+// counters.
 func TestRoundDNSCancelledLookupIsNeutral(t *testing.T) {
 	stats.ResetForTest()
 	var buf bytes.Buffer
@@ -1148,7 +1148,6 @@ func TestRoundDNSCancelledLookupIsNeutral(t *testing.T) {
 
 // Toggling the DNS sub-toggle OFF must clear the seed so re-enabling starts as
 // "no reading yet" rather than resurfacing the pre-disable value as live.
-// Regression for C-65.
 func TestRoundDNSToggleOffClearsSeed(t *testing.T) {
 	stats.ResetForTest()
 	m, _ := newTestMonitor(t, 10, 1)
@@ -1181,7 +1180,7 @@ func TestRoundDNSToggleOffClearsSeed(t *testing.T) {
 }
 
 // A DNS probe already in flight when the DNS sub-toggle is switched OFF must
-// DISCARD its now-disallowed result rather than publish it. Regression for C-65:
+// DISCARD its now-disallowed result rather than publish it:
 // without bumping the generation on the toggle-off edge, the late goroutine sets
 // dnsSeen=true and inserts a sample under a feature the operator turned off.
 func TestRoundDNSInflightDiscardedAfterToggleOff(t *testing.T) {

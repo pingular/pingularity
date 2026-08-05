@@ -339,7 +339,7 @@ func TestActiveIperfResolution(t *testing.T) {
 // a multi-byte password/addr/bind/RSAKey can arrive over the byte cap and reach
 // sanitizeIperfServers; a raw s[:n] there would store invalid UTF-8 that JSON/SQLite
 // then mangle (the whole field silently corrupted). capLen backs the cut to a valid
-// boundary. Regression for C-68.
+// boundary.
 func TestSanitizeIperfServersRuneSafeTruncation(t *testing.T) {
 	const maxAddr, maxKey = 255, 8192 // mirror sanitizeIperfServers' local consts
 	// Build each field so the byte cap lands INSIDE a 4-byte emoji, which a naive
@@ -403,7 +403,7 @@ func mkEpochController(t *testing.T, st *store.Store) *Controller {
 // advances the in-memory epoch before it persists, so a failed persist leaves memory
 // ahead of disk; a Reload that then reads the stale on-disk value must keep the
 // higher live epoch (seedSessionEpoch stores max), or every token the logout revoked
-// would revalidate. Regression for C-05 (bump-vs-reload).
+// would revalidate. This is the bump-vs-reload race.
 func TestReloadNeverLowersSessionEpoch(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -442,8 +442,8 @@ func TestReloadNeverLowersSessionEpoch(t *testing.T) {
 // Two concurrent logouts must persist a monotonically non-decreasing epoch: their
 // advance+persist serialize under the writer lock, so the on-disk value ends at the
 // highest bump - a restart then loads it. Without the lock the two persists could
-// land out of order and leave a stale epoch on disk. Regression for C-05
-// (bump-vs-bump). Run under -race to also catch unsynchronized epoch access.
+// land out of order and leave a stale epoch on disk. This is the bump-vs-bump
+// race. Run under -race to also catch unsynchronized epoch access.
 func TestConcurrentLogoutsPersistMonotonicEpoch(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {

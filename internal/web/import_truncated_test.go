@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// C-06: a backup cut off partway (config/data applied, later data silently
+// A backup cut off partway (config/data applied, later data silently
 // missing) or one with trailing junk must be a 400, not a false "Imported". The
 // category loop stops at dec.More()==false, which is also what EOF looks like, so
 // the handler now requires the closing '}' and then EOF.

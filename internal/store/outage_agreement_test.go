@@ -189,3 +189,29 @@ func TestHeatmapAndUptimeAgreeOverAWholeSuspendShapedOutage(t *testing.T) {
 		t.Errorf("both agree on %v, but the observed length recorded on the 'up' is 60s", o.Down)
 	}
 }
+
+// A trailing 'down' that recovered without a closing 'up' (the monitor
+// restarts optimistically online) is a resolved outage that UptimeSince books but
+// ResolvedOutagesSince used to miss - printing "no outages" while the heatmap
+// showed one. Both must now agree.
+func TestResolvedOutagesReconcilesTrailingRecoveredDown(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	eventAt(t, st, now, 300, "down", -1)           // down 5 min ago, never closed
+	sampleAt(t, st, now, 300, "cf", "ipv4", false) // failing at the down
+	sampleAt(t, st, now, 200, "cf", "ipv4", true)  // quorum recovery ~200s ago
+	sampleAt(t, st, now, 100, "cf", "ipv4", true)
+
+	count, downtime, err := st.ResolvedOutagesSince(ctx, now.Add(-time.Hour).Unix())
+	if err != nil {
+		t.Fatalf("ResolvedOutagesSince: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("count = %d, want 1 (a recovered trailing down is a resolved outage)", count)
+	}
+	if downtime < 90 || downtime > 110 {
+		t.Errorf("downtime = %d, want ~100s (down at -300s, recovered at -200s)", downtime)
+	}
+}

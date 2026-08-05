@@ -4,7 +4,7 @@ package netinfo
 
 import "testing"
 
-// C-53: a raw-socket packet whose IPv4 header claims IHL < 5 (fewer than 20
+// A raw-socket packet whose IPv4 header claims IHL < 5 (fewer than 20
 // bytes) is malformed and must be rejected, not parsed - otherwise classifyRaw
 // slices the ICMP payload from inside the header and a crafted short IHL can land
 // the "type" byte on header data and be misclassified. Mirrors the darwin twin's
