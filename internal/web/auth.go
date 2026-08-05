@@ -788,19 +788,69 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// The Settings drawer posts here on EVERY Save, before the settings
+		// POST. A request that changes no access state must succeed without a
+		// step-up (or any limiter spend) - demanding the password to save an
+		// unrelated latency tweak locked ordinary saves out of a login-protected
+		// install entirely. Empty username and password mean "keep current", so
+		// only a real difference counts as a change.
+		reqUser := strings.TrimSpace(in.Username)
+		delta := in.Password != "" ||
+			(reqUser != "" && reqUser != s.settings.AuthUser()) ||
+			(in.AuthEnabled != nil && *in.AuthEnabled != s.settings.AuthEnabled()) ||
+			(in.LocalOnly != nil && *in.LocalOnly != s.settings.AccessLocalOnly())
+		if !delta {
+			writeJSON(w, s.accessStatus(r))
+			return
+		}
 		// Step-up: a live session must not be able to change access-control
 		// settings (password, username, login toggle, network scope) without
 		// re-proving the CURRENT password - otherwise a hijacked or walk-up
 		// session silently takes over the account. Only enforced once auth is
 		// active; first-time setup has no current password to prove.
-		// checkPassword burns bcrypt under the process-wide bcryptSem, so it
-		// can't be turned into a CPU-grind vector. Runs under s.importMu (held
-		// above), serialized against a restore reconcile like the mutations.
+		// checkPassword burns bcrypt under the process-wide bcryptSem, and the
+		// attempt spends the same per-client budget as login and Basic - a
+		// hijacked session must not get unlimited serialized password guesses
+		// out of this endpoint when the login form caps them. Runs under
+		// s.importMu (held above), serialized against a restore reconcile like
+		// the mutations.
+		// stepUpVerified records that THIS request proved the current password
+		// (bcrypt or the known-good escape valve). Trust decisions after the
+		// mutations - refreshing the known-good cache - key on this, never on
+		// the post-mutation auth state: a rename+enable from the
+		// disabled-with-hash state ends active WITHOUT any proof, and caching
+		// its arbitrary current_password would let it pass a blocked step-up
+		// later; a verified rename+disable ends inactive WITH proof, and
+		// skipping the refresh strands the escape valve on the dead name.
+		stepUpVerified := false
 		if s.settings.AuthActive() {
-			if in.CurrentPassword == "" || !s.checkPassword(s.settings.AuthUser(), in.CurrentPassword) {
+			refuse := func(why string) {
 				stats.Inc("web.stepup_fail")
-				s.log.Warn("access change refused: current password missing or wrong", "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
+				s.log.Warn("access change refused: "+why, "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
 				http.Error(w, "current password is required to change access settings", http.StatusForbidden)
+			}
+			if in.CurrentPassword == "" {
+				refuse("current password missing") // not a guess - no budget spent
+				return
+			}
+			key := s.limiterKey(r)
+			if !s.logins.reserve(key) {
+				// Budget spent: only the cached known-good credential passes,
+				// with no bcrypt work - the same escape valve login has, so an
+				// attacker sharing the bucket can't lock the operator out.
+				if !s.knownGood(s.settings.AuthUser(), in.CurrentPassword) {
+					stats.Inc("web.limiter_trips")
+					http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
+					return
+				}
+				stepUpVerified = true // matched a pair that passed bcrypt earlier
+			} else if s.checkPassword(s.settings.AuthUser(), in.CurrentPassword) {
+				s.logins.ok(key)
+				s.rememberGood(s.settings.AuthUser(), in.CurrentPassword)
+				stepUpVerified = true
+			} else {
+				s.logins.releaseFail(key)
+				refuse("current password wrong")
 				return
 			}
 		}
@@ -870,6 +920,18 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			// reaching a successful rename means the caller was authenticated.
 			if renamed && s.settings.AuthActive() {
 				s.setSessionCookie(w, s.secureCookie(r))
+			}
+			// The known-good fingerprint embeds the username, so the cached
+			// pair died with the old name - and during a limiter block the
+			// escape valve is all a legitimate step-up has. Refresh it under
+			// the new name ONLY when this request actually proved the current
+			// password, independent of where the enable toggle ended up: a
+			// verified rename+disable still deserves the refresh (re-enabling
+			// needs no proof, and the next real step-up must not 429), while a
+			// no-proof rename+enable from the disabled state must never seed
+			// the cache with an unverified value.
+			if renamed && stepUpVerified {
+				s.rememberGood(s.settings.AuthUser(), in.CurrentPassword)
 			}
 		}
 		if in.LocalOnly != nil {

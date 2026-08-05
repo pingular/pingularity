@@ -1519,6 +1519,11 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		URL string `json:"url"`
+		// The Alerts tab's currently SELECTED Webhook format (possibly
+		// unsaved) - the test must exercise the same payload shape real
+		// alerts will use, or a self-hosted ntfy passes Test on a JSON blob
+		// it would never receive again.
+		Format string `json:"format"`
 	}
 	if err := decodeJSONBody(w, r, &in); err != nil {
 		return // response already written (415/400)
@@ -1527,7 +1532,15 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no webhook URL set", http.StatusBadRequest)
 		return
 	}
+	// Same tolerance as settings sanitize: an unknown value means hostname
+	// detection, exactly what FormatFn's absence meant before.
+	switch in.Format {
+	case "auto", "ntfy", "generic":
+	default:
+		in.Format = ""
+	}
 	n := notify.New(func() string { return in.URL }, s.log)
+	n.FormatFn = func() string { return in.Format }
 	// Surface the delivery result - the point of the Test button is to confirm
 	// the webhook works. Send scrubs the URL/token from the error (the host may
 	// remain, but it's the user's own webhook), so it's safe to return. 502 so
@@ -2551,6 +2564,11 @@ var dataCategories = []struct{ cat, key, table string }{
 	// omitted. Written after "downtime" so a restore lands the events first; both
 	// merge by ts, so order only matters for config staying last.
 	{"downtime", "pauses", "pauses"},
+	// The held-aside half of the pause record (see the store's exportTables
+	// comment): exported so a backup taken while genuine history sits in
+	// quarantine does not silently lose it. Written after pauses; restored
+	// rows land back in the destination's quarantine for ITS re-judgement.
+	{"downtime", "pauses_quarantine", "pauses_quarantine"},
 	{"config", "config", "settings"},
 }
 
@@ -2602,10 +2620,20 @@ var importReconcileHook func()
 // build would silently drop bumps the version; files without the key still
 // stamp 2 or 1 and restore everywhere.
 //
+// It went to 4 when the downtime category gained `pauses_quarantine` - the
+// held-aside half of the pause record. Genuine history sits there between a
+// wrong stale-clock judgement and its re-judgement, so a build that does not
+// know the key restores the observation spans without their held remainder and
+// reports success - the silent downgrade this contract exists to prevent. The
+// key is content-dependent (handleExport omits it when the table is empty, the
+// overwhelmingly common case), so ordinary backups still stamp 2 or 3 and keep
+// restoring on the builds that predate it; only a file actually CARRYING held
+// rows demands 4.
+//
 // minExportSchema is the oldest we still read: bumping the writer must not orphan
 // the backups already on disk.
 const (
-	exportSchema    = 3
+	exportSchema    = 4
 	minExportSchema = 1
 )
 
@@ -2618,10 +2646,12 @@ func exportSchemaFor(keys []string) int {
 	v := 1
 	for _, k := range keys {
 		switch k {
-		case "speed_servers": // the key the schema went to 3 for (see exportSchema)
-			return 3
+		case "pauses_quarantine": // the key the schema went to 4 for (see exportSchema)
+			v = max(v, 4)
+		case "speed_servers": // ... to 3 for
+			v = max(v, 3)
 		case "pauses": // ... and to 2 for
-			v = 2
+			v = max(v, 2)
 		}
 	}
 	return v
@@ -2660,6 +2690,22 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer snap.Rollback()
+	// The held-pause key is CONTENT-dependent: an empty pauses_quarantine
+	// carries nothing an older build could drop, and including it would stamp
+	// the file schema 4 (exportSchemaFor) and lock pre-quarantine builds out of
+	// a backup they fully understand - the inverse of the mistake the schema
+	// contract guards. Checked against the same snapshot the rows stream from.
+	// If the check itself fails, KEEP the key: the failure mode must be "an
+	// older build refuses the file", never "held history silently shed".
+	for i, dc := range sel {
+		if dc.key != "pauses_quarantine" {
+			continue
+		}
+		if has, herr := s.store.HasQuarantinedPausesTx(r.Context(), snap); herr == nil && !has {
+			sel = append(sel[:i], sel[i+1:]...)
+		}
+		break
+	}
 	// Progress-refreshed write deadline: rearm as rows flush, so a client that stops
 	// reading is reaped within one window instead of holding the cursor for minutes.
 	bump := exportDeadlineBumper(w, s.log)
@@ -2858,7 +2904,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		// a restore could land pause rows already past it and say nothing, so the
 		// spans that shape uptime coverage disappeared at the next prune without the
 		// warning every other category gets.
-		"pauses": s.settings.DowntimeRetention(),
+		"pauses": s.settings.DowntimeRetention(), "pauses_quarantine": s.settings.DowntimeRetention(),
 	}
 	result := map[string]int{}
 	prunable := map[string]bool{} // category -> imported rows predate its retention window

@@ -217,3 +217,201 @@ func TestClearDowntimeDropsQuarantinedPauses(t *testing.T) {
 			"come back out of quarantine", kept)
 	}
 }
+
+// A LONG-RUNNING process must not need a restart to give quarantined history
+// back. Open under a plausible-but-stale clock (dead RTC battery, a year
+// behind) wrongly holds genuine rows aside; when NTP corrects the clock, the
+// pruner's hourly step detector notices - and once the corrected clock
+// SURVIVES the settle window (a clock pruning does not trust must not re-judge
+// history either), a generation arms and the next write restores what the
+// corrected clock exonerates. Before this trigger, restoration waited for the
+// next restart: coverage stayed inflated and a backup taken meanwhile
+// silently omitted the held rows.
+func TestClockStepRearmsTheQuarantineRejudgement(t *testing.T) {
+	path := t.TempDir() + "/step.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Now().Unix()
+	seedLegacyPause(t, s, now-3600, 300) // genuine, fully in the past
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	staleNow := now - 365*24*3600
+	if staleNow < plausibleEpoch {
+		t.Fatalf("premise broken: stale clock %d is pre-epoch", staleNow)
+	}
+	stats.ResetForTest()
+	s2, err := openAt(path, staleNow)
+	if err != nil {
+		t.Fatalf("open under stale clock: %v", err)
+	}
+	defer s2.Close()
+	if got := len(pauseDurations(t, s2, "pauses")); got != 0 {
+		t.Fatalf("premise broken: %d row(s) still live under the stale clock", got)
+	}
+	if held := pauseDurations(t, s2, "pauses_quarantine"); len(held) != 1 {
+		t.Fatalf("premise broken: quarantine holds %v, want the one genuine row", held)
+	}
+	if s2.pauseRepairArmed() {
+		t.Fatal("premise broken: a plausible open-clock must not arm the re-judgement at Open")
+	}
+
+	// NTP steps the clock; the pruner's hourly reading detects it. The step
+	// alone must NOT arm the re-judgement - the same reading just declared the
+	// clock unsettled for destructive pruning, and re-judging history under a
+	// possibly-bogus temporary step is the same hazard.
+	stepped := time.Now().Add(2 * pruneClockStepSlack)
+	if !s2.clockStepped(stepped, 0) {
+		t.Fatal("premise broken: the shifted reading was not detected as a step")
+	}
+	if s2.pauseRepairArmed() {
+		t.Fatal("a just-detected step armed the re-judgement before the clock settled")
+	}
+	s2.maybeRepairFuturePausesAt(now) // a write lands mid-settle: nothing may move
+	if held := pauseDurations(t, s2, "pauses_quarantine"); len(held) != 1 {
+		t.Fatalf("a write during the settle window moved history: quarantine=%v", held)
+	}
+
+	// An hour later (wall and uptime advancing together - no further drift)
+	// the settle window is still running: still parked.
+	if !s2.clockStepped(stepped.Add(time.Hour), time.Hour) {
+		t.Fatal("premise broken: mid-settle reading should still report unsettled")
+	}
+	if s2.pauseRepairArmed() {
+		t.Fatal("armed while the settle window was still running")
+	}
+
+	// Past the settle window with the clock steady: the step has earned the
+	// re-judgement.
+	after := pruneClockSettle + time.Hour
+	if s2.clockStepped(stepped.Add(after), after) {
+		t.Fatal("premise broken: a settled steady clock still reported stepped")
+	}
+	if !s2.pauseRepairArmed() {
+		t.Fatal("a settled step must arm the pause re-judgement; " +
+			"without it, restoration waits for a restart that may be months away")
+	}
+
+	// The next write re-judges under the corrected clock and gives the row back.
+	s2.maybeRepairFuturePausesAt(now)
+	if kept := pauseDurations(t, s2, "pauses"); len(kept) != 1 || kept[0] != 300 {
+		t.Errorf("pauses hold %v after the step-triggered re-judgement, want [300]", kept)
+	}
+	if held := pauseDurations(t, s2, "pauses_quarantine"); len(held) != 0 {
+		t.Errorf("quarantine still holds %v after a corrected clock exonerated it", held)
+	}
+	if got := stats.Lifetime().Counters["db.pause_rows_restored"]; got != 1 {
+		t.Errorf("db.pause_rows_restored = %d, want 1", got)
+	}
+	if s2.pauseRepairArmed() {
+		t.Error("still armed after the re-judgement ran; writes must go back to the bare fast path")
+	}
+}
+
+// A REVERTING step must not burn the trigger. A bogus temporary step (VM
+// snapshot resume, hypervisor glitch) that reverts inside the settle window is
+// just another step: the deferral extends, and the single judgement that
+// eventually runs uses whatever clock actually survives settling.
+func TestRevertingStepKeepsDeferringTheRejudgement(t *testing.T) {
+	path := t.TempDir() + "/revert.db"
+	s, err := openAt(path, time.Now().Unix()-365*24*3600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	stepped := time.Now().Add(2 * pruneClockStepSlack)
+	if !s.clockStepped(stepped, 0) {
+		t.Fatal("premise broken: first step not detected")
+	}
+	// The bogus step reverts an hour in: detected as another step, still parked.
+	if !s.clockStepped(time.Now().Add(time.Hour), time.Hour) {
+		t.Fatal("premise broken: the revert was not detected as a step")
+	}
+	if s.pauseRepairArmed() {
+		t.Fatal("armed between a step and its revert")
+	}
+	// The reverted (original) clock settles: one arm, under the surviving clock.
+	after := pruneClockSettle + 2*time.Hour
+	if s.clockStepped(time.Now().Add(after), after) {
+		t.Fatal("premise broken: settled reverted clock still reported stepped")
+	}
+	if !s.pauseRepairArmed() {
+		t.Fatal("the surviving clock settled but nothing armed")
+	}
+}
+
+// The settle window is an ELIGIBILITY gate for every outstanding generation,
+// not only the one a settling step would arm - and once a step has settled,
+// repair judges in the vetted frame, ignoring whatever clock the consuming
+// write happens to carry. The hazard: an implausible Open arms generation 1;
+// a bogus plausible step (say three days backward, past the 48h repair skew)
+// is detected and starts settling; the next write would otherwise consume
+// generation 1 immediately, judging genuine pauses with the clock the pruner
+// itself just refused to trust - quarantining real history.
+func TestSettleGatesOutstandingGenerationAndVettedFrameWins(t *testing.T) {
+	path := t.TempDir() + "/gate.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Now().Unix()
+	seedLegacyPause(t, s, now-3600, 300) // genuine, fully in the past
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The RTC-less boot: implausible clock, judgement skipped, generation 1 armed.
+	s2, err := openAt(path, 120)
+	if err != nil {
+		t.Fatalf("open implausible: %v", err)
+	}
+	defer s2.Close()
+	if !s2.pauseRepairArmed() {
+		t.Fatal("premise broken: implausible open did not arm the deferred judgement")
+	}
+	if got := len(pauseDurations(t, s2, "pauses")); got != 1 {
+		t.Fatalf("premise broken: %d live rows, want the 1 unjudged genuine pause", got)
+	}
+
+	// A bogus step lands - three days backward - and is detected: settling.
+	bogus := time.Now().Add(-3 * 24 * time.Hour)
+	if !s2.clockStepped(bogus, 0) {
+		t.Fatal("premise broken: bogus step not detected")
+	}
+	// The write that would have consumed generation 1, carrying the bogus
+	// machine clock. It must PARK: nothing judged, generation kept.
+	s2.maybeRepairFuturePausesAt(bogus.Unix())
+	if got := len(pauseDurations(t, s2, "pauses_quarantine")); got != 0 {
+		t.Fatal("a settling clock judged history: the genuine pause was quarantined by the bogus reading")
+	}
+	if !s2.pauseRepairArmed() {
+		t.Fatal("the parked write consumed the generation")
+	}
+
+	// The clock corrects (another step, back to now's frame) and settles.
+	if !s2.clockStepped(time.Now().Add(time.Hour), time.Hour) {
+		t.Fatal("premise broken: the correcting step was not detected")
+	}
+	after := pruneClockSettle + 2*time.Hour
+	if s2.clockStepped(time.Now().Add(after), after) {
+		t.Fatal("premise broken: settled corrected clock still reported stepped")
+	}
+
+	// The consuming write arrives carrying an ABSURD reading (a decade stale).
+	// The vetted frame must win: the genuine row is judged with the settled
+	// clock and stays live; the stale reading would have quarantined it.
+	s2.maybeRepairFuturePausesAt(now - 10*365*24*3600)
+	if kept := pauseDurations(t, s2, "pauses"); len(kept) != 1 || kept[0] != 300 {
+		t.Errorf("pauses hold %v after the vetted-frame judgement, want [300]", kept)
+	}
+	if held := pauseDurations(t, s2, "pauses_quarantine"); len(held) != 0 {
+		t.Errorf("quarantine holds %v: the write's stale reading was allowed to judge", held)
+	}
+	if s2.pauseRepairArmed() {
+		t.Error("generation not consumed by the vetted-frame judgement")
+	}
+}

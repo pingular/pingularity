@@ -553,3 +553,26 @@ func TestRaceHaltedClassifiesTheTwoDeadlines(t *testing.T) {
 		t.Errorf("own-budget expiry with no anchor: stop=%v ok=%v, want stop with no centre", stop, ok)
 	}
 }
+
+// The whole zero-ping pipeline, together: a real measured 0 (Windows-coarse
+// clock) survives as a positive value from the race's clamp through the
+// millisecond conversion into the decision figure. Regression: DurMS truncates
+// to whole microseconds, so the 1ns clamp used to store 0.0 - which validMS
+// reads as "nothing measured", silently sending decisions back to the mean.
+func TestZeroPingSurvivesToDecision(t *testing.T) {
+	var best time.Duration
+	keep := keepFastestPing(&best)
+	keep(400 * time.Millisecond)
+	keep(0) // measured, sub-clock-resolution round trip
+	if best <= 0 {
+		t.Fatalf("clamp lost the zero sample: best=%v", best)
+	}
+	ms := msIfPositive(best)
+	if ms == nil || *ms <= 0 {
+		t.Fatalf("conversion lost the floor: msIfPositive(%v)=%v", best, ms)
+	}
+	r := Result{PingMS: 40, PingBestMS: ms}
+	if got := decisionPingMS(r); got != *ms {
+		t.Fatalf("decisionPingMS=%v fell back to the mean; want the %v floor", got, *ms)
+	}
+}

@@ -67,7 +67,7 @@ func TestFirstWriteUnderAPlausibleClockRemovesFutureReachingPause(t *testing.T) 
 	if got := stats.Lifetime().Counters["db.pause_rows_repaired"]; got != 1 {
 		t.Errorf("db.pause_rows_repaired = %d, want 1: the deferred removal must be visible, not silent", got)
 	}
-	if s.pauseFutureRepairPending.Load() {
+	if s.pauseRepairArmed() {
 		t.Errorf("repair flag still armed after the judgement ran; later writes must be a bare atomic load")
 	}
 }
@@ -116,7 +116,7 @@ func TestDeferredRepairStaysOffWhileTheClockIsImplausible(t *testing.T) {
 		t.Errorf("a pre-epoch clock judged the future-end rule (rows=%d, want 1); "+
 			"a clock that early cannot anchor the judgement", n)
 	}
-	if !s.pauseFutureRepairPending.Load() {
+	if !s.pauseRepairArmed() {
 		t.Errorf("repair flag disarmed under an implausible clock; the re-judgement would never run")
 	}
 
@@ -126,7 +126,7 @@ func TestDeferredRepairStaysOffWhileTheClockIsImplausible(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer s2.Close()
-	if s2.pauseFutureRepairPending.Load() {
+	if s2.pauseRepairArmed() {
 		t.Errorf("store opened under a plausible clock armed the lazy repair; Open already judged")
 	}
 }

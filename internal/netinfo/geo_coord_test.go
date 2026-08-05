@@ -272,3 +272,31 @@ func TestFetchRecoversTheCoordinateAfterAProviderOutage(t *testing.T) {
 			"only recovery and the ISP city is gone for the life of this IP", got.Lat, got.Lon)
 	}
 }
+
+// A provider answer missing one coordinate component must not place the origin.
+// ipwho.is decodes into pointer fields precisely so absent/null reads as
+// missing: a bare float64 turned {"longitude":-86} into the pair (0,-86), which
+// passes validCoord (a lone zero component is a legitimate equator coordinate)
+// and anchored the ISP origin off the coast of Peru. An EXPLICIT zero component
+// with the other present is real and must survive.
+func TestIpwhoisHalfPairIsNotAPosition(t *testing.T) {
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	get := func(body string) (lat, lon float64, ok bool) {
+		m.http = &http.Client{Transport: &countingGeo{body: body}}
+		_, _, la, lo, ok := ipwhoisGeo(context.Background(), m, "203.0.113.79")
+		return la, lo, ok
+	}
+	// Longitude present, latitude absent: label-only answer, no coordinate.
+	if la, lo, ok := get(`{"success":true,"city":"Somewhere","country_code":"XX","longitude":-86.0}`); !ok || validCoord(la, lo) {
+		t.Fatalf("half-pair produced a usable position (%v,%v ok=%v)", la, lo, ok)
+	}
+	// Null is absent too, not zero.
+	if la, lo, ok := get(`{"success":true,"city":"Somewhere","country_code":"XX","latitude":null,"longitude":-86.0}`); !ok || validCoord(la, lo) {
+		t.Fatalf("null latitude produced a usable position (%v,%v ok=%v)", la, lo, ok)
+	}
+	// An explicit zero latitude with a real longitude is a legitimate equator
+	// position and must pass.
+	if la, lo, ok := get(`{"success":true,"city":"Sao Tome","country_code":"ST","latitude":0,"longitude":6.73}`); !ok || !validCoord(la, lo) || lo != 6.73 {
+		t.Fatalf("explicit equator coordinate rejected (%v,%v ok=%v)", la, lo, ok)
+	}
+}
