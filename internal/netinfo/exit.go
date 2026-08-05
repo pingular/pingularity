@@ -372,12 +372,12 @@ func publicIPGeo(ctx context.Context, m *Manager, ip string) (city, country stri
 
 // validCoord reports whether a provider's pair is usable as a centre. 0,0 is
 // this codebase's "unset" convention rather than the Gulf of Guinea, and the
-// rest guards what the providers can actually emit: a null or absent numeric
-// field decodes to zero, geojs' strings parse through strconv (which accepts
-// "NaN" and "Inf"), and one missing component yields a half-pair like 0,-86.
-// Any of those reaching an origin would centre a server search on nothing, and
-// a NaN would additionally defeat the dedupe comparison and break the JSON
-// encode of the snapshot that carries it.
+// rest guards what the providers can actually emit: geojs' strings parse
+// through strconv, which accepts "NaN" and "Inf". Half-pairs (one component
+// missing) are neutralized at DECODE, where presence is still visible: ipwho.is
+// uses pointer fields, geojs zeroes the pair when either string fails to parse.
+// A NaN reaching an origin would additionally defeat the dedupe comparison and
+// break the JSON encode of the snapshot that carries it.
 func validCoord(lat, lon float64) bool {
 	if lat == 0 && lon == 0 {
 		return false
@@ -392,16 +392,24 @@ func validCoord(lat, lon float64) bool {
 // (rate-limit / reserved range), which the API still returns with HTTP 200.
 func ipwhoisGeo(ctx context.Context, m *Manager, ip string) (city, country string, lat, lon float64, ok bool) {
 	var r struct {
-		Success bool    `json:"success"`
-		City    string  `json:"city"`
-		Country string  `json:"country_code"`
-		Lat     float64 `json:"latitude"`
-		Lon     float64 `json:"longitude"`
+		Success bool   `json:"success"`
+		City    string `json:"city"`
+		Country string `json:"country_code"`
+		// Pointers, not floats: a null or absent component must read as
+		// MISSING, not 0.0. A half-pair like (absent, -86) is otherwise
+		// indistinguishable from a real equator coordinate, passes validCoord
+		// (a lone zero component is legitimate), and anchors the ISP origin on
+		// the equator.
+		Lat *float64 `json:"latitude"`
+		Lon *float64 `json:"longitude"`
 	}
 	if !getJSON(ctx, m, "https://ipwho.is/"+ip, &r) || !r.Success || r.City == "" {
 		return
 	}
-	return r.City, r.Country, r.Lat, r.Lon, true
+	if r.Lat == nil || r.Lon == nil {
+		return r.City, r.Country, 0, 0, true // the label still names the connection; 0,0 = unplaceable
+	}
+	return r.City, r.Country, *r.Lat, *r.Lon, true
 }
 
 // geojsGeo geolocates ip via geojs.io - the fallback when ipwho.is is down or

@@ -489,7 +489,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		ThreshDownMbps: 100, ThreshUpMbps: 20, ThreshPingMS: 50, ThreshJitterMS: 10,
 		ThreshLossPct: 5, ThreshConsec: 3, ThreshBloatDownMS: 80, ThreshBloatUpMS: 90,
 		AlertOnOutage: true, WebhookURL: "https://example.com/hook",
-		HeartbeatURL: "https://hc.example.com/uuid", DigestFreq: "weekly",
+		HeartbeatURL: "https://hc.example.com/uuid", DigestFreq: "weekly", WebhookFormat: "ntfy",
 		SchedLatEnabled: true, SchedLatWindows: []settings.Window{{Days: "0111110", Start: 540, End: 1020}},
 		SchedSpeedEnabled: true, SchedSpeedWindows: []settings.Window{{Days: settings.AllDays, Start: 0, End: 0}},
 	}
@@ -977,5 +977,48 @@ func TestLogsClearRunsOnLogClear(t *testing.T) {
 	s.OnLogClear = nil
 	if w := do(t, s.Handler(), "POST", "/api/logs", `{"clear":true}`); w.Code != http.StatusOK {
 		t.Fatalf("clear logs with nil OnLogClear %d: %s", w.Code, w.Body)
+	}
+}
+
+// The Test button must exercise the payload shape real alerts will use: the
+// selected Webhook format override rides along and is applied to the test
+// notifier. A self-hosted ntfy (undetectable from the hostname) gets a native
+// ntfy test, and a forced-generic config gets JSON even on an ntfy-ish host.
+func TestNotifyTestHonorsFormat(t *testing.T) {
+	s := newTestServer(t)
+	h := s.Handler()
+	type hit struct {
+		title string
+		body  string
+		json  bool
+	}
+	var got hit
+	recv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = hit{title: r.Header.Get("X-Title"), body: string(b), json: json.Valid(b) && strings.HasPrefix(strings.TrimSpace(string(b)), "{")}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recv.Close()
+
+	// ntfy override on a plain host: native delivery (title header, plain body).
+	if w := do(t, h, "POST", "/api/notify/test", `{"url":"`+recv.URL+`","format":"ntfy"}`); w.Code != http.StatusOK {
+		t.Fatalf("ntfy-format test: %d %s", w.Code, w.Body)
+	}
+	if got.title == "" || got.json {
+		t.Fatalf("ntfy override not applied: title=%q json=%v body=%q", got.title, got.json, got.body)
+	}
+	// generic override: JSON payload, no ntfy headers - regardless of host.
+	if w := do(t, h, "POST", "/api/notify/test", `{"url":"`+recv.URL+`","format":"generic"}`); w.Code != http.StatusOK {
+		t.Fatalf("generic-format test: %d %s", w.Code, w.Body)
+	}
+	if got.title != "" || !got.json {
+		t.Fatalf("generic override not applied: title=%q json=%v body=%q", got.title, got.json, got.body)
+	}
+	// Unknown/empty format falls back to hostname detection - plain host gets generic.
+	if w := do(t, h, "POST", "/api/notify/test", `{"url":"`+recv.URL+`","format":"bogus"}`); w.Code != http.StatusOK {
+		t.Fatalf("bogus-format test: %d %s", w.Code, w.Body)
+	}
+	if !got.json {
+		t.Fatalf("bogus format should fall back to detection (generic here): body=%q", got.body)
 	}
 }

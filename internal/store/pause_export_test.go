@@ -202,3 +202,109 @@ func TestOldBackupWithoutPausesRestoresCleanly(t *testing.T) {
 		t.Fatalf("the destination's own unobserved seconds = %d, want 300 (an import merges, never deletes)", p)
 	}
 }
+
+// A backup taken while genuine history sits in quarantine must CARRY it. The
+// held rows land back in the destination's quarantine - never directly in
+// coverage - and the import arms the deferred re-judgement, so the
+// destination's own clock exonerates what it can vouch for and keeps holding
+// what no clock ever could. Before pauses_quarantine joined exportTables, a
+// backup in that window silently lost the held rows: if the source box then
+// died, the restored history reported different coverage than the source.
+func TestBackupCarriesQuarantinedHistory(t *testing.T) {
+	srcPath := t.TempDir() + "/src.db"
+	src, err := Open(srcPath)
+	if err != nil {
+		t.Fatalf("open src: %v", err)
+	}
+	now := time.Now().Unix()
+	seedLegacyPause(t, src, now-3600, 300)                  // genuine, fully past
+	seedLegacyPause(t, src, now, int64(maxPauseDuration-1)) // crafted decade-reacher
+	if err := src.Close(); err != nil {
+		t.Fatalf("close src: %v", err)
+	}
+	// A stale-clock open quarantines BOTH (every end reads future a year back).
+	src, err = openAt(srcPath, now-365*24*3600)
+	if err != nil {
+		t.Fatalf("stale reopen: %v", err)
+	}
+	defer src.Close()
+	if held := pauseDurations(t, src, "pauses_quarantine"); len(held) != 2 {
+		t.Fatalf("premise broken: quarantine holds %v, want both rows", held)
+	}
+
+	// The backup, taken in exactly the loss window - and restored elsewhere.
+	dst, err := Open(t.TempDir() + "/dst.db")
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	defer dst.Close()
+	applied := restoreBackup(t, src, dst)
+	if applied["pauses_quarantine"] != 2 {
+		t.Fatalf("restore carried %d held rows, want 2", applied["pauses_quarantine"])
+	}
+	if got := pauseDurations(t, dst, "pauses"); len(got) != 0 {
+		t.Fatalf("held rows entered coverage directly on import: pauses=%v", got)
+	}
+	if !dst.pauseRepairArmed() {
+		t.Fatal("the import did not arm the re-judgement; held rows would wait for a restart")
+	}
+	// The destination's next write re-judges under ITS clock: the genuine row
+	// is exonerated into coverage, the decade-reacher stays held.
+	dst.maybeRepairFuturePausesAt(now)
+	if kept := pauseDurations(t, dst, "pauses"); len(kept) != 1 || kept[0] != 300 {
+		t.Errorf("pauses hold %v after the re-judgement, want [300]", kept)
+	}
+	if held := pauseDurations(t, dst, "pauses_quarantine"); len(held) != 1 || held[0] != int64(maxPauseDuration-1) {
+		t.Errorf("quarantine holds %v, want only the decade-reacher", held)
+	}
+
+	// And a crafted file cannot implant structural garbage as held history.
+	// Distinct timestamps on purpose: a ts already present in the destination
+	// quarantine is skipped by the destination-wins merge, which would let a
+	// structurally VALID row read as "rejected" here and prove nothing.
+	n, err := dst.ImportTable(context.Background(), "pauses_quarantine", []map[string]any{
+		{"ts": int64(100), "duration_s": int64(60)},                   // pre-epoch anchor
+		{"ts": now + 1000, "duration_s": int64(-5)},                   // negative span
+		{"ts": now + 2000, "duration_s": int64(maxPauseDuration + 1)}, // past the retention ceiling
+	})
+	if err != nil || n != 0 {
+		t.Fatalf("garbage held rows: applied=%d err=%v, want 0 applied", n, err)
+	}
+}
+
+// A cancellation landing between a durable chunk commit and the next BeginTx
+// returns committed rows WITH an error - and a retry of those rows is pure
+// NOT EXISTS no-ops. The re-judgement must therefore arm at every durable
+// chunk commit, or held rows imported through exactly that window stay out of
+// coverage until a restart or the next detected clock step.
+func TestPartialQuarantineImportStillArmsRepair(t *testing.T) {
+	dst, err := Open(t.TempDir() + "/partial.db")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dst.Close()
+	if dst.pauseRepairArmed() {
+		t.Fatal("premise broken: fresh plausible store is armed")
+	}
+
+	rows := make([]map[string]any, importTxRows+1) // one full chunk + one leftover
+	for i := range rows {
+		rows[i] = map[string]any{"ts": int64(plausibleEpoch + int64(i)), "duration_s": int64(9 * 365 * 24 * 3600)}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	importChunkHook = cancel // the cancellation lands right after the chunk commit
+	defer func() { importChunkHook = nil }()
+
+	n, err := dst.ImportTable(ctx, "pauses_quarantine", rows)
+	if err == nil {
+		t.Fatal("premise broken: the injected cancellation did not surface as an error")
+	}
+	if n != importTxRows {
+		t.Fatalf("committed %d rows, want exactly the durable chunk (%d)", n, importTxRows)
+	}
+	if !dst.pauseRepairArmed() {
+		t.Fatal("a durable chunk of held rows landed but nothing armed the re-judgement; " +
+			"a retry is all no-ops, so the rows would wait for a restart")
+	}
+}

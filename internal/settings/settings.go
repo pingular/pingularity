@@ -1527,11 +1527,13 @@ func normalize(v Values) Values {
 		v.IPv6Mode = "auto"
 	}
 	// Webhook format override: an unknown value falls back to hostname
-	// detection rather than silently mis-shaping deliveries.
+	// detection rather than silently mis-shaping deliveries. "" normalizes to
+	// "auto" so the settings select always has a matching option to display -
+	// a value no option carries renders as a blank dropdown.
 	switch v.WebhookFormat {
-	case "", "auto", "ntfy", "generic":
+	case "auto", "ntfy", "generic":
 	default:
-		v.WebhookFormat = ""
+		v.WebhookFormat = "auto"
 	}
 	// Auto-picker location: keep only a usable "lat,lon" pair (finite, in range).
 	// ParseFloat accepts "NaN"/"Inf", which would centre the Ookla server picker

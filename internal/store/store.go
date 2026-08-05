@@ -158,13 +158,31 @@ type Store struct {
 	clockBase     time.Time
 	clockBaseUp   time.Duration
 	clockSettleUp time.Duration
+	// pauseStepSeen (under clockMu): a wall-clock step was detected and the
+	// pause re-judgement is owed - once the clock survives the settle window.
+	// While set, ALL deferred pause repair is parked, including generations
+	// armed earlier (an implausible Open's) - the same reading that parked
+	// destructive pruning must not judge history either.
+	pauseStepSeen bool
+	// pauseVetted (under clockMu): the reading that survived the most recent
+	// settle window; zero until a step has settled. Once present, every
+	// deferred repair judges in THIS frame, advanced by monotonic elapsed
+	// time - never a fresh wall reading, which a step after arming (but
+	// before the consuming write) could have made untrustworthy again.
+	pauseVetted time.Time
 
-	// pauseFutureRepairPending records that Open ran under an implausible clock
-	// (an RTC-less board opens the store at service start, before NTP syncs), so
-	// the now-anchored half of the pause repair could not run there. The first
-	// write that observes a plausible clock re-runs it once - see
-	// maybeRepairFuturePausesAt.
-	pauseFutureRepairPending atomic.Bool
+	// pauseRepairArm/pauseRepairDone are the deferred pause re-judgement
+	// trigger, as a GENERATION pair rather than a boolean: arm != done means a
+	// judgement is owed. Open seeds generation 1 when its clock is implausible
+	// (an RTC-less board opens at service start, before NTP syncs); a detected
+	// clock step arms a fresh generation once it settles (see clockStepped).
+	// A generation - with the judging clock read only AFTER observing it -
+	// closes the race a boolean had: a writer that captured time.Now() before
+	// an NTP correction could consume the one trigger and re-judge with the
+	// pre-correction clock, restoring nothing. See maybeRepairFuturePausesFn.
+	pauseRepairArm  atomic.Uint64
+	pauseRepairDone atomic.Uint64
+	pauseRepairMu   sync.Mutex // serializes the judgement transaction itself
 }
 
 // pragmaConn is the per-connection pragma query appended to every file-backed
@@ -201,14 +219,29 @@ func buildDSN(path string) string {
 // Open opens (creating if needed) the SQLite database at path and ensures the
 // schema exists.
 func Open(path string) (*Store, error) {
-	return openAt(path, time.Now().Unix())
+	// ONE reading: the clock the pause rows are judged with (nowU) and the
+	// step detector's baseline are the same time.Time. Two separate readings -
+	// even nanoseconds apart, and previously a whole slow Open apart - leave a
+	// seam where an NTP correction lands between them: rows judged with the
+	// stale clock, the corrected one installed as the baseline, and no step
+	// ever visible afterwards to trigger the re-judgement.
+	now := time.Now()
+	return openAtClock(path, now.Unix(), now)
 }
 
-// openAt is Open against a caller-supplied clock (the same seam
+// openAt is Open against a caller-supplied judging clock (the same seam
 // repairInsanePausesAt gives the repair), so tests can open a store the way an
 // RTC-less board does - at service start, before NTP, under an implausible
-// clock - without faking time.
+// clock - without faking time. The detector baseline stays the real clock,
+// which is exactly the shape of the scenario being modelled: rows judged by
+// one clock, the machine actually running on another.
 func openAt(path string, nowU int64) (*Store, error) {
+	return openAtClock(path, nowU, time.Now())
+}
+
+// openAtClock is the full seam: the judging clock AND the wall/monotonic
+// reading the step detector baselines on, as one pair.
+func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 	// Create the parent dir for file-backed databases (skips ":memory:" and bare
 	// filenames, whose dir is "."). 0o700 because the DB holds secrets at rest
 	// (bcrypt auth hash, webhook URLs) - not readable by other local users.
@@ -354,12 +387,14 @@ func openAt(path string, nowU int64) (*Store, error) {
 		db:          db,
 		recCache:    map[int64]recScan{},
 		seriesCache: map[seriesKey]*seriesEntry{},
-		opened:      time.Now(), // carries a monotonic reading; see clockStepped
+		opened:      opened, // the top-of-Open reading; carries a monotonic reading for clockStepped
 	}
 	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
 	// When the clock could not anchor the future-end pause repair above, arm the
 	// lazy re-judgement: the first write under a plausible clock runs it instead.
-	st.pauseFutureRepairPending.Store(nowU < plausibleEpoch)
+	if nowU < plausibleEpoch {
+		st.pauseRepairArm.Store(1)
+	}
 	return st, nil
 }
 
@@ -522,15 +557,20 @@ func repairInsanePausesAt(db *sql.DB, nowU int64) error {
 // forever, since no plausible clock ever reaches its end. Nothing trusts the clock
 // to be RIGHT any more, only to be a clock.
 //
-// Two things this deliberately does not do. Restoration happens here, so a
-// long-running process whose clock syncs AFTER Open keeps showing the inflated
-// uptime until it restarts: the lazy re-judgement disarms once it has run (see
-// maybeRepairFuturePausesAt), and re-arming it while the quarantine is occupied
-// would run this transaction on every probe round for as long as one crafted row
-// sits there. And quarantined rows are not in exportTables, so a backup taken
-// during that window omits them - the restore is machine-local clock repair, not
-// history, and once the clock is right the rows are back in pauses and export
-// normally.
+// Restoration happens here and on a bounded trigger: the lazy re-judgement
+// consumes its generation once it has run (see maybeRepairFuturePausesFn), and
+// a DETECTED clock step arms a fresh one - after the step survives the
+// pruner's settle window (clockStepped, read hourly by the pruner), because a
+// clock pruning does not yet trust must not re-judge history either. A process
+// whose clock syncs after Open therefore re-judges within roughly the settle
+// window plus an hour plus one write, not at the next restart. Arming is per
+// correction, never per write: re-arming while the quarantine is occupied
+// would otherwise run this transaction on every probe round for as long as one
+// crafted row sits there. And a backup taken between a wrong judgement and
+// the step-triggered repair still carries the held rows: pauses_quarantine
+// exports under its own key, lands back in the destination's quarantine, and
+// the import arms a re-judgement so the destination's clock decides what to
+// exonerate.
 //
 // Shared by the at-Open path and the lazy first-plausible-write path
 // (maybeRepairFuturePausesAt): both must apply the identical judgement, or the
@@ -622,29 +662,59 @@ func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
 	return nil
 }
 
-// maybeRepairFuturePausesAt runs the future-end pause repair Open had to skip,
-// the first time a write observes a plausible clock. Gating the re-judgement on
-// the OPEN-time clock alone left a hole exactly where it matters: the RTC-less
-// board the epoch-clock import fallback serves always opens the store at
-// service start, before NTP syncs, so on that hardware the repair never fired
-// and the crafted decade-ahead row it exists to remove survived every boot.
-// Called from the per-round write paths (InsertSamples, InsertPause). Cheap by
-// design: one atomic load once judged (or when the store opened under a
-// plausible clock, which never arms the flag), and no query until a plausible
-// clock is actually observed. On a failed repair the flag re-arms - the DELETE
-// is idempotent and a later write retries - and the write itself is never
-// failed for it.
+// maybeRepairFuturePauses runs the deferred future-end pause repair when a
+// trigger generation is armed and the clock is plausible: Open's skipped
+// judgement (implausible boot clock - the RTC-less board the epoch-clock
+// import fallback serves) and the settled-step re-judgement both arrive here,
+// from the per-round write paths (InsertSamples, InsertPause). Cheap by
+// design: the disarmed fast path is two atomic loads and no query runs until
+// a plausible clock is actually observed.
+//
+// The wall clock is read INSIDE, only after observing the armed generation -
+// never taken from the caller. A caller-supplied timestamp could be captured
+// before the very correction that armed the trigger (the writer preempted
+// between time.Now() and the flag check), consuming the only trigger and
+// re-judging with the pre-correction clock: nothing restored, nothing left
+// armed. Reading after the observation orders the clock after the event.
+func (s *Store) maybeRepairFuturePauses() {
+	s.maybeRepairFuturePausesFn(func() int64 { return time.Now().Unix() })
+}
+
+// maybeRepairFuturePausesAt is the test seam: an injected reading, delivered
+// through the same after-the-observation path.
 func (s *Store) maybeRepairFuturePausesAt(nowU int64) {
-	if !s.pauseFutureRepairPending.Load() || nowU < plausibleEpoch {
-		return
+	s.maybeRepairFuturePausesFn(func() int64 { return nowU })
+}
+
+func (s *Store) maybeRepairFuturePausesFn(nowFn func() int64) {
+	if !s.pauseRepairArmed() {
+		return // the every-write fast path
 	}
-	if !s.pauseFutureRepairPending.CompareAndSwap(true, false) {
-		return // another writer won the race and is running it
+	s.pauseRepairMu.Lock()
+	defer s.pauseRepairMu.Unlock()
+	arm := s.pauseRepairArm.Load()
+	if arm == s.pauseRepairDone.Load() {
+		return // another writer already judged this generation
+	}
+	nowU, trusted := s.repairReading(nowFn)
+	if !trusted {
+		return // a step is settling: stays armed, no clock may judge yet
+	}
+	if nowU < plausibleEpoch {
+		return // stays armed; the first plausible write judges
 	}
 	if err := repairFutureReachingPausesAt(s.db, nowU); err != nil {
+		// Stays armed (done not advanced) - the DELETE is idempotent and a
+		// later write retries. The write itself is never failed for it.
 		log.Printf("pingularity: deferred pause repair failed (a later write retries): %v", err)
-		s.pauseFutureRepairPending.Store(true)
+		return
 	}
+	s.pauseRepairDone.Store(arm)
+}
+
+// pauseRepairArmed reports whether a re-judgement generation is owed.
+func (s *Store) pauseRepairArmed() bool {
+	return s.pauseRepairArm.Load() != s.pauseRepairDone.Load()
 }
 
 // pauseRepairFutureSkew is how far past the repairing clock a stored pause may
@@ -912,7 +982,7 @@ func (s *Store) InsertSamples(ctx context.Context, sms []Sample) error {
 	// A probe round means the process is alive and reading its clock: the moment
 	// that clock turns plausible, run the future-end pause repair Open had to
 	// skip (an atomic no-op on every store that was judged at Open).
-	s.maybeRepairFuturePausesAt(time.Now().Unix())
+	s.maybeRepairFuturePauses()
 	if len(sms) == 0 {
 		return nil
 	}
@@ -977,7 +1047,7 @@ func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int6
 	// The other per-round write path (a board with monitoring paused at boot
 	// checkpoints pauses, not samples): same deferred re-judgement as
 	// InsertSamples, before the live row lands.
-	s.maybeRepairFuturePausesAt(time.Now().Unix())
+	s.maybeRepairFuturePauses()
 	// The same rule the importer applies (PauseSpanSane). It used to check only for
 	// a positive duration, which made this the one way into the table that a
 	// crafted backup file could not have taken: the monitor measures a pause on the
@@ -3722,9 +3792,53 @@ func (s *Store) clockStepped(now time.Time, uptime time.Duration) bool {
 	if drift > pruneClockStepSlack {
 		s.clockBase, s.clockBaseUp = now.Round(0), uptime
 		s.clockSettleUp = uptime + pruneClockSettle
+		// A detected step is the bounded trigger for re-judging quarantined
+		// pauses - the judgement Open ran under a plausible-but-stale clock (a
+		// batteryless board a year behind) wrongly held genuine rows, and
+		// nothing re-ran it until restart. But do NOT arm it yet: this same
+		// branch just declared the post-step clock untrusted for destructive
+		// pruning, and re-judging history is the same bargain - a temporary
+		// bogus step (VM snapshot resume, hypervisor sync glitch) could
+		// quarantine genuine pauses or restore held garbage. Note the step;
+		// the arm happens below, once the clock survives the settle window.
+		// A reverting step lands back in this branch and keeps deferring, so
+		// the judgement runs once, under whatever clock the settle vouches for.
+		s.pauseStepSeen = true
 		return true
 	}
-	return uptime < s.clockSettleUp
+	if uptime < s.clockSettleUp {
+		return true
+	}
+	// Steady through the settle window after a step: the clock has earned the
+	// re-judgement. Arming is once per correction, not once per write, so a
+	// crafted far-future row costs one repair transaction per real clock
+	// change - not the every-probe-round loop the old restart-only rule
+	// guarded against.
+	if s.pauseStepSeen {
+		s.pauseStepSeen = false
+		s.pauseVetted = now // the reading the settle window vouched for
+		s.pauseRepairArm.Add(1)
+	}
+	return false
+}
+
+// repairReading picks the clock the deferred pause repair may judge with, or
+// reports that no reading is currently trustworthy (a detected step is still
+// settling - every generation parks, not only the one that step would arm).
+// Once any step has settled, its vetted reading - advanced by monotonic
+// elapsed time, which no later wall step can bend - is the judging frame, and
+// the caller-supplied reading is ignored; before any step, the fallback (the
+// caller's clock, plausibility-gated by the caller) is all there is.
+func (s *Store) repairReading(fallback func() int64) (int64, bool) {
+	s.clockMu.Lock()
+	defer s.clockMu.Unlock()
+	if s.pauseStepSeen {
+		return 0, false
+	}
+	if !s.pauseVetted.IsZero() {
+		return s.pauseVetted.Add(time.Since(s.pauseVetted)).Unix(), true
+	}
+	return fallback(), true
 }
 
 func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBefore time.Time) (int64, error) {
@@ -4013,6 +4127,20 @@ var exportTables = map[string]struct {
 	// (see the straddle rule there).
 	"pauses": {cols: []string{"ts", "duration_s"}, keyCols: []string{"ts"}, notNull: []string{"duration_s"},
 		intCols: []string{"ts", "duration_s"}, rowSane: pauseRowSane},
+	// The held-aside half of the pause record. A backup taken between a wrong
+	// stale-clock judgement and the settled-step re-judgement used to omit
+	// these rows entirely - if the source box then died, the genuine history
+	// in quarantine was gone and the restored box reported different coverage
+	// than the source. Held rows export under their own key and land back in
+	// the DESTINATION's quarantine, never directly in coverage: the
+	// destination's own re-judgement (armed by the import) exonerates what its
+	// clock can vouch for and keeps holding what it cannot - the same
+	// judgement local rows get. A file CARRYING this key stamps envelope
+	// schema 4 (see the web layer's exportSchema contract), so older builds
+	// refuse it loudly instead of skipping the key and silently shedding the
+	// held history; an empty quarantine omits the key and stamps as before.
+	"pauses_quarantine": {cols: []string{"ts", "duration_s"}, keyCols: []string{"ts"}, notNull: []string{"duration_s"},
+		intCols: []string{"ts", "duration_s"}, rowSane: quarantineRowSane},
 	"speed": {cols: []string{"ts", "down_mbps", "up_mbps", "ping_ms", "server", "server_id",
 		"public_ipv4", "public_ipv6", "isp", "isp_location", "dns_ip", "dns_provider", "dns_location",
 		"packet_loss", "healthy", "jitter_ms", "download_bytes", "upload_bytes", "cf_colo", "exit_summary", "run_trigger",
@@ -4183,6 +4311,17 @@ func (s *Store) BeginReadSnapshot(ctx context.Context) (*sql.Tx, error) {
 	return s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 }
 
+// HasQuarantinedPausesTx reports whether any pause rows sit in quarantine,
+// against the same read snapshot an export streams from. The answer decides
+// whether the file carries the pauses_quarantine key at all - and therefore
+// which schema version it needs - so it must describe the exact instant the
+// rows do, not the live table.
+func (s *Store) HasQuarantinedPausesTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pauses_quarantine)`).Scan(&n)
+	return n != 0, err
+}
+
 // ExportTableRowsTx is ExportTableRows scoped to a caller-provided read snapshot.
 func (s *Store) ExportTableRowsTx(ctx context.Context, tx *sql.Tx, table string, fn func(map[string]any) error) error {
 	return exportRows(ctx, tx, table, fn)
@@ -4265,6 +4404,13 @@ func (s *Store) ExportTable(ctx context.Context, table string) ([]map[string]any
 // busy_timeout, silently dropping probe rounds and transition events. The
 // per-key merge below makes a partially applied import safe to re-run.
 const importTxRows = 5000
+
+// importChunkHook runs after a mid-batch chunk commit succeeds, before the
+// next transaction opens. Test seam only (nil in production): the interesting
+// window is a cancellation landing between a durable commit and the BeginTx
+// that follows it, which makes ImportTableBatch return rows-committed WITH an
+// error - and a retry of those same rows is all NOT EXISTS no-ops.
+var importChunkHook func()
 
 // ImportTable merges exported rows into a whitelisted table in bounded
 // transactions (importTxRows apiece, so a big restore doesn't starve live
@@ -4585,7 +4731,19 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 			// import) remaining-rows window can't keep serving memoized answers that
 			// the just-committed rows have already contradicted.
 			s.invalidateReadCaches()
+			// Held rows are DURABLE from this commit on, so the re-judgement
+			// arms here, not only at the happy-path return: if the next
+			// BeginTx fails (a cancellation landing just after the commit),
+			// the caller sees an error, retries - and the retried rows are
+			// all NOT EXISTS no-ops that would never arm. The rows would then
+			// sit out of coverage until a restart or the next clock step.
+			if table == "pauses_quarantine" && pending > 0 {
+				s.pauseRepairArm.Add(1)
+			}
 			committed, pending, inTx = committed+pending, 0, 0
+			if importChunkHook != nil {
+				importChunkHook()
+			}
 			if tx, err = s.db.BeginTx(ctx, nil); err != nil {
 				return committed, err
 			}
@@ -4596,6 +4754,13 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 		return committed, err
 	}
 	durable = true
+	// Freshly imported held rows must not wait for a restart (or the next
+	// clock step) to be re-judged: arm a generation so the next write runs
+	// the same exoneration a local quarantine gets. Eligibility still holds -
+	// if a step happens to be settling, the repair parks until it clears.
+	if table == "pauses_quarantine" && committed+pending > 0 {
+		s.pauseRepairArm.Add(1)
+	}
 	return committed + pending, nil
 }
 
@@ -4634,6 +4799,28 @@ func pauseRowSane(row map[string]any) bool {
 		// rows; if the refusal was clock skew, a re-run after sync lands them.
 		stats.Inc("import.pause_dropped")
 		log.Printf("pingularity: import dropped pause row (ts=%d duration_s=%d): not a believable span; if this is a genuine backup and this machine's clock was behind when it was restored, re-run the import once the clock has synced", ts, dur)
+		return false
+	}
+	return true
+}
+
+// quarantineRowSane vets an imported HELD pause row: structurally a span
+// (positive, epoch-plausible, bounded by the retention ceiling) but with NO
+// future-end cap - reaching past the clock is why the row is in quarantine,
+// and pauseRowSane's importable check would reject every genuine held row.
+// Restoration into coverage is not decided here: the row lands back in
+// quarantine and only the destination's re-judgement (pauseRepairFutureSkew)
+// can move it, so a crafted file gets no wider claim on coverage than the
+// local quarantine machinery already grants rows at rest.
+func quarantineRowSane(row map[string]any) bool {
+	ts, okTS := row["ts"].(int64)
+	dur, okDur := row["duration_s"].(int64)
+	if !okTS || !okDur {
+		return false
+	}
+	if !pauseSpanBounded(ts, dur) {
+		stats.Inc("import.pause_quarantine_dropped")
+		log.Printf("pingularity: import dropped quarantined pause row (ts=%d duration_s=%d): not a structurally believable span", ts, dur)
 		return false
 	}
 	return true

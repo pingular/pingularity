@@ -3,6 +3,7 @@ package speedtest
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -48,5 +49,36 @@ func TestAStopClickInsideTheClaimWindowIsNotLost(t *testing.T) {
 		s.Abort(s.RunID())
 		<-out
 		t.Fatal("the run never stopped: the stop click was swallowed by the claim window")
+	}
+}
+
+// An abort raised for an OLDER run must never clobber one raised for a newer
+// run. The interleaving (abort_window semantics, one step further): Abort(A)
+// passes its id check and stalls before recording; A ends; B claims and
+// Abort(B) records B; the stalled Abort(A) finally stores. With a plain Store,
+// B's startup check then read A, ignored it, and B survived an Abort that had
+// reported success. recordAbort's CAS floor makes the late store a no-op.
+func TestStaleAbortCannotClobberNewerRequest(t *testing.T) {
+	s, _ := newAbortScheduler(t, testerFunc(func(ctx context.Context) (Result, error) {
+		return Result{}, nil
+	}))
+	s.recordAbort(7) // Abort(B): recorded for the newer run
+	s.recordAbort(5) // the stalled Abort(A) finally stores
+	if got := s.abortFor.Load(); got != 7 {
+		t.Fatalf("stale abort overwrote newer request: abortFor=%d, want 7", got)
+	}
+	s.recordAbort(9) // a genuinely newer request still lands
+	if got := s.abortFor.Load(); got != 9 {
+		t.Fatalf("newer abort did not record: abortFor=%d, want 9", got)
+	}
+	// Concurrent recorders converge on the maximum, no interleaving lost.
+	var wg sync.WaitGroup
+	for i := uint64(1); i <= 64; i++ {
+		wg.Add(1)
+		go func(id uint64) { defer wg.Done(); s.recordAbort(id) }(i)
+	}
+	wg.Wait()
+	if got := s.abortFor.Load(); got != 64 {
+		t.Fatalf("concurrent records lost the maximum: abortFor=%d, want 64", got)
 	}
 }

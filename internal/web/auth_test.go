@@ -1225,6 +1225,168 @@ func TestBcryptSemBoundsConcurrency(t *testing.T) {
 // access-control setting; without it a hijacked/walk-up session takes over the
 // account (sets a new password, renames it, or disables login) knowing only
 // the session cookie.
+// The Settings drawer POSTs /api/access on every Save, even when nothing
+// access-related was touched. Such a no-change request must succeed without the
+// current password, or a login-protected install cannot save ordinary settings.
+func TestAccessNoChangeNeedsNoStepUp(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+	h := s.Handler()
+
+	// Exactly what the drawer sends on an untouched Access tab: current state
+	// echoed back, empty password fields.
+	noop := `{"local_only":false,"auth_enabled":true,"username":"admin","password":"","current_password":""}`
+	if w := doSession(t, s, h, "POST", "/api/access", noop); w.Code != http.StatusOK {
+		t.Fatalf("no-change access POST: %d %s, want 200 without step-up", w.Code, w.Body)
+	}
+	// Same-value fields individually are also no-ops, not access changes.
+	for _, body := range []string{`{"auth_enabled":true}`, `{"username":"admin"}`, `{"local_only":false}`} {
+		if w := doSession(t, s, h, "POST", "/api/access", body); w.Code != http.StatusOK {
+			t.Fatalf("POST %s: %d, want 200 (no state change)", body, w.Code)
+		}
+	}
+	// The save flow's second half - an ordinary settings POST - now runs.
+	if w := doSession(t, s, h, "POST", "/api/settings", `{}`); w.Code != http.StatusOK {
+		t.Fatalf("settings save after no-op access POST: %d %s", w.Code, w.Body)
+	}
+	if got := counter("web.stepup_fail"); got != 0 {
+		t.Fatalf("web.stepup_fail = %d, want 0 (no step-up ran)", got)
+	}
+	if !s.settings.AuthActive() || s.settings.AuthUser() != "admin" {
+		t.Fatal("no-op POSTs changed auth state")
+	}
+}
+
+// Step-up verification spends the same per-client budget as login: a stolen
+// session gets at most maxLoginFails serialized guesses, while the operator's
+// known-good password still passes during the block.
+func TestStepUpRateLimited(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+	h := s.Handler()
+
+	// One legitimate step-up caches the known-good fingerprint (as any real
+	// operator's earlier successful save would have). A password rotation is the
+	// delta - NOT local_only, which would make the guard reject the test's
+	// non-loopback requests before they reach the handler.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret","password":"secret2"}`); w.Code != http.StatusOK {
+		t.Fatalf("legitimate step-up: %d %s", w.Code, w.Body)
+	}
+	// A hijacked session grinds guesses: each wrong attempt records a failure...
+	for i := 0; i < maxLoginFails; i++ {
+		w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"wrong","password":"pwned"}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("guess %d: %d, want 403", i, w.Code)
+		}
+	}
+	// ...and once the budget is spent, further guesses get 429, not bcrypt.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"stillwrong","password":"pwned"}`); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("guess after budget: %d, want 429", w.Code)
+	}
+	if got := counter("web.limiter_trips"); got == 0 {
+		t.Fatal("limiter_trips did not count the blocked step-up")
+	}
+	if s.checkPassword("admin", "pwned") {
+		t.Fatal("a refused guess changed the stored credential")
+	}
+	// The operator's real password rides the known-good escape valve through
+	// the block - the attacker sharing the bucket can't lock them out.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret2","username":"bob"}`); w.Code != http.StatusOK {
+		t.Fatalf("known-good step-up during block: %d %s", w.Code, w.Body)
+	}
+	if got := s.settings.AuthUser(); got != "bob" {
+		t.Fatalf("known-good step-up did not apply the change: user=%q", got)
+	}
+	// The rename re-caches the fingerprint under the new name: a SECOND change
+	// during the same block must also pass. (The fingerprint embeds the
+	// username, so without the re-cache the escape valve died with the rename
+	// and the operator was locked out for the cooldown.)
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret2","username":"carol"}`); w.Code != http.StatusOK {
+		t.Fatalf("second known-good step-up after a rename: %d %s", w.Code, w.Body)
+	}
+	if got := s.settings.AuthUser(); got != "carol" {
+		t.Fatalf("second rename did not apply: user=%q", got)
+	}
+}
+
+// A rename+enable from the disabled-with-hash state carries NO password proof
+// (step-up only guards while auth is active), so it must never seed the
+// known-good cache: the request's arbitrary current_password would later pass
+// a blocked step-up without ever having touched bcrypt.
+func TestUnverifiedRenameEnableDoesNotSeedKnownGood(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+	if err := s.settings.SetAuthEnabled(context.Background(), false); err != nil {
+		t.Fatalf("disable auth: %v", err)
+	}
+	h := s.Handler()
+
+	// Disabled: the POST is ungated and step-up is skipped, but the mutation
+	// ends with auth ACTIVE (hash retained + enable).
+	if w := do(t, h, "POST", "/api/access", `{"username":"eve","auth_enabled":true,"current_password":"garbage"}`); w.Code != http.StatusOK {
+		t.Fatalf("rename+enable while disabled: %d %s", w.Code, w.Body)
+	}
+	if !s.settings.AuthActive() || s.settings.AuthUser() != "eve" {
+		t.Fatalf("premise broken: active=%v user=%q", s.settings.AuthActive(), s.settings.AuthUser())
+	}
+	// Burn the limiter budget with wrong guesses...
+	for i := 0; i < maxLoginFails; i++ {
+		if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"wrong","password":"x"}`); w.Code != http.StatusForbidden {
+			t.Fatalf("guess %d: %d, want 403", i, w.Code)
+		}
+	}
+	// ...then replay the unverified value. It must NOT ride the escape valve.
+	w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"garbage","password":"pwned"}`)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("unverified cached value passed a blocked step-up: %d %s", w.Code, w.Body)
+	}
+	if s.checkPassword("eve", "pwned") {
+		t.Fatal("the blocked request changed the stored credential")
+	}
+}
+
+// A VERIFIED rename+disable must still refresh the known-good cache under the
+// new name, even though auth ends inactive: re-enabling needs no proof, and
+// the operator's next real step-up during the same block must not 429.
+func TestVerifiedRenameDisableKeepsEscapeValve(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+	h := s.Handler()
+
+	// Seed the cache the way any real operator's earlier save would.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret","password":"secret2"}`); w.Code != http.StatusOK {
+		t.Fatalf("seed rotation: %d %s", w.Code, w.Body)
+	}
+	for i := 0; i < maxLoginFails; i++ {
+		if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"wrong","password":"x"}`); w.Code != http.StatusForbidden {
+			t.Fatalf("guess %d: %d, want 403", i, w.Code)
+		}
+	}
+	// Verified (via the escape valve) rename + disable in one request.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret2","username":"bob","auth_enabled":false}`); w.Code != http.StatusOK {
+		t.Fatalf("verified rename+disable during block: %d %s", w.Code, w.Body)
+	}
+	if s.settings.AuthActive() || s.settings.AuthUser() != "bob" {
+		t.Fatalf("premise broken: active=%v user=%q", s.settings.AuthActive(), s.settings.AuthUser())
+	}
+	// Re-enable needs no proof while inactive.
+	if w := do(t, h, "POST", "/api/access", `{"auth_enabled":true}`); w.Code != http.StatusOK {
+		t.Fatalf("re-enable: %d %s", w.Code, w.Body)
+	}
+	// Still inside the cooldown: the renamed operator's real password must
+	// pass - the rename refreshed the fingerprint under the new name.
+	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret2","password":"secret3"}`); w.Code != http.StatusOK {
+		t.Fatalf("legitimate step-up after verified rename+disable/re-enable: %d %s", w.Code, w.Body)
+	}
+	if !s.checkPassword("bob", "secret3") {
+		t.Fatal("the verified step-up did not apply the change")
+	}
+}
+
 func TestAccessChangeRequiresCurrentPassword(t *testing.T) {
 	stats.ResetForTest()
 	s := newTestServer(t)

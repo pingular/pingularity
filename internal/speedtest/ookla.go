@@ -1841,7 +1841,15 @@ func msIfPositive(d time.Duration) *float64 {
 	if d <= 0 {
 		return nil
 	}
-	return f64p(util.DurMS(d))
+	ms := util.DurMS(d)
+	if ms <= 0 {
+		// DurMS truncates to whole microseconds, so the race's 1ns "measured
+		// zero" clamp (keepFastestPing) came out as 0 here - and a stored 0
+		// reads as "nothing measured" to validMS, sending every decision back
+		// to the unfiltered mean. Keep the evidence positive end to end.
+		ms = 0.001
+	}
+	return f64p(ms)
 }
 
 // decisionPingMS is the latency figure this run's CHOICES are made on: the

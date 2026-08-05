@@ -475,7 +475,7 @@
   .ctl:has(>input[type=text])>input[type=text]:focus{box-shadow:none;}
   .tab-uniform .ctl:has(>input[type=text]){width:60%;}
   .tab-uniform .ctl:has(>input[type=text])>input[type=text]{width:auto;min-width:0;justify-self:stretch;}
-  .srow-wide{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;margin:6px 0 4px;justify-content:flex-start;}
+  .srow-wide{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;margin:6px 0 4px;justify-content:flex-start;font-size:13px;} /* same 13px .srow pins - these rows are not .srow, so without it they inherit the drawer base and read larger */
   /* Webhook/Heartbeat: label and its field on ONE line - label hugs the left, the field
      (input, or input+Test) fills the rest. Fixed label column so both rows' fields align. */
   .srow-wide.srow-inline{display:grid;grid-template-columns:120px minmax(0,1fr);align-items:center;gap:12px;min-height:33px;}
@@ -491,10 +491,14 @@
   /* Labels never wrap internally ("Alert on / outage"): the whole group moves to
      the next line as one piece instead, and the control sits right beside its text. */
   .notif-inline .lbl{white-space:nowrap;flex:none;}
-  .notif-inline .ctl{width:auto;}
-  .notif-inline .ctl:has(>input[type=checkbox]){width:76px;} /* the Off|On pill keeps its standard footprint */
-  .notif-inline .ctl>select{width:auto;min-width:0;padding-right:22px;} /* natural width; keep room for the arrow */
-  .notif-inline .ctl:has(>input[type=number])>input[type=number]{width:38px;} /* 1-10: two digits */
+  /* Every control in this row renders the same 90px pill the tab-uniform rows net
+     out to (60% of the 150px .ctl cell), so the quartet matches Min download & co.
+     The :has() variants out-specify the tab-uniform width rules they replace. */
+  .notif-inline .ctl,
+  .notif-inline .ctl:has(>input[type=checkbox]),
+  .notif-inline .ctl:has(>input[type=number]){width:90px;}
+  .notif-inline .ctl{grid-template-columns:1fr;} /* no dead 30px unit column; the number ctl keeps tab-uniform's 1fr auto so its unit stays inside the pill */
+  .notif-inline .ctl>select{width:100%;}
   .srow-div{grid-column:1/-1;height:0;border-top:1px solid var(--line);margin:12px 0 4px;}
   /* About-tab log viewer: a scrollable, colour-coded log window with Copy/Download/
      Clear icon pills floating in its top-right corner. */
@@ -1830,16 +1834,16 @@
             <button class="btn" id="testWebhook" type="button">Test</button>
           </div>
         </div>
-        <label class="srow"><span class="lbl">Webhook format
-          <span class="info" tabindex="0" data-tip="How the alert is shaped for the receiver. Automatic recognizes Discord, Slack, ntfy.sh, and Healthchecks from the address; pick ntfy for a self-hosted ntfy server on your own domain (title, priority, and icon arrive properly instead of a JSON blob), or plain JSON to force the generic payload.">i</span></span>
-          <span class="ctl"><select id="setWebhookFormat"><option value="">Automatic</option><option value="ntfy">ntfy</option><option value="generic">plain JSON</option></select><span class="unit"></span></span></label>
         <div class="notif-inline">
+          <label class="srow"><span class="lbl">Webhook format
+            <span class="info" tabindex="0" data-tip="How the alert is shaped for the receiver. Auto recognizes Discord, Slack, ntfy.sh, and Healthchecks from the address; pick ntfy for a self-hosted ntfy server on your own domain (title, priority, and icon arrive properly instead of a JSON blob), or plain JSON to force the generic payload.">i</span></span>
+            <span class="ctl"><select id="setWebhookFormat"><option value="auto">Auto</option><option value="ntfy">ntfy</option><option value="generic">plain JSON</option></select></span></label>
           <label class="srow"><span class="lbl">Alert on outage
             <span class="info" tabindex="0" data-tip="Send a webhook alert whenever the link goes down and when it comes back.">i</span></span>
             <span class="ctl"><input type="checkbox" id="setAlertOutage"><span class="unit"></span></span></label>
-          <label class="srow"><span class="lbl">Alert after
+          <label class="srow"><span class="lbl">Breaches in a row
             <span class="info" tabindex="0" data-tip="Alert only after a threshold is breached this many speedtests in a row, so a single blip doesn't page you. 1 = alert on every breach.">i</span></span>
-            <span class="ctl"><input type="number" id="setThreshConsec" min="1" max="10" step="1"><span class="unit">in a row</span></span></label>
+            <span class="ctl"><input type="number" id="setThreshConsec" min="1" max="10" step="1"><span class="unit"></span></span></label>
           <label class="srow"><span class="lbl">Periodic summary
             <span class="info" tabindex="0" data-tip="Post a recurring health summary to the webhook: uptime, median speeds, outage count and downtime for the period.
 • A 'how it went' report, not just failures.">i</span></span>
@@ -5971,7 +5975,7 @@ function setField(id,kind,v){ switch(kind){
   case 'day': secOrig[id]={raw:v||0, shown:Math.round((v||0)/86400)}; $(id).value=secOrig[id].shown; break;
   case 'float': $(id).value=v||0; break;
   case 'text': $(id).value=v||''; break;
-  default: $(id).value=v; } }
+  default: { const el=$(id); el.value=v; if(el.tagName==='SELECT'&&el.selectedIndex<0&&el.options.length) el.selectedIndex=0; } } }
 function getField(id,kind,fb){ switch(kind){
   case 'bool': return $(id).checked;
   // 0 is a legal value (e.g. Retries "0 = no retry") - only an unparsable
@@ -6748,7 +6752,7 @@ $('testWebhook').addEventListener('click', async () => {
   if(!url){ msg.textContent='Enter a webhook URL first.'; return; }
   const b=$('testWebhook'); b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
   try{
-    const r=await fetch('api/notify/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    const r=await fetch('api/notify/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url, format:$('setWebhookFormat').value})});
     msg.textContent = r.ok ? 'Test alert sent - check your channel.' : ('Test failed: '+await r.text());
   }catch(e){ msg.textContent='Test failed.'; }
   b.disabled=false; b.innerHTML=t; setTimeout(()=>{ if(msg.textContent.startsWith('Test')) msg.textContent=''; },4000);

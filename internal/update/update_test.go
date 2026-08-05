@@ -268,3 +268,33 @@ func TestNextIntervalRetriesFastUntilFirstSuccess(t *testing.T) {
 		t.Fatalf("dev build: nextInterval = %v, want %v", got, checkInterval)
 	}
 }
+
+// The CheckNow kick shares the re-arm path with the timer tick. Regression:
+// the kick used to run checkOnce without re-arming, so enabling checks after a
+// disabled boot tick left a FAILED first attempt waiting out the daily timer
+// instead of the firstPollRetry ladder.
+func TestKickRearmsOnLadderAfterEnable(t *testing.T) {
+	enabled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // the feed is down
+	}))
+	defer srv.Close()
+	c := New("0.7.0", func() bool { return enabled }, nil)
+	c.url = srv.URL
+
+	ctx := context.Background()
+	attempts := 0
+	// The startup tick while disabled: schedule stays daily.
+	if d := c.checkAndNext(ctx, &attempts); d != checkInterval {
+		t.Fatalf("disabled tick scheduled %v, want the daily %v", d, checkInterval)
+	}
+	// The toggle turns on and kicks; the check fails. The next attempt must be
+	// the first ladder step, not the rest of the daily interval.
+	enabled = true
+	if d := c.checkAndNext(ctx, &attempts); d != firstPollRetry[0] {
+		t.Fatalf("failed kick scheduled %v, want ladder start %v", d, firstPollRetry[0])
+	}
+	if d := c.checkAndNext(ctx, &attempts); d != firstPollRetry[1] {
+		t.Fatalf("second failure scheduled %v, want %v", d, firstPollRetry[1])
+	}
+}

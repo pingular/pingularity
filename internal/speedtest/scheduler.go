@@ -186,12 +186,28 @@ func (s *Scheduler) Abort(id uint64) bool {
 	// find nil, do nothing, and report that it had done nothing - while Running()
 	// (which is what puts the stop button on screen) already said yes. The id
 	// carries the request across the gap: RunOnce checks it once its cancel is live.
-	s.abortFor.Store(cur)
+	s.recordAbort(cur)
 	// Only cancel a run that still IS this one; the pointer and the id move together.
 	if f := s.cur.Load(); f != nil && f.id == cur {
 		f.cancel()
 	}
 	return true
+}
+
+// recordAbort publishes cur as the raised abort target - unless a NEWER
+// request is already recorded (run ids are monotonic, so newer = larger). A
+// plain Store let a stalled Abort lose the race the slow way round: it read
+// its target while that run was still current, was preempted, and its late
+// store then clobbered an abort just raised for the run that replaced it -
+// which read back a stale id, ignored it, and ran on although ITS Abort had
+// returned true.
+func (s *Scheduler) recordAbort(cur uint64) {
+	for {
+		old := s.abortFor.Load()
+		if old >= cur || s.abortFor.CompareAndSwap(old, cur) {
+			return
+		}
+	}
 }
 
 // SetCurrentServer records the server the in-progress run selected (called by

@@ -145,12 +145,28 @@ func (c *Checker) Loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-c.kick:
-			c.checkOnce(ctx)
+			// The kick re-arms the schedule too. It used to only checkOnce:
+			// enable-after-disabled with a failing feed then sat out whatever
+			// the timer held from the DISABLED era - up to the full daily
+			// interval - instead of the firstPollRetry ladder.
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+			t.Reset(c.checkAndNext(ctx, &attempts))
 		case <-t.C:
-			c.checkOnce(ctx)
-			t.Reset(c.nextInterval(&attempts))
+			t.Reset(c.checkAndNext(ctx, &attempts))
 		}
 	}
+}
+
+// checkAndNext runs one check and picks the delay before the next scheduled
+// one - the single re-arm path shared by the timer tick and the CheckNow kick.
+func (c *Checker) checkAndNext(ctx context.Context, attempts *int) time.Duration {
+	c.checkOnce(ctx)
+	return c.nextInterval(attempts)
 }
 
 // nextInterval picks the delay before the next scheduled check: the
