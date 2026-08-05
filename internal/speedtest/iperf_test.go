@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingular/pingularity/internal/settings"
 	"github.com/pingular/pingularity/internal/store"
 )
 
@@ -502,6 +503,22 @@ func TestIperfStreamsClamp(t *testing.T) {
 	for _, c := range cases {
 		if got := iperfStreams(c.fn); got != c.want {
 			t.Errorf("iperfStreams() = %d, want %d", got, c.want)
+		}
+	}
+}
+
+// The tester's ceiling and the one the rest of the product enforces must be the
+// same number. They were 8 and 32: settings accepted a configured 12, the API
+// echoed it and the dashboard offered it, and then --parallel got 8 - a control
+// that reads as working and does nothing.
+func TestIperfStreamCeilingMatchesSettings(t *testing.T) {
+	if iperfMaxStreams != settings.MaxIperfStreams {
+		t.Fatalf("tester ceiling %d != settings ceiling %d: values in between are accepted and then dropped",
+			iperfMaxStreams, settings.MaxIperfStreams)
+	}
+	for _, n := range []int{9, 12, 16, settings.MaxIperfStreams} {
+		if got := iperfStreams(func() int { return n }); got != n {
+			t.Errorf("iperfStreams(%d) = %d, want %d - the configured count never reaches --parallel", n, got, n)
 		}
 	}
 }

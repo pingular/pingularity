@@ -182,7 +182,7 @@ release:
   # rolling-commit amend, so the GitHub pre-release already exists with same-named
   # assets and the re-run would 422 on upload without this overwrite. A STABLE
   # release, by contrast, is cut once and must stay immutable: its checksums are
-  # attested in release.yml (C-28), and silently overwriting a published stable
+  # attested in release.yml, and silently overwriting a published stable
   # asset would invalidate that provenance. This field is a plain bool (not
   # templateable), so the prerelease-vs-stable split is enforced upstream in
   # release.yml - the "Forbid re-cutting a published stable release" guard fails the

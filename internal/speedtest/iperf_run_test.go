@@ -108,7 +108,7 @@ func TestIperfRunKeepsPartialOnUploadFailure(t *testing.T) {
 
 // A kept partial (one direction survived the other's failure) takes the success path,
 // so it never touches speed.fail. It must still leave a trace: the speed.iperf_partial
-// counter, so a direction that's been dark for weeks is observable as a rate (F-11).
+// counter, so a direction that's been dark for weeks is observable as a rate.
 func TestIperfRunPartialIncrementsMetric(t *testing.T) {
 	stats.ResetForTest()
 	installFakeIperf(t, func(args []string) ([]byte, error) {
@@ -126,7 +126,7 @@ func TestIperfRunPartialIncrementsMetric(t *testing.T) {
 }
 
 // A context cancelled mid-run must surface as a failure, never be laundered into a
-// "partial success" that looks like a healthy one-direction outage (F-11). The partial
+// "partial success" that looks like a healthy one-direction outage. The partial
 // counter must NOT tick for a cancellation.
 func TestIperfRunCancelledIsNotPartial(t *testing.T) {
 	stats.ResetForTest()
@@ -214,7 +214,7 @@ func TestIperfRunPingFallsBackToMinRTT(t *testing.T) {
 	}
 }
 
-// The automatic OAEP->PKCS#1 downgrade was removed (audit F-01): an authorization
+// The automatic OAEP->PKCS#1 downgrade was removed: an authorization
 // rejection is a real failure, NOT a cue to silently retry with the weaker legacy
 // padding. A run whose credentials the server rejects on OAEP must fail outright,
 // with no --use-pkcs1-padding attempt made behind the operator's back.

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/pingular/pingularity/internal/stats"
 )
 
 // geoResp builds a fresh canned response (new body each call, so a host can be hit
@@ -62,5 +64,26 @@ func TestPublicIPGeo(t *testing.T) {
 					city, cc, lat, lon, ok, c.wantCity, c.wantCC, c.wantLat, c.wantLon, c.wantOK)
 			}
 		})
+	}
+}
+
+// A bare three-letter code is weak evidence (several collide with words -
+// "sea", "den", "van", "was"), so cityFromRDNS must raise a low-confidence marker
+// while still returning the city; an indexed code ("fra10") is stronger and must
+// not raise it. The city string is unchanged either way (display only, zero coords).
+func TestCityFromRDNSLowConfidenceMarker(t *testing.T) {
+	stats.ResetForTest()
+	if got := cityFromRDNS("core.sea.example.net"); got != "Seattle" {
+		t.Fatalf("cityFromRDNS(bare sea) = %q, want Seattle", got)
+	}
+	if n := stats.Lifetime().Counters["netinfo.rdns_city_lowconf"]; n != 1 {
+		t.Fatalf("bare three-letter token: lowconf counter = %d, want 1", n)
+	}
+	stats.ResetForTest()
+	if got := cityFromRDNS("ae1-cr2.fra10.isp.net"); got != "Frankfurt" {
+		t.Fatalf("cityFromRDNS(indexed fra10) = %q, want Frankfurt", got)
+	}
+	if n := stats.Lifetime().Counters["netinfo.rdns_city_lowconf"]; n != 0 {
+		t.Fatalf("indexed token fra10: lowconf counter = %d, want 0 (stronger evidence)", n)
 	}
 }

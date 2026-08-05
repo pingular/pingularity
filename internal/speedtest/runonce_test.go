@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,5 +249,55 @@ func TestRunOnceUnmeasurableThresholdDoesNotPinAdaptiveCadenceAfterRecovery(t *t
 	}
 	if s.consecBreach != 1 {
 		t.Fatalf("consecBreach = %d, want 1 (the streak must be preserved, not cleared, by an unran check)", s.consecBreach)
+	}
+}
+
+// OnUnhealthy is an operator webhook that can be slow or dead. It must be
+// dispatched only AFTER RunOnce releases the single-flight flag, so a manual run
+// fired while the alert is stuck proceeds instead of wrongly returning ErrBusy.
+// Exactly one notification must go out per breaching run.
+func TestRunOnceReleasesFlagBeforeAlert(t *testing.T) {
+	stats.ResetForTest()
+	s, _ := newRunOnceScheduler(t, Result{
+		DownloadMbps: 5, UploadMbps: 1, PingMS: 20, Server: "S", ServerID: "1",
+		DownloadBytes: 5_000_000, UploadBytes: 1_000_000,
+	})
+	s.ThresholdsFn = func() settings.Thresholds { return settings.Thresholds{DownMbps: 100} } // 5 < 100 -> breach
+
+	var alerts int32
+	inAlert := make(chan struct{})
+	release := make(chan struct{})
+	s.OnUnhealthy = func(store.SpeedSample, []string) {
+		if atomic.AddInt32(&alerts, 1) == 1 {
+			// Model a dead endpoint: hold the FIRST alert open until the test lets go.
+			close(inAlert)
+			<-release
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RunOnce(context.Background(), "scheduled")
+		done <- err
+	}()
+	<-inAlert // the first run has measured, persisted, and is now stuck in OnUnhealthy
+
+	// The flag must already be down (the alert fires only after its release), so a
+	// manual run during the stuck webhook must be allowed, not bounced with ErrBusy.
+	if s.Running() {
+		t.Fatal("single-flight flag still held while OnUnhealthy is in flight")
+	}
+	if _, err := s.RunOnce(context.Background(), "manual"); err != nil {
+		t.Fatalf("run during a slow/dead alert must be allowed, got %v", err)
+	}
+
+	close(release) // let the first run's webhook return
+	if err := <-done; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	// One notification per breaching run: the scheduled run and the manual run each
+	// breached and each alerted exactly once.
+	if got := atomic.LoadInt32(&alerts); got != 2 {
+		t.Fatalf("alerts = %d, want 2 (exactly one per breaching run)", got)
 	}
 }

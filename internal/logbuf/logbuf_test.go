@@ -129,9 +129,8 @@ func TestRingByteCeiling(t *testing.T) {
 // After eviction the backing array's tail must no longer reference the dropped
 // entries: trim compacts survivors to the front and zeros the vacated slots, so
 // the evicted strings become collectable instead of being pinned by the backing
-// array until a later Append overwrites the slot. Regression for C-57 (both the
-// one-line duplicate-survivor case and larger drops that retained evicted
-// strings).
+// array until a later Append overwrites the slot. Covers both the one-line
+// duplicate-survivor case and larger drops that retained evicted strings.
 func TestTrimReleasesEvictedSlots(t *testing.T) {
 	r := New(3)
 	for i := 1; i <= 6; i++ {
@@ -152,8 +151,7 @@ func TestTrimReleasesEvictedSlots(t *testing.T) {
 }
 
 // Clear must release the retained entries, not merely reslice to length 0 (which
-// would leave the backing array pinning every cleared string). Regression for
-// C-57.
+// would leave the backing array pinning every cleared string).
 func TestClearReleasesReferences(t *testing.T) {
 	r := New(4)
 	for i := 1; i <= 4; i++ {
@@ -173,7 +171,7 @@ func TestClearReleasesReferences(t *testing.T) {
 }
 
 // LoadFile must refuse a symlink rather than following it to an attacker-chosen
-// target, and must not seed the ring from it. Regression for C-23.
+// target, and must not seed the ring from it.
 func TestLoadFileRejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
 	real := filepath.Join(dir, "real.txt")
@@ -195,7 +193,6 @@ func TestLoadFileRejectsSymlink(t *testing.T) {
 
 // LoadFile must refuse a device file rather than reading from it forever (a
 // never-ending stream like /dev/zero would otherwise OOM/hang startup).
-// Regression for C-23.
 func TestLoadFileRejectsDevice(t *testing.T) {
 	const dev = "/dev/zero"
 	if _, err := os.Lstat(dev); err != nil {
@@ -213,7 +210,7 @@ func TestLoadFileRejectsDevice(t *testing.T) {
 // A file far larger than the ring's byte ceiling must not be read whole: only a
 // bounded tail is loaded (honouring the memory bound before allocation), the
 // newest entries are kept, and the partial line at the seek boundary is dropped
-// rather than fabricated into a torn entry. Regression for C-23.
+// rather than fabricated into a torn entry.
 func TestLoadFileReadsBoundedNewestTail(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "logs.txt")

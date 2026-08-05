@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/pingular/pingularity/internal/settings"
 	"github.com/pingular/pingularity/internal/stats"
 	"github.com/pingular/pingularity/internal/util"
 )
@@ -128,11 +129,14 @@ const (
 	iperfMinDur         = 1
 	iperfMaxDur         = 30
 	iperfDefaultStreams = 1
-	iperfMaxStreams     = 8
-	iperfDefaultOmit    = 1
-	iperfMaxOmit        = 5
-	iperfMaxWindow      = 65536 // KB (64 MB) ceiling for -w; 0 = auto
-	iperfMaxMSS         = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
+	// One ceiling, not two: the settings layer clamps to this on the way in and
+	// the dashboard offers it as the input's max, so a second literal here would
+	// accept a value everywhere else and then quietly drop it before --parallel.
+	iperfMaxStreams  = settings.MaxIperfStreams
+	iperfDefaultOmit = 1
+	iperfMaxOmit     = 5
+	iperfMaxWindow   = 65536 // KB (64 MB) ceiling for -w; 0 = auto
+	iperfMaxMSS      = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
 )
 
 // iperfRetryDelay is the backoff before a retry; iperfUploadSettle pauses before the
@@ -510,7 +514,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		// A cancelled or timed-out context must NOT be laundered into a "partial
 		// success": if a direction failed while the run's context was already done, the
 		// real cause is the cancellation, not a one-direction outage - surface it so a
-		// shutdown mid-run isn't recorded as a healthy partial (audit F-11). A run that
+		// shutdown mid-run isn't recorded as a healthy partial. A run that
 		// finished cleanly and is only cancelled afterward has no direction error, so it
 		// is unaffected.
 		if ctx.Err() != nil && (dnErr != nil || upErr != nil) {
@@ -521,7 +525,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		// been blank for weeks" has no evidence on any surface: the run takes the success
 		// path, so speed.fail never increments. Count partials on their own counter and
 		// log which direction dropped, so a persistently failing direction shows up as a
-		// rate instead of being invisible (audit F-11).
+		// rate instead of being invisible.
 		if dir == "both" && (dnErr != nil || upErr != nil) {
 			stats.Inc("speed.iperf_partial")
 			if i.Log != nil {
@@ -555,7 +559,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			if r := i.UDPRateFn(); r > 0 {
 				rate = r // explicit user cap bypasses the auto ceiling (e.g. to sample gigabit loss)
 				// The UDP pass moves real bytes that the usage figure never counts (it
-				// records only the final TCP aggregates - audit F-05). At the auto ceiling
+				// records only the final TCP aggregates). At the auto ceiling
 				// that's negligible, but a high manual cap can dwarf the tracked transfer
 				// (10 Gbps x 2s ~= 2.5 GB/run), so warn once the operator opts into it.
 				if r >= iperfUDPRateWarn && i.Log != nil {
@@ -757,7 +761,7 @@ func dialNetwork(ipver string) string {
 //
 // It sends no iperf3 control cookie and closes right after the handshake, so a normal
 // persistent `iperf3 -s` logs a stray/aborted control connection ("unable to receive
-// cookie") - cosmetic noise, not a failed test (audit F-08). The one case where it is
+// cookie") - cosmetic noise, not a failed test. The one case where it is
 // NOT free: a one-shot server (`iperf3 -s -1`) accepts exactly one connection, so this
 // probe consumes it. That mode is incompatible with pingularity's repeated scheduled
 // runs anyway (it dies after a single test), so the status light assumes a persistent
@@ -791,7 +795,7 @@ func CheckIperfServer(ctx context.Context, addr string) (rttMS float64, err erro
 // sending iperf3's control cookie, timing only the SYN->SYN/ACK handshake. On a persistent
 // server that is cosmetic (a logged "unable to receive cookie" per probe, no test run), but
 // it is NOT a protocol-clean transaction and would consume a one-shot `-s -1` server - see
-// CheckIperfServer for why that mode is out of scope here (audit F-08). Returns nil when too
+// CheckIperfServer for why that mode is out of scope here. Returns nil when too
 // few probes land (host unreachable) so the caller falls back to min_rtt, then the idle
 // baseline.
 func measureServerRTT(ctx context.Context, host, port string, tp iperfTunables) *float64 {
@@ -925,7 +929,7 @@ func callStr(fn func() string) string {
 // resolveAuth reads the auth settings and, when enabled and complete, writes the server's
 // public key to a temp file (--rsa-public-key-path needs a path); the returned cleanup
 // removes it. When auth is enabled but a field is missing it FAILS CLOSED with an error
-// rather than silently running unauthenticated (audit F-07): a half-configured credential
+// rather than silently running unauthenticated: a half-configured credential
 // is an operator mistake, and running without it would leak an unauthenticated test to a
 // server the operator meant to gate. Auth left off entirely returns an empty config and no
 // error, as before.

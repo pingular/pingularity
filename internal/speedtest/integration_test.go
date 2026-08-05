@@ -3,7 +3,7 @@
 // These tests run the REAL pingularity->iperf3 path against a live `iperf3 -s`
 // server, which the fake-exec unit tests deliberately never do. They are the only
 // place that catches argv/flag ROLE bugs (e.g. --bind vs --bind-dev), live JSON
-// schema drift, and version-specific behavior - the gap the audit called out (F-12).
+// schema drift, and version-specific behavior - exactly what a stubbed child cannot.
 //
 // Run with a reachable server:
 //
@@ -88,7 +88,7 @@ func TestIntegrationBindSourceAddress(t *testing.T) {
 	}
 }
 
-// Enabling auth with a missing field must FAIL CLOSED (audit F-07) - it must not
+// Enabling auth with a missing field must FAIL CLOSED - it must not
 // silently run unauthenticated - and it must do so before touching the network.
 func TestIntegrationIncompleteAuthFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

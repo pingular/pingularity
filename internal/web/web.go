@@ -414,6 +414,16 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Content-Security-Policy", csp)
 		h.Set("Referrer-Policy", "no-referrer")
+		// A dashboard reachable from the internet must not end up in a search
+		// index. It is one person's monitoring of one connection, not public
+		// content: indexing it would publish the operator's ISP, exit city,
+		// speed history and outage log to anyone searching, and (because every
+		// install renders the same titles and headings) would also scatter
+		// duplicate branded pages across the web. Header rather than a meta
+		// tag so it covers /api and /metrics too, which no crawler should list
+		// either. The public demo is a separate build on its own host and is
+		// unaffected.
+		h.Set("X-Robots-Tag", "noindex, nofollow")
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics" {
 			h.Set("Cache-Control", "no-store")
 		}

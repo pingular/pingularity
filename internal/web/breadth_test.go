@@ -194,3 +194,20 @@ func TestHandleLogout(t *testing.T) {
 		t.Error("public -allow-host domain -> logout cookie should be Secure")
 	}
 }
+
+// A self-hosted dashboard on a public address must never be indexable: it is
+// one operator's ISP, exit city, speed history and outage log, and every
+// install renders identical titles, so indexing also scatters duplicate
+// branded pages. Asserted on the UI, the API and /metrics together, because a
+// meta tag would only have covered the first.
+func TestDashboardIsNotIndexable(t *testing.T) {
+	s := newTestServer(t)
+	h := s.Handler()
+	for _, path := range []string{"/", "/api/status", "/metrics"} {
+		w := do(t, h, "GET", path, "")
+		if got := w.Header().Get("X-Robots-Tag"); got != "noindex, nofollow" {
+			t.Errorf("%s: X-Robots-Tag = %q, want \"noindex, nofollow\" - a publicly reachable "+
+				"install would otherwise be crawlable", path, got)
+		}
+	}
+}
