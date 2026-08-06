@@ -1165,6 +1165,20 @@ func (s *Store) monitoringSince(ctx context.Context, nowU int64) (int64, error) 
 	return anchor, nil
 }
 
+// HasHistory reports whether the database holds ANY measurement history -
+// samples, events, or speed runs. This, not the install anchor's age, is what
+// separates an upgrade from a fresh install: the anchor (first_seen_ts) only
+// persists once a dashboard or digest computes uptime, so a headless install
+// or a speedtest-only one can carry months of rows and no anchor at all.
+// Cheap: three LIMIT-1 existence probes.
+func (s *Store) HasHistory(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM samples LIMIT 1)
+		OR EXISTS(SELECT 1 FROM events LIMIT 1)
+		OR EXISTS(SELECT 1 FROM speed LIMIT 1)`).Scan(&n)
+	return n != 0, err
+}
+
 // InstallBornAt returns the persisted install anchor (first_seen_ts) as a unix
 // second, or 0 if it has not been recorded yet. A cheap single-key lookup; used as
 // a stable per-install id (a fresh database gets a new one) to scope first-run UI.
@@ -4201,6 +4215,11 @@ var settingsExportDeny = map[string]bool{
 	// (telemetry_enabled was never denied.)
 	"telemetry_install_id": true, "telemetry_salt": true,
 	"telemetry_id_born_at": true, "telemetry_consent_version": true,
+	// First-run Quick Setup machinery: the answer and the offer clock belong to
+	// the INSTALL, not the data. Restoring a mid-offer backup must not reopen
+	// the dialog on (or hold monitoring of) an established destination; the
+	// destination's own boot decision, taken from its restored history, stands.
+	"quick_setup_done": true, "quick_setup_offer_since": true,
 	"telemetry_last_speed_ts": true, "telemetry_last_event_ts": true,
 	"telemetry_last_send_ts": true, "telemetry_clean_shutdown": true,
 	// Digest delivery state (when the last summary went out): local-only, and a

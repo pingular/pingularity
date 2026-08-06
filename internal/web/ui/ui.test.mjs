@@ -65,6 +65,8 @@ const DEFS = {
   outageDeletable: 'function outageDeletable',
   isReconcile503: 'function isReconcile503', retryAfterMs: 'function retryAfterMs',
   pkcs1FlagUsable: 'function pkcs1FlagUsable', pkcs1BoxState: 'function pkcs1BoxState',
+  qsUseNote: 'function qsUseNote', qsSettingsPayload: 'function qsSettingsPayload',
+  iperfPwOrphan: 'function iperfPwOrphan',
 };
 const NAMES = Object.keys(DEFS);
 const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
@@ -74,7 +76,7 @@ const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
 // `$` is injected so setSpdAvg can be driven against a fake element: the pill's
 // visible text and its accessible name are set on different lines, and whether the
 // second one is reached is exactly what is under test.
-const factory = new Function('document', 'TC', 'DAYN', 'isNum', '$', 'esc', 'AX_PAD', defs + '\nreturn {' + NAMES.join(',') + '};');
+const factory = new Function('document', 'TC', 'DAYN', 'isNum', '$', 'esc', 'AX_PAD', 'iperfServers', defs + '\nreturn {' + NAMES.join(',') + '};');
 const TC = { hm0: '#000000', down: '#ffffff' };
 const fakeCtx = { _v: '#000000', set fillStyle(x) { this._v = x; }, get fillStyle() { return this._v; } };
 const fakeDoc = { createElement: () => ({ getContext: () => fakeCtx }) };
@@ -95,12 +97,13 @@ const fakeEl = () => ({
 // the page rather than copied here - a literal would silently drift.
 const AX_PAD_VAL = new Function(script.match(/const AX_GAP = [^;]*;/)[0] + '\n'
   + script.match(/const AX_PAD = [^;]*;/)[0] + '\nreturn AX_PAD;')();
+let fakeIperfServers = [];
 const F = factory(fakeDoc, TC, ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], v => typeof v === 'number',
   () => fakePill,
   // esc is a one-line arrow in the page, so it is injected rather than extracted;
   // the panel strings below interpolate daemon-supplied place names through it.
   s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
-  AX_PAD_VAL);
+  AX_PAD_VAL, fakeIperfServers);
 
 // Everything below picks single definitions out of the script and compiles those,
 // so a syntax error anywhere in the other ~6800 lines passes every test here AND
@@ -2162,6 +2165,109 @@ test('an already-on legacy-padding toggle stays clearable on a build that cannot
   assert.equal(ok.disabled, false, '3.18 can send the flag');
   assert.equal(ok.note, '', 'a usable flag needs no note');
   assert.equal(pkcs1BoxState(0, '', false).disabled, false, 'an undetectable build locks nothing');
+});
+
+// The coach must never mount behind the Quick Setup dim: its once/capture
+// pointerdown would let a click INSIDE the dialog mark the never-seen coach as
+// seen forever. And the save path's guards: the byte cap that stops a bcrypt
+// rejection landing after the marker persisted, and the access latch that
+// stops a retry re-posting credentials the server already took.
+test('Quick Setup guard rails: coach deferral, byte cap, access latch', () => {
+  const coach = extract('function showCoach');
+  assert.match(coach, /if\(!\$\('qsDlg'\)\.hidden\) return;/, 'showCoach must defer behind the dialog');
+  const save = extract('function qsSave');
+  assert.match(save, /encode\(pass\)\.length>72/, 'the 72-byte bcrypt cap is checked before any write');
+  assert.match(save, /network && !qsAccessDone/, 'a retry must not re-post credentials');
+  const dec = extract('function qsDecline');
+  assert.match(dec, /qsGo'\)\.disabled\) return;/, 'Esc must not decline mid-save');
+  assert.match(html, /id="qsPass" placeholder="Password" maxlength="72"/, 'the field cap matches the server');
+});
+
+// The save gate must judge what is IN the editor, not what was last captured:
+// a typed replacement password (or a just-cleared field) exists only in the
+// DOM until captureIperfEditor folds it in.
+test('the orphan save-gate captures the open editor before judging', () => {
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  const cap = save.indexOf('captureIperfEditor();');
+  const gate = save.indexOf('iperfPwOrphan()');
+  assert.ok(cap >= 0 && gate >= 0 && cap < gate, 'captureIperfEditor() must run before the orphan check');
+});
+
+// A renamed iperf3 server whose stored password was never re-entered is one
+// Save away from losing the credential: the store files passwords strictly by
+// address, so the rename orphans it. v0.60.0's render-time message clear made
+// that loss SILENT (Done's own click wiped the warning); the orphan predicate
+// is what now keeps the warning alive and blocks the save.
+test('iperfPwOrphan: exactly the one-save-from-loss state', () => {
+  const { iperfPwOrphan } = F;
+  const base = { _del: false, orig_has_password: true, orig_addr: 'a.example:5201', addr: 'b.example:5201', password: '', label: '' };
+  fakeIperfServers.length = 0;
+  fakeIperfServers.push({ ...base });
+  assert.ok(iperfPwOrphan(), 'renamed + stored password + nothing typed = orphan');
+  fakeIperfServers[0].password = 'newpw';
+  assert.equal(iperfPwOrphan(), null, 'a typed replacement un-orphans');
+  fakeIperfServers[0].password = ''; fakeIperfServers[0].addr = 'a.example:5201';
+  assert.equal(iperfPwOrphan(), null, 'restoring the address un-orphans');
+  fakeIperfServers[0].addr = 'b.example:5201'; fakeIperfServers[0]._del = true;
+  assert.equal(iperfPwOrphan(), null, 'a deleted row is an explicit choice, not an orphan');
+  fakeIperfServers[0]._del = false; fakeIperfServers[0].orig_has_password = false;
+  assert.equal(iperfPwOrphan(), null, 'no stored password, nothing to lose');
+  fakeIperfServers.length = 0;
+});
+
+// The warning outlives the editor exactly while its reason does, and the save
+// is blocked while the reason stands. Source-order pins: the orphan branch runs
+// before the editor-closed clear, and the guard sits before the body capture.
+test('the orphaned-password warning survives Done and blocks Save', () => {
+  const render = script.slice(script.indexOf('function renderIperfServers()'));
+  const rbody = render.slice(0, render.indexOf('\nfunction '));
+  assert.ok(rbody.indexOf('iperfPwOrphan()') >= 0 && rbody.indexOf('iperfPwOrphan()') < rbody.indexOf('iperfEditingId==null'),
+    'render must consult the orphan predicate before the editor-closed clear');
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  assert.ok(save.indexOf('iperfPwOrphan()') >= 0 && save.indexOf('iperfPwOrphan()') < save.indexOf('const body = settingsBody()'),
+    'save must refuse an orphaning payload before it is built');
+});
+
+// Quick Setup's cost line is arithmetic shown to a stranger deciding whether
+// to consent to data spend - the numbers are pinned, not trusted. 1 Gbit
+// reference: 1.8 GB down + 1.275 GB up per run.
+test('Quick Setup cost note: pinned numbers per cadence', () => {
+  const { qsUseNote } = F;
+  assert.match(qsUseNote(0), /43\.2\u00a0GB down \+ 30\.6\u00a0GB up per day/);
+  assert.match(qsUseNote(1), /7\.2\u00a0GB down \+ 5\.1\u00a0GB up per day/);
+  assert.equal(qsUseNote(2), 'No scheduled tests, only a run after an outage or when you click Run.');
+  assert.doesNotMatch(qsUseNote(0), /month/, 'the monthly total was deliberately dropped');
+});
+
+// What consent actually writes. Manually must turn the schedule OFF without
+// touching the interval - and every exit carries the answered marker.
+test('Quick Setup payloads: enable-with-interval or plain off, marker always', () => {
+  const { qsSettingsPayload } = F;
+  assert.deepEqual(qsSettingsPayload(0), { quick_setup_done: true, speedtest_enabled: true, speed_seconds: 3600 });
+  assert.deepEqual(qsSettingsPayload(1), { quick_setup_done: true, speedtest_enabled: true, speed_seconds: 21600 });
+  assert.deepEqual(qsSettingsPayload(2), { quick_setup_done: true, speedtest_enabled: false },
+    'Manually must not send an interval - declining a cadence is not choosing one');
+});
+
+// The gate is strict equality: an older daemon or the demo shim simply lacks
+// the field, and absent must mean never - not truthy-by-accident.
+test('Quick Setup only shows on quick_setup_pending === true', () => {
+  assert.match(script, /s\.quick_setup_pending===true\) showQuickSetup\(\)/,
+    'the boot hook must gate on strict === true');
+});
+
+// The two exits differ, permanently: dismissal persists the answer and applies
+// nothing (the previewed theme reverts); the dialog itself is a real modal.
+test('Quick Setup markup and decline semantics', () => {
+  assert.match(html, /id="qsDlg" role="dialog" aria-modal="true"/);
+  assert.equal((html.match(/class="qs-sw(?: on)?" data-sw=/g) || []).length, 9, 'nine theme swatches');
+  assert.match(html, /id="qsX" aria-label="Dismiss and keep the defaults"/);
+  const dec = extract('function qsDecline');
+  assert.match(dec, /applyTheme\(t\)/, 'decline must un-preview the theme');
+  assert.match(dec, /qsMark\(\)/, 'decline must persist the answer');
+  const save = extract('function qsSave');
+  assert.match(save, /local_only:false/, 'network choice reaches /api/access');
+  assert.match(save, /loadSettings\(\)/, 'a save re-syncs the drawer from server truth');
 });
 
 // Leaving a saved-on toggle enabled is only half the rule: the moment it is

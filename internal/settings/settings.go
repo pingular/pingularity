@@ -74,6 +74,7 @@ const (
 	keyAuthHash        = "auth_hash"            // bcrypt hash of the password ("" = unset)
 	keyAuthSessEpoch   = "auth_session_epoch"   // logout revocation epoch (folded into token MACs; persisted so logout survives a restart)
 	keyUpdateCheck     = "update_check_enabled" // daily background poll for a newer release
+	keyQuickSetup      = "quick_setup_done"     // the first-run Quick Setup dialog was answered or dismissed; never show it again
 	keyLogLevel        = "log_level"            // logging: "off" (nothing) or any other value = on (full debug). UI sends debug|off
 	keyLogRedactPII    = "log_redact_pii"       // censor PII values (IPs/ISP/hostnames/user) in logs
 	// Adaptive / event-driven speedtesting (see internal/speedtest, internal/monitor).
@@ -258,6 +259,12 @@ type Values struct {
 	// internal/update): default on, a plain GET to the public version endpoint
 	// with no identity sent. Owned by its own toggle, not the settings form.
 	UpdateCheckEnabled bool
+
+	// QuickSetupDone records that the first-run Quick Setup dialog was answered
+	// (or dismissed - dismissal is an answer: keep the defaults). The dashboard
+	// offers the dialog only while this is false AND the install is young (see
+	// the status handler); either exit persists true so it never returns.
+	QuickSetupDone bool
 
 	// LogLevel is the logging switch: "off" logs nothing; any other value turns
 	// full (debug) logging on, for both the console output and the in-memory buffer
@@ -653,6 +660,9 @@ func overlay(v Values, m map[string]string) Values {
 	}
 	if b, ok := pbool(m[keyUpdateCheck]); ok {
 		v.UpdateCheckEnabled = b
+	}
+	if b, ok := pbool(m[keyQuickSetup]); ok {
+		v.QuickSetupDone = b
 	}
 	if val, ok := m[keyLogLevel]; ok {
 		v.LogLevel = val
@@ -1147,6 +1157,7 @@ type Patch struct {
 	AlertOnOutage        *bool
 	WebhookURL           *string
 	WebhookFormat        *string
+	QuickSetupDone       *bool
 	HeartbeatURL         *string
 	DigestFreq           *string
 	SchedLatEnabled      *bool
@@ -1161,6 +1172,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.LatencyEnabled, p.LatencyEnabled)
 	setIf(&v.DNSProbe, p.DNSProbe)
 	setIf(&v.NetinfoEnabled, p.NetinfoEnabled)
+	setIf(&v.QuickSetupDone, p.QuickSetupDone)
 	setIf(&v.Speed, p.Speed)
 	setIf(&v.Retention, p.Retention)
 	setIf(&v.SpeedRetention, p.SpeedRetention)
@@ -1337,6 +1349,7 @@ func formKeys(v Values) map[string]string {
 		keySchedLatWindows:   windowsJSON(v.SchedLatWindows),
 		keySchedSpeedEnabled: b2s(v.SchedSpeedEnabled),
 		keySchedSpeedWindows: windowsJSON(v.SchedSpeedWindows),
+		keyQuickSetup:        b2s(v.QuickSetupDone),
 	}
 }
 
@@ -1358,6 +1371,77 @@ func (c *Controller) SetUpdateCheckEnabled(ctx context.Context, on bool) error {
 
 // UpdateCheckEnabled reports whether the daily update check is on.
 func (c *Controller) UpdateCheckEnabled() bool { return c.get().UpdateCheckEnabled }
+
+// QuickSetupDone reports whether the first-run Quick Setup dialog was answered.
+func (c *Controller) QuickSetupDone() bool { return c.get().QuickSetupDone }
+
+// SetQuickSetupDone records the first-run dialog's answer (Start and dismiss
+// both count). Monotonic in practice: nothing ever sets it back.
+func (c *Controller) SetQuickSetupDone(ctx context.Context, done bool) error {
+	return c.mutate(ctx, func(v *Values) map[string]string {
+		v.QuickSetupDone = done
+		return map[string]string{keyQuickSetup: b2s(done)}
+	})
+}
+
+// keyQuickSetupOffer is when the first-run offer opened - machinery state, not
+// config, seeded exactly once by EnsureQuickSetupOffer. The offer's clock must
+// be its own: the install anchor (first_seen_ts) only persists once samples
+// exist, and while the offer HOLDS monitoring there are no samples - anchoring
+// the hold on it would deadlock a headless install into never monitoring.
+const keyQuickSetupOffer = "quick_setup_offer_since"
+
+// quickSetupGrace is how long the first-run offer (and its monitoring hold)
+// stays open before it self-expires: long enough that a fresh install whose
+// dashboard is first opened after a restart still gets its one offer, short
+// enough that an install nobody browses to starts monitoring on its own.
+const quickSetupGrace = 48 * 60 * 60
+
+// QuickSetupHold is the one definition of "the first-run offer is open": not
+// yet answered, an offer clock exists, and the grace has not run out. The
+// status payload's quick_setup_pending and the monitoring hold both use it -
+// they must never disagree, or the dialog would promise a state the daemon
+// does not have.
+func QuickSetupHold(done bool, offerSinceUnix, nowUnix int64) bool {
+	return !done && offerSinceUnix != 0 && nowUnix-offerSinceUnix < quickSetupGrace
+}
+
+// EnsureQuickSetupOffer runs once at boot and materializes the offer decision.
+// "Fresh" means the database holds NO measurement history at all - not that
+// the install anchor is young. Any history (a day of samples, one speed run,
+// an anchor from a past dashboard visit) is an upgrade: the marker is written
+// outright, so it can never see a first-run prompt and - critically - its
+// already-running monitoring is never held. Anchor age alone would get both
+// wrong: a headless or speedtest-only install has history but no anchor, and a
+// day-old install upgrading has a young anchor but is running. A history read
+// error takes NO decision (no writes): the same boot logic runs again next
+// start, which is the self-correcting failure direction.
+func (c *Controller) EnsureQuickSetupOffer(ctx context.Context, nowUnix int64) error {
+	if c.QuickSetupDone() {
+		return nil
+	}
+	if c.QuickSetupOfferSince(ctx) != 0 {
+		return nil
+	}
+	history, err := c.store.HasHistory(ctx)
+	if err != nil {
+		return err
+	}
+	if history || c.store.InstallBornAt(ctx) != 0 {
+		return c.SetQuickSetupDone(ctx, true)
+	}
+	return c.store.SetSetting(ctx, keyQuickSetupOffer, strconv.FormatInt(nowUnix, 10))
+}
+
+// QuickSetupOfferSince reads the offer clock (0 = never seeded).
+func (c *Controller) QuickSetupOfferSince(ctx context.Context) int64 {
+	m, err := c.store.AllSettings(ctx)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(m[keyQuickSetupOffer], 10, 64)
+	return n
+}
 
 // SetLogLevel sets the logging switch: "off" logs nothing, any other value turns
 // full (debug) logging on; an unrecognized value coerces to "info" (still on). The

@@ -490,6 +490,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		ThreshLossPct: 5, ThreshConsec: 3, ThreshBloatDownMS: 80, ThreshBloatUpMS: 90,
 		AlertOnOutage: true, WebhookURL: "https://example.com/hook",
 		HeartbeatURL: "https://hc.example.com/uuid", DigestFreq: "weekly", WebhookFormat: "ntfy",
+		QuickSetupDone:  true, // non-default, so a dropped Patch mapping is caught
 		SchedLatEnabled: true, SchedLatWindows: []settings.Window{{Days: "0111110", Start: 540, End: 1020}},
 		SchedSpeedEnabled: true, SchedSpeedWindows: []settings.Window{{Days: settings.AllDays, Start: 0, End: 0}},
 	}
