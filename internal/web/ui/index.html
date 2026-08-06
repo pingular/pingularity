@@ -203,6 +203,65 @@
   .coach-row p{margin:0;}
   .coach .k-pwr{color:var(--up);font-weight:650;}
   .coach .k-set{color:var(--accent);font-weight:650;}
+  /* First-run Quick Setup dialog: offered once on a fresh install (the server
+     gates it - see quick_setup_pending), styled to the settings drawer's squared
+     geometry. Dismissal (X / Esc) persists the answer and applies NOTHING; the
+     primary button is the consent that saves the choices. */
+  .qs-dim{position:fixed;inset:0;background:rgba(10,16,12,.58);backdrop-filter:blur(2.5px);z-index:900;}
+  .qs{position:fixed;left:50%;top:74px;transform:translateX(-50%);width:584px;max-width:calc(100vw - 32px);
+    max-height:calc(100vh - 90px);overflow-y:auto;
+    background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line2);border-radius:4px;
+    box-shadow:0 24px 60px rgba(0,0,0,.5);padding:22px 24px 18px;z-index:901;color:var(--fg);}
+  .qs h2{margin:0;font-size:19px;font-weight:600;letter-spacing:.2px;
+    font-family:'Quicksand','Quicksand Fallback',system-ui,sans-serif;}
+  .qs-sub{margin:6px 0 0;color:var(--muted);font-size:13px;}
+  .qs-x{position:absolute;top:12px;right:12px;width:30px;height:30px;background:transparent;border:none;
+    color:var(--muted);font-size:19px;line-height:1;cursor:pointer;border-radius:3px;}
+  .qs-x:hover{color:var(--fg);background:var(--bg2);}
+  .qs-row{margin-top:17px;}
+  .qs-rl{font-weight:600;font-size:13.5px;margin-bottom:8px;}
+  .qs-seg{display:flex;border:1px solid var(--line2);border-radius:3px;overflow:hidden;}
+  .qs-seg b{flex:1;text-align:center;padding:8px 0;font-weight:500;font-size:13px;color:var(--muted);
+    cursor:pointer;background:var(--bg2);}
+  .qs-seg b+b{border-left:1px solid var(--line);}
+  .qs-seg b.on{background:var(--accent);color:var(--on-accent);font-weight:600;}
+  .qs-note{margin-top:7px;color:var(--muted);font-size:12px;}
+  .qs-pw{margin-top:10px;display:none;gap:8px;}
+  .qs-pw input{flex:1;min-width:0;box-sizing:border-box;background:var(--bg);border:1px solid var(--line2);
+    border-radius:3px;color:var(--fg);padding:8px 11px;font:inherit;font-size:13px;}
+  .qs-pw input::placeholder{color:var(--muted);}
+  .qs-two{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;}
+  .qs-two .qs-rl{white-space:nowrap;}
+  .qs-two>div:last-child{flex:1;min-width:0;}
+  .qs-them{display:flex;gap:10px;}
+  .qs-sw{width:34px;height:34px;border-radius:3px;border:1px solid var(--line2);cursor:pointer;flex:none;
+    padding:0;background:none;}
+  .qs-sw:hover{border-color:var(--accent);}
+  .qs-sw.on{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 25%,transparent);}
+  .qs-sw[data-sw="retro"]{background:linear-gradient(135deg,#38493e 50%,#ffb000 50%);}
+  .qs-sw[data-sw="dark"]{background:linear-gradient(135deg,#5b9dff 50%,#0e0f12 50%);}
+  .qs-sw[data-sw="light"]{background:linear-gradient(135deg,#3060b4 50%,#fffefa 50%);}
+  .qs-sw[data-sw="amoled"]{background:linear-gradient(135deg,#bd93f9 50%,#000000 50%);}
+  .qs-sw[data-sw="cyber"]{background:linear-gradient(135deg,#05d9e8 50%,#ff3df5 50%);}
+  .qs-sw[data-sw="slate"]{background:linear-gradient(135deg,#e6e6ea 50%,#16171b 50%);}
+  .qs-sw[data-sw="solarized"]{background:linear-gradient(135deg,#2aa198 50%,#002b36 50%);}
+  .qs-sw[data-sw="parchment"]{background:linear-gradient(135deg,#9a4e22 50%,#efe4c8 50%);}
+  .qs-sw[data-sw="ember"]{background:linear-gradient(135deg,#ff7a1a 50%,#191411 50%);}
+  .qs-tog{position:relative;display:flex;align-items:center;width:100%;height:34px;background:var(--bg2);
+    border:1px solid var(--line2);border-radius:3px;overflow:hidden;font-size:12px;cursor:pointer;}
+  .qs-tog input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;}
+  .qs-tog::before,.qs-tog::after{flex:1;text-align:center;align-self:stretch;display:flex;align-items:center;
+    justify-content:center;color:var(--muted);transition:background .12s,color .12s;}
+  .qs-tog::before{content:"Off";}
+  .qs-tog::after{content:"On";border-left:1px solid var(--line2);}
+  .qs-tog:has(>input:checked)::after{background:var(--accent);color:var(--on-accent);}
+  .qs-tog:has(>input:not(:checked))::before{background:color-mix(in srgb,var(--muted) 50%,transparent);color:var(--fg);}
+  .qs-foot{margin-top:20px;}
+  .qs-go{background:var(--accent);color:var(--on-accent);border:none;border-radius:3px;padding:10px 22px;
+    font:inherit;font-size:14px;font-weight:600;cursor:pointer;}
+  .qs-go:disabled{opacity:.6;cursor:default;}
+  .qs-err{margin-top:9px;color:var(--down,#e07a5f);font-size:12.5px;min-height:1em;}
+
   /* Colour-matched pulse on each button while the coachmark shows; motion-gated. */
   @media (prefers-reduced-motion: no-preference){
     .coach-pulse-pwr{animation:coachPulsePwr 2s ease-out infinite;}
@@ -2107,6 +2166,58 @@ Applies live and persists.">i</span></span>
 <div class="del-zone r" id="delZoneR">✕</div>
 
 <div class="data-pop" id="dataPop" role="listbox" aria-label="Speedtest data usage by window" hidden></div>
+
+<!-- First-run Quick Setup. Server-gated (quick_setup_pending in /api/status):
+     fresh installs only, once. X and Esc decline - the answer is persisted and
+     nothing else is written; Start monitoring saves the four choices. -->
+<div class="qs-dim" id="qsDim" hidden></div>
+<div class="qs" id="qsDlg" role="dialog" aria-modal="true" aria-labelledby="qsTitle" hidden>
+  <button class="qs-x" id="qsX" aria-label="Dismiss and keep the defaults" title="Dismiss">&#10005;</button>
+  <h2 id="qsTitle">Quick Setup</h2>
+  <p class="qs-sub">Change any of this at any time in Settings.</p>
+  <div class="qs-row">
+    <div class="qs-rl">Speed tests</div>
+    <div class="qs-seg" id="qsSched">
+      <b class="on">Hourly</b><b>Every 6 hours</b><b>Manually</b>
+    </div>
+    <div class="qs-note" id="qsUse"></div>
+  </div>
+  <div class="qs-row">
+    <div class="qs-rl">Who can open this dashboard</div>
+    <div class="qs-seg" id="qsAcc">
+      <b class="on">This machine only</b><b>Anyone on my network</b>
+    </div>
+    <div class="qs-note" id="qsAccNote">The safe default. Nothing is reachable from other devices.</div>
+    <div class="qs-pw" id="qsPw">
+      <input type="text" id="qsUser" placeholder="Username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="120">
+      <input type="password" id="qsPass" placeholder="Password" maxlength="72">
+    </div>
+  </div>
+  <div class="qs-row qs-two">
+    <div>
+      <div class="qs-rl">Theme</div>
+      <div class="qs-them" id="qsTheme">
+        <button class="qs-sw on" data-sw="retro" title="Retro" aria-label="Retro theme"></button>
+        <button class="qs-sw" data-sw="dark" title="Dark" aria-label="Dark theme"></button>
+        <button class="qs-sw" data-sw="light" title="Light" aria-label="Light theme"></button>
+        <button class="qs-sw" data-sw="amoled" title="AMOLED" aria-label="AMOLED theme"></button>
+        <button class="qs-sw" data-sw="cyber" title="Cyber" aria-label="Cyber theme"></button>
+        <button class="qs-sw" data-sw="slate" title="Slate" aria-label="Slate theme"></button>
+        <button class="qs-sw" data-sw="solarized" title="Solarized" aria-label="Solarized theme"></button>
+        <button class="qs-sw" data-sw="parchment" title="Parchment" aria-label="Parchment theme"></button>
+        <button class="qs-sw" data-sw="ember" title="Ember" aria-label="Ember theme"></button>
+      </div>
+    </div>
+    <div>
+      <div class="qs-rl">Check for updates</div>
+      <label class="qs-tog"><input type="checkbox" id="qsUpd" checked></label>
+    </div>
+  </div>
+  <div class="qs-foot">
+    <button class="qs-go" id="qsGo" type="button">Start monitoring</button>
+    <div class="qs-err" id="qsErr"></div>
+  </div>
+</div>
 <div class="data-pop" id="uptimePop" role="listbox" aria-label="Uptime by window" hidden></div>
 <div class="hm-tip" id="hmTip" hidden></div>
 <div class="hm-tip" id="chartTip" hidden></div>
@@ -3248,6 +3359,11 @@ function dismissCoach(){ const c=$('coachmark'); if(c) c.remove();
 function showCoach(){
   if(!coachInstallId || lsGet('coachSeen:'+coachInstallId) || $('coachmark')) return;
   if(_drawer && _drawer.classList.contains('open')) return; // don't pop over open Settings
+  // Never mount behind the Quick Setup dim: the card would sit invisible under
+  // the modal while its once/capture pointerdown armed - the user's next click
+  // INSIDE the dialog would mark the never-seen coach as seen forever. qsClose
+  // re-calls this after the dialog hides, so deferral costs nothing.
+  if(!$('qsDlg').hidden) return;
   const c=document.createElement('div'); c.className='coach'; c.id='coachmark';
   // role=note: purely informational now - no controls, nothing to focus.
   c.setAttribute('role','note'); c.setAttribute('aria-label','Quick tour');
@@ -3266,11 +3382,103 @@ function showCoach(){
   document.addEventListener('pointerdown', dismissCoach, {once:true, capture:true});
   $('powerBtn').classList.add('coach-pulse-pwr'); $('gearBtn').classList.add('coach-pulse-set');
 }
+
+// --- First-run Quick Setup ------------------------------------------------
+// Server-gated: /api/status carries quick_setup_pending only while the install
+// is fresh AND unanswered (see web.go quickSetupPending). Both exits persist
+// the answer; ONLY the primary button applies anything. Declining a previewed
+// theme reverts it: "keep the defaults" must include the pixels.
+let qsSchedSel=0, qsShown=false;
+// Cost of each cadence on a 1 Gbit reference line (Ookla ~14.4s down + ~10.2s
+// up per test = 1.8 GB down + 1.275 GB up per run). Pure so the numbers are
+// pinned by test rather than trusted in prose.
+function qsUseNote(sel){
+  if(sel===2) return 'No scheduled tests, only a run after an outage or when you click Run.';
+  const n = sel===0?24:4;
+  return 'On a 1\u00a0Gbit line at this pace, speed tests use roughly <b>'+(n*1.8).toFixed(1)+
+    '\u00a0GB down + '+(n*1.275).toFixed(1)+'\u00a0GB up per day</b>.';
+}
+// What Start monitoring writes to /api/settings. Manually turns the schedule
+// OFF and leaves the interval untouched: the pill declines a cadence, it does
+// not invent one. Every payload carries the answered marker.
+function qsSettingsPayload(sel){
+  const p={quick_setup_done:true};
+  if(sel===2){ p.speedtest_enabled=false; }
+  else { p.speedtest_enabled=true; p.speed_seconds=(sel===0?3600:21600); }
+  return p;
+}
+function qsClose(){ $('qsDlg').hidden=true; $('qsDim').hidden=true; showCoach(); } // the coach was deferred behind the dialog
+function qsMark(){ // fire-and-forget: on failure the server just offers again next visit
+  fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},keepalive:true,
+    body:JSON.stringify({quick_setup_done:true})}).catch(()=>{});
+}
+function qsDecline(){
+  if($('qsGo').disabled) return; // a save is applying; Esc must not race it with a decline
+  const t=lsGet('theme')||'retro';
+  if(document.documentElement.dataset.theme!==t) applyTheme(t); // un-preview
+  qsMark(); qsClose();
+}
+let qsAccessDone=false; // a retry after a partial failure must not re-post credentials the server already took
+async function qsSave(){
+  const go=$('qsGo'); go.disabled=true; $('qsErr').textContent='';
+  try{
+    const network=$('qsAcc').querySelectorAll('b')[1].classList.contains('on');
+    const user=$('qsUser').value.trim(), pass=$('qsPass').value;
+    if(network && (!!user !== !!pass)) throw new Error('Enter both a username and a password, or neither.');
+    // bcrypt reads at most 72 BYTES; the server refuses longer rather than
+    // silently truncating. Catch it before any write so a rejection cannot
+    // land after the answered-marker is already persisted.
+    if(network && new TextEncoder().encode(pass).length>72) throw new Error('Passwords are limited to 72 bytes - pick a shorter one.');
+    let r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(qsSettingsPayload(qsSchedSel))});
+    if(!r.ok) throw new Error(await r.text()||'saving settings failed');
+    if(!$('qsUpd').checked){
+      r=await fetch('api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})});
+      if(!r.ok) throw new Error(await r.text()||'saving the update check failed');
+    }
+    if(network && !qsAccessDone){
+      r=await fetch('api/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        local_only:false, auth_enabled:!!(user&&pass), username:user, password:pass, current_password:''})});
+      if(!r.ok) throw new Error(await r.text()||'saving access failed');
+      qsAccessDone=true; // once auth is live, current_password:'' would 403 - never send twice
+    }
+    const t=document.documentElement.dataset.theme; if(t) lsSet('theme',t); // the preview becomes the saved pick
+    await loadSettings(); loadAccess();
+    qsClose();
+  }catch(e){ $('qsErr').textContent=String(e.message||e); go.disabled=false; }
+}
+function showQuickSetup(){
+  if(qsShown) return; qsShown=true;
+  const cur=document.documentElement.dataset.theme||'retro';
+  document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.classList.toggle('on', b.dataset.sw===cur));
+  $('qsUse').innerHTML=qsUseNote(qsSchedSel);
+  $('qsDim').hidden=false; $('qsDlg').hidden=false;
+  $('qsGo').focus(); // keyboard users land on the primary action, not the page behind the dim
+}
+$('qsSched').querySelectorAll('b').forEach((b,i)=>b.addEventListener('click',()=>{
+  $('qsSched').querySelectorAll('b').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  qsSchedSel=i; $('qsUse').innerHTML=qsUseNote(i);
+}));
+$('qsAcc').querySelectorAll('b').forEach((b,i)=>b.addEventListener('click',()=>{
+  $('qsAcc').querySelectorAll('b').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  $('qsPw').style.display=(i===1?'flex':'none');
+  $('qsAccNote').textContent = i===1
+    ? 'Reachable from your LAN. Authentication and static IP are recommended.'
+    : 'The safe default. Nothing is reachable from other devices.';
+}));
+document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('#qsTheme .qs-sw').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  applyTheme(b.dataset.sw); // live preview, charts included; saved only by Start monitoring
+}));
+$('qsX').addEventListener('click', qsDecline);
+$('qsGo').addEventListener('click', qsSave);
+
 // Escape closes whatever's open. Nested popovers (win-pop, the data popover's
 // input) stopPropagation on their own Escape, so this only fires when focus is
 // outside them: closes the data popover if open, otherwise the settings drawer.
 document.addEventListener('keydown', e=>{
   if(e.key!=='Escape') return;
+  if(!$('qsDlg').hidden){ qsDecline(); return; } // Quick Setup: Esc = dismiss, keep the defaults
   if(!$('dataPop').hidden){ const p=$('families').querySelector('.stat-data'); hideDataPop(); if(p) p.focus(); return; }
   if(!$('uptimePop').hidden){ const p=$('families').querySelector('.stat-up'); hideUptimePop(); if(p) p.focus(); return; }
   if(_drawer.classList.contains('open')) requestCloseDrawer();
@@ -3591,7 +3799,12 @@ async function refreshStatus() {
     if($('runsSection').style.display!=='none') loadRuns(); }
   staleFails=0; lastStatusAt=Date.now(); setStale(false);
   // First-run coachmark, scoped to this install so a fresh volume re-shows it.
-  if(s.first_seen){ coachInstallId=String(s.first_seen); showCoach(); }
+  // Quick Setup outranks it: the coach waits behind the dialog (qsClose shows
+  // it). STRICT === true - an older daemon and the demo shim simply lack the
+  // field, and absent must mean never.
+  if(s.first_seen) coachInstallId=String(s.first_seen);
+  if(s.quick_setup_pending===true) showQuickSetup();
+  else if(s.first_seen) showCoach();
   $('ver').textContent = s.version || '';
   applyUpdateUI(s.update);
   if(!powerPending) setPowerUI(!s.paused); // don't clobber the optimistic flip while a power POST is resolving
@@ -6275,6 +6488,10 @@ function newIperfServer(label,addr){ return {label:label||'',addr:addr||'',orig_
 // records the stored address so a later rename knows the saved password can't follow.
 function mapIperfServer(t){ t=t||{}; return {label:t.label||'',addr:t.addr||'',orig_addr:t.addr||'',bind:t.bind||'',ipver:t.ipver||'auto',auth:!!t.auth,username:t.username||'',rsa_key:t.rsa_key||'',pkcs1:!!t.pkcs1,has_password:!!t.has_password,orig_has_password:!!t.has_password,password:''}; }
 function activeIperfServer(){ return iperfServers.find(s=>s._id===iperfActiveId)||null; }
+// A server whose address changed away from the one its stored password is filed
+// under, with no replacement password typed: saving now would orphan (destroy)
+// the stored credential. Deleted rows don't count - deletion is explicit.
+function iperfPwOrphan(){ return iperfServers.find(s=>!s._del && s.orig_has_password && s.addr!==s.orig_addr && !s.password)||null; }
 function editingIperfServer(){ return iperfServers.find(s=>s._id===iperfEditingId)||null; }
 // Lenient client check (the backend + tester validate strictly): non-empty, not
 // flag-shaped, no embedded whitespace. Good enough for instant feedback.
@@ -6306,11 +6523,17 @@ function renderIperfServers(){
   list.innerHTML = iperfServers.length ? iperfServers.map(iperfCardHTML).join('')
     : '<div class="iperf-card-empty">No servers saved yet - add one to run iperf3 tests.</div>';
   $('iperfAddBtn').disabled = iperfServers.length>=12;
-  // The message under the list is scoped to an open edit - the address/password
-  // warning above all. With no editor open there is no such edit, so it must not
-  // survive Save, Done, a discarded change or Load defaults, each of which closes
-  // the editor and re-renders. The list's own status line is set immediately below.
-  if(iperfEditingId==null) $('iperfMsg').textContent='';
+  // The message under the list dies when its REASON dies, not when the editor
+  // closes. Closing the editor over a renamed server does not un-orphan its
+  // stored password: the rename is applied live, Done captures it, and the next
+  // Save would post password:'' under an address the store has no entry for -
+  // silently destroying the credential (mergeIperfPasswords keys strictly by
+  // address). So while any server is in that state the warning stays, editor
+  // open or not; once the address is restored, a new password typed, or truth
+  // re-baselined (applySettings), it clears here.
+  const orphan=iperfPwOrphan();
+  if(orphan) $('iperfMsg').textContent='You changed '+(orphan.label||orphan.orig_addr)+"'s address - the saved password is stored under the old one, so re-enter it (or change the address back) before saving.";
+  else if(iperfEditingId==null) $('iperfMsg').textContent='';
   const need = $('setSpeedEngine').checked && !iperfServers.length;
   if(need) $('iperfMsg').textContent='Add a server to run iperf3 tests.';
   else if($('iperfMsg').textContent==='Add a server to run iperf3 tests.') $('iperfMsg').textContent='';
@@ -6729,6 +6952,21 @@ let saveInFlight=false;
     $('settingsMsg').textContent='Fix the iperf3 server address before saving.';
     return;
   }
+  // A renamed server whose stored password was never re-entered: the save would
+  // silently drop the credential (the store files passwords by address), and
+  // every later run would fail closed. Block with the remedy, don't destroy.
+  // Capture the open editor BEFORE judging: the typed replacement password (or
+  // a just-cleared field) lives only in the DOM until captured, and a stale
+  // model here blocks the exact remedy the warning prescribes - or waves
+  // through the loss it exists to stop. settingsBody() captures again below;
+  // the call is idempotent.
+  captureIperfEditor();
+  { const orphan=iperfPwOrphan();
+    if(orphan){
+      activateTab('server');
+      $('settingsMsg').textContent='Re-enter '+(orphan.label||orphan.orig_addr)+"'s password (its address changed), or change the address back, before saving.";
+      return;
+    } }
   const body = settingsBody();   // captures the open iperf3 editor (incl. a just-typed address) too
   // iperf3 with no valid server set would fail every run ("no iperf3 server set") - block
   // the save and point the user at the fix rather than persist a broken engine.

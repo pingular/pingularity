@@ -330,6 +330,17 @@ func (p *program) run(ctx context.Context) {
 		})
 		spawnLoop("settings-retry", func() { p.retrySettingsLoad(ctx, set) })
 	}
+	// Materialize the first-run Quick Setup decision - but only on a LOADED
+	// controller (ErrLegacyReseal means loaded; a failed load must not take a
+	// sticky decision from defaults: the offer-clock write has no loaded-guard,
+	// and once seeded it would hold an established install's monitoring for
+	// 48h). Skipping costs nothing - the same decision runs next boot, or after
+	// the retry loop's successful Reload via the next restart.
+	if err == nil || errors.Is(err, settings.ErrLegacyReseal) {
+		if qerr := set.EnsureQuickSetupOffer(ctx, time.Now().Unix()); qerr != nil {
+			earlyLog = append(earlyLog, func() { p.log.Warn("quick setup offer decision failed; retaken next boot", "err", qerr) })
+		}
+	}
 
 	// Apply the saved log level now that settings are loaded (the logger starts
 	// pinned to logLevelOff so "off" is truly silent), and keep it synced: the
@@ -477,12 +488,29 @@ func (p *program) run(ctx context.Context) {
 	// (netinfo logs one under it) and the redactor censors it by key, so a mode
 	// string logged there reads as [redacted] and tells support nothing.
 	p.log.Info("family probing", "ipv4_mode", p.cfg.IPv4Mode, "ipv6_mode", set.IPv6Mode())
+	// monitoringLive is the master switch the loops actually obey: the power
+	// button AND the first-run hold. While the Quick Setup offer is open the
+	// daemon measures nothing - the dialog's button is called Start monitoring
+	// and it must be telling the truth. The hold can only release (answer or
+	// 48h expiry), so once seen released it is never re-checked: the settings
+	// read is cheap but the offer clock is a DB read, and this runs every round.
+	var qsHoldReleased atomic.Bool
+	monitoringLive := func() bool {
+		if !qsHoldReleased.Load() {
+			if settings.QuickSetupHold(set.QuickSetupDone(), set.QuickSetupOfferSince(ctx), time.Now().Unix()) {
+				return false
+			}
+			qsHoldReleased.Store(true)
+		}
+		return set.Monitoring()
+	}
+
 	m := monitor.New(p.cfg, pr, p.store, p.log)
 	m.IntervalFn = set.LatencyInterval
 	m.WakeFn = set.Changed
 	m.DownAfterFn = set.DownAfter
 	m.UpAfterFn = set.UpAfter
-	m.EnabledFn = set.Monitoring
+	m.EnabledFn = monitoringLive
 	m.LatencyFn = func() bool {
 		// Both families explicitly off = nothing the operator allows us to dial;
 		// idle (like the latency toggle being off) rather than probe disabled
@@ -521,7 +549,7 @@ func (p *program) run(ctx context.Context) {
 	// making these lookups too - and the setting turns them off for good. Without
 	// this the hourly loop kept sending the public IP to third parties while the
 	// dashboard said monitoring was paused.
-	ni.EnabledFn = func() bool { return set.Monitoring() && set.NetinfoEnabled() }
+	ni.EnabledFn = func() bool { return monitoringLive() && set.NetinfoEnabled() }
 	seedKnownCounters() // create fixed counters at 0 so a first event after restart is a visible 0->1 step (rate/increase can miss a series that appears at 1)
 
 	// Speedtests/reconnects refresh connection info; this loop is just a backstop
@@ -627,7 +655,7 @@ func (p *program) run(ctx context.Context) {
 	sched.IntervalFn = set.SpeedInterval
 	sched.WakeFn = set.Changed
 	sched.EnabledFn = func() bool {
-		return set.Monitoring() && set.SpeedtestEnabled() && set.SpeedAllowed(time.Now())
+		return monitoringLive() && set.SpeedtestEnabled() && set.SpeedAllowed(time.Now())
 	}
 	sched.ThresholdsFn = set.Thresholds      // mark each run healthy/unhealthy
 	sched.BreachStreakFn = set.BreachStreak  // debounce: alert only after N consecutive breaches
@@ -660,7 +688,7 @@ func (p *program) run(ctx context.Context) {
 		// speedtest can still run in that state (RUN is ungated), so stamping the
 		// cached identity would record a possibly-stale IP/ISP/exit as this run's
 		// context. Only stamp an identity we could actually have just refreshed.
-		if !set.Monitoring() || !set.NetinfoEnabled() || i.UpdatedAt == 0 {
+		if !monitoringLive() || !set.NetinfoEnabled() || i.UpdatedAt == 0 {
 			return speedtest.ConnInfo{}
 		}
 		if i.CarriedIdentity() {
@@ -713,7 +741,7 @@ func (p *program) run(ctx context.Context) {
 		// still honored via SpeedAllowed. The gate is consulted LAST, after every
 		// setting that could veto the run: a trigger the settings already suppressed
 		// must not consume the window and space out the next allowed one.
-		if set.Monitoring() && set.SpeedtestOnReconnect() && set.SpeedAllowed(now) {
+		if monitoringLive() && set.SpeedtestOnReconnect() && set.SpeedAllowed(now) {
 			if speedGate.allow(now, reconnectSpeedGap(set.SpeedInterval())) {
 				spawn(func() {
 					// A dispatch that bounces off RunOnce's single-flight has measured
@@ -738,7 +766,7 @@ func (p *program) run(ctx context.Context) {
 	// unless the feature, speedtests, and monitoring are all on; OnDegraded still
 	// honors the speed schedule window.
 	m.DegradedPingFn = func() float64 {
-		if !set.SpeedtestOnDegraded() || !set.SpeedtestEnabled() || !set.Monitoring() {
+		if !set.SpeedtestOnDegraded() || !set.SpeedtestEnabled() || !monitoringLive() {
 			return 0
 		}
 		return set.DegradedPingMS()

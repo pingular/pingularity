@@ -132,8 +132,11 @@ func TestExportRedactsEveryIperfSecretField(t *testing.T) {
 // side lights up this test instead of leaking the credential into a backup.
 func TestExportDeniesSettingsSecretKeys(t *testing.T) {
 	// webhook_url / heartbeat_url are intentionally exportable now (part of a
-	// backup), so only the password hash remains denied.
-	secretKeys := []string{keyAuthHash}
+	// backup). The quick-setup pair is denied for a different reason than the
+	// hash: the answer and the offer clock belong to the INSTALL - a restored
+	// mid-offer backup must not reopen the dialog on (or hold monitoring of)
+	// an established destination.
+	secretKeys := []string{keyAuthHash, keyQuickSetup, keyQuickSetupOffer}
 
 	seed := map[string]string{
 		keyDigestFreq: "daily", // a non-secret control that MUST survive export

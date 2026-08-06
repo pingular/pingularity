@@ -1066,6 +1066,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"families":             st.Families,                // per-family (IPv4/IPv6) live state
 		"paused":               st.Paused,                  // monitoring stopped via the power button
 		"first_seen":           s.store.InstallBornAt(ctx), // stable per-install id; scopes the first-run coachmark
+		"quick_setup_pending":  s.quickSetupPending(ctx),   // offer the first-run Quick Setup dialog (fresh installs only)
 	}
 	// The scheduler's own next-due time (anchor + interval + jitter, adaptive
 	// cadence included), so the header's "next ..." matches reality instead of
@@ -2177,6 +2178,7 @@ type settingsDTO struct {
 	SpeedtestOnReconnect     *bool   `json:"speedtest_on_reconnect"`
 	IPv6Mode                 *string `json:"ipv6_mode"`
 	WebhookFormat            *string `json:"webhook_format"`
+	QuickSetupDone           *bool   `json:"quick_setup_done"`
 	ExitTarget               *string `json:"exit_target"`
 	// Adaptive / event-driven speedtesting.
 	SpeedtestAdaptive   *bool    `json:"speedtest_adaptive"`
@@ -2273,6 +2275,7 @@ func dtoFrom(v settings.Values) settingsDTO {
 		SpeedtestOnReconnect:     ptr(v.SpeedtestOnReconnect),
 		IPv6Mode:                 ptr(v.IPv6Mode),
 		WebhookFormat:            ptr(v.WebhookFormat),
+		QuickSetupDone:           ptr(v.QuickSetupDone),
 		ExitTarget:               ptr(v.ExitTarget),
 		SpeedtestAdaptive:        ptr(v.SpeedtestAdaptive),
 		SpeedtestOnDegraded:      ptr(v.SpeedtestOnDegraded),
@@ -2345,6 +2348,17 @@ func secsToDur(n int64) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// quickSetupPending reports whether the dashboard should offer the first-run
+// Quick Setup dialog. The rule lives in settings.QuickSetupHold - the SAME
+// predicate that holds monitoring at boot (main.go), so the dialog and the
+// paused power button always tell one story. The offer clock is seeded once by
+// EnsureQuickSetupOffer; upgrades were materialized as already-answered there,
+// so an unseeded clock here simply reads as "no offer".
+func (s *Server) quickSetupPending(ctx context.Context) bool {
+	return settings.QuickSetupHold(s.settings.QuickSetupDone(),
+		s.settings.QuickSetupOfferSince(ctx), time.Now().Unix())
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -2397,6 +2411,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			SpeedtestOnReconnect: in.SpeedtestOnReconnect,
 			IPv6Mode:             in.IPv6Mode,
 			WebhookFormat:        in.WebhookFormat,
+			QuickSetupDone:       in.QuickSetupDone,
 			ExitTarget:           in.ExitTarget,
 			SpeedtestAdaptive:    in.SpeedtestAdaptive,
 			SpeedtestOnDegraded:  in.SpeedtestOnDegraded,
@@ -2537,6 +2552,16 @@ func (s *Server) handleMonitoring(w http.ResponseWriter, r *http.Request) {
 		if err := s.settings.SetMonitoring(r.Context(), in.Enabled); err != nil {
 			s.internalError(w, err)
 			return
+		}
+		// An explicit power-ON is an answer to the first-run offer: without
+		// this, the boot hold would keep monitoring off while the button
+		// optimistically flips on, then snaps back - a power button that
+		// visibly refuses to work. Best-effort: a failed write leaves the
+		// offer open, which is the state we were already in.
+		if in.Enabled && !s.settings.QuickSetupDone() {
+			if err := s.settings.SetQuickSetupDone(r.Context(), true); err != nil {
+				s.log.Warn("power-on could not answer the quick-setup offer", "err", err)
+			}
 		}
 		s.log.Info("monitoring toggled", "enabled", in.Enabled)
 	}

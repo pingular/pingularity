@@ -114,6 +114,17 @@ func TestBuildAndBoot(t *testing.T) {
 	if _, ok := status["online"]; !ok {
 		t.Errorf("/api/status missing \"online\" field: %v", status)
 	}
+	// A fresh database must boot with the first-run Quick Setup offer open AND
+	// monitoring held behind it (the paused power button). This is the one test
+	// that drives run()'s actual wiring: EnsureQuickSetupOffer at boot and the
+	// monitoringLive hold - a refactor that drops either leaves the feature
+	// dead or the hold fictional with every unit test still green.
+	if v, _ := status["quick_setup_pending"].(bool); !v {
+		t.Errorf("fresh boot: quick_setup_pending = %v, want true", status["quick_setup_pending"])
+	}
+	if v, _ := status["paused"].(bool); !v {
+		t.Errorf("fresh boot: paused = %v, want true (monitoring must hold behind the offer)", status["paused"])
+	}
 
 	// The dashboard HTML is served at the root.
 	rootResp, err := client.Get(base + "/")
