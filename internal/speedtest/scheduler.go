@@ -623,6 +623,11 @@ func fptr(v *float64) any {
 var (
 	startupDelay    = 3 * time.Second
 	scheduleRecheck = 30 * time.Second
+	// The pause before the consent-triggered startup run (Loop's startupPending
+	// latch). Longer than startupDelay on purpose: this one fires while the user
+	// is looking at a dashboard they just opened for the first time, so the page
+	// gets a beat to settle before the test saturates the link.
+	firstEnableDelay = 10 * time.Second
 )
 
 // scheduleJitter returns a bounded random offset in [0, min(interval/10, 60s))
@@ -646,13 +651,29 @@ func scheduleJitter(interval time.Duration) time.Duration {
 // broadcast, related or not - only re-derives the deadline, never restarts the
 // wait. When a run is due but the schedule window is closed, the loop re-checks
 // every scheduleRecheck and fires as soon as the window opens.
+//
+// The startup run belongs to the first moment the scheduler is ENABLED, not to
+// boot. On an already-configured install those coincide and it fires at
+// boot+startupDelay as it always has. On a fresh install the boot slot is
+// skipped - the user hasn't consented to tests yet - and without a carry-over
+// the consent moment inherited nothing: answering Quick Setup with "hourly"
+// started monitoring instantly but left the speed panel empty for a full
+// interval, because the wake only re-derived a deadline anchored at boot. The
+// startupPending latch carries the unclaimed slot forward: the first time a
+// wake (or deferral re-check) finds the scheduler enabled, the startup run
+// fires - after firstEnableDelay, so the dashboard the user just landed on has
+// a beat to settle - and the schedule anchors to its end. One slot per boot:
+// once claimed, later off/on toggles follow the normal anchor arithmetic,
+// which already fires promptly when more than an interval has passed and
+// deliberately doesn't re-test when less has.
 func (s *Scheduler) Loop(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(startupDelay):
 	}
-	if s.enabled() {
+	startupPending := !s.enabled()
+	if !startupPending {
 		s.RunOnce(ctx, "startup")
 	}
 	lastRun := time.Now()
@@ -664,6 +685,59 @@ func (s *Scheduler) Loop(ctx context.Context) {
 	deferred := false // tracks the running→deferred edge, so the reason logs once
 
 	for {
+		if startupPending && s.enabled() {
+			// No scheduled deadline is knowable while the startup run is imminent
+			// or in flight - the published one still says boot+interval, which the
+			// run about to fire would predate by most of the interval. Withdraw it
+			// (status omits the field), the same shape the boot startup run has
+			// while the anchor is still unpublished; the post-run setAnchor below
+			// restores it.
+			s.anchor.Store(nil)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(firstEnableDelay):
+			}
+			// A run that completed during the pause (reconnect after a flap,
+			// manual) IS the first measurement - the slot it was armed for is
+			// served, and firing the latch anyway would stack a second full test
+			// onto a link still settling from the first. The nudge only fires for
+			// persisted runs, so a failed attempt doesn't burn the slot.
+			select {
+			case <-s.runWake:
+				startupPending = false
+			default:
+			}
+			// Re-checked after the pause: a toggle straight back off within it
+			// means no consent run, and the slot stays available rather than
+			// being burned on a run that never happened.
+			if startupPending && s.enabled() {
+				// An ErrBusy here is a run that STARTED during the pause and is
+				// still in flight - it serves the slot like the completed-run
+				// case above, but the slot going unfilled must stay traceable
+				// (same reasoning as the scheduled collision below): if that run
+				// fails, this log line is what a gap in the history leads back to.
+				if _, err := s.RunOnce(ctx, "startup"); errors.Is(err, ErrBusy) {
+					stats.Inc("speed.scheduled_skipped")
+					s.log.Info("startup speedtest skipped: another run was already in progress")
+				}
+				startupPending = false
+				lastRun = time.Now()
+				jitter = scheduleJitter(s.curInterval())
+				s.setAnchor(lastRun, jitter)
+				// An overdue-while-gated stretch may have logged the deferred
+				// edge; this run answers it, so the next real deferral logs anew
+				// (and the scheduled path doesn't print a stale "resumed").
+				deferred = false
+			} else {
+				// Declined (toggled off mid-pause) or served by a run that
+				// completed during it: the boot-anchored deadline withdrawn
+				// above is still the real one - republish it, or status would
+				// omit the next run for up to a full interval.
+				s.setAnchor(lastRun, jitter)
+			}
+			continue
+		}
 		var wake <-chan struct{}
 		if s.WakeFn != nil {
 			wake = s.WakeFn()
@@ -734,7 +808,13 @@ func (s *Scheduler) Loop(ctx context.Context) {
 			// Settings changed; recompute the deadline against the same anchor.
 		case <-s.runWake:
 			// A run completed - possibly a reconnect/degraded/manual one on another
-			// goroutine. If it left us in a breach, count the adaptive cadence from
+			// goroutine. If the startup slot was still armed (gated boot, e.g. a
+			// restart outside the schedule window), that measurement serves it:
+			// without this, the latch would fire a duplicate full test right after
+			// one that just finished - exactly the back-to-back double test the
+			// scheduled path's ErrBusy handling was engineered against.
+			startupPending = false
+			// If it left us in a breach, count the adaptive cadence from
 			// that run: the old anchor could otherwise sleep out hours of a base
 			// interval before the fast cadence engages.
 			if s.AdaptiveFn != nil && s.AdaptiveFn() && s.lastUnhealthy.Load() {

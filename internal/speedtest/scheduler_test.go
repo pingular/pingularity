@@ -230,12 +230,16 @@ func TestSchedulerSingleFlight(t *testing.T) {
 // A run that comes due while the schedule window is closed must fire shortly
 // after the window opens, not a full interval later. (A tick landing outside a
 // daily window used to restart the full-interval wait, retrying at roughly the
-// same wall-clock time forever.)
+// same wall-clock time forever.) Boots ENABLED so the startup slot is consumed
+// up front and the window-open fire is the SCHEDULED deferral path - the
+// gated-boot flavor of window-open now belongs to the startupPending latch and
+// is covered by the latch tests.
 func TestSchedulerRunsWhenWindowOpens(t *testing.T) {
 	stats.ResetForTest()
-	defer func(d, r time.Duration) { startupDelay, scheduleRecheck = d, r }(startupDelay, scheduleRecheck)
+	defer func(d, r, f time.Duration) { startupDelay, scheduleRecheck, firstEnableDelay = d, r, f }(startupDelay, scheduleRecheck, firstEnableDelay)
 	startupDelay = 0
 	scheduleRecheck = 5 * time.Millisecond
+	firstEnableDelay = 0
 
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -249,9 +253,10 @@ func TestSchedulerRunsWhenWindowOpens(t *testing.T) {
 		return Result{DownloadMbps: 1, Server: "fake"}, nil
 	})
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := NewScheduler(tester, st, 500*time.Millisecond, log)
+	s := NewScheduler(tester, st, 300*time.Millisecond, log)
 
-	var allowed atomic.Bool // window starts closed
+	allowed := atomic.Bool{} // window starts OPEN: boot claims the startup slot
+	allowed.Store(true)
 	s.EnabledFn = func() bool { return allowed.Load() }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -266,16 +271,25 @@ func TestSchedulerRunsWhenWindowOpens(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	go func() { defer close(done); s.Loop(ctx) }()
 
-	// The window stays closed across the first deadline (t=500ms): no run.
+	// The boot startup run consumes the slot, then the window closes.
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled boot did not run the startup test")
+	}
+	allowed.Store(false)
+
+	// The window stays closed across the next deadline (300ms + jitter <30ms
+	// after the startup run): no run.
 	select {
 	case <-runs:
 		t.Fatal("speedtest ran while the schedule window was closed")
-	case <-time.After(600 * time.Millisecond):
+	case <-time.After(450 * time.Millisecond):
 	}
 
 	// Open the window: the overdue test must fire at the recheck cadence. The
-	// old loop would have waited out another full interval (t=1s), well past
-	// this deadline.
+	// old loop would have waited out another full interval, well past this
+	// deadline.
 	allowed.Store(true)
 	select {
 	case <-runs:
@@ -283,14 +297,357 @@ func TestSchedulerRunsWhenWindowOpens(t *testing.T) {
 		t.Fatal("speedtest did not fire promptly after the window opened")
 	}
 
-	// The gated startup run never reached RunOnce; the window-open run is
-	// attributed to the "scheduled" trigger.
+	// The startup slot was spent at boot, so the window-open fire is the
+	// scheduled path - the one a history gap is traced to.
 	snap := stats.Lifetime()
 	if got := snap.Counters["speed.run.scheduled"]; got < 1 {
-		t.Errorf("speed.run.scheduled = %d, want >= 1", got)
+		t.Errorf("speed.run.scheduled = %d, want >= 1 (the deferral path must fire as scheduled)", got)
 	}
-	if got := snap.Counters["speed.run.startup"]; got != 0 {
-		t.Errorf("speed.run.startup = %d, want 0 (startup was gated)", got)
+	if got := snap.Counters["speed.run.startup"]; got != 1 {
+		t.Errorf("speed.run.startup = %d, want exactly 1 (boot only)", got)
+	}
+}
+
+// The startup run belongs to the first moment the scheduler is ENABLED, not to
+// boot. A fresh install boots with the scheduler gated (Quick Setup hold +
+// speedtests off); when the user consents - Quick Setup's Start monitoring, or
+// the Settings toggle later - the first test must fire shortly after, and the
+// schedule must anchor to ITS end, not to boot. Before the latch, the consent
+// wake only re-derived the boot-anchored deadline: a user who chose "hourly"
+// stared at an empty speed panel for the full hour.
+func TestSchedulerFirstEnableRunsStartup(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 0
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool // fresh install: gated at boot
+	s.EnabledFn = func() bool { return enabled.Load() }
+	// The settings-broadcast wake, so consent reaches the loop without waiting
+	// out the hour deadline - exactly how set.Changed delivers it in production.
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+	broadcast := func() { wakeMu.Lock(); close(wakeCh); wakeCh = make(chan struct{}); wakeMu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+	// Boot must complete gated before the test enables (the anchor publishes
+	// right after the boot check), or the Store below could turn this into an
+	// enabled boot.
+	waitForAnchor(t, s)
+	boot := s.anchor.Load()
+
+	// Gated boot: no startup run.
+	select {
+	case <-runs:
+		t.Fatal("speedtest ran while the scheduler was gated at boot")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Consent: enable + settings broadcast. The carried-over startup run must
+	// fire promptly - not an interval from boot.
+	enabled.Store(true)
+	broadcast()
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consent did not trigger the carried-over startup run")
+	}
+
+	// The schedule re-anchors to the consent run's END. Asserted on the anchor
+	// itself, not a NextRun window: the boot anchor plus its jitter satisfied
+	// any tolerance wide enough to absorb jitter, which mutation testing showed
+	// let the re-anchor lines be deleted with every test still green. The
+	// reference is the BOOT anchor, not an instant captured just before
+	// consent: Windows' monotonic clock ticks at interrupt granularity (up to
+	// ~15.6ms), and the consent run completes inside one tick, so
+	// After(just-before-consent) was false forever there - the 100ms gated-boot
+	// window above is what guarantees the two anchors can never share a tick.
+	reDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if a := s.anchor.Load(); a != nil && a.lastRun.After(boot.lastRun) {
+			break
+		}
+		if time.Now().After(reDeadline) {
+			t.Fatal("anchor was never re-derived from the consent run's end (still boot-anchored or withdrawn)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// One slot per boot: toggling off and on again must NOT fire another
+	// immediate run - later toggles follow the normal anchor arithmetic.
+	enabled.Store(false)
+	broadcast()
+	enabled.Store(true)
+	broadcast()
+	select {
+	case <-runs:
+		t.Fatal("a second enable toggle fired an immediate run; the startup slot is per boot")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if got := stats.Lifetime().Counters["speed.run.startup"]; got != 1 {
+		t.Errorf("speed.run.startup = %d, want exactly 1", got)
+	}
+}
+
+// A boot with the scheduler enabled claims the startup slot immediately, as it
+// always has - and having claimed it, a later off/on toggle must not fire an
+// extra run.
+func TestSchedulerEnabledBootConsumesStartupSlot(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 0
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	enabled := atomic.Bool{}
+	enabled.Store(true)
+	s.EnabledFn = func() bool { return enabled.Load() }
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+	broadcast := func() { wakeMu.Lock(); close(wakeCh); wakeCh = make(chan struct{}); wakeMu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled boot did not run the startup test")
+	}
+
+	enabled.Store(false)
+	broadcast()
+	enabled.Store(true)
+	broadcast()
+	select {
+	case <-runs:
+		t.Fatal("off/on toggle after a claimed startup slot fired an extra run")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// A run that completes while the startup slot is still armed SERVES it - the
+// latch must not stack a second full test onto a link still settling from the
+// first. This is the runWake path: gated boot (e.g. a restart outside the
+// schedule window), an out-of-band run (manual/reconnect) completes, and a
+// later enable must NOT fire an immediate startup run.
+func TestSchedulerCompletedRunServesArmedSlot(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 0
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool
+	s.EnabledFn = func() bool { return enabled.Load() }
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+	broadcast := func() { wakeMu.Lock(); close(wakeCh); wakeCh = make(chan struct{}); wakeMu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+	waitForAnchor(t, s) // boot completed gated; the slot is armed
+
+	// An out-of-band run completes (manual ignores EnabledFn); its runWake
+	// nudge reaches the loop whichever select it is sleeping in.
+	if _, err := s.RunOnce(ctx, "manual"); err != nil {
+		t.Fatalf("manual run: %v", err)
+	}
+	<-runs
+	time.Sleep(50 * time.Millisecond) // let the loop drain the nudge
+
+	// Enabling now must not fire a startup run: the measurement exists.
+	enabled.Store(true)
+	broadcast()
+	select {
+	case <-runs:
+		t.Fatal("latch fired a duplicate test right after a completed run")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := stats.Lifetime().Counters["speed.run.startup"]; got != 0 {
+		t.Errorf("speed.run.startup = %d, want 0 (the manual run served the slot)", got)
+	}
+}
+
+// The same rule inside the pause: a run that completes during firstEnableDelay
+// serves the slot (the post-pause drain), and the deadline withdrawn at latch
+// entry must be republished - not left absent for the rest of the interval.
+func TestSchedulerRunDuringPauseServesSlot(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 0
+	firstEnableDelay = 250 * time.Millisecond
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool
+	s.EnabledFn = func() bool { return enabled.Load() }
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+	broadcast := func() { wakeMu.Lock(); close(wakeCh); wakeCh = make(chan struct{}); wakeMu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+	waitForAnchor(t, s)
+
+	// Consent arms the latch; a reconnect-style run completes inside the pause.
+	enabled.Store(true)
+	broadcast()
+	time.Sleep(50 * time.Millisecond) // loop is now inside the pause
+	if _, err := s.RunOnce(ctx, "reconnect"); err != nil {
+		t.Fatalf("reconnect run: %v", err)
+	}
+	<-runs
+
+	// The pause ends: no second test, and the slot is spent, not kept.
+	select {
+	case <-runs:
+		t.Fatal("latch stacked a startup test onto the run that completed during the pause")
+	case <-time.After(500 * time.Millisecond):
+	}
+	broadcast() // a later settings save must not revive it either
+	select {
+	case <-runs:
+		t.Fatal("the served slot survived; a later broadcast fired a startup run")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if got := stats.Lifetime().Counters["speed.run.startup"]; got != 0 {
+		t.Errorf("speed.run.startup = %d, want 0", got)
+	}
+	// The withdrawn deadline came back (the else branch republishes the
+	// boot-anchored one).
+	if s.anchor.Load() == nil {
+		t.Error("anchor left withdrawn after the slot was served during the pause")
+	}
+}
+
+// A toggle straight back off during the firstEnableDelay pause must not burn
+// the startup slot on a run that never happened: the re-check after the pause
+// declines, and a LATER consent still gets its first run.
+func TestSchedulerEnableToggleDuringPauseKeepsSlot(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 0
+	firstEnableDelay = 200 * time.Millisecond
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool
+	s.EnabledFn = func() bool { return enabled.Load() }
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+	broadcast := func() { wakeMu.Lock(); close(wakeCh); wakeCh = make(chan struct{}); wakeMu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	// Boot must complete gated before the test enables, or the Store below can
+	// beat the loop's own boot check and turn this into an enabled boot. The
+	// anchor is published right after that check, so it is the barrier.
+	waitForAnchor(t, s)
+
+	// Enable, let the loop enter the pause, then flip off inside it. (If the
+	// flip beats the loop's own check instead, the latch never arms - the
+	// assertions below hold on either interleaving.)
+	enabled.Store(true)
+	broadcast()
+	time.Sleep(50 * time.Millisecond)
+	enabled.Store(false)
+
+	select {
+	case <-runs:
+		t.Fatal("speedtest ran although consent was withdrawn during the pause")
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// The slot survived: consenting again gets the first run.
+	enabled.Store(true)
+	broadcast()
+	select {
+	case <-runs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot was burned by the withdrawn consent; re-enable got no first run")
 	}
 }
 

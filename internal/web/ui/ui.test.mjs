@@ -2183,6 +2183,19 @@ test('Quick Setup guard rails: coach deferral, byte cap, access latch', () => {
   assert.match(html, /id="qsPass" placeholder="Password" maxlength="72"/, 'the field cap matches the server');
 });
 
+// The coachmark anchors to the header's BOTTOM, and on narrow viewports the
+// header grows after the card mounts (the toolbar wraps as status pills fill
+// in). A window-resize listener never fires for that, which left the card
+// overlapping the wrapped pill rows at ~390px - so the anchor itself must be
+// observed, and the observer must die with the card.
+test('the coachmark tracks header growth, not just window resizes', () => {
+  const coach = extract('function showCoach');
+  assert.match(coach, /new ResizeObserver\(repositionCoach\)/, 'showCoach must observe the header');
+  assert.match(coach, /coachRO\.observe\(hdr\)/, 'the observer must watch the header element');
+  const dis = extract('function dismissCoach');
+  assert.match(dis, /coachRO\.disconnect\(\)/, 'dismissCoach must disconnect the observer');
+});
+
 // The save gate must judge what is IN the editor, not what was last captured:
 // a typed replacement password (or a just-cleared field) exists only in the
 // DOM until captureIperfEditor folds it in.

@@ -3346,7 +3346,7 @@ $('gearBtn').addEventListener('click', () => {
 // suppressed forever by a browser that saw an earlier one. No dismiss button: the
 // first click/tap anywhere (the popup included) puts it away, as does opening
 // Settings (openDrawer calls dismissCoach). Copy is static, so no esc().
-let coachInstallId='';
+let coachInstallId='', coachRO=null;
 function repositionCoach(){ const c=$('coachmark'); if(!c) return;
   // Anchor just below the header bar, wherever it sits at this width (the header
   // height changes when the toolbar wraps on narrow/mobile viewports).
@@ -3354,6 +3354,7 @@ function repositionCoach(){ const c=$('coachmark'); if(!c) return;
   c.style.top=((hdr?hdr.getBoundingClientRect().bottom:52)+8)+'px'; }
 function dismissCoach(){ const c=$('coachmark'); if(c) c.remove();
   window.removeEventListener('resize', repositionCoach);
+  if(coachRO){ coachRO.disconnect(); coachRO=null; }
   $('powerBtn').classList.remove('coach-pulse-pwr'); $('gearBtn').classList.remove('coach-pulse-set');
   if(coachInstallId) lsSet('coachSeen:'+coachInstallId,'1'); }
 function showCoach(){
@@ -3376,6 +3377,13 @@ function showCoach(){
   document.body.appendChild(c);
   repositionCoach();
   window.addEventListener('resize', repositionCoach);
+  // The header is not a fixed-height anchor: on narrow viewports the toolbar
+  // wraps, and it grows AFTER the card mounts as the status pills fill in - a
+  // window-resize listener never hears about that, so the card was left
+  // overlapping the wrapped pill rows at ~390px. Watch the anchor itself.
+  const hdr=document.querySelector('header');
+  if(hdr && typeof ResizeObserver!=='undefined'){
+    coachRO=new ResizeObserver(repositionCoach); coachRO.observe(hdr); }
   // Any first interaction dismisses it. Capture phase so a click a handler
   // swallows (the power button, a chart) still counts; dismissCoach is
   // idempotent if Settings already dismissed it.
