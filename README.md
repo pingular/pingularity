@@ -1,5 +1,7 @@
 # Pingularity
 
+**[pingularity.dev](https://pingularity.dev)** · **[live demo](https://demo.pingularity.dev)**
+
 A single-binary internet connectivity monitor with a built-in web dashboard,
 native speedtests, and a Prometheus `/metrics` endpoint. It continuously checks
 your connection by pinging several always-on internet landmarks at once and going
@@ -7,6 +9,8 @@ by majority vote (a *quorum* across multiple *anchors*), with anti-flapping
 (*debounce*) so a single blip isn't mistaken for a real outage. It records
 latency, uptime, and speed to SQLite and shows it all in a live UI - no runtime
 to install.
+
+This is the [live demo](https://demo.pingularity.dev) - same dashboard, synthetic data:
 
 ![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), a speedtest with bufferbloat, the latency-over-time chart, and a year-long downtime heatmap](docs/dashboard.png)
 
