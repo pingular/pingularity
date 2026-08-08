@@ -84,6 +84,18 @@ type Scheduler struct {
 	// have something to fail against.
 	AdaptiveFn func() bool
 
+	// ReadyFn, if set, reports whether the inputs the startup run's server
+	// selection depends on are as ready as they are going to get (in production:
+	// netinfo has published once, or nothing is coming - see main.go). Only the
+	// LATCH's consent run consults it, and only as a bounded extra wait
+	// (firstEnableReadyBound) on top of firstEnableDelay: the ten-second pad
+	// alone let the first-ever test race netinfo's first refresh and auto-select
+	// from the Ookla API's IP placement instead of the real city race. The boot
+	// startup run on an already-configured install deliberately does NOT wait -
+	// delaying every reboot's first sample is a worse trade than one
+	// possibly-uncentred selection there.
+	ReadyFn func() bool
+
 	// BusyFn, if set, reports whether the link is already moving significant data;
 	// when true a *scheduled* run is deferred (re-checked shortly) so the test
 	// neither competes with real traffic nor measures a saturated link. Reconnect,
@@ -105,6 +117,24 @@ type Scheduler struct {
 	// detected by a reconnect/degraded/manual run engages the adaptive cadence
 	// right away instead of after the already-armed base-interval sleep.
 	runWake chan struct{}
+
+	// startupGate, when armed by the latch, is the completions snapshot the
+	// startup run must still match AFTER claiming the single-flight guard. The
+	// latch's own served-check runs before its RunOnce call, and a run still in
+	// flight at that check can complete - counter bumped, guard released - in
+	// the instructions between the check and the claim. Validating after the
+	// claim closes that hole: a completing run bumps completions BEFORE
+	// releasing the guard, so holding the guard makes the comparison race-free.
+	// Nil when no latch run is pending (the boot startup run does not gate).
+	startupGate atomic.Pointer[uint64]
+
+	// completions counts persisted runs (incremented where runWake is nudged).
+	// The startup latch snapshots it at entry and treats ANY advance as the
+	// slot being served: the capacity-1 runWake drain alone leaves a window
+	// where a run still in flight at the drain completes - nudge sent, guard
+	// released - just before the latch's own RunOnce claims the free guard and
+	// starts a duplicate test. A counter comparison cannot lose that race.
+	completions atomic.Uint64
 
 	// anchor publishes Loop's deadline reference so NextRun can report the same
 	// deadline Loop is waiting on. It holds lastRun WITH its monotonic reading
@@ -375,6 +405,16 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	if afterClaimHook != nil {
 		afterClaimHook()
 	}
+	// Startup preflight (see startupGate): if a run completed since the latch
+	// decided the slot was unserved, that run IS the first measurement - bail
+	// as ErrBusy (the latch's ErrBusy branch logs the skip and anchors to now,
+	// which is within jitter of the serving run's completion).
+	if reason == "startup" {
+		if g := s.startupGate.Swap(nil); g != nil && s.completions.Load() != *g {
+			s.curID.Store(0)
+			return store.SpeedSample{}, ErrBusy
+		}
+	}
 	// OnUnhealthy (an HTTP webhook to an operator's endpoint) must fire only AFTER
 	// the single-flight flag is released: a slow or dead endpoint held inline would
 	// keep 'running' set, so a manual run fired during the alert wrongly bounced off
@@ -586,6 +626,7 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	// Nudge the schedule loop (non-blocking; a pending nudge already covers it):
 	// this run may have flipped lastUnhealthy, and the loop's current sleep was
 	// armed before it (see Loop's runWake case).
+	s.completions.Add(1) // before the nudge: latch observers compare, never race
 	if s.runWake != nil {
 		select {
 		case s.runWake <- struct{}{}:
@@ -628,6 +669,13 @@ var (
 	// is looking at a dashboard they just opened for the first time, so the page
 	// gets a beat to settle before the test saturates the link.
 	firstEnableDelay = 10 * time.Second
+	// How much LONGER than firstEnableDelay the latch will wait for ReadyFn
+	// before running anyway. A hung lookup must not hold the first test hostage:
+	// 30s from consent is still worlds better than the interval, and the common
+	// case (netinfo publishing within a few seconds of the power-on wake) never
+	// waits at all.
+	firstEnableReadyBound = 20 * time.Second
+	firstEnableReadyPoll  = 500 * time.Millisecond
 )
 
 // scheduleJitter returns a bounded random offset in [0, min(interval/10, 60s))
@@ -667,13 +715,21 @@ func scheduleJitter(interval time.Duration) time.Duration {
 // which already fires promptly when more than an interval has passed and
 // deliberately doesn't re-test when less has.
 func (s *Scheduler) Loop(ctx context.Context) {
+	// Read BEFORE the settle sleep: consent that lands during it is a
+	// disabled-to-enabled transition and must go through the latch below (pad +
+	// readiness), not masquerade as an already-configured boot and run
+	// immediately with none of either.
+	initiallyEnabled := s.enabled()
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(startupDelay):
 	}
-	startupPending := !s.enabled()
-	if !startupPending {
+	startupPending := !initiallyEnabled
+	// Both reads must agree: configured at Loop start AND still enabled now.
+	// A disable during the settle sleep skips the run (pre-existing off/on
+	// semantics take over); it does not re-arm the latch.
+	if initiallyEnabled && s.enabled() {
 		s.RunOnce(ctx, "startup")
 	}
 	lastRun := time.Now()
@@ -685,7 +741,20 @@ func (s *Scheduler) Loop(ctx context.Context) {
 	deferred := false // tracks the running→deferred edge, so the reason logs once
 
 	for {
+		// Subscribe BEFORE reading any state the sleep depends on. Changed()
+		// hands out a channel the next broadcast closes and replaces: fetching
+		// it AFTER the latch check leaves a window where consent lands between
+		// check and fetch - the fetched channel is the post-broadcast
+		// replacement, the wake is lost, and the loop sleeps out most of an
+		// interval with the latch armed. Fetch-first inverts it: a broadcast
+		// before the fetch is seen by the state reads below; one after the
+		// fetch closes the channel we sleep on.
+		var wake <-chan struct{}
+		if s.WakeFn != nil {
+			wake = s.WakeFn()
+		}
 		if startupPending && s.enabled() {
+			latchEntryCompletions := s.completions.Load()
 			// No scheduled deadline is knowable while the startup run is imminent
 			// or in flight - the published one still says boot+interval, which the
 			// run about to fire would predate by most of the interval. Withdraw it
@@ -698,15 +767,41 @@ func (s *Scheduler) Loop(ctx context.Context) {
 				return
 			case <-time.After(firstEnableDelay):
 			}
-			// A run that completed during the pause (reconnect after a flap,
-			// manual) IS the first measurement - the slot it was armed for is
-			// served, and firing the latch anyway would stack a second full test
-			// onto a link still settling from the first. The nudge only fires for
-			// persisted runs, so a failed attempt doesn't burn the slot.
+			// Bounded wait for the selection inputs (see ReadyFn). Bails early
+			// if consent is withdrawn - the re-check below keeps the slot.
+			if s.ReadyFn != nil && !s.ReadyFn() {
+				bound := time.After(firstEnableReadyBound)
+			ready:
+				for s.enabled() {
+					select {
+					case <-ctx.Done():
+						return
+					case <-bound:
+						break ready
+					case <-time.After(firstEnableReadyPoll):
+						if s.ReadyFn() {
+							break ready
+						}
+					}
+				}
+			}
+			// A run that completed since the latch armed (reconnect after a
+			// flap, manual) IS the first measurement - the slot is served, and
+			// firing the latch anyway would stack a second full test onto a
+			// link still settling from the first. Decided by the completions
+			// COUNTER, not the runWake drain alone: a run still in flight when
+			// the drain looks can complete - nudge sent, single-flight released
+			// - in the instructions between the drain and the RunOnce below,
+			// and the drain would miss it while RunOnce claims the freed guard
+			// and duplicates the test. Only persisted runs count, so a failed
+			// attempt doesn't burn the slot. The drain still empties the
+			// capacity-1 nudge so the main select doesn't spin on it.
 			select {
 			case <-s.runWake:
-				startupPending = false
 			default:
+			}
+			if s.completions.Load() != latchEntryCompletions {
+				startupPending = false
 			}
 			// Re-checked after the pause: a toggle straight back off within it
 			// means no consent run, and the slot stays available rather than
@@ -717,6 +812,8 @@ func (s *Scheduler) Loop(ctx context.Context) {
 				// case above, but the slot going unfilled must stay traceable
 				// (same reasoning as the scheduled collision below): if that run
 				// fails, this log line is what a gap in the history leads back to.
+				gate := latchEntryCompletions
+				s.startupGate.Store(&gate)
 				if _, err := s.RunOnce(ctx, "startup"); errors.Is(err, ErrBusy) {
 					stats.Inc("speed.scheduled_skipped")
 					s.log.Info("startup speedtest skipped: another run was already in progress")
@@ -730,17 +827,21 @@ func (s *Scheduler) Loop(ctx context.Context) {
 				// (and the scheduled path doesn't print a stale "resumed").
 				deferred = false
 			} else {
-				// Declined (toggled off mid-pause) or served by a run that
-				// completed during it: the boot-anchored deadline withdrawn
-				// above is still the real one - republish it, or status would
-				// omit the next run for up to a full interval.
+				// Declined (toggled off mid-pause): the boot-anchored deadline
+				// withdrawn above is still the real one - republish it, or
+				// status would omit the next run for up to a full interval.
+				// Served by a run that completed during the pause: that run IS
+				// a measurement, so anchor the schedule to it - the latch can
+				// arm long before consent (the 48h hold), and republishing a
+				// boot-stale anchor would make wait<=0 and fire a scheduled
+				// test right on the heels of the run that just served the slot.
+				if !startupPending {
+					lastRun = time.Now()
+					jitter = scheduleJitter(s.curInterval())
+				}
 				s.setAnchor(lastRun, jitter)
 			}
 			continue
-		}
-		var wake <-chan struct{}
-		if s.WakeFn != nil {
-			wake = s.WakeFn()
 		}
 		// Re-read the interval each cycle so runtime changes take effect; keep the
 		// lastRun anchor so a change shifts the deadline, never resets it.
@@ -812,8 +913,17 @@ func (s *Scheduler) Loop(ctx context.Context) {
 			// restart outside the schedule window), that measurement serves it:
 			// without this, the latch would fire a duplicate full test right after
 			// one that just finished - exactly the back-to-back double test the
-			// scheduled path's ErrBusy handling was engineered against.
-			startupPending = false
+			// scheduled path's ErrBusy handling was engineered against. And a
+			// SERVING run re-anchors the schedule, same rule as the latch's own
+			// serve: the latch can be armed with the anchor already overdue, and
+			// keeping it would fire a scheduled test right on the heels of the
+			// run that just served the slot the moment the scheduler enables.
+			if startupPending {
+				startupPending = false
+				lastRun = time.Now()
+				jitter = scheduleJitter(s.curInterval())
+				s.setAnchor(lastRun, jitter)
+			}
 			// If it left us in a breach, count the adaptive cadence from
 			// that run: the old anchor could otherwise sleep out hours of a base
 			// interval before the fast cadence engages.

@@ -195,7 +195,11 @@ The **`-v pingularity-data:/var/lib/pingularity`** volume is what makes updates
 safe: the SQLite database *and* `pingularity.key` (which encrypts saved iperf3
 passwords) live there. Skip the volume and a `docker pull` + recreate throws
 away your history and key. Pass flags as arguments after the image name, e.g.
-`ghcr.io/pingular/pingularity -speedtest-interval 30m`.
+`ghcr.io/pingular/pingularity -speedtest-interval 30m` - in compose, that means
+under `command:`, e.g. `command: ["-allow-host=your.domain"]`. Pingularity does
+not interpret `PINGULARITY_OPTS` as flags: that variable is expanded by the
+native Linux systemd units from `/etc/default/pingularity`, and the container
+images ignore it.
 
 Two image variants ship to the same repo. The default
 `ghcr.io/pingular/pingularity` is a lean distroless image and deliberately ships

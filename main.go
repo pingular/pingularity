@@ -114,6 +114,12 @@ type program struct {
 	store    *store.Store
 	cancel   context.CancelFunc
 	done     chan struct{}
+
+	// optsIgnored records that runCmd found a set-but-unexpanded PINGULARITY_OPTS
+	// (container installs; see ignoredOptsWarning). The stderr line has already
+	// been printed by then - this replays the event into the structured log and
+	// ring once they exist, so the About tab shows it too.
+	optsIgnored bool
 }
 
 func (p *program) Start(s service.Service) error {
@@ -430,6 +436,8 @@ func (p *program) run(ctx context.Context) {
 			"hint", "enable authentication instead")
 	}
 
+	p.replayIgnoredOpts()
+
 	// A reload signal (SIGHUP on Unix; `systemctl reload` works too - the unit
 	// gets ExecReload via the ReloadSignal option, see svcopts_other.go) reloads
 	// persisted settings live, picking up an out-of-band change like
@@ -495,12 +503,23 @@ func (p *program) run(ctx context.Context) {
 	// 48h expiry), so once seen released it is never re-checked: the settings
 	// read is cheap but the offer clock is a DB read, and this runs every round.
 	var qsHoldReleased atomic.Bool
+	// qsOnHoldRelease fires ONCE at the hold-release edge (CAS below). Wired
+	// after netinfo exists (assignment happens during single-threaded setup,
+	// before any loop that calls monitoringLive spawns): the 48h expiry is a
+	// pure clock event with NO settings broadcast, so without this poke
+	// netinfo would sit on its minute-long disabled poll while the consent
+	// speedtest's bounded readiness wait (sched.ReadyFn) runs out - and the
+	// first-ever run would auto-select unanchored after all. The answer-path
+	// release fires it too, where the loop's resume one-shot makes it a no-op.
+	var qsOnHoldRelease func()
 	monitoringLive := func() bool {
 		if !qsHoldReleased.Load() {
 			if settings.QuickSetupHold(set.QuickSetupDone(), set.QuickSetupOfferSince(ctx), time.Now().Unix()) {
 				return false
 			}
-			qsHoldReleased.Store(true)
+			if qsHoldReleased.CompareAndSwap(false, true) && qsOnHoldRelease != nil {
+				qsOnHoldRelease()
+			}
 		}
 		return set.Monitoring()
 	}
@@ -550,7 +569,12 @@ func (p *program) run(ctx context.Context) {
 	// this the hourly loop kept sending the public IP to third parties while the
 	// dashboard said monitoring was paused.
 	ni.EnabledFn = func() bool { return monitoringLive() && set.NetinfoEnabled() }
-	seedKnownCounters() // create fixed counters at 0 so a first event after restart is a visible 0->1 step (rate/increase can miss a series that appears at 1)
+	// Settings broadcasts wake the netinfo loop, so power-on refreshes NOW
+	// instead of at the next minute tick - the first speedtest's server
+	// selection (sched.ReadyFn below) is what rides on that promptness.
+	ni.WakeFn = set.Changed
+	qsOnHoldRelease = ni.Nudge // the broadcast-less 48h edge (see monitoringLive)
+	seedKnownCounters()        // create fixed counters at 0 so a first event after restart is a visible 0->1 step (rate/increase can miss a series that appears at 1)
 
 	// Speedtests/reconnects refresh connection info; this loop is just a backstop
 	// to keep it no staler than an hour when those don't fire.
@@ -657,6 +681,7 @@ func (p *program) run(ctx context.Context) {
 	sched.EnabledFn = func() bool {
 		return monitoringLive() && set.SpeedtestEnabled() && set.SpeedAllowed(time.Now())
 	}
+	sched.ReadyFn = newFirstRunReadyFn(set, ni)
 	sched.ThresholdsFn = set.Thresholds      // mark each run healthy/unhealthy
 	sched.BreachStreakFn = set.BreachStreak  // debounce: alert only after N consecutive breaches
 	sched.AdaptiveFn = set.SpeedtestAdaptive // shorten the interval while the last run breached
@@ -1078,6 +1103,43 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // EVERY ORIGIN HERE IS DERIVED FROM THE CONNECTION. A searched city is not one
 // of them: it is a statement of intent, wired through AutoLocFn, and it
 // bypasses the race. A pinned server (speed_server_id) overrides both.
+// newFirstRunReadyFn builds the consent run's selection-readiness predicate
+// (speedtest.Scheduler.ReadyFn): with a server pinned or a city searched the
+// race doesn't need netinfo; a working iperf3 engine measures its own
+// configured server (though iperf3-but-unavailable falls back to Ookla, so
+// THAT case still waits); with connection info off nothing is ever coming;
+// otherwise ready = netinfo has published at least once (even a failed fetch
+// stamps UpdatedAt, so a dead lookup can't hold the first test past the
+// scheduler's bounded wait).
+//
+// Known, accepted residual: the first publish carries the FAST fields; the
+// exit-router hop is patched in only after its traceroute finishes, so the
+// consent run can race {isp, geo} while later runs race {exit, isp, geo}.
+// Waiting for the exit would hold the first test up to the trace's own 12s
+// budget on every fresh install - a worse trade than a first selection
+// centred on the ISP city (and the ISP-name lane usually seats the on-net
+// server regardless, which is the exit-city winner in practice).
+//
+// A named constructor so the root tests can pin the composition against the
+// real settings controller and netinfo manager - the wiring is the feature.
+func newFirstRunReadyFn(set *settings.Controller, ni *netinfo.Manager) func() bool {
+	return func() bool {
+		if set.SpeedServerID() != "" {
+			return true
+		}
+		if _, _, ok := set.AutoLocation(); ok {
+			return true
+		}
+		if set.SpeedEngine() == "iperf3" && speedtest.IperfAvailable() {
+			return true
+		}
+		if !set.NetinfoEnabled() {
+			return true
+		}
+		return ni.Get().UpdatedAt != 0
+	}
+}
+
 func autoOrigins(i netinfo.Info) []speedtest.Origin {
 	var out []speedtest.Origin
 	// The exit-node city: the last hop still inside the ISP, and the truest
@@ -1339,10 +1401,64 @@ func buildLogger(stdout io.Writer, lvl slog.Leveler, ring *logbuf.Ring) *slog.Lo
 	return slog.New(logfilter.NewCapture(stdout, &slog.HandlerOptions{Level: lvl}, sink))
 }
 
+// ignoredOptsMsg is worded for `docker logs`: it names the variable (never its
+// value - /etc/default/pingularity commonly carries secrets) and says where
+// flags actually go in a container. "Expanded", not "read": the binary itself
+// never parses the variable anywhere - on native installs it is systemd that
+// expands it into argv before exec.
+const ignoredOptsMsg = "PINGULARITY_OPTS is set, but Pingularity's official container images do not expand it - " +
+	"only Pingularity's Linux systemd units do (/etc/default/pingularity). " +
+	"Pass flags as image arguments instead (compose `command:` / `docker run <image> <flags>`)."
+
+// ignoredOptsWarning reports whether a set PINGULARITY_OPTS should draw the
+// stale-configuration warning. The contract this speaks for is the OFFICIAL
+// images: both use an exec-form ENTRYPOINT, nothing in them expands the
+// variable, and this binary never parses it, so a non-blank value there is dead
+// configuration - including when the operator ALSO passed equivalent flags via
+// the image arguments (the variable itself is still stale). On a native install
+// the systemd unit expands the same variable into this process's argv, so the
+// set-and-working case stays silent via inContainer=false.
+//
+// InContainer is a heuristic, and the warning's claims are scoped accordingly:
+// a custom wrapper image that expands the variable itself, or a systemd-managed
+// container, would still warn (the message names the official images); a
+// container runtime the marker files miss, or a manual native launch where the
+// variable is equally ignored, stays silent. Membership of the variable's
+// tokens in os.Args is deliberately NOT the rule - `-db` is in every
+// container's argv from the ENTRYPOINT, so a value like "-db /custom/path"
+// (the most dangerous ignored flag) would never warn under token matching.
+func ignoredOptsWarning(opts string, inContainer bool) bool {
+	return strings.TrimSpace(opts) != "" && inContainer
+}
+
+// replayIgnoredOpts re-emits runCmd's ignored-PINGULARITY_OPTS finding into the
+// structured log and ring once they exist (stderr already carried it before
+// logging was up), so the About tab shows it too. Coverage split: automatic
+// unit coverage (TestReplayIgnoredOpts) pins this helper's armed/unarmed
+// behavior; the manually dispatched deep-test pins the production invocation
+// in program.run and delivery through the real logger into the About ring via
+// its /api/logs assertion. Static strings only - the variable's VALUE must
+// never appear (see ignoredOptsMsg).
+func (p *program) replayIgnoredOpts() {
+	if !p.optsIgnored {
+		return
+	}
+	p.log.Warn("PINGULARITY_OPTS is set, but the official container images do not expand it",
+		"hint", "pass flags as image arguments (compose `command:` / `docker run <image> <flags>`)")
+}
+
 func runCmd(args []string) error {
 	cfg, err := config.ParseFlags(args)
 	if err != nil {
 		return err
+	}
+	// Before anything that can exit early (a bad -db aborts startup well before
+	// program.run): a container operator who set PINGULARITY_OPTS expecting it to
+	// become flags gets told immediately, in `docker logs`, rather than debugging
+	// a 403 from a flag that never existed. See ignoredOptsWarning for the rule.
+	optsIgnored := ignoredOptsWarning(os.Getenv("PINGULARITY_OPTS"), util.InContainer())
+	if optsIgnored {
+		fmt.Fprintln(os.Stderr, "pingularity: WARNING: "+ignoredOptsMsg)
 	}
 	// Runtime-adjustable verbosity (changed live from the dashboard) plus a small
 	// in-memory ring that captures the same lines stdout/journald gets, so the
@@ -1361,7 +1477,7 @@ func runCmd(args []string) error {
 	// when off, the level filters everything out, so the ring stays empty on its own.
 	// The ring keeps each line raw and PII-masked; the dashboard chooses which to show.
 	log := buildLogger(os.Stdout, lvl, ring)
-	prg := &program{cfg: cfg, log: log, logLevel: lvl, ring: ring}
+	prg := &program{cfg: cfg, log: log, logLevel: lvl, ring: ring, optsIgnored: optsIgnored}
 	s, err := service.New(prg, svcConfig(nil))
 	if err != nil {
 		return err

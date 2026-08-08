@@ -4,7 +4,7 @@ name: Deep test
 # covers: the OS service lifecycle (install -> auto-start -> probes -> stop /
 # restart -> uninstall), data-dir permissions, netinfo/traceroute paths, and the
 # Docker image + the canonical compose flow. Dispatch after platform-sensitive
-# changes; artifacts carry full logs for every leg.
+# changes; artifacts carry assertion output and diagnostic log tails per leg.
 on: workflow_dispatch
 
 permissions:
@@ -294,9 +294,14 @@ jobs:
           note() { echo "ASSERT FAIL: $*"; echo 1 >> "$FAILS"; }
           {
             # This block mirrors the canonical hosted compose (served by the dl
-            # Worker at dl.pingularity.dev/compose.yaml; template lives in the
+            # Worker at install.pingularity.dev/compose.yaml; template lives in the
             # pingularity.dev repo, dl/worker.js). Keep shapes in sync.
-            mkdir -p compose-test && cd compose-test
+            mkdir -p compose-test
+            cd compose-test
+            # Leave nothing running if any assertion path dies mid-flow (local
+            # reruns would otherwise find port 9000 taken); explicit downs still
+            # run between phases.
+            trap 'docker compose down --remove-orphans >/dev/null 2>&1 || true' EXIT
             cat > compose.yaml <<'EOF'
           services:
             pingularity:
@@ -329,6 +334,56 @@ jobs:
             echo "compose bridge-mode metrics -> $bm"
             [ "$bm" = "200" ] || note "compose bridge-mode /metrics returned $bm, want 200"
             docker compose down
+            echo "--- reverse-proxy shape: command: flags reach the Host guard (issue #16) ---"
+            # PINGULARITY_OPTS is the native unit's convention; a container must get
+            # flags via command:. Assert the chain on the DEFAULT image - compose
+            # command: syntax, its exec-form entrypoint, the flag parser, and the
+            # DNS-rebinding guard - by admitting one public Host and rejecting
+            # another. The iperf variant gets the same pair in its own step below.
+            sed -i 's/^    ports: \["9000:9000"\]$/    ports: ["9000:9000"]\n    command: ["-allow-host=ping.example.com"]/' compose.yaml
+            docker compose up -d
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            ah=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9000/ || echo FAIL)
+            oh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: other.example.com' http://127.0.0.1:9000/ || echo FAIL)
+            echo "allow-host admitted -> $ah, other public Host -> $oh"
+            [ "$ah" = "200" ] || note "command:-supplied -allow-host did not admit its Host (got $ah, want 200)"
+            [ "$oh" = "403" ] || note "unlisted public Host was not rejected (got $oh, want 403)"
+            args=$(docker inspect pingularity --format '{{json .Args}}')
+            echo "argv: $args"
+            case "$args" in *"-allow-host=ping.example.com"*) ;; *) note "compose command: flag missing from container argv";; esac
+            # The variable itself must stay inert and WARNED about in a container.
+            docker compose down
+            # The sentinel is a value shape /etc/default/pingularity really carries
+            # (-metrics-token) and must never surface in any log; the allow-host
+            # part is what the inertness 403 is asserted against. Do NOT sentinel
+            # on the domain - the Host guard legitimately logs rejected Hosts.
+            sed -i 's/^    command: \["-allow-host=ping.example.com"\]$/    environment:\n      - PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL/' compose.yaml
+            docker compose up -d
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
+            eh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9000/ || echo FAIL)
+            echo "env-var variant Host -> $eh (must stay 403: nothing expands PINGULARITY_OPTS in a container)"
+            [ "$eh" = "403" ] || note "PINGULARITY_OPTS env var unexpectedly took effect (got $eh, want 403)"
+            # Capture logs first: a bare `docker logs | grep -q` under pipefail can
+            # turn a successful early match into SIGPIPE pipeline failure.
+            clogs=$(docker logs pingularity 2>&1)
+            grep -Fq 'WARNING: PINGULARITY_OPTS' <<<"$clogs" || note "ignored-PINGULARITY_OPTS stderr warning missing from container logs"
+            # The stderr grep above cannot see the structured replay (different
+            # text, different sink) - assert the About-ring copy via /api/logs,
+            # or the whole replay could be deleted with everything still green.
+            # Fail CLOSED: a partial body could carry the replay phrase yet
+            # truncate before leaked data, so a failed fetch is its own failure.
+            if api_logs=$(curl -fsS --max-time 5 http://127.0.0.1:9000/api/logs); then
+              grep -Fq 'official container images do not expand it' <<<"$api_logs" \
+                || note "structured ignored-PINGULARITY_OPTS warning missing from /api/logs (About ring)"
+              grep -Fq 'DEEP_SECRET_SENTINEL' <<<"$api_logs" && note "the PINGULARITY_OPTS value leaked into /api/logs"
+            else
+              note "fetching /api/logs failed"
+            fi
+            grep -Fq 'DEEP_SECRET_SENTINEL' <<<"$clogs" && note "the PINGULARITY_OPTS value leaked into container logs"
+            # Keep diagnostics in docker.log without ever printing a leaked value.
+            echo "--- env-leg container logs (sentinel-filtered tail) ---"
+            { grep -Fv 'DEEP_SECRET_SENTINEL' <<<"$clogs" || true; } | tail -15
+            docker compose down
           } 2>&1 | tee -a docker.log
           n=$(wc -l < "$FAILS" | tr -d ' ')
           [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the compose flow - see docker.log"; exit 1; }
@@ -344,6 +399,7 @@ jobs:
             # no distroless `nonroot` for, the /data COPY that gives the volume its
             # mode - would first surface in a user's release. The amd64 binary is
             # already staged at linux/amd64/pingularity by the build step above.
+            trap 'docker rm -fv ping-iperf ping-iperf-cmd ping-iperf-env >/dev/null 2>&1 || true' EXIT
             docker build -f Dockerfile.iperf -t ping-iperf .
             uid=$(docker run --rm --entrypoint id ping-iperf -u)
             perm=$(docker run --rm --entrypoint stat ping-iperf -c '%a' /var/lib/pingularity)
@@ -357,10 +413,40 @@ jobs:
             im=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9112/metrics || echo FAIL)
             echo "iperf image metrics -> $im"
             [ "$im" = "200" ] || note "iperf image /metrics returned $im, want 200"
-            docker logs ping-iperf 2>&1 | grep -q "group/world-accessible" \
+            ilogs=$(docker logs ping-iperf 2>&1)
+            grep -Fq "group/world-accessible" <<<"$ilogs" \
               && note "the iperf image warned about its own data directory on startup"
-            echo "--- iperf container logs ---"; docker logs ping-iperf 2>&1 | tail -15
-            docker rm -f ping-iperf
+            echo "--- iperf container logs ---"; tail -15 <<<"$ilogs"
+            docker rm -fv ping-iperf
+            echo "--- issue #16 parity: same Host-guard pair on the variant the report used ---"
+            docker run -d --name ping-iperf-cmd -p 9113:9000 ping-iperf -allow-host=ping.example.com
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9113/metrics >/dev/null 2>&1 && break; sleep 2; done
+            iah=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9113/ || echo FAIL)
+            ioh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: other.example.com' http://127.0.0.1:9113/ || echo FAIL)
+            iargs=$(docker inspect ping-iperf-cmd --format '{{json .Args}}')
+            echo "iperf command-arg: allowed -> $iah, other -> $ioh, argv: $iargs"
+            [ "$iah" = "200" ] || note "iperf image: command-arg -allow-host did not admit its Host (got $iah, want 200)"
+            [ "$ioh" = "403" ] || note "iperf image: unlisted public Host not rejected (got $ioh, want 403)"
+            case "$iargs" in *"-allow-host=ping.example.com"*) ;; *) note "iperf image: run-arg flag missing from container argv";; esac
+            docker rm -fv ping-iperf-cmd
+            docker run -d --name ping-iperf-env -p 9113:9000 -e "PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL" ping-iperf
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9113/metrics >/dev/null 2>&1 && break; sleep 2; done
+            ieh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9113/ || echo FAIL)
+            echo "iperf env-var: Host -> $ieh (must stay 403)"
+            [ "$ieh" = "403" ] || note "iperf image: PINGULARITY_OPTS env var unexpectedly took effect (got $ieh, want 403)"
+            elogs=$(docker logs ping-iperf-env 2>&1)
+            grep -Fq 'WARNING: PINGULARITY_OPTS' <<<"$elogs" || note "iperf image: ignored-PINGULARITY_OPTS stderr warning missing from container logs"
+            if iapi_logs=$(curl -fsS --max-time 5 http://127.0.0.1:9113/api/logs); then
+              grep -Fq 'official container images do not expand it' <<<"$iapi_logs" \
+                || note "iperf image: structured warning missing from /api/logs (About ring)"
+              grep -Fq 'DEEP_SECRET_SENTINEL' <<<"$iapi_logs" && note "iperf image: the PINGULARITY_OPTS value leaked into /api/logs"
+            else
+              note "iperf image: fetching /api/logs failed"
+            fi
+            grep -Fq 'DEEP_SECRET_SENTINEL' <<<"$elogs" && note "iperf image: the PINGULARITY_OPTS value leaked into container logs"
+            echo "--- iperf env-leg container logs (sentinel-filtered tail) ---"
+            { grep -Fv 'DEEP_SECRET_SENTINEL' <<<"$elogs" || true; } | tail -15
+            docker rm -fv ping-iperf-env
           } 2>&1 | tee -a docker.log
           n=$(wc -l < "$FAILS" | tr -d ' ')
           [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the iperf3 image - see docker.log"; exit 1; }
