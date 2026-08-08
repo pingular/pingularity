@@ -79,6 +79,18 @@ type Manager struct {
 	// on your own" is not "refuse when I ask".
 	EnabledFn func() bool
 
+	// WakeFn, if set, supplies the settings-change wake channel (see the
+	// comment on enabled/WakeFn above the Loop).
+	WakeFn func() <-chan struct{}
+
+	// nudge (capacity 1) lets Nudge poke Loop into the same re-evaluation a
+	// wake triggers, for enable edges that produce NO settings broadcast -
+	// the Quick Setup hold expiring 48h after boot is a pure clock event.
+	// Routed through Loop rather than calling Refresh directly so the resume
+	// one-shot dedupes it: on an install that already refreshed it is a no-op,
+	// never a second set of third-party lookups.
+	nudge chan struct{}
+
 	mu   sync.RWMutex
 	info Info
 
@@ -152,7 +164,8 @@ func NewManager(log *slog.Logger) *Manager {
 			Timeout:       10 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		log: log,
+		nudge: make(chan struct{}, 1),
+		log:   log,
 	}
 }
 
@@ -352,6 +365,26 @@ var refreshRetryDelay = 2 * time.Second
 // as it always did.
 func (m *Manager) enabled() bool { return m.EnabledFn == nil || m.EnabledFn() }
 
+// Nudge pokes Loop into the same immediate re-evaluation a settings wake
+// causes. Safe from any goroutine; a pending nudge already covers it.
+func (m *Manager) Nudge() {
+	select {
+	case m.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// WakeFn, if set, returns a channel closed when settings change, so Loop
+// re-evaluates enabled() the moment it flips instead of at the next
+// minute tick. What it buys is the resume one-shot firing IMMEDIATELY at
+// power-on: a fresh install's first speedtest auto-selects its server from the
+// cities netinfo names, and before this wake the ten-second consent run raced
+// a refresh that had up to a minute of poll latency before it even started -
+// so the first selection fell back to the Ookla API's placement of the source
+// address (speed.cityrace_unanchored) while every later run raced real
+// origins. Wakes are cheap: no network call happens unless the resume edge or
+// staleness says so.
+
 // Loop refreshes immediately, then acts as a staleness backstop: it refreshes
 // only when the cached info exceeds maxStale. Speedtests, reconnects, and manual
 // refreshes are the primary drivers (connection info rarely changes except
@@ -359,50 +392,69 @@ func (m *Manager) enabled() bool { return m.EnabledFn == nil || m.EnabledFn() }
 // maxStale when none of those fire - e.g. speedtests disabled or set longer than
 // maxStale.
 func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
-	if m.enabled() {
-		m.Refresh(ctx)
-	}
-	// Poll while disabled so a resume is picked up promptly. The tick is cheap -
-	// it makes no network call - and refreshing the moment lookups are allowed
-	// again is what keeps the Connection panel from showing stale data after an
-	// unpause. resumed guards that one-shot so an already-running Manager is not
-	// refreshed twice.
-	resumed := m.enabled()
+	// Evaluate-then-sleep, subscribing FIRST each round. Changed() hands out a
+	// channel the next broadcast closes and replaces, so the channel must be
+	// fetched BEFORE any state read the sleep depends on: fetched after, a
+	// broadcast landing between read and fetch is lost - the loop would sleep
+	// its full minute with an enable pending, which is exactly the latency the
+	// wake exists to remove (the consent speedtest's bounded readiness wait is
+	// shorter than that minute). Evaluating at the top also covers the
+	// pre-loop window the old boot-time refresh had: iteration one IS the boot
+	// refresh (resumed starts false).
+	//
+	// resumed guards the resume one-shot: refreshing the moment lookups are
+	// allowed again is what keeps the Connection panel from showing stale data
+	// after an unpause, and the one-shot keeps an already-running Manager from
+	// being refreshed twice.
+	resumed := false
 	for {
-		// Sleep until the data would reach maxStale. If something else refreshed
-		// it meanwhile, UpdatedAt advanced and the check below is a no-op, so the
-		// next sleep recomputes from the newer time. A failed fetch still stamps
-		// UpdatedAt (it carried last-known data forward), so after an error
-		// staleness is capped at errRetryStale - otherwise a transient 429 at the
-		// tick would suppress any retry for a full maxStale.
+		var wake <-chan struct{}
+		if m.WakeFn != nil {
+			wake = m.WakeFn()
+		}
+		// Staleness cap: a failed fetch still stamps UpdatedAt (it carried
+		// last-known data forward), so after an error staleness is capped at
+		// errRetryStale - otherwise a transient 429 would suppress any retry
+		// for a full maxStale.
 		stale := maxStale
 		if m.Get().Error != "" && stale > errRetryStale {
 			stale = errRetryStale
 		}
+		switch {
+		case !m.enabled():
+			// Off: make no network call, and arm the one-shot so the next
+			// enabled evaluation refreshes immediately however fresh the cache
+			// looks.
+			resumed = false
+		case !resumed:
+			resumed = true
+			m.Refresh(ctx)
+		case m.age() >= stale:
+			m.Refresh(ctx)
+		}
+		// Sleep until the data would reach the cap. If something else
+		// refreshed it meanwhile, UpdatedAt advanced and the next evaluation
+		// is a no-op, so the next sleep recomputes from the newer time.
 		wait := stale - m.age()
 		if wait < time.Minute {
 			wait = time.Minute
 		}
-		// While lookups are off, wake every minute to notice a resume rather than
-		// sleeping out a full maxStale first.
+		// While lookups are off the timer is only a backstop (the wake and
+		// nudge are the real resume signals) - but keep it at a minute so a
+		// missed edge still recovers quickly.
 		if !m.enabled() {
 			wait = time.Minute
 		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-wake:
+			// Settings changed - re-evaluate. An unrelated save is a no-op
+			// (enabled and fresh); the resume one-shot is what makes power-on
+			// refresh NOW.
+		case <-m.nudge:
+			// A broadcast-less enable edge (see Nudge) - same re-evaluation.
 		case <-time.After(wait):
-			switch {
-			case !m.enabled():
-				// Off: make no network call, and arm the one-shot so the next
-				// enabled tick refreshes immediately however fresh the cache looks.
-				resumed = false
-			case !resumed:
-				resumed = true
-				m.Refresh(ctx)
-			case m.age() >= stale:
-				m.Refresh(ctx)
-			}
 		}
 	}
 }

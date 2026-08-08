@@ -71,7 +71,8 @@ The rows in detail:
   read-only for a root daemon writing under `/var`), `ProtectHome=yes`,
   `PrivateTmp=yes`, `ProtectKernelTunables=yes`, `RestrictSUIDSGID=yes` and
   `LockPersonality=yes` (svcopts_other.go). It matches the packaged unit in every other respect
-  (`$PINGULARITY_OPTS` from `/etc/default/pingularity`, a 5s restart, a bounded
+  (`$PINGULARITY_OPTS` from `/etc/default/pingularity` - a native-systemd
+  mechanism; the container images ignore that variable - a 5s restart, a bounded
   restart loop, `ExecReload` for the SIGHUP settings reload) but not the
   de-rooting — aligning it with the packaged unit is planned but not yet
   shipped, so today treat a self-install as root, though not unprotected. If you want
@@ -175,7 +176,9 @@ TLS is terminated upstream. Instead:
 
 So the practical rule is: **if you front it with a TLS proxy, set
 `-allow-host` to the public domain and have the proxy preserve the `Host`
-header.** That one flag is what turns on the `Secure` cookie, and it is also
+header.** (In a container that flag goes after the image name - compose:
+under `command:`; `PINGULARITY_OPTS` is expanded only by the native systemd
+units and the images ignore it.) That one flag is what turns on the `Secure` cookie, and it is also
 what tells the rebinding guard below to admit your public domain. Add
 `-trusted-proxy` with the proxy's address so the login rate limiter keys on the
 real client rather than on the proxy.

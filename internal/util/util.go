@@ -52,9 +52,11 @@ func InContainer() bool {
 // Sharing the namespace (--network=host) keeps the stub reachable, so a
 // host-networked container reads the host's real resolver and is not warned.
 //
-// It matters because `network_mode: host` is Linux-only, so every Docker Desktop
-// user on macOS or Windows is pushed into exactly this mode by the compose file,
-// and nothing on screen would otherwise say the numbers changed meaning.
+// It matters because most Docker Desktop users on macOS or Windows run in
+// exactly this mode: `network_mode: host` there needs Docker Desktop 4.34+
+// with the option enabled in Settings (TCP/UDP only), so the compose file's
+// published-port fallback lands them on the bridge - and nothing on screen
+// would otherwise say the numbers changed meaning.
 //
 // The test is deliberately narrow, because a FALSE warning on a correctly
 // configured host install is worse than a missed one: a bridged container has
