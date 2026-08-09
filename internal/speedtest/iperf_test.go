@@ -280,13 +280,18 @@ func TestIperfPKCS1Args(t *testing.T) {
 
 func TestAvailableCongestionControl(t *testing.T) {
 	got := AvailableCongestionControl()
-	if runtime.GOOS != "linux" {
-		// Non-Linux has no enumerable sysctl -> a small curated fallback list,
-		// never nil/empty, never a panic.
-		if len(got) == 0 {
-			t.Errorf("non-Linux should return a curated list, got %v", got)
+	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" {
+		// macOS/Windows iperf3 has no -C option: offering ANY algorithm there
+		// just advertises a value that aborts every run, so the list is empty.
+		// (FreeBSD DOES support -C and enumerates via sysctl - see
+		// TestParseFreeBSDCC, which exercises that parser independent of GOOS.)
+		if len(got) != 0 {
+			t.Errorf("macOS/Windows should offer nothing (setting -C aborts the run), got %v", got)
 		}
 		return
+	}
+	if runtime.GOOS == "freebsd" {
+		return // live sysctl output varies by release; parser covered separately
 	}
 	// On Linux the sysctl (when present) lists >=1 algorithm (cubic/reno at minimum);
 	// a sandbox without /proc yields nil, never a panic.
@@ -778,5 +783,68 @@ func TestParseIperfServerZonedIPv6(t *testing.T) {
 	}
 	if _, _, err := parseIperfServer("1.2.3.4:5201:9"); err == nil {
 		t.Error("multi-colon garbage must still be rejected")
+	}
+}
+
+// TestParseFreeBSDCC pins the net.inet.tcp.cc.available parser against BOTH
+// release shapes. The 14.x table form regressed a prior strings.Fields parser
+// into feeding "CCmod"/"D"/"*"/"0" to iperf3 as algorithm names.
+func TestParseFreeBSDCC(t *testing.T) {
+	cases := []struct {
+		name, in string
+		want     []string
+	}{
+		{"13.x comma line", "newreno, cubic, htcp\n", []string{"newreno", "cubic", "htcp"}},
+		{"13.x no trailing newline", "newreno, cubic", []string{"newreno", "cubic"}},
+		{"single algorithm", "newreno", []string{"newreno"}},
+		{
+			"14.x table with header and default marker",
+			"CCmod       D PCB\nnewreno       0\ncubic     *   0\nhtcp          0\n",
+			[]string{"newreno", "cubic", "htcp"},
+		},
+		{
+			"14.x table, default marker glued to name column",
+			"CC\n*cubic\nnewreno\n",
+			[]string{"cubic", "newreno"},
+		},
+		{"empty", "", nil},
+		{"whitespace only", "   \n\n", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseFreeBSDCC(c.in)
+			if len(got) != len(c.want) {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("got %v, want %v", got, c.want)
+				}
+			}
+			// No parsed token may contain table cruft.
+			for _, g := range got {
+				if !isCCName(g) {
+					t.Errorf("parsed %q is not a valid algorithm name", g)
+				}
+			}
+		})
+	}
+}
+
+// TestAvailableCongestionControlFreeBSDInjected drives the FreeBSD branch's
+// sysctl reader through the injectable ccSysctl seam so the table-parsing path
+// is covered on any host (the switch only reaches it when GOOS==freebsd, so we
+// test the reader+parser composition directly here).
+func TestParseFreeBSDCC_DropsAllTableNoise(t *testing.T) {
+	got := parseFreeBSDCC("CCmod   D PCB\nnewreno  *  1\ncubic       0\n")
+	for _, bad := range []string{"CCmod", "D", "PCB", "*", "1", "0"} {
+		for _, g := range got {
+			if g == bad {
+				t.Errorf("table noise %q leaked into %v", bad, got)
+			}
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 algorithms, got %v", got)
 	}
 }

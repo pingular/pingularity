@@ -432,6 +432,15 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 		case m.age() >= stale:
 			m.Refresh(ctx)
 		}
+		// Recompute the cap AFTER the refresh above: a boot/refresh can flip the
+		// snapshot healthy->error, and arming the timer with the pre-refresh cap
+		// would wait the full maxStale instead of the errRetryStale the error
+		// path wants (and would delay the IPv6-only transition, which assumes the
+		// faster retry). `stale` above sized nothing but the pre-refresh read.
+		stale = maxStale
+		if m.Get().Error != "" && stale > errRetryStale {
+			stale = errRetryStale
+		}
 		// Sleep until the data would reach the cap. If something else
 		// refreshed it meanwhile, UpdatedAt advanced and the next evaluation
 		// is a no-op, so the next sleep recomputes from the newer time.
