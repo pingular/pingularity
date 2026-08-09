@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual escape hatch for a stranded tag: the 2026-08-06 Actions outage
+  # throttled webhooks and the TAG event never replayed (push events did, tag
+  # events do not), leaving a pushed tag with no release run - the remedy was
+  # deleting and re-pushing the tag. With this, dispatch the workflow AT the
+  # tag ref instead (Actions UI -> Release -> Run workflow -> pick the tag).
+  workflow_dispatch:
 
 # Only one release run per tag at a time. Re-cutting a tag (delete + re-push, as the
 # rc loop does) cancels the in-flight run instead of racing it, which otherwise
@@ -19,6 +25,19 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
+      # workflow_dispatch (the stranded-tag escape hatch) can fire on a BRANCH,
+      # and a branch may be NAMED like a version - the SemVer check below reads
+      # GITHUB_REF_NAME and would pass it, while GoReleaser publishes the git tag
+      # at HEAD instead. On a v-named branch whose HEAD sits on an existing
+      # release tag that would OVERWRITE a shipped release. Refuse anything that
+      # is not a tag ref outright, before any checkout or token use.
+      - name: Require a tag ref
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::release runs only on a tag ref (got ${GITHUB_REF_TYPE} '${GITHUB_REF_NAME}'); dispatch the workflow with a tag ref, not a branch"
+            exit 1
+          fi
+
       # The trigger glob 'v*' also matches junk like 'v', 'vtest', or 'v1.2' - a
       # stray or malformed tag must not cut a release. Enforce a proper SemVer
       # grammar (leading v) before any checkout or token use. This is a regex, not a
@@ -31,9 +50,21 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
           if ! printf '%s' "$tag" | grep -Eq "$semver"; then
-            echo "::error::tag '$tag' is not a valid SemVer tag (vMAJOR.MINOR.PATCH[-prerelease][+build]); refusing to release"
+            echo "::error::tag '$tag' is not a valid SemVer tag (vMAJOR.MINOR.PATCH[-prerelease]); refusing to release"
             exit 1
           fi
+          # SemVer permits +build metadata, but this pipeline CANNOT ship it
+          # safely: the prerelease test below is a shell `*-*` glob, and build
+          # metadata like +build-1 contains a hyphen, so a STABLE tag with build
+          # metadata would be misread as a prerelease and skip the immutable-
+          # stable overwrite guard. Docker tags reject '+' outright as well.
+          # Reject build metadata here rather than silently mishandle it.
+          case "$tag" in
+            *+*)
+              echo "::error::tag '$tag' carries +build metadata, which this release pipeline does not support (it breaks the stable/prerelease split and Docker tagging); cut vMAJOR.MINOR.PATCH[-prerelease] instead"
+              exit 1
+              ;;
+          esac
 
       # Stable releases are immutable: their checksums are attested in the publish
       # job, so silently overwriting a published stable asset would invalidate that
@@ -82,6 +113,19 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+
+      # GoReleaser publishes the tag it resolves at HEAD (git describe --exact-match),
+      # not GITHUB_REF_NAME. The guard job validated the ref name; assert they are the
+      # same tag here, so a dispatch can never publish a DIFFERENT release than the one
+      # that passed the guards.
+      - name: Assert HEAD tag matches the ref
+        run: |
+          head_tag="$(git describe --exact-match --tags HEAD)" || {
+            echo "::error::HEAD is not on an exact tag; refusing to release"; exit 1; }
+          if [ "$head_tag" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::HEAD tag '$head_tag' != ref '${GITHUB_REF_NAME}'; the release would publish a different version than was guarded"
+            exit 1
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

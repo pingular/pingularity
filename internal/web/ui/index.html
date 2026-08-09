@@ -225,6 +225,10 @@
     cursor:pointer;background:var(--bg2);}
   .qs-seg b+b{border-left:1px solid var(--line);}
   .qs-seg b.on{background:var(--accent);color:var(--on-accent);font-weight:600;}
+  /* The pills are keyboard radios (role=radio); show a clear focus ring so a Tab/
+     arrow user can see which option is active. Inset so it isn't clipped by the
+     group's overflow:hidden. */
+  .qs-seg b:focus-visible{outline:2px solid var(--accent);outline-offset:-3px;}
   .qs-note{margin-top:7px;color:var(--muted);font-size:12px;}
   .qs-pw{margin-top:10px;display:none;gap:8px;}
   .qs-pw input{flex:1;min-width:0;box-sizing:border-box;background:var(--bg);border:1px solid var(--line2);
@@ -1276,7 +1280,12 @@
     .toast{bottom:calc(54px + env(safe-area-inset-bottom));}
   }
   /* Login overlay - covers everything while auth is required and unauthed. */
-  .login-overlay{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
+  /* z-index 1000: the login overlay is the ultimate blocker and must sit ABOVE
+     every other modal, including Quick Setup (900/901). A 401 raised WHILE Quick
+     Setup is open (e.g. a session expiring mid-save) surfaces the login on top of
+     the now-inert dialog; at a lower z-index it painted behind QS and focus
+     landed on a field the user could neither see nor reach - a dead end. */
+  .login-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;
     background:rgba(0,0,0,.6);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}
   .login-overlay[hidden]{display:none;}
   /* Mobile: a fixed inset:0 overlay is sized to the LARGE (tallest) viewport, so with the
@@ -2127,7 +2136,7 @@ Applies live and persists.">i</span></span>
           <div class="log-wrap">
             <div class="log-tools">
               <button class="log-ic" id="logCopy" type="button" title="Copy logs" aria-label="Copy logs">⧉</button>
-              <a class="log-ic" id="logDownload" href="api/logs?download=1" download="pingularity-logs.txt" title="Download logs" aria-label="Download logs">⤓</a>
+              <a class="log-ic" id="logDownload" href="#" role="button" title="Download logs" aria-label="Download logs">⤓</a>
               <button class="log-ic" id="logClear" type="button" title="Clear logs" aria-label="Clear logs"></button>
             </div>
             <pre class="log-window" id="logWindow" aria-live="polite" tabindex="0">Open this tab to load recent logs…</pre>
@@ -2176,16 +2185,16 @@ Applies live and persists.">i</span></span>
   <h2 id="qsTitle">Quick Setup</h2>
   <p class="qs-sub">Change any of this at any time in Settings.</p>
   <div class="qs-row">
-    <div class="qs-rl">Speed tests</div>
-    <div class="qs-seg" id="qsSched">
-      <b class="on">Hourly</b><b>Every 6 hours</b><b>Manually</b>
+    <div class="qs-rl" id="qsSchedLbl">Speed tests</div>
+    <div class="qs-seg" id="qsSched" role="radiogroup" aria-labelledby="qsSchedLbl">
+      <b class="on" role="radio" aria-checked="true" tabindex="0">Hourly</b><b role="radio" aria-checked="false" tabindex="-1">Every 6 hours</b><b role="radio" aria-checked="false" tabindex="-1">Manually</b>
     </div>
     <div class="qs-note" id="qsUse"></div>
   </div>
   <div class="qs-row">
-    <div class="qs-rl">Who can open this dashboard</div>
-    <div class="qs-seg" id="qsAcc">
-      <b class="on">This machine only</b><b>Anyone on my network</b>
+    <div class="qs-rl" id="qsAccLbl">Who can open this dashboard</div>
+    <div class="qs-seg" id="qsAcc" role="radiogroup" aria-labelledby="qsAccLbl">
+      <b class="on" role="radio" aria-checked="true" tabindex="0">This machine only</b><b role="radio" aria-checked="false" tabindex="-1">Anyone on my network</b>
     </div>
     <div class="qs-note" id="qsAccNote">The safe default. Nothing is reachable from other devices.</div>
     <div class="qs-pw" id="qsPw">
@@ -2284,7 +2293,7 @@ The window button takes a duration (7d) or a date range typed how you like it - 
             <option selected>10</option><option>25</option><option>50</option><option>100</option><option>250</option>
           </select>
         </label>
-        <a class="btn ghost" href="api/speed/runs.csv" download style="text-decoration:none">⤓ CSV</a>
+        <a class="btn ghost" id="csvDownload" href="#" role="button" style="text-decoration:none">⤓ CSV</a>
         <span style="flex:1"></span>
         <button class="btn ghost" id="runsPrev" type="button">‹ Prev</button>
         <span class="mono" id="runsPageInfo"></span>
@@ -3406,19 +3415,18 @@ function qsUseNote(sel){
   return 'On a 1\u00a0Gbit line at this pace, speed tests use roughly <b>'+(n*1.8).toFixed(1)+
     '\u00a0GB down + '+(n*1.275).toFixed(1)+'\u00a0GB up per day</b>.';
 }
-// What Start monitoring writes to /api/settings. Manually turns the schedule
-// OFF and leaves the interval untouched: the pill declines a cadence, it does
-// not invent one. Every payload carries the answered marker.
-function qsSettingsPayload(sel){
-  const p={quick_setup_done:true};
-  if(sel===2){ p.speedtest_enabled=false; }
-  else { p.speedtest_enabled=true; p.speed_seconds=(sel===0?3600:21600); }
-  return p;
+let _qsInerted=[];
+function qsClose(){
+  $('qsDlg').hidden=true; $('qsDim').hidden=true;
+  _qsInerted.forEach(el=>el.inert=false); _qsInerted=[]; // restore the page behind
+  showCoach(); // the coach was deferred behind the dialog
 }
-function qsClose(){ $('qsDlg').hidden=true; $('qsDim').hidden=true; showCoach(); } // the coach was deferred behind the dialog
 function qsMark(){ // fire-and-forget: on failure the server just offers again next visit
-  fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},keepalive:true,
-    body:JSON.stringify({quick_setup_done:true})}).catch(()=>{});
+  // Dismiss via the atomic endpoint: marks answered ONLY, freezing no settings
+  // (the old /api/settings marker post ran through the form-patch path, which
+  // persisted every default and shadowed later CLI flags).
+  fetch('api/quick-setup',{method:'POST',headers:{'Content-Type':'application/json'},keepalive:true,
+    body:JSON.stringify({dismiss:true})}).catch(()=>{});
 }
 function qsDecline(){
   if($('qsGo').disabled) return; // a save is applying; Esc must not race it with a decline
@@ -3426,54 +3434,126 @@ function qsDecline(){
   if(document.documentElement.dataset.theme!==t) applyTheme(t); // un-preview
   qsMark(); qsClose();
 }
-let qsAccessDone=false; // a retry after a partial failure must not re-post credentials the server already took
+// The whole first-run answer, applied by ONE atomic server call. The old flow
+// was a sequence of partial /api/settings + /api/access + marker POSTs that
+// froze every setting, could commit opposite choices on a mid-sequence retry,
+// and could mark setup done while half-applied. Now qsSave posts once; the
+// server validates, applies, and marks done in a single transaction.
 async function qsSave(){
   const go=$('qsGo'); go.disabled=true; $('qsErr').textContent='';
   try{
     const network=$('qsAcc').querySelectorAll('b')[1].classList.contains('on');
     const user=$('qsUser').value.trim(), pass=$('qsPass').value;
     if(network && (!!user !== !!pass)) throw new Error('Enter both a username and a password, or neither.');
-    // bcrypt reads at most 72 BYTES; the server refuses longer rather than
-    // silently truncating. Catch it before any write so a rejection cannot
-    // land after the answered-marker is already persisted.
+    // Byte caps mirror the server (bcrypt reads at most 72 bytes; the username
+    // cap is 128) - caught here for a clear message before the round trip.
     if(network && new TextEncoder().encode(pass).length>72) throw new Error('Passwords are limited to 72 bytes - pick a shorter one.');
-    let r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(qsSettingsPayload(qsSchedSel))});
-    if(!r.ok) throw new Error(await r.text()||'saving settings failed');
-    if(!$('qsUpd').checked){
-      r=await fetch('api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})});
-      if(!r.ok) throw new Error(await r.text()||'saving the update check failed');
-    }
-    if(network && !qsAccessDone){
-      r=await fetch('api/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-        local_only:false, auth_enabled:!!(user&&pass), username:user, password:pass, current_password:''})});
-      if(!r.ok) throw new Error(await r.text()||'saving access failed');
-      qsAccessDone=true; // once auth is live, current_password:'' would 403 - never send twice
-    }
+    if(network && new TextEncoder().encode(user).length>128) throw new Error('Usernames are limited to 128 bytes - pick a shorter one.');
+    // "This machine only" enables local-only; "Anyone on my network" disables it
+    // and optionally sets a login. speed_seconds is ignored server-side when
+    // speedtests are off (the Manually pill).
+    const body={
+      speedtest_enabled: qsSchedSel!==2,
+      speed_seconds: qsSchedSel===0?3600:21600,
+      update_check: $('qsUpd').checked,
+      local_only: !network,
+      auth_enabled: !!(network && user && pass),
+      username: network?user:'',
+      password: network?pass:'',
+    };
+    const r=await fetch('api/quick-setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok) throw new Error(await r.text()||'saving setup failed');
     const t=document.documentElement.dataset.theme; if(t) lsSet('theme',t); // the preview becomes the saved pick
     await loadSettings(); loadAccess();
     qsClose();
   }catch(e){ $('qsErr').textContent=String(e.message||e); go.disabled=false; }
 }
+// qsBootLocalOnly = how the install booted (access_local_only from status). When
+// it booted network-reachable (e.g. -access network in a container), the operator
+// is almost certainly connected over the network, so "This machine only" would
+// lock them out - warn, and default the choice to "Anyone on my network".
+let qsBootLocalOnly=true;
+function qsMachineOnlyNote(){
+  return qsBootLocalOnly
+    ? 'The safe default. Nothing is reachable from other devices.'
+    : 'You are reaching this over the network - choosing this will lock you out. Keep "Anyone on my network" and set a login below.';
+}
 function showQuickSetup(){
   if(qsShown) return; qsShown=true;
+  // Default the access choice to how the install actually booted: a container
+  // started with -access network shows "Anyone on my network" (and its login
+  // fields) preselected, so accepting the default can't lock the operator out of
+  // the port they just opened. This also sets the note and password visibility.
+  segChoose.qsAcc(qsBootLocalOnly ? 0 : 1, false);
   const cur=document.documentElement.dataset.theme||'retro';
   document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.classList.toggle('on', b.dataset.sw===cur));
   $('qsUse').innerHTML=qsUseNote(qsSchedSel);
   $('qsDim').hidden=false; $('qsDlg').hidden=false;
+  // Inert the rest of the page so Tab can't escape the dialog into the dashboard
+  // behind the dim (only touch what isn't already inert, and restore exactly that
+  // on close - mirrors the login overlay). qsDim/qsDlg stay interactive - and so
+  // does loginOverlay: it is a HIGHER-priority modal (z-index 1000) that manages
+  // its own inert state, and inerting it here would leave a 401-raised login
+  // visible-but-dead on top of us (it snapshots "everything not already inert",
+  // so it would never restore what we inerted).
+  _qsInerted=[...document.body.children].filter(el=>el!==$('qsDlg') && el!==$('qsDim') && el!==$('loginOverlay') && !el.inert);
+  _qsInerted.forEach(el=>el.inert=true);
   $('qsGo').focus(); // keyboard users land on the primary action, not the page behind the dim
 }
-$('qsSched').querySelectorAll('b').forEach((b,i)=>b.addEventListener('click',()=>{
-  $('qsSched').querySelectorAll('b').forEach(x=>x.classList.remove('on')); b.classList.add('on');
-  qsSchedSel=i; $('qsUse').innerHTML=qsUseNote(i);
-}));
-$('qsAcc').querySelectorAll('b').forEach((b,i)=>b.addEventListener('click',()=>{
-  $('qsAcc').querySelectorAll('b').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+// Wire a .qs-seg as a real radiogroup: mouse OR keyboard. Arrows/Home/End move
+// and select (checked follows focus, per the WAI-ARIA radio pattern), Space/Enter
+// select, with a roving tabindex (only the checked pill is tabbable) and
+// aria-checked kept in sync so a screen reader announces the choice. select(i)
+// runs the group's side effect. Replaces click-only <b> pills that keyboard and
+// AT users could neither reach nor operate.
+const segChoose={}; // groupId -> choose(i,focus), so showQuickSetup can preset a group
+function wireSeg(groupId, select){
+  const items=[...$(groupId).querySelectorAll('b')];
+  const choose=(i,focus)=>{
+    items.forEach((x,j)=>{
+      const on=j===i;
+      x.classList.toggle('on',on);
+      x.setAttribute('aria-checked',on?'true':'false');
+      x.tabIndex=on?0:-1;
+    });
+    if(focus) items[i].focus();
+    select(i);
+  };
+  segChoose[groupId]=choose;
+  items.forEach((b,i)=>{
+    b.addEventListener('click',()=>choose(i,false));
+    b.addEventListener('keydown',e=>{
+      let ni;
+      if(e.key==='ArrowRight'||e.key==='ArrowDown') ni=(i+1)%items.length;
+      else if(e.key==='ArrowLeft'||e.key==='ArrowUp') ni=(i-1+items.length)%items.length;
+      else if(e.key==='Home') ni=0;
+      else if(e.key==='End') ni=items.length-1;
+      else if(e.key===' '||e.key==='Enter'){ e.preventDefault(); choose(i,false); return; }
+      else return;
+      e.preventDefault(); choose(ni,true);
+    });
+  });
+}
+wireSeg('qsSched', i=>{ qsSchedSel=i; $('qsUse').innerHTML=qsUseNote(i); });
+wireSeg('qsAcc', i=>{
   $('qsPw').style.display=(i===1?'flex':'none');
   $('qsAccNote').textContent = i===1
     ? 'Reachable from your LAN. Authentication and static IP are recommended.'
-    : 'The safe default. Nothing is reachable from other devices.';
-}));
+    : qsMachineOnlyNote();
+});
+// Focus trap: while Quick Setup is open, Tab must cycle within the dialog, not
+// escape to the (inert) page behind it. Roving tabindex means only the checked
+// radio of each group is in the tab order, so arrows still move within a group.
+$('qsDlg').addEventListener('keydown', e=>{
+  if(e.key!=='Tab') return;
+  const dlg=$('qsDlg');
+  const f=[...dlg.querySelectorAll('button,input,[tabindex]')].filter(el=>
+    el.tabIndex>=0 && !el.disabled && el.offsetParent!==null);
+  if(!f.length) return;
+  const first=f[0], last=f[f.length-1], a=document.activeElement;
+  if(e.shiftKey && (a===first || !dlg.contains(a))){ e.preventDefault(); last.focus(); }
+  else if(!e.shiftKey && (a===last || !dlg.contains(a))){ e.preventDefault(); first.focus(); }
+});
 document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.addEventListener('click',()=>{
   document.querySelectorAll('#qsTheme .qs-sw').forEach(x=>x.classList.remove('on')); b.classList.add('on');
   applyTheme(b.dataset.sw); // live preview, charts included; saved only by Start monitoring
@@ -3486,6 +3566,7 @@ $('qsGo').addEventListener('click', qsSave);
 // outside them: closes the data popover if open, otherwise the settings drawer.
 document.addEventListener('keydown', e=>{
   if(e.key!=='Escape') return;
+  if(!loginOverlay.hidden) return; // login is a required blocker on top - Esc must not reach the dialog behind it
   if(!$('qsDlg').hidden){ qsDecline(); return; } // Quick Setup: Esc = dismiss, keep the defaults
   if(!$('dataPop').hidden){ const p=$('families').querySelector('.stat-data'); hideDataPop(); if(p) p.focus(); return; }
   if(!$('uptimePop').hidden){ const p=$('families').querySelector('.stat-up'); hideUptimePop(); if(p) p.focus(); return; }
@@ -3811,7 +3892,7 @@ async function refreshStatus() {
   // it). STRICT === true - an older daemon and the demo shim simply lack the
   // field, and absent must mean never.
   if(s.first_seen) coachInstallId=String(s.first_seen);
-  if(s.quick_setup_pending===true) showQuickSetup();
+  if(s.quick_setup_pending===true){ qsBootLocalOnly = s.access_local_only!==false; showQuickSetup(); }
   else if(s.first_seen) showCoach();
   $('ver').textContent = s.version || '';
   applyUpdateUI(s.update);
@@ -6148,12 +6229,12 @@ const FIELDS=[
   ['setIPv6','ipv6_mode','val'],
   ['setExitTarget','exit_target','text'],
   ['setIperfDur','iperf_duration','int',5],
-  ['setIperfStreams','iperf_streams','int',1],
+  ['setIperfStreams','iperf_streams','int',8],  // blank falls back to the shipping default (config.go IperfStreams), not the minimum
   ['setOoklaConnections','ookla_connections','int',0],
   ['setOoklaLoss','ookla_loss','bool'],
   ['setSpeedBestOf','speed_best_of','bool'],
   ['setIperfWindow','iperf_window','int',0],
-  ['setIperfOmit','iperf_omit','int',0],
+  ['setIperfOmit','iperf_omit','int',1],  // blank falls back to the shipping default warm-up (config.go IperfOmit), not zero
   ['setSpeedRetries','speed_retries','int',1],
   ['setIperfRetries','iperf_retries','int',1],
   ['setIperfMSS','iperf_mss','int',0],
@@ -6747,7 +6828,60 @@ $('copyLatWins').addEventListener('click', ()=>{
   renderWindows('speed', w.slice(0,MAX_WINDOWS)); updateConflictWarnings(); });
 document.querySelectorAll('.cat').forEach(b=>{ b.setAttribute('aria-pressed', b.classList.contains('on')); b.addEventListener('click', ()=> toggleBtn(b)); });
 function getCats(id){ return Array.from(document.querySelectorAll('#'+id+' .cat.on')).map(b=>b.dataset.cat); }
-$('exportBtn').addEventListener('click', ()=>{ const c=getCats('exportCats'); if(!c.length){ $('exportMsg').textContent='Select at least one category to export.'; return; } var a=document.createElement('a'); a.href='api/export?'+c.map(x=>x+'=1').join('&'); a.download=''; document.body.appendChild(a); a.click(); a.remove(); });
+// Download an auth-gated file through the marked fetch path: a native <a href>
+// GET carries the cookie but NOT X-Pingularity-UI, so on an expired session it
+// draws the browser's Basic prompt instead of the SPA login. fetch()->blob()
+// goes through window.fetch (marked), whose 401 handler shows the login overlay.
+// Buffer at most this before giving up. downloadVia routes through the marked
+// fetch (so an expired session shows OUR login, not the Basic prompt), which
+// means holding the body in memory - fine for logs/CSV (ring / retention bounded)
+// and normal exports, but a giant backup would exhaust the browser. Past this
+// cap we abort and tell the operator to use the streaming route (the DB file /
+// CLI) rather than letting the tab hang. A real in-browser streaming download
+// needs a session-bound token; this is the honest cheap guard until then.
+const downloadCapBytes = 100*1024*1024; // 100 MiB
+async function downloadVia(url, fallbackName){
+  // Returns 'ok' | 'toobig' | 'fail'. Streams into a bounded buffer instead of
+  // r.blob() so an oversized response is caught BEFORE it eats all of memory.
+  try{
+    const r=await fetch(url);
+    if(!r.ok) return 'fail'; // 401 already triggered showLogin() in the fetch wrapper
+    const cd=r.headers.get('Content-Disposition')||'';
+    const m=/filename="?([^"';]+)"?/i.exec(cd);
+    const name=(m&&m[1])||fallbackName||'download';
+    let b;
+    if(r.body && r.body.getReader){
+      const reader=r.body.getReader(), chunks=[]; let total=0;
+      for(;;){
+        const {done, value}=await reader.read();
+        if(done) break;
+        total+=value.byteLength;
+        if(total>downloadCapBytes){ await reader.cancel(); return 'toobig'; }
+        chunks.push(value);
+      }
+      b=new Blob(chunks, {type: r.headers.get('Content-Type')||'application/octet-stream'});
+    } else {
+      b=await r.blob(); // no streaming API: fall back (cap not enforceable)
+    }
+    const u=URL.createObjectURL(b), a=document.createElement('a');
+    a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(u), 60000);
+    return 'ok';
+  }catch(_){ return 'fail'; }
+}
+$('exportBtn').addEventListener('click', async ()=>{
+  const c=getCats('exportCats');
+  if(!c.length){ $('exportMsg').textContent='Select at least one category to export.'; return; }
+  $('exportMsg').textContent='';
+  const res=await downloadVia('api/export?'+c.map(x=>x+'=1').join('&'), 'pingularity-export.json');
+  if(res==='toobig'){
+    $('exportMsg').textContent='This backup is too large to download in the browser. Copy the database file directly, or fetch it with curl - see the docs.';
+  } else if(res==='fail'){
+    $('exportMsg').textContent='Export failed.';
+  }
+});
+$('logDownload').addEventListener('click', e=>{ e.preventDefault(); downloadVia('api/logs?download=1&masked='+(logMasked?1:0), 'pingularity-logs.txt'); });
+$('csvDownload').addEventListener('click', e=>{ e.preventDefault(); downloadVia('api/speed/runs.csv', 'pingularity-speed-runs.csv'); });
 // The picker button IS the state: empty shows the prompt, a chosen file turns
 // it solid-accent and shows the (ellipsized) filename - no side caption needed.
 $('importFile').addEventListener('change', ()=>{ const f=$('importFile').files[0];
@@ -7078,6 +7212,12 @@ $('testWebhook').addEventListener('click', async () => {
 const loginOverlay=$('loginOverlay');
 let _loginInerted=[];
 function showLogin(){ if(loginOverlay.hidden){ loginOverlay.hidden=false;
+  // The overlay being presented is the active blocker and MUST be interactive:
+  // clear any inert another modal left on it (Quick Setup used to inert every
+  // body child, including this hidden overlay, and never restored it - a 401 mid
+  // Quick Setup then showed a visible-but-dead login). Self-correcting regardless
+  // of who inerted it.
+  loginOverlay.inert=false;
   // Make the rest of the page inert so focus can't escape the modal; only touch
   // elements not already inert (e.g. a closed drawer manages its own) and
   // restore exactly those on hide.
@@ -7098,7 +7238,22 @@ loginOverlay.addEventListener('keydown', e=>{
 // globally so every existing call site triggers it without per-call checks.
 // _fetch is the raw original, used by the login itself to avoid re-triggering.
 const _fetch=window.fetch.bind(window);
-window.fetch=async(...a)=>{ const r=await _fetch(...a); if(r.status===401) showLogin(); return r; };
+// Mark every SPA request with an app-owned header. The server suppresses the
+// Basic-auth challenge (WWW-Authenticate) on a 401 that carries it, so the
+// browser's NATIVE credentials dialog never stacks on top of our login overlay
+// - while curl/wget/Prometheus, which never send it, still get the challenge.
+// This replaces the old Sec-Fetch-Mode signal, which Chrome omits on plain-HTTP
+// LAN origins (a dashboard at http://192.168.x.x is not "potentially
+// trustworthy"), so the double prompt returned on exactly the common install.
+window.fetch=async(...a)=>{
+  const init=a[1]?{...a[1]}:{};
+  const h=new Headers(init.headers||(a[0] instanceof Request?a[0].headers:undefined));
+  h.set('X-Pingularity-UI','1');
+  init.headers=h;
+  const r=await _fetch(a[0],init);
+  if(r.status===401) showLogin();
+  return r;
+};
 
 $('loginForm').addEventListener('submit', async e=>{
   e.preventDefault();

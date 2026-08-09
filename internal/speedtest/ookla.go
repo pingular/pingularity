@@ -1479,6 +1479,23 @@ func sponsorMatchesISP(sponsor, isp string) bool {
 //
 // Best-of-N reads ranks 2 and 3 straight off this list: the pings already
 // happened to choose rank 1, so the extra servers cost nothing to identify.
+// rankPingLatency decides what a ranking ping recorded and whether it counts as
+// answered. A SUCCESSFUL ping (nil error, at least one sample) whose mean rounds
+// to zero on a coarse clock - the sub-millisecond Windows case - is clamped to
+// the smallest positive duration, so the fastest server still ranks first and
+// its selection-report row reads answered (~0ms) rather than unanswered below
+// every slower server. A failed or unsampled ping is not answered: its Latency
+// holds a stale list-fetch echo that must never enter the ranking.
+func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Duration, bool) {
+	if err != nil || !sampled {
+		return 0, false
+	}
+	if latency <= 0 {
+		return time.Nanosecond, true
+	}
+	return latency, true
+}
+
 func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64) {
 	if len(servers) == 0 {
 		return nil, nil
@@ -1489,12 +1506,11 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 	cand := autoCandidates(sorted, isp)
 
 	// The explicit per-server ranking outcome, for the selection report. The
-	// Latency FIELD cannot carry it: the library assigns the ~10-sample mean
-	// only on success, and a failed ranking ping leaves whatever the list
-	// fetch wrote there - often a stale positive echo sample - so "Latency>0"
-	// cannot distinguish answered from unanswered. The SORT below still keys
-	// on the field exactly as it always has (stale values included): ranking
-	// order is behavior, this capture is observability.
+	// Latency FIELD alone cannot carry it: the library assigns the ~10-sample
+	// mean only on success, and a failed ranking ping leaves whatever the list
+	// fetch wrote there - often a stale positive echo sample. applyRankPing both
+	// records the honest outcome here AND fixes the field (measured on success,
+	// ZERO on failure) so the sort below can't rank a stale value first.
 	pings := make([]*float64, len(cand))
 	var wg sync.WaitGroup
 	for i, s := range cand {
@@ -1509,10 +1525,7 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 			// echo as an answered ten-sample ranking ping.
 			sampled := false
 			err := s.PingTestContext(ctx, func(time.Duration) { sampled = true }) // sets s.Latency on success
-			if err == nil && sampled && s.Latency > 0 {
-				ms := pingMSOf(s.Latency)
-				pings[i] = &ms
-			}
+			pings[i] = applyRankPing(s, err, sampled)
 		}(i, s)
 	}
 	wg.Wait()
@@ -1523,18 +1536,38 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 
 	out := append(ookla.Servers(nil), cand...)
 	// Stable so unpinged servers keep their nearest-first order among themselves.
-	sort.SliceStable(out, func(i, j int) bool {
-		li, lj := out[i].Latency, out[j].Latency
-		switch {
-		case li > 0 && lj > 0:
-			return li < lj
-		case li > 0:
-			return true // a measured server always beats an unreachable one
-		default:
-			return false
-		}
-	})
+	sort.SliceStable(out, func(i, j int) bool { return rankLess(out[i], out[j]) })
 	return out, rankPings
+}
+
+// applyRankPing records a ranking-ping outcome on the server and returns the
+// measured latency (ms) for the selection report, or nil on failure. On success
+// it writes the measured value (a clamped near-zero, never 0, so the fastest
+// server still sorts first); on FAILURE it zeros Latency, so a stale discovery
+// echo can't rank an unreachable server ahead of a reachable one measured slower.
+func applyRankPing(s *ookla.Server, err error, sampled bool) *float64 {
+	if lat, answered := rankPingLatency(err, sampled, s.Latency); answered {
+		s.Latency = lat
+		ms := pingMSOf(lat)
+		return &ms
+	}
+	s.Latency = 0
+	return nil
+}
+
+// rankLess orders ranked servers: a measured server (Latency>0) always before an
+// unreachable one (Latency==0, including a failed ranking ping), lowest latency
+// first among the measured.
+func rankLess(a, b *ookla.Server) bool {
+	la, lb := a.Latency, b.Latency
+	switch {
+	case la > 0 && lb > 0:
+		return la < lb
+	case la > 0:
+		return true
+	default:
+		return false
+	}
 }
 
 // serverLabel is the human name for a server, as stored on the run.

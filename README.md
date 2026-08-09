@@ -21,13 +21,14 @@ go build -o pingularity .   # requires Go 1.25.12+; pure Go, no cgo
 ./pingularity               # probes every 5s; UI on http://localhost:9000
 ```
 
-No flags needed. The UI binds `:9000` by default, but a fresh native install
-starts **private**: a built-in filter answers only the machine it runs on, and
-other devices get `403` until you flip **Network access** on in the settings
-drawer's Access tab (flip it on and hit Save; the tab shows the address to use). Docker
-installs skip the filter - it can't work behind container networking - so
-there the dashboard is LAN-reachable immediately. `-listen 127.0.0.1:9000`
-hard-pins it to local-only at the socket level.
+No flags needed. The UI binds `:9000` by default, but every install starts
+**private**: a built-in filter answers only the machine it runs on, and other
+devices get `403` until you flip **Network access** on in the settings drawer's
+Access tab (flip it on and hit Save; the tab shows the address to use), or start
+with `-access network`. This is true in a container too - a published port
+returns `403` until you set `-access network` (or `-e PINGULARITY_ACCESS=network`),
+so a container is never accidentally exposed. `-listen 127.0.0.1:9000` hard-pins
+it to local-only at the socket level regardless.
 
 Connectivity is probed over **both IPv4 and IPv6** (each as an independent
 quorum of three anycast anchors). IPv6 is auto-detected - skipped on IPv4-only
@@ -190,6 +191,14 @@ The image is multi-arch (amd64 + arm64). Two flags matter:
   `--cap-drop` setups don't, and there the trace can't send its packets and the
   Exit row shows as unavailable (everything else still works). Spelling it out
   keeps the command correct everywhere.
+
+> **Reaching the dashboard from other devices.** Every install starts
+> loopback-only, containers included - it is never guessed open from the network
+> setup. With `--network=host` the dashboard answers on the *host's*
+> `localhost:9000`, but other devices on your LAN get `403` until you opt in with
+> `-access network` (or `-e PINGULARITY_ACCESS=network`) - set a login at the same
+> time. A bridged container that publishes a port with `-p` needs the same flag,
+> or the published port returns `403`.
 
 The **`-v pingularity-data:/var/lib/pingularity`** volume is what makes updates
 safe: the SQLite database *and* `pingularity.key` (which encrypts saved iperf3
@@ -623,8 +632,12 @@ and persist across restarts:
   config / latency / speed / downtime, export them to a JSON file, and import one
   back - time-series data is **merged** (existing/newer local rows are kept, only
   missing rows are added) while **config is overwritten** and reloaded live.
-  Both ends stream, so even a multi-hundred-MB export of years of history
-  round-trips. The import warns you when it matters: restored rows older than
+  Both ends stream on the wire, but the *browser* download buffers the file in
+  memory, so a very large backup (years of dense history) can outgrow the tab -
+  the dashboard stops and says so rather than hanging. For one that big, copy the
+  SQLite database file at the `-db` path (that single file *is* the complete
+  backup), or stream `/api/export` straight to disk with `curl -OJ` (add
+  `-u user:pass` when a login is set). The import warns you when it matters: restored rows older than
   your current retention windows will be pruned within the hour (raise
   retention first to keep them), and a config restore that carried "login on"
   without a password leaves login off until you set one.
@@ -640,15 +653,12 @@ and persist across restarts:
 - **Access** → access controls (changes here apply on **Save**).
   **Network access** decides whether other devices can reach the dashboard /
   API / `/metrics`, or only this machine - a live loopback filter, so remote
-  clients get 403. It starts **off on native installs** (localhost-only until
-  you flip it) and **on in Docker**. In a *bridged* container the network hides
-  who a request really came from, so there the filter cannot be enforced -
-  publish the port narrowly and use the login password instead (the API reports
-  the difference as `local_only` vs `local_only_active`, and the tab says so). A
-  `--network=host` container sees real peer addresses, so local-only is enforced
-  there exactly as on a native install. The tab shows the **reachable
-  address(es)** with port plus a static-IP hint. **Require login** (off by
-  default) gates
+  clients get 403. It starts **off everywhere** (localhost-only until you flip
+  it), containers included: the loopback filter is enforced the same way in every
+  environment, and a container that must be reachable opts in explicitly with
+  `-access network` (or `-e PINGULARITY_ACCESS=network`) rather than being guessed
+  open. The tab shows the **reachable address(es)** with port plus a static-IP
+  hint. **Require login** (off by default) gates
   everything behind a password: browsers get a login form + session cookie,
   while API clients and Prometheus use HTTP Basic with the same credentials
   (passwords are capped at 72 bytes, the bcrypt limit). Failed logins are
@@ -733,6 +743,7 @@ the settings drawer afterward and persists across restarts.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket) |
+| `-access` | `local` | who may open the dashboard: `local` (loopback only) or `network` (reachable from the LAN - set a login). A container that publishes a port needs `network` (or `PINGULARITY_ACCESS=network`), or the published port returns 403. Also settable in the UI |
 | `-db` | per-OS ([details](#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
 | `-interval` | `5s` | time between probe rounds, `1s`-`1h` (a value saved in the UI takes precedence) |
 | `-timeout` | `3s` | per-target dial timeout, `1s`-`30s` (a value saved in the UI takes precedence) |
@@ -747,9 +758,18 @@ the settings drawer afterward and persists across restarts.
 | `-allow-host` | *(none)* | extra `Host` header values the DNS-rebinding guard accepts - only needed behind a reverse proxy on a public domain |
 | `-trusted-proxy` | *(none)* | proxy IPs/CIDRs whose `X-Forwarded-For` identifies the real client, so one visitor's failed logins can't rate-limit everyone behind the proxy |
 | `-metrics-token` | *(none)* | optional read-only token a scraper presents to `/metrics` (Bearer or Basic password) instead of the admin login, so Prometheus needn't hold an account that can change settings; only consulted when Require login is on |
+| `-quick-setup` | `prompt` | headless first-run: `skip` starts monitoring immediately and never shows the browser Quick Setup dialog; `prompt` leaves it for a first visit |
 
 Out-of-range numeric flags are rejected at startup (and at `pingularity
 install`) rather than silently adjusted.
+
+> **Headless installs:** a genuinely fresh install waits (monitoring paused) for
+> a first-run consent - either the browser **Quick Setup** dialog or an explicit
+> flag - so it never starts probing before someone has said to. Passing any
+> monitoring flag (`-speedtest`, `-speedtest-interval`, `-latency`, `-interval`)
+> counts as that consent; if you only tune other knobs (say `-timeout` or
+> `-ipv6`) pass `-quick-setup=skip` so the service starts monitoring at boot
+> instead of holding for the dialog.
 
 ## Metrics (optional)
 
@@ -1064,7 +1084,11 @@ constant memory.
   uptime to report, exactly as `pingularity_uptime_ratio` is then absent. A
   running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
   (`0` when idle) - that id is what `/api/speedtest/abort` takes, so a stop can
-  name the run it was decided against
+  name the run it was decided against. A fresh install awaiting first-run consent
+  reports `quick_setup_pending`, and `access_local_only` mirrors the loopback-only
+  access filter (so a client can default the Quick Setup access choice to how the
+  install booted); `bridged_container` is present only in a bridged container,
+  where measurements describe the container network rather than the host's
 - `GET /api/series?mins=…[&exclude=…]` - latency / online time series (server-side
   bucketed); `exclude` drops targets from the lowest-latency line. Also takes an
   absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`; omit `to`
@@ -1121,6 +1145,13 @@ constant memory.
   has already measured a server keeps that result; an abort before the first
   result stores nothing
 - `GET|POST /api/monitoring` - read / set `{enabled}` master start/stop (the power toggle)
+- `POST /api/quick-setup` - apply the first-run **Quick Setup** answer in ONE
+  transaction (speedtest cadence, network access, update check, and an optional
+  login) and mark it answered so the dialog never returns; `{dismiss:true}` marks
+  it answered without changing anything else. `auth_enabled` must agree with
+  whether a `password` is sent, and it refuses (`403`) once a login is already
+  configured - change access under Settings then. Fresh installs only; the offer
+  is `quick_setup_pending` in `/api/status`
 - `GET|POST /api/update` - update-check status / toggle the daily release poll
 - `GET|POST /api/logs` - the About-tab log viewer: read recent lines (or
   `?download=1` for a text file, still the complete buffer) / set log level, PII
@@ -1170,6 +1201,14 @@ constant memory.
 > webhook/heartbeat URLs - so Pingularity creates its data directory `0700`
 > and the database file `0600` (owner-only).
 > Keep it that way if you relocate the DB with `-db`.
+>
+> **Legacy Docker volumes:** the database file is always owner-only, but a named
+> volume created by an *older* image may have a group/world-readable directory
+> root (Docker's volume copy-up loosens it), and Pingularity won't silently
+> re-lock a directory it can't prove is its own - so it logs a one-line notice on
+> start instead. The data is already private; to clear the notice, tighten the
+> directory once: `docker exec <container> chmod 700 /var/lib/pingularity`. Fresh
+> volumes are recognized automatically and need nothing.
 >
 > The full picture - what the trust boundary is, what privilege each install
 > channel runs with, what the defaults protect and how to deploy it safely - is in
