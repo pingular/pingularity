@@ -1574,3 +1574,51 @@ func TestSchedulerEnabledBootSkipsStartupAfterCompletedRun(t *testing.T) {
 		t.Errorf("speed.run.startup = %d, want 0 (the manual run served the boot slot)", got)
 	}
 }
+
+// The startup-latch recheck poll (scheduler.go:878): when the scheduler boots
+// DISABLED (startupPending armed) and the window later opens by the CLOCK with
+// nothing broadcasting, only the recheck poll catches it - otherwise the armed
+// startup run sleeps through a full interval. No WakeFn here, a big interval, and
+// the window opened silently: the run must still fire promptly. Removing line 878
+// makes it wait the full interval (test times out).
+func TestSchedulerStartupLatchPollsForClockOpenedWindow(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, r, f time.Duration) { startupDelay, scheduleRecheck, firstEnableDelay = d, r, f }(startupDelay, scheduleRecheck, firstEnableDelay)
+	startupDelay = 0
+	scheduleRecheck = 20 * time.Millisecond
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 4)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Big interval so a full-interval sleep is unmistakably distinct from the poll.
+	s := NewScheduler(tester, st, 30*time.Second, log)
+
+	var enabled atomic.Bool // starts DISABLED -> boot is startupPending (latch armed)
+	s.EnabledFn = func() bool { return enabled.Load() }
+	// Deliberately NO WakeFn: the window opens by clock, nothing broadcasts, so
+	// only the startup-latch recheck poll can catch it.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	time.Sleep(60 * time.Millisecond)
+	enabled.Store(true) // window opens by CLOCK, silently
+
+	select {
+	case <-runs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup run never fired after the window opened by clock - the startup-latch recheck poll (scheduler.go:878) is dead")
+	}
+}

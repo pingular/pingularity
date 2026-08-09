@@ -360,6 +360,11 @@ func (m *Manager) RefreshNow(ctx context.Context) Info {
 // shrink it.
 var refreshRetryDelay = 2 * time.Second
 
+// afterFn is Loop's backstop sleep timer, injectable so a test can read the wait
+// Loop computes from the POST-refresh staleness cap without sleeping it out.
+// Production is the real timer.
+var afterFn = func(d time.Duration) <-chan time.Time { return time.After(d) }
+
 // enabled reports whether connection-info lookups may run. Nil means yes, so a
 // Manager built without the hook (tests, callers that always want it) behaves
 // as it always did.
@@ -463,7 +468,7 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 			// refresh NOW.
 		case <-m.nudge:
 			// A broadcast-less enable edge (see Nudge) - same re-evaluation.
-		case <-time.After(wait):
+		case <-afterFn(wait):
 		}
 	}
 }

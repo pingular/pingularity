@@ -939,6 +939,24 @@ var (
 	}
 )
 
+// ooklaPing is the ranking latency probe, a swap-a-var seam (like ooklaDownload/
+// ooklaUpload) so rankedServers' selection logic - which reachable/failed server
+// wins - is testable without a live server.
+var ooklaPing = func(ctx context.Context, srv *ookla.Server, cb func(time.Duration)) error {
+	return srv.PingTestContext(ctx, cb)
+}
+
+// uploadSpent is the data an upload attempt actually pushed across the (possibly
+// metered) link, for data-usage accounting. It is confirmed bytes (GetTotalUpload)
+// PLUS the backlog (GetUploadBacklog): bytes read into the socket but not
+// server-confirmed. speedtest-go v1.7.11 counts only confirmed bytes in
+// GetTotalUpload - correct for the RATE (ULSpeed) but it drops the bytes a FAILED
+// or aborted attempt already sent, which "data used" must still include. Download
+// has no equivalent gap (GetTotalDownload counts bytes actually received).
+func uploadSpent(srv *ookla.Server) int64 {
+	return srv.Context.GetTotalUpload() + srv.Context.GetUploadBacklog()
+}
+
 // errTransferAbandoned marks a transfer we walked away from because the context
 // died first (see runTransfer). It travels alongside the context error - both are
 // wrapped, so callers testing for context.Canceled still match - and it is what
@@ -1125,7 +1143,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	// Same ten samples the library already sends - the callback only keeps the
 	// fastest alongside the mean it returns, so this costs no extra probe.
 	var bestPing time.Duration
-	if err := srv.PingTestContext(ctx, keepFastestPing(&bestPing)); err != nil {
+	if err := ooklaPing(ctx, srv, keepFastestPing(&bestPing)); err != nil {
 		return Result{}, fmt.Errorf("ping: %w", err)
 	}
 	// Idle baseline for latency-under-load: same method/target as the loaded
@@ -1187,7 +1205,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			if !finished { // abandoned: srv belongs to the orphan now (see above)
 				return e
 			}
-			upBytes += srv.Context.GetTotalUpload() // count this attempt before the next Reset zeroes it
+			upBytes += uploadSpent(srv) // confirmed + backlog: a FAILED attempt's pushed bytes aren't in GetTotalUpload alone
 			if e == nil && ctx.Err() != nil {
 				e = ctx.Err()
 			}
@@ -1524,7 +1542,7 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 			// value - so "err == nil && Latency > 0" would record a one-shot
 			// echo as an answered ten-sample ranking ping.
 			sampled := false
-			err := s.PingTestContext(ctx, func(time.Duration) { sampled = true }) // sets s.Latency on success
+			err := ooklaPing(ctx, s, func(time.Duration) { sampled = true }) // sets s.Latency on success
 			pings[i] = applyRankPing(s, err, sampled)
 		}(i, s)
 	}

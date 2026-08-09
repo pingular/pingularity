@@ -1657,3 +1657,35 @@ func TestQuickSetupAuthFlagMustMatchPassword(t *testing.T) {
 		t.Errorf("auth_enabled:true with a matching password: got %d, want 200", w.Code)
 	}
 }
+
+// A lost-response retry of Quick Setup must stay idempotent even when the first
+// answer ENABLED a login: the endpoint is auth-exempt (it self-gates), so a
+// cookieless retry hits the "already done" no-op (200) instead of the session
+// guard's 401. Uses the network-access answer (local_only:false) - a machine-only
+// answer would correctly 403 a remote retry on the access filter, which is not
+// this bug.
+func TestQuickSetupRetryIdempotentAfterAuthEnabled(t *testing.T) {
+	s := newTestServer(t)
+	post := func(body, remote string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000" // IP literal passes the rebinding guard
+		r.RemoteAddr = remote
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r) // full guarded handler (auth middleware included)
+		return w
+	}
+	body := `{"speedtest_enabled":false,"update_check":true,"local_only":false,"auth_enabled":true,"username":"admin","password":"correct horse battery"}`
+	// First answer from the box itself (loopback): turns on network access + a login.
+	if w := post(body, "127.0.0.1:11111"); w.Code != http.StatusOK {
+		t.Fatalf("first answer: %d, want 200", w.Code)
+	}
+	if !s.settings.AuthActive() {
+		t.Fatal("precondition: the answer should have activated auth")
+	}
+	// Lost the response (and its Set-Cookie); a cookieless retry from a network
+	// peer must be the idempotent no-op, not a guard 401.
+	if w := post(body, "192.0.2.10:5000"); w.Code != http.StatusOK {
+		t.Errorf("cookieless retry after auth enabled: %d, want 200 (idempotent no-op, not a guard 401)", w.Code)
+	}
+}

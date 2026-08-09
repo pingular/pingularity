@@ -130,14 +130,17 @@ func congestionForOS(requested, goos string) (effective string, dropped bool) {
 	return requested, false
 }
 
-func AvailableCongestionControl() []string {
-	// Only Linux iperf3 has the -C socket option; on macOS and Windows passing
-	// it aborts the whole run at startup ("an option you are trying to set is
-	// not implemented yet"). Offering a curated list there advertised choices
-	// that BREAK every test, so offer nothing and let the field mean "system
-	// default". (setCongestionSkipped mirrors this at run time for a value that
-	// arrived via an imported backup from a Linux box.)
-	switch runtime.GOOS {
+func AvailableCongestionControl() []string { return availableCongestionControlFor(runtime.GOOS) }
+
+// availableCongestionControlFor is AvailableCongestionControl with the OS as a
+// parameter, so the FreeBSD sysctl-reading + table-parsing branch is testable on
+// ANY host (through the injectable ccSysctl seam) rather than only when
+// GOOS==freebsd. Only Linux iperf3 has the -C socket option; on macOS and Windows
+// passing it aborts the whole run at startup, so offer nothing there and let the
+// field mean "system default". (setCongestionSkipped mirrors this at run time for
+// a value that arrived via an imported backup from a Linux box.)
+func availableCongestionControlFor(goos string) []string {
+	switch goos {
 	case "linux":
 		b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_allowed_congestion_control")
 		if err != nil {

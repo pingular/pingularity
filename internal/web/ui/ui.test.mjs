@@ -377,6 +377,26 @@ test('a 401 during Quick Setup shows an INTERACTIVE login, not a dead one', () =
   assert.equal(wrap.inert, true, 'the dashboard behind must stay inert');
 });
 
+test('log and CSV downloads surface an oversized result instead of failing silently (#5)', () => {
+  assert.match(script, /function flashStatus\(/, 'a status-toast helper exists');
+  assert.match(script, /function flashStatus\(msg\)\{[\s\S]{0,140}undoToast/, 'flashStatus writes the role=status toast');
+  assert.match(script, /This CSV is too large to download/, 'CSV handler messages on toobig (was silent)');
+  assert.match(script, /These logs are too large to download/, 'log handler messages on toobig (was silent)');
+  // the no-stream fallback also refuses an over-cap declared size instead of buffering blindly
+  assert.match(script, /Content-Length[\s\S]{0,80}downloadCapBytes[\s\S]{0,40}return 'toobig'/, 'blob fallback caps via Content-Length');
+});
+
+test('log download never carries a navigable api/logs href - no Basic-prompt bypass (#6)', () => {
+  assert.doesNotMatch(html, /id="logDownload"[^>]*href="api\/logs/, 'initial markup has no native api/logs href');
+  assert.doesNotMatch(script, /setAttribute\('href'\s*,\s*'api\/logs/, 'no runtime code sets a native api/logs href');
+  assert.doesNotMatch(script, /updateLogDownload/, 'the href-setting helper is gone (middle-click/save-as cannot bypass the marked fetch)');
+});
+
+test('Quick Setup update checkbox is named and errors are announced (#8)', () => {
+  assert.match(html, /id="qsUpd"[^>]*aria-label="Check for updates"/, 'update checkbox has an accessible name');
+  assert.match(html, /id="qsErr"[^>]*role="alert"/, 'the async error element is a live region');
+});
+
 test('int-field fallbacks match the shipping defaults (streams=8, omit=1)', () => {
   const streams = html.match(/\['setIperfStreams','iperf_streams','int',(\d+)\]/);
   const omit = html.match(/\['setIperfOmit','iperf_omit','int',(\d+)\]/);
