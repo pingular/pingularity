@@ -408,6 +408,19 @@ func authExempt(r *http.Request) bool {
 		return true
 	case p == "/api/access" && r.Method == http.MethodGet:
 		return true
+	case p == "/api/quick-setup":
+		// The first-run endpoint self-gates rather than leaning on the session
+		// guard, which keeps a lost-response retry idempotent: a cookieless retry
+		// AFTER the answer enabled auth hits the "already done" 200 no-op instead of
+		// a guard 401. What an unauthenticated caller can reach here is bounded to
+		// two harmless outcomes - the done/no-op, and the `dismiss` marker (closes
+		// the first-run dialog, changing no access/auth/monitoring state; reachable
+		// while auth is active BY DESIGN so a dialog on an out-of-band-secured
+		// install can still be dismissed, see handleQuickSetup). A full answer that
+		// would change access/auth still 403s inside the handler once a login is
+		// active. The network/host filters (local-only, DNS-rebind) run BEFORE this
+		// exemption, so it never widens who can reach the port.
+		return true
 	case p == "/metrics":
 		return false
 	default:

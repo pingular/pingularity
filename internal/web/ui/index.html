@@ -2219,12 +2219,12 @@ Applies live and persists.">i</span></span>
     </div>
     <div>
       <div class="qs-rl">Check for updates</div>
-      <label class="qs-tog"><input type="checkbox" id="qsUpd" checked></label>
+      <label class="qs-tog"><input type="checkbox" id="qsUpd" checked aria-label="Check for updates"></label>
     </div>
   </div>
   <div class="qs-foot">
     <button class="qs-go" id="qsGo" type="button">Start monitoring</button>
-    <div class="qs-err" id="qsErr"></div>
+    <div class="qs-err" id="qsErr" role="alert"></div>
   </div>
 </div>
 <div class="data-pop" id="uptimePop" role="listbox" aria-label="Uptime by window" hidden></div>
@@ -6861,7 +6861,10 @@ async function downloadVia(url, fallbackName){
       }
       b=new Blob(chunks, {type: r.headers.get('Content-Type')||'application/octet-stream'});
     } else {
-      b=await r.blob(); // no streaming API: fall back (cap not enforceable)
+      // No streaming API (very old browser): can't cap mid-read, so refuse up
+      // front if the server declared a size over the cap; else fall back to blob.
+      if(parseInt(r.headers.get('Content-Length')||'0',10) > downloadCapBytes) return 'toobig';
+      b=await r.blob();
     }
     const u=URL.createObjectURL(b), a=document.createElement('a');
     a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
@@ -6880,8 +6883,18 @@ $('exportBtn').addEventListener('click', async ()=>{
     $('exportMsg').textContent='Export failed.';
   }
 });
-$('logDownload').addEventListener('click', e=>{ e.preventDefault(); downloadVia('api/logs?download=1&masked='+(logMasked?1:0), 'pingularity-logs.txt'); });
-$('csvDownload').addEventListener('click', e=>{ e.preventDefault(); downloadVia('api/speed/runs.csv', 'pingularity-speed-runs.csv'); });
+// Transient status via the shared role=status toast (announced to screen readers).
+function flashStatus(msg){ const tb=$('undoToast'); if(!tb) return; tb.textContent=msg; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 6000); }
+$('logDownload').addEventListener('click', async e=>{ e.preventDefault();
+  const r=await downloadVia('api/logs?download=1&masked='+(logMasked?1:0), 'pingularity-logs.txt');
+  if(r==='toobig') flashStatus('These logs are too large to download in the browser - fetch /api/logs with curl.');
+  else if(r==='fail') flashStatus('Log download failed.');
+});
+$('csvDownload').addEventListener('click', async e=>{ e.preventDefault();
+  const r=await downloadVia('api/speed/runs.csv', 'pingularity-speed-runs.csv');
+  if(r==='toobig') flashStatus('This CSV is too large to download in the browser - copy the database file or fetch /api/speed/runs.csv with curl.');
+  else if(r==='fail') flashStatus('CSV download failed.');
+});
 // The picker button IS the state: empty shows the prompt, a chosen file turns
 // it solid-accent and shows the (ellipsized) filename - no side caption needed.
 $('importFile').addEventListener('change', ()=>{ const f=$('importFile').files[0];
@@ -7483,10 +7496,14 @@ function setLogStall(on){
 }
 // The download is server-generated (works over plain HTTP), so it carries the
 // current mask state so the file matches what you see.
-function updateLogDownload(){ const a=$('logDownload'); if(a) a.setAttribute('href','api/logs?download=1&masked='+(logMasked?1:0)); }
+// The log download goes through the marked fetch (see the click handler), so the
+// anchor MUST NOT carry a real api/logs href: a native href would let middle-click
+// / "save link as" bypass X-Pingularity-UI and draw the browser's Basic-auth
+// prompt on an expired session. The click reads logMasked directly, so there is
+// nothing to keep in the href - it stays "#".
 // setLogMask flips the view between full and masked instantly and marks the state
 // user-owned so a later poll can't flip it back.
-function setLogMask(on){ logMasked=!!on; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; updateLogDownload(); paintLogs(); }
+function setLogMask(on){ logMasked=!!on; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; paintLogs(); }
 // logMerge decides what one /api/logs response does to the view, and is pure so
 // the rule can be tested on its own:
 //   'skip'    a delta that carried nothing - the steady state; take the cursor,
@@ -7520,7 +7537,7 @@ function renderLogs(d, delta){
   const on=$('setLogOn'); if(on && d.level) on.checked = (d.level!=='off');
   // Seed the mask from the persisted preference on first load only; after that the
   // local toggle is authoritative (a stale poll must not flip the view underneath).
-  if(!logMaskInit && typeof d.redact==='boolean'){ logMasked=d.redact; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; updateLogDownload(); }
+  if(!logMaskInit && typeof d.redact==='boolean'){ logMasked=d.redact; logMaskInit=true; const rd=$('setLogRedact'); if(rd) rd.checked=logMasked; }
   const win=$('logWindow'); if(!win) return;
   const lines=d.lines||[], dropped=d.dropped||0;
   // "painted" means there are rendered LINES to append to. An empty view is

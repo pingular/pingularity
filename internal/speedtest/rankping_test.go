@@ -1,7 +1,9 @@
 package speedtest
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -66,5 +68,36 @@ func TestApplyRankPingAndRanking(t *testing.T) {
 	}
 	if rankLess(failed, slow) {
 		t.Error("an unreachable server must never rank ahead of a reachable one")
+	}
+}
+
+// rankedServers (the call site) must not let a candidate whose ranking ping
+// FAILED win on its stale discovery latency. Drives the site through the ooklaPing
+// seam: a reachable server measured at 11ms vs an unreachable one holding a stale
+// 1ms. The fix ranks the reachable one first; reverting applyRankPing's zeroing
+// lets the stale 1ms win (test fails) - the call-site coverage the helper-only
+// tests were missing.
+func TestRankedServersDropsUnreachableStaleLatency(t *testing.T) {
+	orig := ooklaPing
+	defer func() { ooklaPing = orig }()
+	ooklaPing = func(ctx context.Context, srv *ookla.Server, cb func(time.Duration)) error {
+		if srv.ID == "reachable" {
+			srv.Latency = 11 * time.Millisecond // the library sets the measured mean on success
+			cb(srv.Latency)
+			return nil
+		}
+		return errors.New("connection refused") // no sample -> failed ranking ping
+	}
+	servers := ookla.Servers{
+		{ID: "unreachable", Sponsor: "A", Name: "near", Distance: 0, Latency: 1 * time.Millisecond}, // stale, low
+		{ID: "reachable", Sponsor: "B", Name: "far", Distance: 1, Latency: 0},
+	}
+	out, _ := rankedServers(context.Background(), servers, "")
+	if len(out) == 0 || out[0].ID != "reachable" {
+		var ids []string
+		for _, s := range out {
+			ids = append(ids, fmt.Sprintf("%s(%v)", s.ID, s.Latency))
+		}
+		t.Fatalf("reachable must rank first; a failed ping's stale 1ms must not win. order=%v", ids)
 	}
 }

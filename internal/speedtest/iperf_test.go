@@ -831,10 +831,8 @@ func TestParseFreeBSDCC(t *testing.T) {
 	}
 }
 
-// TestAvailableCongestionControlFreeBSDInjected drives the FreeBSD branch's
-// sysctl reader through the injectable ccSysctl seam so the table-parsing path
-// is covered on any host (the switch only reaches it when GOOS==freebsd, so we
-// test the reader+parser composition directly here).
+// Parser-only: pins that table noise never leaks (see TestAvailableCongestionControlFreeBSD
+// for the reader+branch composition through the ccSysctl seam).
 func TestParseFreeBSDCC_DropsAllTableNoise(t *testing.T) {
 	got := parseFreeBSDCC("CCmod   D PCB\nnewreno  *  1\ncubic       0\n")
 	for _, bad := range []string{"CCmod", "D", "PCB", "*", "1", "0"} {
@@ -846,5 +844,40 @@ func TestParseFreeBSDCC_DropsAllTableNoise(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("want 2 algorithms, got %v", got)
+	}
+}
+
+// TestAvailableCongestionControlFreeBSD actually drives the FreeBSD branch
+// (reader + table parser) through the injectable ccSysctl seam, on any host - the
+// coverage the "injected" comment previously claimed but never delivered.
+// Disconnecting the freebsd case now fails here instead of leaving the suite green.
+func TestAvailableCongestionControlFreeBSD(t *testing.T) {
+	orig := ccSysctl
+	defer func() { ccSysctl = orig }()
+
+	// 14.x table shape, via the seam -> parsed algorithm names, noise dropped.
+	ccSysctl = func() ([]byte, error) {
+		return []byte("CCmod   D PCB\nnewreno  *  1\ncubic       0\nhtcp        0\n"), nil
+	}
+	got := availableCongestionControlFor("freebsd")
+	want := []string{"newreno", "cubic", "htcp"}
+	if len(got) != len(want) {
+		t.Fatalf("freebsd branch: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("freebsd branch: got %v, want %v", got, want)
+		}
+	}
+
+	// A read failure yields no dropdown, not a crash.
+	ccSysctl = func() ([]byte, error) { return nil, errors.New("sysctl unavailable") }
+	if got := availableCongestionControlFor("freebsd"); got != nil {
+		t.Errorf("read error: got %v, want nil", got)
+	}
+
+	// macOS/Windows offer nothing (the -C option aborts there).
+	if got := availableCongestionControlFor("darwin"); got != nil {
+		t.Errorf("darwin: got %v, want nil", got)
 	}
 }
