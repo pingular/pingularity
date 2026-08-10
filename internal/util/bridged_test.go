@@ -1,47 +1,42 @@
 package util
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
-// The access default keys on BridgedContainer, so the detector must err SAFE:
-// classify as host-net (loopback-only enforceable) ONLY when a host-namespace
-// interface is visible; treat everything else as isolated (reachable). This
-// table pins both directions - especially the two cases the old address-range
-// guess got wrong: a custom-subnet bridge (was locked out) and a host on a
-// 172.16/12 LAN (was wrongly opened).
-func TestSharesHostNet(t *testing.T) {
+// A false warning on a correctly configured host install is worse than a missed
+// one, so the host-networked shapes below matter more than the bridged ones.
+func TestBridgedFrom(t *testing.T) {
+	ips := func(ss ...string) []net.IP {
+		out := make([]net.IP, 0, len(ss))
+		for _, s := range ss {
+			out = append(out, net.ParseIP(s))
+		}
+		return out
+	}
 	for _, tc := range []struct {
-		name string
-		ifs  []string
-		want bool // true = shares host net = enforce local-only
+		name  string
+		addrs []net.IP
+		want  bool
 	}{
-		// Host networking: a host-namespace interface is visible.
-		{"host: docker0 next to the NIC", []string{"eth0", "docker0", "lo"}, true},
-		{"host: podman0", []string{"enp3s0", "podman0", "lo"}, true},
-		{"host: a user-defined bridge", []string{"eth0", "br-9a1f2c3d", "lo"}, true},
-		{"host: a container veth pair end", []string{"eth0", "veth1a2b3c", "lo"}, true},
-		{"host: a CNI bridge", []string{"eth0", "cni-podman0", "lo"}, true},
-		// Bridged / isolated: only the container's own eth0 (+ lo). NONE of these
-		// may be classified host-net, or the published port 403s with no way in.
-		{"bridged: docker default pool", []string{"eth0", "lo"}, false},
-		{"bridged: custom subnet (old design locked this out)", []string{"eth0", "lo"}, false},
-		{"bridged: attached to two user networks (multi-eth)", []string{"eth0", "eth1", "lo"}, false},
-		{"host-net with only one NIC, no bridge up yet (over-expose, never lock out)", []string{"ens0", "lo"}, false},
-		{"nothing", nil, false},
-		// A bridged container must never see a host-namespace name; guard the
-		// substring matching isn't fooled by a plain interface that merely
-		// contains the letters.
-		{"not a bridge: 'ethbr-ish' does not start with br-", []string{"ethbr0", "lo"}, false},
+		{"bridged: docker0 default pool", ips("172.17.0.2"), true},
+		{"bridged: a compose network", ips("172.20.0.5"), true},
+		{"host net: the bridge is visible next to the NIC", ips("192.168.1.40", "172.17.0.1"), false},
+		{"host net: plain LAN host", ips("192.168.1.40"), false},
+		{"host net: LAN plus VPN", ips("10.0.0.5", "10.8.0.2"), false},
+		{"custom bridge subnet, missed by design", ips("10.99.0.2"), false},
+		{"no interfaces up", nil, false},
 	} {
-		if got := sharesHostNet(tc.ifs); got != tc.want {
-			t.Errorf("%s: sharesHostNet(%v) = %v, want %v", tc.name, tc.ifs, got, tc.want)
+		if got := bridgedFrom(tc.addrs); got != tc.want {
+			t.Errorf("%s: %v -> %v, want %v", tc.name, tc.addrs, got, tc.want)
 		}
 	}
 }
 
-// This dev box is not a bridged container, so the live path must resolve without
-// panicking and (off-container) never report bridged.
-func TestBridgedContainerOnThisHost(t *testing.T) {
-	if !InContainer() && BridgedContainer() {
-		t.Error("flagged a non-container host as bridged - a native install must default to loopback-only")
+// This dev box is not a bridged container, so the live path must not warn.
+func TestBridgedFromOnThisHost(t *testing.T) {
+	if !InContainer() && bridgedFrom(upIPv4()) {
+		t.Error("flagged a non-container host as bridged - that is a false warning on a correct install")
 	}
 }

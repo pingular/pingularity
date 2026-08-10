@@ -58,8 +58,9 @@ type failLimiter struct {
 	// (see Server.limiterKey). Set once before serving, read-only after.
 	trusted []netip.Prefix
 	// One-shot operator warnings emitted from the request path.
-	proxiedWarn sync.Once // local-only on, but traffic arrives via a same-host proxy
-	rewriteWarn sync.Once // proxy detected while no -allow-host is configured
+	proxiedWarn            sync.Once // local-only on, but traffic arrives via a same-host proxy
+	rewriteWarn            sync.Once // proxy detected while no -allow-host is configured
+	containerLocalOnlyWarn sync.Once // local-only on but unenforceable inside a container
 	// Rate-limiters for the pre-auth rejection warnings: a flood of crafted
 	// Hosts or non-loopback requests would otherwise fill the log ring with a
 	// warning per request. Each emits at most once per rejectWarnEvery and
@@ -290,14 +291,22 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// warned about below. Restores need no special case here: the reconcile
 		// window is refused outright above, before any setting is consulted.
 		if s.settings.AccessLocalOnly() {
-			// Local-only means loopback-only for EVERYONE, containers included. A
-			// container that must be reachable over the network opts in explicitly
-			// with -access network (PINGULARITY_ACCESS=network), which turns this
-			// filter off. We no longer GUESS a container's network mode from its
-			// interfaces: that heuristic mislabeled real setups both ways - it opened
-			// a host-net box and 403'd a bridged one, and a spoofable interface name
-			// is not an access boundary. An explicit operator signal decides access.
 			switch {
+			case s.Bridged:
+				// A bridged container NATs every external request to the gateway, so
+				// the loopback test can't tell a local user from a LAN one - local-only
+				// is unenforceable here and would just lock the dashboard out. The
+				// published port (-p) and the login password are the real boundary.
+				// A host-networked container shares the host netns, so there the
+				// loopback test IS meaningful and falls through to enforcement below.
+				// Residual: util.BridgedContainer is deliberately narrow and reads a
+				// bridged container on a custom (non-172.16/12) subnet as not bridged;
+				// such a box enforces local-only and 403s the port-published gateway
+				// traffic - fail CLOSED (a lockout costs a restart; silently serving
+				// the LAN costs the protected thing).
+				s.logins.containerLocalOnlyWarn.Do(func() {
+					s.log.Warn("local-only access is on but cannot be enforced in a bridged container; the dashboard stays reachable - restrict it via how you publish the port (-p) and enable the login password")
+				})
 			case !isLoopbackAddr(r.RemoteAddr):
 				// Coalesced like the Host rejection above: every request is still
 				// refused, only the LOG line is throttled - a LAN flood would
@@ -372,23 +381,9 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				if u, _, ok := r.BasicAuth(); ok {
 					s.log.Warn("auth failed", "user", capForLog(u), "ip", clientIP(r), "path", capForLog(r.URL.Path))
 				}
-				// Offer Basic so curl/wget/Prometheus can authenticate - but NOT to
-				// our own SPA, which sets X-Pingularity-UI on every fetch: a
-				// same-origin fetch answered 401+Basic pops the browser's NATIVE
-				// credentials dialog on top of the SPA's own login overlay, once
-				// per API poll. The app header is the discriminator because it is
-				// origin-independent - unlike Sec-Fetch-Mode, which Chrome omits on
-				// a plain-HTTP LAN origin (http://192.168.x.x is not "potentially
-				// trustworthy"), exactly the common dashboard install. A cross-site
-				// page cannot forge the header onto a credentialed request without a
-				// CORS preflight we never grant, and suppressing the challenge only
-				// hides the native prompt - it never weakens the actual auth check.
-				// curl/wget/Prometheus never send it, so they still get Basic. Logged-in
-				// browser visits to /metrics etc. ride the session cookie, so
-				// nothing browser-side needs the challenge.
-				if r.Header.Get("X-Pingularity-UI") == "" {
-					w.Header().Set("WWW-Authenticate", `Basic realm="pingularity"`)
-				}
+				// Offer Basic so curl/Prometheus can authenticate; browsers ignore it
+				// and the SPA shows its own login overlay on the 401.
+				w.Header().Set("WWW-Authenticate", `Basic realm="pingularity"`)
 				http.Error(w, "authentication required", http.StatusUnauthorized)
 				return
 			}
@@ -407,19 +402,6 @@ func authExempt(r *http.Request) bool {
 	case p == "/api/auth/login" || p == "/api/auth/logout":
 		return true
 	case p == "/api/access" && r.Method == http.MethodGet:
-		return true
-	case p == "/api/quick-setup":
-		// The first-run endpoint self-gates rather than leaning on the session
-		// guard, which keeps a lost-response retry idempotent: a cookieless retry
-		// AFTER the answer enabled auth hits the "already done" 200 no-op instead of
-		// a guard 401. What an unauthenticated caller can reach here is bounded to
-		// two harmless outcomes - the done/no-op, and the `dismiss` marker (closes
-		// the first-run dialog, changing no access/auth/monitoring state; reachable
-		// while auth is active BY DESIGN so a dialog on an out-of-band-secured
-		// install can still be dismissed, see handleQuickSetup). A full answer that
-		// would change access/auth still 403s inside the handler once a login is
-		// active. The network/host filters (local-only, DNS-rebind) run BEFORE this
-		// exemption, so it never widens who can reach the port.
 		return true
 	case p == "/metrics":
 		return false
@@ -1002,9 +984,9 @@ func (s *Server) accessStatus(r *http.Request) map[string]any {
 	authed := !active || s.authed(r)
 	out := map[string]any{
 		"local_only":        s.settings.AccessLocalOnly(),
-		"local_only_active": s.settings.AccessLocalOnly(), // now enforced whenever on (no container bypass)
-		"auth_enabled":      s.settings.AuthEnabled(),     // intent - drives the toggle
-		"auth_active":       active,                       // enforced - drives the overlay
+		"local_only_active": s.settings.AccessLocalOnly() && !s.Bridged, // enforced - mirrors auth_active
+		"auth_enabled":      s.settings.AuthEnabled(),                   // intent - drives the toggle
+		"auth_active":       active,                                     // enforced - drives the overlay
 		"has_password":      s.settings.HasPassword(),
 		"authed":            authed,
 	}

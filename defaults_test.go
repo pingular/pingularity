@@ -32,7 +32,7 @@ func TestDefaultSettings(t *testing.T) {
 		SpeedtestOnReconnect: true,
 		IPv6Mode:             "on",
 	}
-	v := defaultSettings(cfg)
+	v := defaultSettings(cfg, false)
 
 	// Mapping: each distinct input lands on its own field. A swap flips one of these.
 	checks := []struct {
@@ -89,20 +89,13 @@ func TestDefaultSettings(t *testing.T) {
 		t.Errorf("DegradedPingMS/SpeedBusyMbps = %v/%v, want 150/5", v.DegradedPingMS, v.SpeedBusyMbps)
 	}
 
-	// Access is EXPLICIT, not guessed: loopback-only by default everywhere, and
-	// off ONLY when the operator set -access network. No container heuristic.
-	if !defaultSettings(cfg).AccessLocalOnly {
-		t.Error("default (no -access) must be loopback-only everywhere, containers included")
+	// AccessLocalOnly: on for a native install (LAN opt-in), off in a container
+	// (unenforceable there). The containerized inversion is easy to get backwards.
+	if !defaultSettings(cfg, false).AccessLocalOnly {
+		t.Error("native install must default AccessLocalOnly=true (LAN access opt-in)")
 	}
-	net := cfg
-	net.Access = "network"
-	if defaultSettings(net).AccessLocalOnly {
-		t.Error("-access network must default AccessLocalOnly=false")
-	}
-	loc := cfg
-	loc.Access = "local"
-	if !defaultSettings(loc).AccessLocalOnly {
-		t.Error("-access local must default AccessLocalOnly=true")
+	if defaultSettings(cfg, true).AccessLocalOnly {
+		t.Error("container install must default AccessLocalOnly=false (filter unenforceable)")
 	}
 }
 

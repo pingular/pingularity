@@ -33,11 +33,6 @@ func GroupOrWorldAccessible(path string) (accessible, known bool) { return false
 // nothing (inheritance is off), so each secured file also sets its own DACL.
 func SecureDir(path string) error { return secure(path) }
 
-// OwnedByThisUser: the container carve-out this backs never fires on Windows
-// (GroupOrWorldAccessible reports known=false there), so no SID comparison is
-// attempted - a constant false keeps the caller honest if that ever changes.
-func OwnedByThisUser(path string) bool { return false }
-
 func secure(path string) error {
 	sid, err := currentUserSID()
 	if err != nil {

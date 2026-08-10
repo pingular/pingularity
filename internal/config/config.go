@@ -23,22 +23,6 @@ type Target struct {
 
 // Config is the fully-resolved runtime configuration for a `pingularity run`.
 type Config struct {
-	// MonitoringConsent is set when the operator explicitly passed a
-	// monitoring-configuring flag (-speedtest, -speedtest-interval, -latency,
-	// -interval). A headless service configured that way has consented to
-	// monitoring, so it must not be held behind the browser-only Quick Setup
-	// dialog for 48h - main marks Quick Setup answered at boot. Not persisted;
-	// derived from the argv every start.
-	MonitoringConsent bool
-
-	// QuickSetupSkip is set by an explicit `-quick-setup=skip`. It is the
-	// direct headless consent signal for operators who never touch a monitoring
-	// flag (e.g. only tune -timeout / -down-after / -ipv6): the monitoring-flag
-	// heuristic above wouldn't fire for them, so the browser-only Quick Setup
-	// hold would pause the service for 48h. This flag marks it answered at boot
-	// regardless. Not persisted; derived from the argv every start.
-	QuickSetupSkip bool
-
 	DBPath         string        // path to the SQLite database file
 	Interval       time.Duration // time between probe rounds
 	Timeout        time.Duration // per-target dial timeout
@@ -69,13 +53,6 @@ type Config struct {
 	// same-host proxy doesn't share one lockout bucket.
 	TrustedProxies string
 	MetricsToken   string // optional read-only token a scraper may use on /metrics instead of the admin login (empty = admin auth)
-
-	// Access is the EXPLICIT access mode: "local" (loopback-only, the safe
-	// default) or "network" (reachable from the LAN). It sets the AccessLocalOnly
-	// default on a fresh install; the UI setting can still change it later. This
-	// replaces guessing a container's network mode from its interfaces - an
-	// operator says what they want instead. From -access or PINGULARITY_ACCESS.
-	Access string
 }
 
 // Family names.
@@ -205,42 +182,8 @@ func ParseFlags(args []string) (Config, error) {
 	fs.DurationVar(&c.Retention, "retain", c.Retention, "prune latency samples older than this (0 = forever); also settable in the UI")
 	fs.DurationVar(&c.SpeedRetention, "retain-speed", c.SpeedRetention, "prune speed history older than this (0 = forever); also settable in the UI")
 	fs.DurationVar(&c.DowntimeRetention, "retain-downtime", c.DowntimeRetention, "prune outage history older than this (0 = forever); also settable in the UI")
-	quickSetup := ""
-	fs.StringVar(&quickSetup, "quick-setup", "", "first-run Quick Setup for headless installs: 'skip' marks it answered so the service starts monitoring immediately without waiting for the browser dialog; 'prompt' (default) leaves the dialog to a first visit")
-	// Access mode is EXPLICIT, not guessed. Default loopback-only; 'network' opens
-	// the dashboard to the LAN. Env PINGULARITY_ACCESS seeds the default so Docker
-	// users can set it with -e (the image can't guess its own network mode); a
-	// -access flag still overrides the env. Precedence: flag > env > default.
-	access := "local"
-	if env := strings.TrimSpace(os.Getenv("PINGULARITY_ACCESS")); env != "" {
-		access = env
-	}
-	fs.StringVar(&c.Access, "access", access, "who may open the dashboard: 'local' (loopback only; the safe default) or 'network' (reachable from the LAN - set a login). Containers that publish a port need 'network' (or PINGULARITY_ACCESS=network)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
-	}
-	// Validate -access / PINGULARITY_ACCESS (an env typo must fail loudly, not
-	// silently fall through to network-open or a broken value).
-	switch c.Access {
-	case "local", "network":
-	default:
-		return Config{}, fmt.Errorf("invalid access mode %q: want 'local' or 'network'", c.Access)
-	}
-	// Explicit monitoring flags = headless consent (see MonitoringConsent).
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "speedtest", "speedtest-interval", "latency", "interval":
-			c.MonitoringConsent = true
-		}
-	})
-	// -quick-setup is the explicit headless-consent knob (see QuickSetupSkip).
-	switch quickSetup {
-	case "", "prompt":
-		// leave the first-visit dialog in place
-	case "skip":
-		c.QuickSetupSkip = true
-	default:
-		return Config{}, fmt.Errorf("invalid -quick-setup %q: want 'skip' or 'prompt'", quickSetup)
 	}
 	// Reject stray positional args. Go's flag package stops at the first non-flag
 	// token and silently ignores the rest, so a typo'd positional (e.g. `run foo

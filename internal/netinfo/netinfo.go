@@ -360,11 +360,6 @@ func (m *Manager) RefreshNow(ctx context.Context) Info {
 // shrink it.
 var refreshRetryDelay = 2 * time.Second
 
-// afterFn is Loop's backstop sleep timer, injectable so a test can read the wait
-// Loop computes from the POST-refresh staleness cap without sleeping it out.
-// Production is the real timer.
-var afterFn = func(d time.Duration) <-chan time.Time { return time.After(d) }
-
 // enabled reports whether connection-info lookups may run. Nil means yes, so a
 // Manager built without the hook (tests, callers that always want it) behaves
 // as it always did.
@@ -437,15 +432,6 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 		case m.age() >= stale:
 			m.Refresh(ctx)
 		}
-		// Recompute the cap AFTER the refresh above: a boot/refresh can flip the
-		// snapshot healthy->error, and arming the timer with the pre-refresh cap
-		// would wait the full maxStale instead of the errRetryStale the error
-		// path wants (and would delay the IPv6-only transition, which assumes the
-		// faster retry). `stale` above sized nothing but the pre-refresh read.
-		stale = maxStale
-		if m.Get().Error != "" && stale > errRetryStale {
-			stale = errRetryStale
-		}
 		// Sleep until the data would reach the cap. If something else
 		// refreshed it meanwhile, UpdatedAt advanced and the next evaluation
 		// is a no-op, so the next sleep recomputes from the newer time.
@@ -468,7 +454,7 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 			// refresh NOW.
 		case <-m.nudge:
 			// A broadcast-less enable edge (see Nudge) - same re-evaluation.
-		case <-afterFn(wait):
+		case <-time.After(wait):
 		}
 	}
 }

@@ -38,12 +38,9 @@ type Iperf struct {
 	// result behind, so neither reaches the scheduler's error path or the
 	// speed.fail counters - without a line here they leave no trace at all.
 	// Optional: nil logs nothing.
-	Log *slog.Logger
-	// congestionSkipOnce coalesces the "ignored -C off Linux" warning so it
-	// logs once per Iperf, not once per transfer.
-	congestionSkipOnce sync.Once
-	ServerFn           func() string // "host" or "host:port" - the user's iperf3 server
-	LabelFn            func() string // friendly name for the active server; "" -> fall back to the host
+	Log      *slog.Logger
+	ServerFn func() string // "host" or "host:port" - the user's iperf3 server
+	LabelFn  func() string // friendly name for the active server; "" -> fall back to the host
 	// OnServer, if set, is called with the display name ("iperf3: <label>", falling back
 	// to the host when unlabelled) once it's known, so the UI can show which server the
 	// running test is hitting. The recorded Result.Server uses the same name - see Run.
@@ -116,124 +113,15 @@ func IperfVersion() string {
 // sysctl, so it returns a small curated list of widely available algorithms. Note -C
 // applies on the SENDER: for a download that's the remote server, so this list only
 // really governs uploads, not downloads (where the server's kernel decides).
-// congestionForOS resolves the -C value actually passed to iperf3 and reports
-// whether a requested value was DROPPED because the platform cannot set it.
-// Only Linux iperf3 has the -C socket option; on macOS and Windows passing it
-// aborts the whole run at startup, so a value that arrived via an imported
-// backup from a Linux box is dropped and the run uses the system default.
-func congestionForOS(requested, goos string) (effective string, dropped bool) {
-	// Linux and FreeBSD iperf3 both support -C; only macOS and Windows abort on
-	// it. Dropping it on FreeBSD stripped a working knob.
-	if requested != "" && goos != "linux" && goos != "freebsd" {
-		return "", true
+func AvailableCongestionControl() []string {
+	if runtime.GOOS != "linux" {
+		return []string{"cubic", "reno", "bbr"}
 	}
-	return requested, false
-}
-
-func AvailableCongestionControl() []string { return availableCongestionControlFor(runtime.GOOS) }
-
-// availableCongestionControlFor is AvailableCongestionControl with the OS as a
-// parameter, so the FreeBSD sysctl-reading + table-parsing branch is testable on
-// ANY host (through the injectable ccSysctl seam) rather than only when
-// GOOS==freebsd. Only Linux iperf3 has the -C socket option; on macOS and Windows
-// passing it aborts the whole run at startup, so offer nothing there and let the
-// field mean "system default". (setCongestionSkipped mirrors this at run time for
-// a value that arrived via an imported backup from a Linux box.)
-func availableCongestionControlFor(goos string) []string {
-	switch goos {
-	case "linux":
-		b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_allowed_congestion_control")
-		if err != nil {
-			return nil
-		}
-		return strings.Fields(string(b))
-	case "freebsd":
-		// FreeBSD enumerates its available algorithms in a sysctl; iperf3 accepts
-		// -C for any of them. A read failure just means no dropdown (Auto only).
-		out, err := ccSysctl()
-		if err != nil {
-			return nil
-		}
-		return parseFreeBSDCC(string(out))
-	default:
-		// macOS/Windows iperf3 has no -C; offering it aborts the run.
+	b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_allowed_congestion_control")
+	if err != nil {
 		return nil
 	}
-}
-
-// ccSysctl reads net.inet.tcp.cc.available. A package var so tests can inject
-// either release's output shape without a FreeBSD host.
-var ccSysctl = func() ([]byte, error) {
-	return exec.Command("sysctl", "-n", "net.inet.tcp.cc.available").Output()
-}
-
-// parseFreeBSDCC extracts algorithm names from net.inet.tcp.cc.available, whose
-// shape changed across releases:
-//
-//	13.x: a single comma-separated line          "newreno, cubic, htcp"
-//	14.x: a header line + one row per algorithm, with extra columns (a "*"
-//	      default marker and PCB counts):
-//	          CCmod       D PCB
-//	          newreno       0
-//	          cubic     *   0
-//	          htcp          0
-//
-// The old strings.Fields parser turned the 14.x table into garbage tokens
-// ("CCmod", "D", "PCB", "*", "0", ...) and handed them to iperf3 as algorithm
-// names. Discriminate on line count: one line is the 13.x list; more is the
-// table, whose first column carries the names (isCCName drops the "CCmod"
-// header and any "*"/count cells).
-func parseFreeBSDCC(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	lines := strings.Split(raw, "\n")
-	seen := map[string]bool{}
-	var out []string
-	add := func(tok string) {
-		tok = strings.Trim(tok, "*")
-		if isCCName(tok) && !seen[tok] {
-			seen[tok] = true
-			out = append(out, tok)
-		}
-	}
-	if len(lines) == 1 {
-		// 13.x: split the single line on commas and whitespace.
-		for _, tok := range strings.FieldsFunc(lines[0], func(r rune) bool {
-			return r == ',' || unicode.IsSpace(r)
-		}) {
-			add(tok)
-		}
-		return out
-	}
-	// 14.x table: the algorithm name is the first column of each row; the
-	// header row's first cell ("CCmod") is rejected by isCCName.
-	for _, ln := range lines {
-		if f := strings.Fields(ln); len(f) > 0 {
-			add(f[0])
-		}
-	}
-	return out
-}
-
-// isCCName reports whether tok is a plausible congestion-control algorithm name:
-// a lowercase identifier (newreno, cubic, htcp, cdg, ...). This is what lets one
-// rule reject the 14.x table's header cell ("CCmod"), single-letter column
-// headers, the "*" default marker, and numeric PCB counts.
-func isCCName(tok string) bool {
-	if tok == "" {
-		return false
-	}
-	for i, r := range tok {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case i > 0 && (r >= '0' && r <= '9' || r == '_' || r == '-'):
-		default:
-			return false
-		}
-	}
-	return true
+	return strings.Fields(string(b))
 }
 
 const (
@@ -529,19 +417,6 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		window: iperfWindow(i.WindowFn), bind: iperfBind(i.BindFn), ipver: iperfIPVersion(i.IPVersionFn),
 		congestion: iperfToken(i.CongestionFn), noDelay: iperfNoDelay(i.NoDelayFn),
 		dscp: iperfToken(i.DSCPFn), mss: iperfMSS(i.MSSFn),
-	}
-	// A congestion algorithm saved on Linux can ride an imported backup onto a
-	// macOS/Windows host, where -C aborts the run at startup. Drop it and run
-	// with the system default instead of failing every test; log once so the
-	// operator can see why their setting is not taking effect.
-	if eff, dropped := congestionForOS(tp.congestion, runtime.GOOS); dropped {
-		i.congestionSkipOnce.Do(func() {
-			if i.Log != nil {
-				i.Log.Warn("iperf3 congestion control ignored: -C is Linux-only; running with the system default",
-					"requested", tp.congestion, "os", runtime.GOOS)
-			}
-		})
-		tp.congestion = eff
 	}
 	dir := speedDirection(i.DirectionFn)
 	auth, cleanup, err := i.resolveAuth()

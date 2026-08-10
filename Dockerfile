@@ -32,13 +32,7 @@ ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/pingularity /pingularity
 # +ep: effective+permitted, so the cap is raised automatically on exec even for
 # a non-root user. `mkdir /data` seeds the data dir the final stage chowns.
-# The .pingularity-image-dir marker is a volume-lineage HEURISTIC (not a proof
-# of volume type): Docker's copy-up carries it into a fresh named volume, so the
-# daemon's container carve-out (store.go) can tell content that came from OUR
-# image from an empty PVC or a plain bind-mounted host directory, which never
-# carry it. A bind mount restored FROM a marked volume would carry it too - an
-# accepted edge, since the content is genuinely ours.
-RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data && touch /data/.pingularity-image-dir
+RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data
 
 # --- final image: distroless nonroot, carrying the capped binary ---
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6

@@ -7,7 +7,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -43,29 +42,29 @@ func InContainer() bool {
 }
 
 // BridgedContainer reports whether we are in a container that does NOT share the
-// host's network namespace ("bridged" / isolated). Two things key on it. The UI
-// warns that bridged measurements describe the container network, not the host's
-// real path (an extra latency hop, a traceroute that dead-ends at the container
-// gateway, and - the largest, least obvious distortion - a substituted DNS
-// resolver, because a loopback stub is unreachable from a bridged namespace so
-// Docker swaps in its own public default). More consequentially, it gates the
-// default access filter: a bridged container can ONLY be reached over the
-// network (even from the host, via the published port), so it must NOT default
-// to loopback-only or it would 403 its own port with no way back in.
+// host's network namespace - the case where every measurement describes the
+// container network instead of the host's real path: an extra hop of latency,
+// a traceroute that dead-ends at the container gateway, and a DNS resolver the
+// runtime substituted for the host's. That last one is the largest distortion
+// and the least obvious: a loopback stub means "me", so it is unreachable from a
+// bridged namespace and Docker replaces it with its own public default - the
+// reported DNS provider and ASN are then a different operator, not a nearer one.
+// Sharing the namespace (--network=host) keeps the stub reachable, so a
+// host-networked container reads the host's real resolver and is not warned.
 //
-// Because it now gates access, the detection errs SAFE: return false ("not
-// bridged", so default to loopback-only) ONLY when we can prove loopback reaches
-// us - natively, or in a container that visibly shares the host's network
-// namespace. Proof of host networking is seeing an interface that exists only in
-// the host namespace: the Docker/Podman default bridge (docker0 / podman0), a
-// user-defined bridge (br-...), a CNI bridge (cni-...), or the host end of any
-// container's veth pair (veth...). A bridged container sees only its own eth0, so
-// it never matches and is treated as isolated (reachable by default) whatever its
-// subnet or interface count. A misread can only leave a host-net container
-// reachable that could have been locked down (recoverable via access/auth) - it
-// can never lock a bridged container out of its own port. The old address-range
-// guess got this wrong both ways: a custom-subnet bridge was locked out, and a
-// host on a 172.16/12 LAN was wrongly opened.
+// It matters because most Docker Desktop users on macOS or Windows run in
+// exactly this mode: `network_mode: host` there needs Docker Desktop 4.34+
+// with the option enabled in Settings (TCP/UDP only), so the compose file's
+// published-port fallback lands them on the bridge - and nothing on screen
+// would otherwise say the numbers changed meaning.
+//
+// The test is deliberately narrow, because a FALSE warning on a correctly
+// configured host install is worse than a missed one: a bridged container has
+// exactly one non-loopback interface, addressed out of Docker's default bridge
+// pool (172.16/12, which covers docker0's 172.17 and compose's 172.18+). A
+// host-networked container sees the host's whole interface set, which - since
+// Docker is by definition running - includes the bridge itself. Bridges built on
+// a custom subnet are missed, and that is the intended trade.
 var (
 	bridgedOnce sync.Once
 	bridgedVal  bool
@@ -74,46 +73,48 @@ var (
 func BridgedContainer() bool {
 	bridgedOnce.Do(func() {
 		if !InContainer() {
-			return // native: loopback works, enforce local-only; never "bridged"
+			return
 		}
-		bridgedVal = !sharesHostNet(ifaceNames())
+		bridgedVal = bridgedFrom(upIPv4())
 	})
 	return bridgedVal
 }
 
-// ifaceNames lists the name of every network interface, up OR down: a bridge
-// with no attached container is down but still a host-namespace tell.
-func ifaceNames() []string {
+// upIPv4 lists the IPv4 addresses of every non-loopback interface that is up.
+func upIPv4() []net.IP {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	out := make([]string, 0, len(ifs))
+	var out []net.IP
 	for _, in := range ifs {
-		out = append(out, in.Name)
+		if in.Flags&net.FlagLoopback != 0 || in.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := in.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+				out = append(out, ipn.IP)
+			}
+		}
 	}
 	return out
 }
 
-// sharesHostNet reports whether names include an interface that exists ONLY in
-// the host's network namespace - a reliable positive signal that this process is
-// in that namespace (native or --network=host), where loopback reaches the
-// listener. A bridged container's namespace holds only its own eth0 (+ lo), never
-// these, so their ABSENCE means "isolated, or we cannot tell", which the caller
-// treats as isolated (reachable). Kept as a pure function over a name list so it
-// is tested directly rather than through a parallel copy of the rule.
-func sharesHostNet(names []string) bool {
-	for _, n := range names {
-		switch {
-		case n == "docker0" || n == "podman0":
-			return true
-		case strings.HasPrefix(n, "br-"),
-			strings.HasPrefix(n, "veth"),
-			strings.HasPrefix(n, "cni-"):
-			return true
+// bridgedFrom is the decision itself, over a plain address list so it can be
+// tested directly rather than through a parallel copy of the rule.
+func bridgedFrom(addrs []net.IP) bool {
+	pool := net.IPNet{IP: net.IPv4(172, 16, 0, 0), Mask: net.CIDRMask(12, 32)}
+	inPool := false
+	for _, ip := range addrs {
+		if pool.Contains(ip) {
+			inPool = true
 		}
 	}
-	return false
+	return len(addrs) == 1 && inPool
 }
 
 // B2I converts a bool to 1/0, for Prometheus gauges, CSV, and SQLite columns.
