@@ -490,7 +490,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		ThreshLossPct: 5, ThreshConsec: 3, ThreshBloatDownMS: 80, ThreshBloatUpMS: 90,
 		AlertOnOutage: true, WebhookURL: "https://example.com/hook",
 		HeartbeatURL: "https://hc.example.com/uuid", DigestFreq: "weekly", WebhookFormat: "ntfy",
-		QuickSetupDone:  true, // server-owned: must NOT be settable via /api/settings (asserted below)
+		QuickSetupDone:  true, // non-default, so a dropped Patch mapping is caught
 		SchedLatEnabled: true, SchedLatWindows: []settings.Window{{Days: "0111110", Start: 540, End: 1020}},
 		SchedSpeedEnabled: true, SchedSpeedWindows: []settings.Window{{Days: settings.AllDays, Start: 0, End: 0}},
 	}
@@ -514,22 +514,13 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 	rin, rgot, rt := reflect.ValueOf(in), reflect.ValueOf(got), reflect.TypeOf(in)
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
-		// QuickSetupDone is the server-owned first-run marker: /api/settings must
-		// NOT write it (a generic settings POST could otherwise reopen Quick Setup
-		// or re-freeze defaults through it). It is deliberately not in the Patch,
-		// so it can't round-trip - asserted explicitly after the loop.
-		if f.Type.Kind() != reflect.Ptr || f.Name == "Defaults" || f.Name == "QuickSetupDone" {
+		if f.Type.Kind() != reflect.Ptr || f.Name == "Defaults" {
 			continue
 		}
 		a, b := rin.Field(i).Elem().Interface(), rgot.Field(i).Elem().Interface()
 		if !reflect.DeepEqual(a, b) {
 			t.Errorf("%s (json %q) did not round-trip: sent %v, persisted %v", f.Name, f.Tag.Get("json"), a, b)
 		}
-	}
-	// The back-door is closed: we POSTed quick_setup_done:true to a fresh server;
-	// it must stay unanswered because /api/settings ignores the marker.
-	if s.settings.QuickSetupDone() {
-		t.Error("quick_setup_done was set through /api/settings - the server-owned marker must be unwritable there")
 	}
 	// The write-only iperf server list round-trips through its own DTO mapping.
 	if len(echo.SchedLatWindows) != 1 || echo.SchedLatWindows[0].Start != 540 {

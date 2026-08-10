@@ -36,13 +36,7 @@ COPY $TARGETPLATFORM/pingularity /pingularity
 # preserves the security.capability xattr across the COPY into the final image
 # (same guarantee the default Dockerfile relies on), so the final stage needs no
 # libcap2-bin of its own.
-# The .pingularity-image-dir marker is a volume-lineage HEURISTIC (not a proof
-# of volume type): Docker's copy-up carries it into a fresh named volume, so the
-# daemon's container carve-out (store.go) can tell content that came from OUR
-# image from an empty PVC or a plain bind-mounted host directory, which never
-# carry it. A bind mount restored FROM a marked volume would carry it too - an
-# accepted edge, since the content is genuinely ours.
-RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data && touch /data/.pingularity-image-dir
+RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data
 
 # --- final image: debian-slim carrying iperf3 + the capped binary ---
 FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
@@ -71,13 +65,6 @@ COPY --from=setcap /pingularity /pingularity
 # 0755 (COPY does not carry the source mode across) and the daemon spends every
 # start warning that its own data directory is readable by others.
 COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
-# Belt and braces: some BuildKit versions apply COPY --chmod to the files but
-# not the directory itself (observed: buildx honors it, ubuntu-latest's plain
-# docker build does not), and this image HAS a shell to correct it. The
-# distroless default image cannot RUN anything; its published buildx output is
-# verified 0700, and the daemon tightens its own container data dir at boot
-# either way (store.go's container carve-out).
-RUN chmod 0700 /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity
 USER pingularity

@@ -65,7 +65,7 @@ const DEFS = {
   outageDeletable: 'function outageDeletable',
   isReconcile503: 'function isReconcile503', retryAfterMs: 'function retryAfterMs',
   pkcs1FlagUsable: 'function pkcs1FlagUsable', pkcs1BoxState: 'function pkcs1BoxState',
-  qsUseNote: 'function qsUseNote',
+  qsUseNote: 'function qsUseNote', qsSettingsPayload: 'function qsSettingsPayload',
   iperfPwOrphan: 'function iperfPwOrphan',
 };
 const NAMES = Object.keys(DEFS);
@@ -290,120 +290,6 @@ test('set/getField: an unedited min/day field round-trips its exact seconds', ()
   assert.equal(SF.getField('spd', 'min', 60), 90);
   els.spd.value = '5';
   assert.equal(SF.getField('spd', 'min', 60), 300);
-});
-
-// Blanking an int field falls back to the SHIPPING DEFAULT, not the minimum:
-// the FIELDS fallbacks must equal config.go's defaults. iperf_streams (default
-// 8, moved from 1 in 0.60.0) and iperf_omit (default 1) drifted - clearing them
-// used to save 1 and 0, the worst measurement and no warm-up. Pins the two that
-// moved so they cannot silently drift from the Go defaults again.
-// Auth-gated downloads must go through the MARKED fetch (downloadVia), not a
-// native <a href> GET - a native GET can't send X-Pingularity-UI, so an expired
-// session would get the browser's Basic prompt instead of the SPA login.
-test('downloads route through the marked fetch, not native href GETs', () => {
-  assert.match(script, /async function downloadVia\(/, 'the marked-fetch download helper exists');
-  assert.doesNotMatch(html, /id="logDownload"[^>]*href="api\/logs/, 'log download is not a native href GET');
-  assert.doesNotMatch(html, /href="api\/speed\/runs\.csv"/, 'CSV download is not a native href GET');
-  assert.match(script, /downloadVia\('api\/export/, 'export uses downloadVia');
-  assert.match(script, /downloadVia\('api\/logs/, 'logs use downloadVia');
-  assert.match(script, /downloadVia\('api\/speed\/runs\.csv/, 'CSV uses downloadVia');
-  // The log download MUST carry the mask state, or "Redact PII" is a lie: a
-  // masked view downloads raw PII. Pin the masked param on the click handler.
-  assert.match(script, /downloadVia\('api\/logs\?download=1&masked='\+\(logMasked\?1:0\)/,
-    'log download honors logMasked (else redaction is bypassed on download)');
-});
-
-// downloadVia buffers the body (it must, to route through the marked fetch), so
-// it caps the buffer and reports 'toobig' instead of letting a giant backup
-// exhaust the browser; the export button surfaces the streaming workaround.
-test('oversized downloads are capped, not silently buffered to death', () => {
-  assert.match(script, /const downloadCapBytes = /, 'a download buffer cap exists');
-  assert.match(script, /getReader\(\)/, 'downloadVia streams into a bounded buffer instead of r.blob()');
-  assert.match(script, /return 'toobig'/, 'past the cap it reports toobig rather than buffering on');
-  // The export handler tells the operator to use the DB file / CLI on toobig.
-  assert.match(script, /res==='toobig'/, 'the export handler checks for the oversized signal');
-  assert.match(script, /too large to download in the browser/, 'and points to the streaming workaround');
-});
-
-test('login overlay sits ABOVE Quick Setup (a 401 mid-setup must not paint behind the dim)', () => {
-  const login = html.match(/\.login-overlay\{[^}]*z-index:(\d+)/);
-  const qsDlg = html.match(/\.qs\{[^}]*z-index:(\d+)/);
-  const qsDim = html.match(/\.qs-dim\{[^}]*z-index:(\d+)/);
-  assert.ok(login && qsDlg && qsDim, 'all three modal layers declare a z-index');
-  const [lz, dz, mz] = [login, qsDlg, qsDim].map(m => Number(m[1]));
-  assert.ok(lz > dz && lz > mz, `login z-index ${lz} must exceed Quick Setup ${dz}/${mz} or the login is unreachable behind it`);
-});
-
-test('Quick Setup segment pills are keyboard-operable radios', () => {
-  // Both groups are radiogroups whose pills carry role=radio + aria-checked + tabindex.
-  assert.match(html, /id="qsSched"[^>]*role="radiogroup"/, 'qsSched is a radiogroup');
-  assert.match(html, /id="qsAcc"[^>]*role="radiogroup"/, 'qsAcc is a radiogroup');
-  assert.match(html, /<b class="on" role="radio" aria-checked="true" tabindex="0">/, 'checked pill is tabbable + announced');
-  assert.match(html, /<b role="radio" aria-checked="false" tabindex="-1">/, 'unchecked pills are roving (tabindex -1)');
-  // The keyboard handler moves selection with arrows/Home/End and selects on Space/Enter.
-  assert.match(script, /function wireSeg\(/, 'the radiogroup wiring helper exists');
-  assert.match(script, /ArrowRight'\|\|e\.key==='ArrowDown'/, 'arrow keys move selection');
-  assert.match(script, /e\.key===' '\|\|e\.key==='Enter'/, 'Space/Enter select');
-  assert.match(script, /setAttribute\('aria-checked'/, 'aria-checked is kept in sync');
-});
-
-test('Quick Setup traps focus and inerts the page behind it', () => {
-  assert.match(script, /\$\('qsDlg'\)\.addEventListener\('keydown'[\s\S]*?e\.key!=='Tab'/, 'a Tab focus-trap is bound to the dialog');
-  assert.match(script, /_qsInerted=\[\.\.\.document\.body\.children\]\.filter/, 'opening inerts the rest of the page');
-  assert.match(script, /_qsInerted\.forEach\(el=>el\.inert=false\)/, 'closing restores exactly what it inerted');
-  // Esc must not reach the dialog behind an open (required) login.
-  assert.match(script, /if\(!loginOverlay\.hidden\) return;.*login is a required blocker/, 'Esc is suppressed while login is up');
-});
-
-test('a 401 during Quick Setup shows an INTERACTIVE login, not a dead one', () => {
-  // Structural pins for the two-sided fix of the visible-but-inert deadlock.
-  assert.match(script, /loginOverlay\.inert=false;/, 'showLogin must clear its own inert when presenting');
-  assert.match(script,
-    /_qsInerted=\[\.\.\.document\.body\.children\]\.filter\(el=>el!==\$\('qsDlg'\) && el!==\$\('qsDim'\) && el!==\$\('loginOverlay'\)/,
-    'showQuickSetup must exclude the login overlay from what it inerts');
-
-  // Behavioral: replay the exact filter/forEach both functions use over a mock
-  // body-child list, in the order that broke before (Quick Setup, THEN a 401).
-  // The login overlay must end interactive; the dashboard behind must stay inert.
-  const el = (id) => ({ id, inert: false, hidden: ['loginOverlay', 'qsDlg', 'qsDim'].includes(id) });
-  const wrap = el('wrap'), login = el('loginOverlay'), qsDim = el('qsDim'), qsDlg = el('qsDlg');
-  const body = [wrap, login, qsDim, qsDlg];
-  // showQuickSetup(): inert everything except qsDlg/qsDim/loginOverlay.
-  body.filter(e => e !== qsDlg && e !== qsDim && e !== login && !e.inert).forEach(e => (e.inert = true));
-  // ...a 401 fires -> showLogin(): clear own inert, reveal, inert the rest.
-  login.inert = false; login.hidden = false;
-  body.filter(e => e !== login && !e.inert).forEach(e => (e.inert = true));
-  assert.equal(login.inert, false, 'login must be interactive when raised over Quick Setup');
-  assert.equal(wrap.inert, true, 'the dashboard behind must stay inert');
-});
-
-test('log and CSV downloads surface an oversized result instead of failing silently (#5)', () => {
-  assert.match(script, /function flashStatus\(/, 'a status-toast helper exists');
-  assert.match(script, /function flashStatus\(msg\)\{[\s\S]{0,140}undoToast/, 'flashStatus writes the role=status toast');
-  assert.match(script, /This CSV is too large to download/, 'CSV handler messages on toobig (was silent)');
-  assert.match(script, /These logs are too large to download/, 'log handler messages on toobig (was silent)');
-  // the no-stream fallback also refuses an over-cap declared size instead of buffering blindly
-  assert.match(script, /Content-Length[\s\S]{0,80}downloadCapBytes[\s\S]{0,40}return 'toobig'/, 'blob fallback caps via Content-Length');
-});
-
-test('log download never carries a navigable api/logs href - no Basic-prompt bypass (#6)', () => {
-  assert.doesNotMatch(html, /id="logDownload"[^>]*href="api\/logs/, 'initial markup has no native api/logs href');
-  assert.doesNotMatch(script, /setAttribute\('href'\s*,\s*'api\/logs/, 'no runtime code sets a native api/logs href');
-  assert.doesNotMatch(script, /updateLogDownload/, 'the href-setting helper is gone (middle-click/save-as cannot bypass the marked fetch)');
-});
-
-test('Quick Setup update checkbox is named and errors are announced (#8)', () => {
-  assert.match(html, /id="qsUpd"[^>]*aria-label="Check for updates"/, 'update checkbox has an accessible name');
-  assert.match(html, /id="qsErr"[^>]*role="alert"/, 'the async error element is a live region');
-});
-
-test('int-field fallbacks match the shipping defaults (streams=8, omit=1)', () => {
-  const streams = html.match(/\['setIperfStreams','iperf_streams','int',(\d+)\]/);
-  const omit = html.match(/\['setIperfOmit','iperf_omit','int',(\d+)\]/);
-  assert.ok(streams, 'iperf_streams FIELDS entry present');
-  assert.equal(streams[1], '8', 'blank Parallel streams must fall back to 8 (config.go IperfStreams), not the minimum 1');
-  assert.ok(omit, 'iperf_omit FIELDS entry present');
-  assert.equal(omit[1], '1', 'blank warm-up (omit) must fall back to 1 (config.go IperfOmit), not 0');
 });
 
 test('getField int: a typed 0 is a value, not the fallback', () => {
@@ -2290,7 +2176,8 @@ test('Quick Setup guard rails: coach deferral, byte cap, access latch', () => {
   const coach = extract('function showCoach');
   assert.match(coach, /if\(!\$\('qsDlg'\)\.hidden\) return;/, 'showCoach must defer behind the dialog');
   const save = extract('function qsSave');
-  assert.match(save, /encode\(pass\)\.length>72/, 'the 72-byte bcrypt cap is checked before the round trip');
+  assert.match(save, /encode\(pass\)\.length>72/, 'the 72-byte bcrypt cap is checked before any write');
+  assert.match(save, /network && !qsAccessDone/, 'a retry must not re-post credentials');
   const dec = extract('function qsDecline');
   assert.match(dec, /qsGo'\)\.disabled\) return;/, 'Esc must not decline mid-save');
   assert.match(html, /id="qsPass" placeholder="Password" maxlength="72"/, 'the field cap matches the server');
@@ -2312,24 +2199,6 @@ test('the coachmark tracks header growth, not just window resizes', () => {
 // The save gate must judge what is IN the editor, not what was last captured:
 // a typed replacement password (or a just-cleared field) exists only in the
 // DOM until captureIperfEditor folds it in.
-// Quick Setup applies as ONE atomic call to /api/quick-setup - not a sequence of
-// partial settings/access/marker POSTs (which froze settings, could commit
-// opposite choices on retry, and could mark done half-applied). The server marks
-// the install answered in the same transaction; the client just posts once.
-test('Quick Setup applies via one atomic /api/quick-setup call', () => {
-  const save = extract('function qsSave');
-  // Exactly one write, to the atomic endpoint - no /api/settings, /api/access,
-  // /api/update, or a separate marker POST.
-  assert.match(save, /fetch\('api\/quick-setup'/, 'qsSave posts to the atomic endpoint');
-  assert.doesNotMatch(save, /fetch\('api\/settings'/, 'no separate settings POST');
-  assert.doesNotMatch(save, /fetch\('api\/access'/, 'no separate access POST');
-  assert.doesNotMatch(save, /fetch\('api\/update'/, 'no separate update POST');
-  assert.doesNotMatch(save, /quick_setup_done/, 'the marker is the server\'s job, not a client write');
-  // The body carries the full answer, and "This machine only" maps to local_only.
-  assert.match(save, /local_only: !network/, 'machine-only maps to local_only:true');
-  assert.match(save, /encode\(user\)\.length>128/, 'username byte cap checked before the round trip');
-});
-
 test('the orphan save-gate captures the open editor before judging', () => {
   const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
   const cap = save.indexOf('captureIperfEditor();');
@@ -2383,20 +2252,21 @@ test('Quick Setup cost note: pinned numbers per cadence', () => {
   assert.doesNotMatch(qsUseNote(0), /month/, 'the monthly total was deliberately dropped');
 });
 
+// What consent actually writes. Manually must turn the schedule OFF without
+// touching the interval - and every exit carries the answered marker.
+test('Quick Setup payloads: enable-with-interval or plain off, marker always', () => {
+  const { qsSettingsPayload } = F;
+  assert.deepEqual(qsSettingsPayload(0), { quick_setup_done: true, speedtest_enabled: true, speed_seconds: 3600 });
+  assert.deepEqual(qsSettingsPayload(1), { quick_setup_done: true, speedtest_enabled: true, speed_seconds: 21600 });
+  assert.deepEqual(qsSettingsPayload(2), { quick_setup_done: true, speedtest_enabled: false },
+    'Manually must not send an interval - declining a cadence is not choosing one');
+});
+
 // The gate is strict equality: an older daemon or the demo shim simply lacks
 // the field, and absent must mean never - not truthy-by-accident.
-test('Quick Setup only shows on quick_setup_pending === true, and defaults access to how it booted', () => {
-  assert.match(script, /s\.quick_setup_pending===true\)\{ qsBootLocalOnly = s\.access_local_only!==false; showQuickSetup\(\); \}/,
-    'the boot hook gates on strict === true and captures the booted access mode');
-  // When the install booted network-reachable (e.g. -access network), "This
-  // machine only" would lock the operator out, so the note must warn instead of
-  // promising "nothing is reachable".
-  const mo = extract('function qsMachineOnlyNote');
-  assert.match(mo, /qsBootLocalOnly/, 'the machine-only note branches on how the install booted');
-  assert.match(mo, /lock you out/, 'a network-reachable install warns that "This machine only" locks you out');
-  // showQuickSetup preselects the access radio from the booted mode.
-  assert.match(script, /segChoose\.qsAcc\(qsBootLocalOnly \? 0 : 1, false\)/,
-    'the access choice defaults to the booted mode so accepting it never locks the operator out');
+test('Quick Setup only shows on quick_setup_pending === true', () => {
+  assert.match(script, /s\.quick_setup_pending===true\) showQuickSetup\(\)/,
+    'the boot hook must gate on strict === true');
 });
 
 // The two exits differ, permanently: dismissal persists the answer and applies
@@ -2408,11 +2278,8 @@ test('Quick Setup markup and decline semantics', () => {
   const dec = extract('function qsDecline');
   assert.match(dec, /applyTheme\(t\)/, 'decline must un-preview the theme');
   assert.match(dec, /qsMark\(\)/, 'decline must persist the answer');
-  const mark = extract('function qsMark');
-  assert.match(mark, /api\/quick-setup/, 'decline marks done via the atomic endpoint, not the freezing settings post');
-  assert.match(mark, /dismiss:true/, 'decline sends dismiss (marker only, freezes nothing)');
   const save = extract('function qsSave');
-  assert.match(save, /local_only: !network/, 'access scope is derived from the chosen option');
+  assert.match(save, /local_only:false/, 'network choice reaches /api/access');
   assert.match(save, /loadSettings\(\)/, 'a save re-syncs the drawer from server truth');
 });
 

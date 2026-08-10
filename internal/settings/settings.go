@@ -1157,6 +1157,7 @@ type Patch struct {
 	AlertOnOutage        *bool
 	WebhookURL           *string
 	WebhookFormat        *string
+	QuickSetupDone       *bool
 	HeartbeatURL         *string
 	DigestFreq           *string
 	SchedLatEnabled      *bool
@@ -1171,6 +1172,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.LatencyEnabled, p.LatencyEnabled)
 	setIf(&v.DNSProbe, p.DNSProbe)
 	setIf(&v.NetinfoEnabled, p.NetinfoEnabled)
+	setIf(&v.QuickSetupDone, p.QuickSetupDone)
 	setIf(&v.Speed, p.Speed)
 	setIf(&v.Retention, p.Retention)
 	setIf(&v.SpeedRetention, p.SpeedRetention)
@@ -1264,7 +1266,6 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 	}
 	var out Values
 	err := c.mutate(ctx, func(cur *Values) map[string]string {
-		old := formKeys(normalize(*cur)) // baseline, to persist only what changes
 		v := *cur
 		p.apply(&v)
 		// Each server's iperf3 password is write-only: the form never echoes it, so a
@@ -1276,20 +1277,7 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 		nv.IperfServers = mergeIperfPasswords(nv.IperfServers, cur.IperfServers)
 		*cur = nv
 		out = *cur
-		// Persist ONLY the keys that actually changed. formKeys(out) is the full
-		// ~50-key snapshot; writing all of it froze every default a partial POST
-		// didn't mention - which shadowed CLI flags AND (since a persisted config
-		// key now reads as establishment) could make a fresh install look upgraded
-		// and skip first-run consent. A no-op POST now persists nothing. The
-		// in-memory Values above are still fully merged, so reads are unaffected.
-		newKeys := formKeys(out)
-		diff := make(map[string]string, len(newKeys))
-		for k, val := range newKeys {
-			if old[k] != val {
-				diff[k] = val
-			}
-		}
-		return diff
+		return formKeys(out)
 	})
 	if err != nil {
 		return Values{}, err
@@ -1373,31 +1361,6 @@ func (c *Controller) SetMonitoring(ctx context.Context, on bool) error {
 	})
 }
 
-// SetMonitoringAnsweringSetup sets the power state AND, when powering ON a
-// still-unanswered install, marks Quick Setup done - both in ONE transaction and
-// one broadcast. An explicit power-on IS an answer to the first-run offer, and
-// splitting it into two writes (as an earlier version did, suppressing the
-// marker-write error) could report monitoring enabled while the boot hold still
-// blocked probes, because the marker never landed. Atomic here: either the UI
-// shows on AND the hold is released, or neither moved. Returns whether the marker
-// was written, so the caller need not re-read.
-func (c *Controller) SetMonitoringAnsweringSetup(ctx context.Context, on bool) (markedDone bool, err error) {
-	err = c.mutate(ctx, func(v *Values) map[string]string {
-		kv := map[string]string{keyMonitoring: b2s(on)}
-		v.Monitoring = on
-		if on && !v.QuickSetupDone {
-			v.QuickSetupDone = true
-			kv[keyQuickSetup] = b2s(true)
-			markedDone = true
-		}
-		return kv
-	})
-	if err != nil {
-		markedDone = false // the transaction rolled back; nothing was written
-	}
-	return markedDone, err
-}
-
 // SetUpdateCheckEnabled flips the daily background poll for a newer release.
 func (c *Controller) SetUpdateCheckEnabled(ctx context.Context, on bool) error {
 	return c.mutate(ctx, func(v *Values) map[string]string {
@@ -1414,80 +1377,6 @@ func (c *Controller) QuickSetupDone() bool { return c.get().QuickSetupDone }
 
 // SetQuickSetupDone records the first-run dialog's answer (Start and dismiss
 // both count). Monotonic in practice: nothing ever sets it back.
-// QuickSetupAnswer is a complete first-run answer. The web handler validates the
-// raw input and pre-hashes the password (bcrypt), then hands the whole thing here
-// to be applied ATOMICALLY - one transaction, one broadcast - so a partial apply
-// can never leave the answered marker set with the rest half-written, and so only
-// these keys are persisted (the settings-form path freezes every default; this
-// does not, leaving CLI-seeded and untouched settings alone).
-type QuickSetupAnswer struct {
-	// Dismiss means "keep every default, just mark answered" (the X / Esc
-	// decline). It writes ONLY the marker - no cadence, access, or auth - so it
-	// neither freezes a setting nor can change access. Overrides the rest.
-	Dismiss          bool
-	SpeedtestEnabled bool
-	SpeedSeconds     int // clamped to [MinSpeed, MaxSpeed]; applied only when SpeedtestEnabled
-	UpdateCheck      bool
-	LocalOnly        bool
-	AuthEnabled      bool   // login required
-	AuthUser         string // trimmed; used only when AuthHash != ""
-	AuthHash         string // bcrypt hash, "" = no password set (login stays inert)
-}
-
-// ApplyQuickSetup writes the whole first-run answer in ONE mutate (atomic + a
-// single broadcast) and marks Quick Setup done in the same transaction. Only the
-// keys this answer covers are persisted - cadence, update check, access/auth, and
-// the marker - so nothing freezes the ~50 form defaults the settings-form path
-// would. Idempotent: a re-apply after a lost response re-writes the same keys.
-func (c *Controller) ApplyQuickSetup(ctx context.Context, a QuickSetupAnswer) error {
-	if a.Dismiss {
-		// Marker only: SetQuickSetupDone writes a single key (no freeze), and
-		// touches no access/auth - safe to call even when a login is active.
-		return c.SetQuickSetupDone(ctx, true)
-	}
-	return c.mutate(ctx, func(v *Values) map[string]string {
-		kv := map[string]string{
-			keySpeedEnabled:    b2s(a.SpeedtestEnabled),
-			keyUpdateCheck:     b2s(a.UpdateCheck),
-			keyAccessLocalOnly: b2s(a.LocalOnly),
-			keyMonitoring:      b2s(true), // "Start monitoring" must actually start it
-			keyQuickSetup:      b2s(true), // the marker, in the SAME transaction
-		}
-		v.SpeedtestEnabled = a.SpeedtestEnabled
-		v.UpdateCheckEnabled = a.UpdateCheck
-		v.AccessLocalOnly = a.LocalOnly
-		v.Monitoring = true // "Start monitoring" turns the power on, in the same tx
-		v.QuickSetupDone = true
-		if a.SpeedtestEnabled {
-			d := time.Duration(a.SpeedSeconds) * time.Second
-			if d < MinSpeed {
-				d = MinSpeed
-			} else if d > MaxSpeed {
-				d = MaxSpeed
-			}
-			v.Speed = d
-			kv[keySpeed] = sec(d)
-		}
-		// Auth: a hash means "set a password and turn login on"; its absence
-		// leaves auth per the AuthEnabled flag (inert without a hash - matches
-		// SetAuthPassword's own semantics).
-		if a.AuthHash != "" {
-			user := capLen(strings.TrimSpace(a.AuthUser), maxUser)
-			if user == "" {
-				user = "admin"
-			}
-			v.AuthUser, v.AuthHash, v.AuthEnabled = user, a.AuthHash, a.AuthEnabled
-			kv[keyAuthUser] = user
-			kv[keyAuthHash] = a.AuthHash
-			kv[keyAuthEnabled] = b2s(a.AuthEnabled)
-		} else {
-			v.AuthEnabled = a.AuthEnabled
-			kv[keyAuthEnabled] = b2s(a.AuthEnabled)
-		}
-		return kv
-	})
-}
-
 func (c *Controller) SetQuickSetupDone(ctx context.Context, done bool) error {
 	return c.mutate(ctx, func(v *Values) map[string]string {
 		v.QuickSetupDone = done
@@ -1514,22 +1403,7 @@ const quickSetupGrace = 48 * 60 * 60
 // they must never disagree, or the dialog would promise a state the daemon
 // does not have.
 func QuickSetupHold(done bool, offerSinceUnix, nowUnix int64) bool {
-	if done || offerSinceUnix == 0 {
-		return false
-	}
-	elapsed := nowUnix - offerSinceUnix
-	// A NEGATIVE elapsed (offer clock in the future) still HOLDS: releasing it
-	// would start monitoring with defaults on a fresh install without the user
-	// ever answering Quick Setup - a consent bypass. It just must not extend the
-	// 48h fallback for years; EnsureQuickSetupOffer re-anchors a future offer
-	// clock at boot (through the fresh-vs-established gate) so elapsed lands back
-	// in [0, grace) and an established install is marked answered rather than
-	// re-held. The one residual is a MID-session backward step on an
-	// already-released fresh install (done=false, monitoring running): the
-	// dialog can re-pop until the next restart re-runs the boot gate and marks
-	// it answered. Rare, recoverable, and self-healing - accepted over a consent
-	// bypass.
-	return elapsed < quickSetupGrace
+	return !done && offerSinceUnix != 0 && nowUnix-offerSinceUnix < quickSetupGrace
 }
 
 // EnsureQuickSetupOffer runs once at boot and materializes the offer decision.
@@ -1542,120 +1416,31 @@ func QuickSetupHold(done bool, offerSinceUnix, nowUnix int64) bool {
 // day-old install upgrading has a young anchor but is running. A history read
 // error takes NO decision (no writes): the same boot logic runs again next
 // start, which is the self-correcting failure direction.
-// EstablishedInStore reports whether the STORE shows an established install:
-// measurement history, an install anchor, or persisted operator configuration.
-// It reads the store DIRECTLY (not the in-memory Values), so the answer is valid
-// even when the settings controller failed to load - which is exactly when the
-// boot-time offer decision was skipped. This is the single definition of
-// "established": EnsureQuickSetupOffer uses it to mark an upgrade answered, and
-// the boot monitoring hold uses it to hold ONLY a genuinely fresh install while
-// settings are still unloaded. A read error is returned, not swallowed, so each
-// caller can pick its own failure direction.
-func (c *Controller) EstablishedInStore(ctx context.Context) (bool, error) {
-	history, err := c.store.HasHistory(ctx)
-	if err != nil {
-		return false, err
-	}
-	// Any measurement history or an install anchor is an upgrade outright.
-	if history || c.store.InstallBornAt(ctx) != 0 {
-		return true, nil
-	}
-	// Also established: a database that already carries operator configuration but
-	// no measurements yet (an upgrade from before the install anchor existed, or a
-	// config written/restored ahead of the first probe). A genuinely new install
-	// has no such keys - defaults live in memory; only explicit changes persist -
-	// so this never misreads a real first-run install as established.
-	all, err := c.store.AllSettings(ctx)
-	if err != nil {
-		return false, err
-	}
-	return hasPriorConfiguration(all), nil
-}
-
 func (c *Controller) EnsureQuickSetupOffer(ctx context.Context, nowUnix int64) error {
 	if c.QuickSetupDone() {
 		return nil
 	}
-	// History gate FIRST, unconditionally: any measurement history or an install
-	// anchor means the install is established, so materialize it as answered and
-	// never hold it - whatever the offer clock reads. This closes both clock
-	// hazards at once: a FUTURE offer clock (booted skewed ahead, corrected
-	// backward) that would otherwise stall the 48h fallback for years, AND a
-	// past-but-young offer clock (a small backward step after the 48h release)
-	// that would otherwise RE-hold and re-pause a running install. An earlier
-	// version checked the offer clock before history and missed the past-young
-	// case.
-	est, err := c.EstablishedInStore(ctx)
-	if err != nil {
-		return err // a read error takes NO decision; retried next boot
-	}
-	if est {
-		return c.SetQuickSetupDone(ctx, true)
-	}
-	// Genuinely fresh (no history). A normal past offer clock is left exactly as
-	// it was (a fresh install mid-hold, or one released after 48h). Only two
-	// states act: never-offered (since==0) seeds the clock, and a future clock
-	// (since>now) is pulled back to now so the countdown is sane.
-	if since := c.QuickSetupOfferSince(ctx); since != 0 && since <= nowUnix {
+	if c.QuickSetupOfferSince(ctx) != 0 {
 		return nil
+	}
+	history, err := c.store.HasHistory(ctx)
+	if err != nil {
+		return err
+	}
+	if history || c.store.InstallBornAt(ctx) != 0 {
+		return c.SetQuickSetupDone(ctx, true)
 	}
 	return c.store.SetSetting(ctx, keyQuickSetupOffer, strconv.FormatInt(nowUnix, 10))
 }
 
-// installStateKeys are settings-table keys that hold INSTALL or session
-// bookkeeping, not operator configuration. A genuinely fresh install can already
-// carry some of these at first boot (the offer clock EnsureQuickSetupOffer seeds,
-// a session epoch, legacy telemetry rows from an older build), so they must NOT
-// count as evidence that the install was configured - see hasPriorConfiguration.
-var installStateKeys = map[string]bool{
-	keyQuickSetup:      true, // quick_setup_done      - the answer marker itself
-	keyQuickSetupOffer: true, // quick_setup_offer_since - the first-run offer clock
-	keyAuthSessEpoch:   true, // auth_session_epoch    - logout revocation, session state
-	"first_seen_ts":    true, // the monitoring anchor - evidence, not config
-	// Legacy telemetry identity/state (feature removed; only on older DBs).
-	"telemetry_id": true, "telemetry_install_id": true, "telemetry_salt": true,
-	"telemetry_id_born_at": true, "telemetry_consent_version": true,
-	"telemetry_last_speed_ts": true, "telemetry_last_event_ts": true,
-	"telemetry_last_send_ts": true, "telemetry_clean_shutdown": true,
-	"digest_last_sent": true, // when the last summary went out - delivery state
-}
-
-// hasPriorConfiguration reports whether a raw settings map holds any OPERATOR
-// configuration: any key that is not pure install/session bookkeeping
-// (installStateKeys). A fresh install persists none - its defaults live in
-// memory and only explicit UI/CLI/import changes reach the table - so a single
-// non-bookkeeping key means the install was deliberately set up. Used to treat a
-// configured-but-historyless database as established rather than fresh.
-func hasPriorConfiguration(m map[string]string) bool {
-	for k := range m {
-		if !installStateKeys[k] {
-			return true
-		}
-	}
-	return false
-}
-
-// QuickSetupOfferSince reads the offer clock (0 = never seeded). Masks a read
-// error as 0 - fine for the status endpoint (a transient error just shows
-// not-pending for one poll and self-heals), but NOT for the latching monitoring
-// hold: see QuickSetupOfferSinceErr.
+// QuickSetupOfferSince reads the offer clock (0 = never seeded).
 func (c *Controller) QuickSetupOfferSince(ctx context.Context) int64 {
-	n, _ := c.QuickSetupOfferSinceErr(ctx)
-	return n
-}
-
-// QuickSetupOfferSinceErr reads the offer clock and SURFACES a store read error
-// instead of masking it as 0. The monitoring hold must use this: a transient
-// read error read as "no clock" would release the hold - and monitoringLive
-// LATCHES that release permanently, starting a fresh install probing unasked off
-// one failed read. On error the hold instead holds (fail-safe).
-func (c *Controller) QuickSetupOfferSinceErr(ctx context.Context) (int64, error) {
 	m, err := c.store.AllSettings(ctx)
 	if err != nil {
-		return 0, err
+		return 0
 	}
 	n, _ := strconv.ParseInt(m[keyQuickSetupOffer], 10, 64)
-	return n, nil
+	return n
 }
 
 // SetLogLevel sets the logging switch: "off" logs nothing, any other value turns

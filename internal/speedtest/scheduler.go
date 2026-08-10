@@ -167,15 +167,6 @@ func (s *Scheduler) enabled() bool {
 	return s.EnabledFn == nil || s.EnabledFn()
 }
 
-// startupRunWanted reports whether the enabled-at-boot startup test should fire:
-// the scheduler was enabled at Loop start AND still is, AND no run completed
-// during the settle sleep. entryCompletions is the completions snapshot taken
-// before the sleep; if it advanced, a manual/reconnect run already served the
-// one-per-boot slot and a startup run would just re-test back-to-back.
-func (s *Scheduler) startupRunWanted(initiallyEnabled bool, entryCompletions uint64) bool {
-	return initiallyEnabled && s.enabled() && s.completions.Load() == entryCompletions
-}
-
 // Running reports whether a speedtest is in progress (any trigger). Safe for
 // concurrent use.
 // Running reports whether a run holds the single-flight claim. It reads the same
@@ -729,19 +720,16 @@ func (s *Scheduler) Loop(ctx context.Context) {
 	// readiness), not masquerade as an already-configured boot and run
 	// immediately with none of either.
 	initiallyEnabled := s.enabled()
-	// Snapshot completions BEFORE the settle sleep: a manual or reconnect run that
-	// lands during the sleep already serves the one-per-boot slot, so the startup
-	// run below must not also fire (a redundant back-to-back test on a link still
-	// settling from the first). Mirrors the disabled->enabled latch, which already
-	// gates on this counter; the enabled-at-boot run used to skip the check.
-	entryCompletions := s.completions.Load()
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(startupDelay):
 	}
 	startupPending := !initiallyEnabled
-	if s.startupRunWanted(initiallyEnabled, entryCompletions) {
+	// Both reads must agree: configured at Loop start AND still enabled now.
+	// A disable during the settle sleep skips the run (pre-existing off/on
+	// semantics take over); it does not re-arm the latch.
+	if initiallyEnabled && s.enabled() {
 		s.RunOnce(ctx, "startup")
 	}
 	lastRun := time.Now()
@@ -808,18 +796,8 @@ func (s *Scheduler) Loop(ctx context.Context) {
 			// and duplicates the test. Only persisted runs count, so a failed
 			// attempt doesn't burn the slot. The drain still empties the
 			// capacity-1 nudge so the main select doesn't spin on it.
-			// A pending runWake token means a persisted run completed and was
-			// NOT yet observed by the main select's runWake case (the loop left
-			// via wake, or entered the latch directly from the settle sleep).
-			// That run serves the slot - HONOR the drained token, don't just
-			// discard it. Combined with the counter check (a run that completed
-			// during the pause), this closes the race where a run finishing
-			// BEFORE latch entry - its increment already baked into
-			// latchEntryCompletions - would otherwise leave the slot armed and
-			// fire a duplicate.
 			select {
 			case <-s.runWake:
-				startupPending = false
 			default:
 			}
 			if s.completions.Load() != latchEntryCompletions {
@@ -868,16 +846,6 @@ func (s *Scheduler) Loop(ctx context.Context) {
 		// Re-read the interval each cycle so runtime changes take effect; keep the
 		// lastRun anchor so a change shifts the deadline, never resets it.
 		wait := time.Until(lastRun.Add(s.curInterval() + jitter))
-		// While the startup slot is still armed but the scheduler is gated
-		// (outside a daily window, monitoring off), the latch branch above is
-		// skipped and this wait would be a full interval - so a window that
-		// opens later by the CLOCK (nothing broadcasts that) is slept straight
-		// through, and the first measurement slips ~an interval. Poll at the
-		// recheck cadence instead, so the latch re-evaluates enabled() as the
-		// window opens.
-		if startupPending && wait > scheduleRecheck {
-			wait = scheduleRecheck
-		}
 		if wait <= 0 {
 			// Due, enabled, schedule window open, and the link isn't already busy. A
 			// closed window or busy link defers: poll every scheduleRecheck and fire
