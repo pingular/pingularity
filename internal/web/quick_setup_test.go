@@ -55,13 +55,14 @@ func TestQuickSetupPendingGates(t *testing.T) {
 		t.Fatal("the upgrade decision must be stored as answered, not recomputed")
 	}
 
-	// The marker beats an open clock: answered is answered.
+	// The marker beats an open clock: answered is answered. Dismiss via the
+	// atomic endpoint - /api/settings can no longer set the server-owned marker.
 	s3 := newTestServer(t)
 	if err := s3.settings.EnsureQuickSetupOffer(ctx, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
-	if w := do(t, s3.Handler(), "POST", "/api/settings", `{"quick_setup_done":true}`); w.Code != 200 {
-		t.Fatalf("marker POST: %d %s", w.Code, w.Body.String())
+	if w := do(t, s3.Handler(), "POST", "/api/quick-setup", `{"dismiss":true}`); w.Code != 200 {
+		t.Fatalf("dismiss POST: %d %s", w.Code, w.Body.String())
 	}
 	if s3.quickSetupPending(ctx) {
 		t.Fatal("an answered dialog must not be offered again")
@@ -76,12 +77,13 @@ func TestQuickSetupPendingGates(t *testing.T) {
 	}
 }
 
-// The dismissal write is a one-field body: nothing else may change. A decline
-// that also reset a setting would make "keep the defaults" a lie.
+// The dismissal write is marker-only: nothing else may change. A decline that
+// also reset a setting would make "keep the defaults" a lie. Goes through the
+// atomic endpoint's dismiss path (the only way to set the marker).
 func TestQuickSetupDismissTouchesNothingElse(t *testing.T) {
 	s := newTestServer(t)
 	before := s.settings.Snapshot()
-	if w := do(t, s.Handler(), "POST", "/api/settings", `{"quick_setup_done":true}`); w.Code != 200 {
+	if w := do(t, s.Handler(), "POST", "/api/quick-setup", `{"dismiss":true}`); w.Code != 200 {
 		t.Fatalf("POST: %d %s", w.Code, w.Body.String())
 	}
 	after := s.settings.Snapshot()
@@ -123,8 +125,8 @@ func TestStatusCarriesQuickSetupPending(t *testing.T) {
 	if !read() {
 		t.Fatal("fresh install: status must offer Quick Setup")
 	}
-	if w := do(t, s.Handler(), "POST", "/api/settings", `{"quick_setup_done":true}`); w.Code != 200 {
-		t.Fatalf("marker POST: %d", w.Code)
+	if w := do(t, s.Handler(), "POST", "/api/quick-setup", `{"dismiss":true}`); w.Code != 200 {
+		t.Fatalf("dismiss POST: %d", w.Code)
 	}
 	if read() {
 		t.Fatal("after the answer, status must stop offering")

@@ -93,6 +93,16 @@ func TestNewerAndIsRelease(t *testing.T) {
 		{"dev", "0.8.0", false},    // dev current never compares
 		{"0.7.0", "banana", false}, // junk latest never wins
 		{"0.7.0", "", false},
+		// A prerelease current ranks below the same-numbered final, so an rc tester
+		// is offered the stable they were testing (latest arrives stripped to its
+		// core, so it is treated as final).
+		{"0.62.0-rc.1", "0.62.0", true},       // promoted: rc -> its own stable IS an upgrade
+		{"0.62.0-rc.2", "0.62.0", true},       // any rc of that version
+		{"v0.62.0-rc1", "0.62.0", true},       // v-prefix + hyphenless rc style
+		{"0.62.0", "0.62.0", false},           // a stable never nags toward its own number
+		{"0.62.0-rc.1", "0.62.0-rc.1", false}, // identical rc: not an upgrade
+		{"0.63.0-rc.1", "0.62.0", false},      // newer rc core is NOT downgraded to older stable
+		{"0.62.0-rc.1", "0.63.0", true},       // a real newer stable still wins outright
 	} {
 		if got := newer(c.cur, c.lat); got != c.want {
 			t.Errorf("newer(%q,%q)=%v want %v", c.cur, c.lat, got, c.want)

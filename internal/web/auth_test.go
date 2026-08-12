@@ -1034,10 +1034,11 @@ func TestLogoutWithoutCookieKeepsSessions(t *testing.T) {
 	}
 }
 
-// In a container the loopback-only filter can't be enforced (every request is
-// NAT'd to the gateway), so a non-loopback peer must be let through - not locked
-// out - while the same request on a native host is still rejected.
-func TestLocalOnlyContainerBypass(t *testing.T) {
+// Local-only means loopback-only for EVERYONE - native and containers alike.
+// There is no interface-heuristic bypass: a non-loopback peer is 403'd whether
+// or not we're in a container. Network reach is an explicit choice (-access
+// network turns AccessLocalOnly off), not something inferred from interfaces.
+func TestLocalOnlyEnforcedEverywhere(t *testing.T) {
 	req := func(s *Server) *httptest.ResponseRecorder {
 		if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
 			t.Fatalf("SetAccessLocalOnly: %v", err)
@@ -1055,61 +1056,34 @@ func TestLocalOnlyContainerBypass(t *testing.T) {
 		t.Errorf("native non-loopback request: %d, want 403", w.Code)
 	}
 
-	var buf bytes.Buffer
-	container := newTestServerLog(t, &buf)
-	container.InContainer, container.Bridged = true, true
-	if w := req(container); w.Code != http.StatusOK {
-		t.Errorf("bridged container non-loopback request: %d, want 200 (local-only unenforceable)", w.Code)
-	}
-	if !strings.Contains(buf.String(), "cannot be enforced in a bridged container") {
-		t.Errorf("expected bridged-container warning in log, got: %s", buf.String())
+	// A container gets NO bypass now - the same 403. (Its published-port operator
+	// sets -access network, which turns local-only off entirely.)
+	container := newTestServer(t)
+	container.InContainer = true
+	if w := req(container); w.Code != http.StatusForbidden {
+		t.Errorf("container non-loopback request: %d, want 403 (no container bypass)", w.Code)
 	}
 }
 
-// A host-networked container (InContainer but not Bridged) keeps loopback
-// meaningful, so local-only must still 403 a non-loopback peer; only a bridged
-// container may fall through unenforced.
-func TestLocalOnlyEnforcedInHostNetContainer(t *testing.T) {
-	req := func(s *Server) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("GET", "/api/access", nil)
-		r.Host = "192.0.2.10" // an IP literal passes the DNS-rebinding guard
-		r.RemoteAddr = "192.0.2.1:1234"
-		w := httptest.NewRecorder()
-		s.Handler().ServeHTTP(w, r)
-		return w
-	}
-
-	s := newTestServer(t)
-	s.InContainer, s.Bridged = true, false
-	if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
-		t.Fatalf("SetAccessLocalOnly: %v", err)
-	}
-	if w := req(s); w.Code != http.StatusForbidden {
-		t.Errorf("host-net container non-loopback request: %d, want 403 (loopback test is meaningful there)", w.Code)
-	}
-	s.Bridged = true
-	if w := req(s); w.Code != http.StatusOK {
-		t.Errorf("bridged container non-loopback request: %d, want 200 (warn-only)", w.Code)
-	}
-}
-
-// accessStatus must distinguish the stored toggle from whether the loopback
-// filter is actually live, exactly as auth_enabled vs auth_active.
+// accessStatus reports enforcement straight from the toggle now: local-only is
+// live whenever it is on, with no container exception.
 func TestAccessStatusReportsLocalOnlyEnforcement(t *testing.T) {
 	s := newTestServer(t)
 	if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
 		t.Fatalf("SetAccessLocalOnly: %v", err)
 	}
-	s.Bridged = true
+	s.InContainer = true // must NOT change enforcement anymore
 	out := s.accessStatus(httptest.NewRequest("GET", "/api/access", nil))
-	if out["local_only"] != true || out["local_only_active"] != false {
-		t.Errorf("bridged: local_only=%v local_only_active=%v, want true/false (stored but not enforced)",
+	if out["local_only"] != true || out["local_only_active"] != true {
+		t.Errorf("container: local_only=%v local_only_active=%v, want true/true (enforced everywhere)",
 			out["local_only"], out["local_only_active"])
 	}
-	s.Bridged = false
+	if err := s.settings.SetAccessLocalOnly(context.Background(), false); err != nil {
+		t.Fatalf("SetAccessLocalOnly: %v", err)
+	}
 	out = s.accessStatus(httptest.NewRequest("GET", "/api/access", nil))
-	if out["local_only"] != true || out["local_only_active"] != true {
-		t.Errorf("not bridged: local_only=%v local_only_active=%v, want true/true (enforced)",
+	if out["local_only"] != false || out["local_only_active"] != false {
+		t.Errorf("network access: local_only=%v local_only_active=%v, want false/false",
 			out["local_only"], out["local_only_active"])
 	}
 }
@@ -1444,5 +1418,274 @@ func TestFirstTimePasswordSetupNeedsNoStepUp(t *testing.T) {
 	}
 	if !s.settings.AuthActive() {
 		t.Fatal("first-time password set did not activate auth")
+	}
+}
+
+// The 401's WWW-Authenticate: Basic challenge exists for CLI clients (curl,
+// wget, Prometheus) - but our own SPA marks every request with X-Pingularity-UI,
+// and a same-origin fetch answered 401+Basic pops the browser's NATIVE dialog on
+// top of the SPA login overlay. So the header must be sent EXACTLY when the app
+// header is absent. Keyed on an app-owned header, not Sec-Fetch-Mode: the latter
+// is omitted by Chrome on a plain-HTTP LAN origin (the common dashboard install),
+// where the old gate let the double prompt return.
+func TestWWWAuthenticateOnlyForNonAppClients(t *testing.T) {
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+	h := s.Handler()
+
+	get := func(hdr map[string]string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/api/settings", nil)
+		r.Host = "127.0.0.1:9000"
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	// CLI shape (no app header): 401 WITH the Basic challenge.
+	w := get(nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated CLI request: got %d, want 401", w.Code)
+	}
+	if got := w.Header().Get("WWW-Authenticate"); got == "" {
+		t.Error("CLI-shaped 401 must carry WWW-Authenticate (wget-style clients wait for the challenge)")
+	}
+
+	// SPA shape (app header set): the same 401, WITHOUT the challenge - the
+	// overlay is the login surface, and the header is what summoned the native
+	// dialog. Origin-independent by construction: no Sec-Fetch-* dependence.
+	w = get(map[string]string{"X-Pingularity-UI": "1"})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("SPA 401: got %d, want 401", w.Code)
+	}
+	if got := w.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("an app-marked request must suppress WWW-Authenticate; got %q (this is the double login modal)", got)
+	}
+
+	// Suppressing the CHALLENGE must not suppress the AUTHENTICATION: Basic still
+	// works even from a marked request.
+	r := httptest.NewRequest("GET", "/api/settings", nil)
+	r.Host = "127.0.0.1:9000"
+	r.SetBasicAuth("admin", "secret")
+	r.Header.Set("X-Pingularity-UI", "1")
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("preemptive Basic with the app header: got %d, want 200", w2.Code)
+	}
+}
+
+// The atomic Quick Setup endpoint must NOT be a step-up bypass: once a login is
+// active, a cookie-only session (no current password) cannot use /api/quick-setup
+// to rotate credentials or disable auth - the takeover /api/access's step-up
+// gate exists to block. Auth active + Quick Setup still pending is the reachable
+// state (a password set via Settings while the first-run offer is open).
+func TestQuickSetupRefusesAccessChangeWhenAuthActive(t *testing.T) {
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret") // auth now active; quick_setup_done still false
+	h := s.Handler()
+
+	sessionOnly := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000"
+		r.Header.Set("Content-Type", "application/json")
+		r.AddCookie(&http.Cookie{Name: sessionCookie,
+			Value: issueToken("admin", s.settings.AuthHash(), s.settings.SessionEpoch(), time.Now())})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	// Takeover attempt: rotate to attacker creds with no current password.
+	w := sessionOnly(`{"auth_enabled":true,"username":"attacker","password":"pwned","local_only":false}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("credential rotation via quick-setup returned %d, want 403", w.Code)
+	}
+	if s.checkPassword("attacker", "pwned") {
+		t.Fatal("attacker credentials were applied - the step-up bypass is open")
+	}
+	if !s.checkPassword("admin", "secret") {
+		t.Fatal("original admin password was changed")
+	}
+
+	// Disable-auth attempt: must also be refused.
+	w = sessionOnly(`{"auth_enabled":false,"local_only":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("disabling auth via quick-setup returned %d, want 403", w.Code)
+	}
+	if !s.settings.AuthActive() {
+		t.Fatal("auth was disabled without the current password")
+	}
+
+	// Dismiss (marker only, no access change) IS allowed even with auth active -
+	// a dismissed dialog must be able to close.
+	w = sessionOnly(`{"dismiss":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("dismiss with auth active returned %d, want 200", w.Code)
+	}
+	if !s.settings.QuickSetupDone() {
+		t.Fatal("dismiss did not mark Quick Setup done")
+	}
+}
+
+// The atomic Quick Setup endpoint must reject an INCOMPLETE answer rather than
+// treat omitted fields as explicit false/zero (which would mark setup done and
+// silently flip access/update off). A complete answer turns monitoring on.
+func TestQuickSetupRejectsIncompleteAnswer(t *testing.T) {
+	post := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		s := newTestServer(t) // fresh: auth inactive, quick_setup pending
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000"
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+
+	if w := post(t, `{}`); w.Code != http.StatusBadRequest {
+		t.Errorf("empty answer: got %d, want 400 (omitted != explicit false)", w.Code)
+	}
+	if w := post(t, `{"speedtest_enabled":true,"update_check":true}`); w.Code != http.StatusBadRequest {
+		t.Errorf("missing local_only: got %d, want 400", w.Code)
+	}
+	if w := post(t, `{"speedtest_enabled":true,"update_check":true,"local_only":true}`); w.Code != http.StatusBadRequest {
+		t.Errorf("speedtests on with no interval: got %d, want 400", w.Code)
+	}
+	// A complete answer succeeds and turns monitoring on.
+	s := newTestServer(t)
+	if err := s.settings.SetMonitoring(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(
+		`{"speedtest_enabled":false,"update_check":true,"local_only":true}`))
+	r.Host = "127.0.0.1:9000"
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("complete answer: got %d, want 200", w.Code)
+	}
+	if !s.settings.Monitoring() {
+		t.Error("a completed Quick Setup must leave monitoring ON (Start monitoring)")
+	}
+}
+
+// A login is active only when a password is set. The atomic endpoint must reject
+// "enable auth, no password" (which would otherwise complete setup with a
+// requested-but-inert login - network-open despite asking for one) and key
+// AuthActive off the password, not the client's flag.
+func TestQuickSetupAuthRequiresPassword(t *testing.T) {
+	post := func(t *testing.T, body string) (*httptest.ResponseRecorder, *Server) {
+		s := newTestServer(t)
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000"
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w, s
+	}
+
+	// auth_enabled with no password -> 400, setup NOT completed, auth NOT active.
+	if w, s := post(t, `{"speedtest_enabled":false,"update_check":true,"local_only":false,"auth_enabled":true,"username":"admin"}`); w.Code != http.StatusBadRequest {
+		t.Errorf("auth_enabled, no password: got %d, want 400", w.Code)
+	} else if s.settings.QuickSetupDone() || s.settings.AuthActive() {
+		t.Errorf("a rejected answer must not complete setup or activate auth (done=%v active=%v)", s.settings.QuickSetupDone(), s.settings.AuthActive())
+	}
+
+	// A supplied password activates auth even with the flag omitted (derived).
+	if w, s := post(t, `{"speedtest_enabled":false,"update_check":true,"local_only":false,"username":"admin","password":"correct horse battery"}`); w.Code != http.StatusOK {
+		t.Errorf("password given: got %d, want 200", w.Code)
+	} else if !s.settings.AuthActive() {
+		t.Error("a supplied password must activate auth")
+	}
+
+	// No auth requested, no password -> valid (network-open, no login).
+	if w, s := post(t, `{"speedtest_enabled":false,"update_check":true,"local_only":false}`); w.Code != http.StatusOK {
+		t.Errorf("no auth: got %d, want 200", w.Code)
+	} else if s.settings.AuthActive() {
+		t.Error("no password must leave auth inactive")
+	}
+}
+
+// The power-on endpoint answers the first-run offer in the SAME transaction as
+// the power flip: after it, monitoring is on AND the offer is answered (pending
+// off), so the UI can't show "on" while the boot hold still blocks probes.
+func TestMonitoringPowerOnAnswersOfferAtomically(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.settings.EnsureQuickSetupOffer(ctx, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if !s.quickSetupPending(ctx) {
+		t.Fatal("precondition: a fresh install should be pending")
+	}
+	r := httptest.NewRequest("POST", "/api/monitoring", strings.NewReader(`{"enabled":true}`))
+	r.Host = "127.0.0.1:9000"
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("power-on: got %d, want 200", w.Code)
+	}
+	if !s.settings.Monitoring() {
+		t.Error("monitoring must be on after power-on")
+	}
+	if s.quickSetupPending(ctx) {
+		t.Error("power-on must answer the offer in the same transaction (no lingering hold)")
+	}
+}
+
+// auth_enabled is a pointer: when sent explicitly it must MATCH whether a
+// password is present. auth_enabled:false with a password is rejected rather
+// than silently activating a login the operator turned off (#10).
+func TestQuickSetupAuthFlagMustMatchPassword(t *testing.T) {
+	post := func(body string) *httptest.ResponseRecorder {
+		s := newTestServer(t)
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000"
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if w := post(`{"speedtest_enabled":false,"update_check":true,"local_only":false,"auth_enabled":false,"password":"secretpw12"}`); w.Code != http.StatusBadRequest {
+		t.Errorf("auth_enabled:false with a password: got %d, want 400 (mismatch)", w.Code)
+	}
+	if w := post(`{"speedtest_enabled":false,"update_check":true,"local_only":false,"auth_enabled":true,"username":"admin","password":"secretpw12"}`); w.Code != http.StatusOK {
+		t.Errorf("auth_enabled:true with a matching password: got %d, want 200", w.Code)
+	}
+}
+
+// A lost-response retry of Quick Setup must stay idempotent even when the first
+// answer ENABLED a login: the endpoint is auth-exempt (it self-gates), so a
+// cookieless retry hits the "already done" no-op (200) instead of the session
+// guard's 401. Uses the network-access answer (local_only:false) - a machine-only
+// answer would correctly 403 a remote retry on the access filter, which is not
+// this bug.
+func TestQuickSetupRetryIdempotentAfterAuthEnabled(t *testing.T) {
+	s := newTestServer(t)
+	post := func(body, remote string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000" // IP literal passes the rebinding guard
+		r.RemoteAddr = remote
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r) // full guarded handler (auth middleware included)
+		return w
+	}
+	body := `{"speedtest_enabled":false,"update_check":true,"local_only":false,"auth_enabled":true,"username":"admin","password":"correct horse battery"}`
+	// First answer from the box itself (loopback): turns on network access + a login.
+	if w := post(body, "127.0.0.1:11111"); w.Code != http.StatusOK {
+		t.Fatalf("first answer: %d, want 200", w.Code)
+	}
+	if !s.settings.AuthActive() {
+		t.Fatal("precondition: the answer should have activated auth")
+	}
+	// Lost the response (and its Set-Cookie); a cookieless retry from a network
+	// peer must be the idempotent no-op, not a guard 401.
+	if w := post(body, "192.0.2.10:5000"); w.Code != http.StatusOK {
+		t.Errorf("cookieless retry after auth enabled: %d, want 200 (idempotent no-op, not a guard 401)", w.Code)
 	}
 }

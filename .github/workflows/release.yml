@@ -3,13 +3,26 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual escape hatch for a stranded tag: the 2026-08-06 Actions outage
+  # throttled webhooks and the TAG event never replayed (push events did, tag
+  # events do not), leaving a pushed tag with no release run - the remedy was
+  # deleting and re-pushing the tag. With this, dispatch the workflow AT the
+  # tag ref instead (Actions UI -> Release -> Run workflow -> pick the tag).
+  workflow_dispatch:
 
-# Only one release run per tag at a time. Re-cutting a tag (delete + re-push, as the
-# rc loop does) cancels the in-flight run instead of racing it, which otherwise
-# collided on asset uploads (422 already_exists / http2 REFUSED_STREAM).
+# Only one release run per tag at a time. Re-cutting a tag (delete + re-push, as
+# the rc loop does) or a manual re-dispatch QUEUES behind the in-flight run
+# rather than cancelling it. Serializing still prevents the concurrent asset-
+# upload collision the cancel was added for (422 already_exists / http2
+# REFUSED_STREAM) - two runs never upload at once - WITHOUT the hazard cancel
+# introduced: a workflow_dispatch (or a late-delivered throttled tag webhook)
+# sharing this group could otherwise cancel a run mid-publish, leaving a
+# half-uploaded release that the stable guard then refuses to complete. The cost
+# is only that an rc re-cut waits for the previous run to finish instead of
+# aborting it - cheap next to corrupting a shipped stable release.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # Least privilege by default; the publish job widens its own grant below.
 permissions:
@@ -19,6 +32,19 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
+      # workflow_dispatch (the stranded-tag escape hatch) can fire on a BRANCH,
+      # and a branch may be NAMED like a version - the SemVer check below reads
+      # GITHUB_REF_NAME and would pass it, while GoReleaser publishes the git tag
+      # at HEAD instead. On a v-named branch whose HEAD sits on an existing
+      # release tag that would OVERWRITE a shipped release. Refuse anything that
+      # is not a tag ref outright, before any checkout or token use.
+      - name: Require a tag ref
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::release runs only on a tag ref (got ${GITHUB_REF_TYPE} '${GITHUB_REF_NAME}'); dispatch the workflow with a tag ref, not a branch"
+            exit 1
+          fi
+
       # The trigger glob 'v*' also matches junk like 'v', 'vtest', or 'v1.2' - a
       # stray or malformed tag must not cut a release. Enforce a proper SemVer
       # grammar (leading v) before any checkout or token use. This is a regex, not a
@@ -31,9 +57,21 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
           if ! printf '%s' "$tag" | grep -Eq "$semver"; then
-            echo "::error::tag '$tag' is not a valid SemVer tag (vMAJOR.MINOR.PATCH[-prerelease][+build]); refusing to release"
+            echo "::error::tag '$tag' is not a valid SemVer tag (vMAJOR.MINOR.PATCH[-prerelease]); refusing to release"
             exit 1
           fi
+          # SemVer permits +build metadata, but this pipeline CANNOT ship it
+          # safely: the prerelease test below is a shell `*-*` glob, and build
+          # metadata like +build-1 contains a hyphen, so a STABLE tag with build
+          # metadata would be misread as a prerelease and skip the immutable-
+          # stable overwrite guard. Docker tags reject '+' outright as well.
+          # Reject build metadata here rather than silently mishandle it.
+          case "$tag" in
+            *+*)
+              echo "::error::tag '$tag' carries +build metadata, which this release pipeline does not support (it breaks the stable/prerelease split and Docker tagging); cut vMAJOR.MINOR.PATCH[-prerelease] instead"
+              exit 1
+              ;;
+          esac
 
       # Stable releases are immutable: their checksums are attested in the publish
       # job, so silently overwriting a published stable asset would invalidate that
@@ -41,6 +79,14 @@ jobs:
       # rc re-cut loop (a plain bool there, not templateable per channel), so this
       # guard confines that overwrite to prerelease tags - it fails the run if a
       # STABLE tag's GitHub release already exists. Cut a new version instead.
+      #
+      # FAIL CLOSED: `gh release view` (and `gh api`) exit non-zero for a genuine
+      # 404 AND for auth failures, rate limiting, and outages alike, so treating
+      # every non-zero exit as "absent" would let a transient API blip green-light
+      # an overwrite. Only a definite HTTP 404 may proceed; a 200 refuses; any
+      # other result retries and then fails closed. The workflow_dispatch escape
+      # hatch exists for the very outages that cause those transient errors, so
+      # this correlation is real, not hypothetical.
       - name: Forbid re-cutting a published stable release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,11 +95,19 @@ jobs:
           case "$tag" in
             *-*) echo "prerelease tag ($tag): re-cut permitted"; exit 0 ;;
           esac
-          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets. Cut a new version instead."
-            exit 1
-          fi
-          echo "stable tag ($tag): no existing release - ok to publish"
+          for attempt in 1 2 3; do
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1); then
+              echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets. Cut a new version instead."
+              exit 1
+            fi
+            case "$out" in
+              *"HTTP 404"*) echo "stable tag ($tag): no existing release - ok to publish"; exit 0 ;;
+            esac
+            echo "attempt $attempt: could not determine release state for '$tag' (not a 404): $out"
+            sleep 5
+          done
+          echo "::error::could not confirm whether stable release '$tag' already exists (API errors, not a 404); failing closed. Re-run once the API is healthy."
+          exit 1
 
   # Gate the publish on the FULL exact-SHA CI (race, vet, gofmt, UI, govulncheck,
   # cross-build, native smoke, goreleaser check) so a tag can never publish code the
@@ -83,6 +137,51 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # GoReleaser does NOT resolve the current tag with `git describe`: it reads
+      # GORELEASER_CURRENT_TAG first (pinned on the Run GoReleaser step below to
+      # the guarded ref), else the HIGHEST version tag pointing at HEAD. On a
+      # commit carrying more than one tag those two disagree, so the env pin is
+      # what actually guarantees the publish uses the exact tag the guards
+      # approved. This assert stays as a cheap belt-and-suspenders check that HEAD
+      # is on the guarded tag; `git describe` only approximates GoReleaser's
+      # resolution, so treat the env pin above as the real guarantee, not this.
+      - name: Assert HEAD tag matches the ref
+        run: |
+          head_tag="$(git describe --exact-match --tags HEAD)" || {
+            echo "::error::HEAD is not on an exact tag; refusing to release"; exit 1; }
+          if [ "$head_tag" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::HEAD tag '$head_tag' != ref '${GITHUB_REF_NAME}'; the release would publish a different version than was guarded"
+            exit 1
+          fi
+
+      # Re-run the stable-overwrite guard immediately before publishing. The guard
+      # JOB ran separately with the full CI run in between, and "Re-run failed
+      # jobs" skips an already-passed guard - so a transient API blip that let the
+      # guard pass must not carry through to the actual overwrite. Same fail-closed
+      # logic as the guard job (kept inline because the guard job deliberately runs
+      # before any checkout, so the two cannot share a script without weakening it).
+      - name: Recheck no published stable release before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            *-*) echo "prerelease tag ($tag): re-cut permitted"; exit 0 ;;
+          esac
+          for attempt in 1 2 3; do
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1); then
+              echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets."
+              exit 1
+            fi
+            case "$out" in
+              *"HTTP 404"*) echo "stable tag ($tag): still no existing release - ok to publish"; exit 0 ;;
+            esac
+            echo "attempt $attempt: could not determine release state for '$tag' (not a 404): $out"
+            sleep 5
+          done
+          echo "::error::could not confirm whether stable release '$tag' already exists (API errors, not a 404); failing closed."
+          exit 1
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -105,6 +204,12 @@ jobs:
           version: 'v2.17.0'
           args: release --clean
         env:
+          # Pin GoReleaser's current-tag resolution to the exact ref the guards
+          # validated. Without this it resolves the highest version tag at HEAD,
+          # which diverges from the guarded ref when a commit carries more than
+          # one tag - letting it publish/overwrite a DIFFERENT release than was
+          # checked. This is the real guarantee behind the assert step above.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
           # Creates the GitHub Release and pushes the GHCR image.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Publishing the Homebrew tap and winget manifests writes to OTHER

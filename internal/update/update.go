@@ -246,9 +246,14 @@ func (c *Checker) fetch(ctx context.Context) (string, error) {
 // on both ends (our build and the endpoint's claim).
 func isRelease(s string) bool { return semverRE.MatchString(s) }
 
-// newer reports whether latest is strictly greater than current as a semver,
-// ignoring any suffix. Unparseable input returns false - fail toward "no
-// update" rather than nag on garbage.
+// newer reports whether latest is strictly greater than current as a semver.
+// The numeric MAJOR.MINOR.PATCH decides it; on a tie a PRERELEASE current (e.g.
+// "0.62.0-rc.1") ranks below the same-numbered final ("0.62.0"), per SemVer
+// precedence - so an rc tester is offered the stable they were testing without
+// anyone having to inflate the version to force the badge. latest arrives
+// stripped to its numeric core (see fetch), so it never carries a prerelease;
+// the tie-break is written symmetrically anyway. Unparseable input returns
+// false - fail toward "no update" rather than nag on garbage.
 func newer(current, latest string) bool {
 	c, ok1 := parse(current)
 	l, ok2 := parse(latest)
@@ -260,7 +265,20 @@ func newer(current, latest string) bool {
 			return l[i] > c[i]
 		}
 	}
-	return false
+	// Equal core: a final release outranks its own prerelease, and nothing else
+	// is an upgrade (a stable never nags toward its own rc, two finals are equal).
+	return isPrerelease(current) && !isPrerelease(latest)
+}
+
+// isPrerelease reports whether s carries a SemVer prerelease suffix - a hyphen
+// immediately after the MAJOR.MINOR.PATCH core, e.g. "0.62.0-rc.1". Build
+// metadata ("0.62.0+build") is not a prerelease, and non-semver input never is.
+func isPrerelease(s string) bool {
+	loc := semverRE.FindStringIndex(s)
+	if loc == nil {
+		return false
+	}
+	return strings.HasPrefix(s[loc[1]:], "-")
 }
 
 func parse(s string) ([3]int, bool) {

@@ -271,7 +271,12 @@ func (p *program) run(ctx context.Context) {
 	// but inside a container the dashboard is only reachable over the network, and
 	// the filter can't be enforced there anyway - so default it off in containers.
 	containerized := util.InContainer()
-	def := defaultSettings(p.cfg, containerized)
+	// The local-only DEFAULT keys on BRIDGED, not merely containerized: a
+	// host-networked container CAN enforce loopback-only (the guard 403s LAN
+	// peers there), so it must default ON like native - otherwise a fresh
+	// host-net install is remotely reachable, and claimable, before setup. Only
+	// a bridged container, where the filter is unenforceable, defaults off.
+	def := defaultSettings(p.cfg)
 	// Seal the stored iperf3 passwords at rest (key file beside the DB, 0600). If the key
 	// can't be opened we carry on WITHOUT encryption rather than refuse to run: monitoring
 	// is the job, and a legible warning beats a dead daemon.
@@ -343,9 +348,15 @@ func (p *program) run(ctx context.Context) {
 	// 48h). Skipping costs nothing - the same decision runs next boot, or after
 	// the retry loop's successful Reload via the next restart.
 	if err == nil || errors.Is(err, settings.ErrLegacyReseal) {
-		if qerr := set.EnsureQuickSetupOffer(ctx, time.Now().Unix()); qerr != nil {
-			earlyLog = append(earlyLog, func() { p.log.Warn("quick setup offer decision failed; retaken next boot", "err", qerr) })
-		}
+		// Record the first-run decision on the loaded controller (consent-by-flags
+		// then offer seeding). Deferred logging - the real logger isn't up yet. The
+		// settings-retry loop runs the SAME step after a successful reload, so a
+		// first boot whose settings load FAILED still gets the decision (and a fresh
+		// install's consent hold) once settings come back, instead of quietly
+		// starting to probe.
+		p.materializeQuickSetup(ctx, set, func(msg string, e error) {
+			earlyLog = append(earlyLog, func() { p.log.Warn(msg, "err", e) })
+		})
 	}
 
 	// Apply the saved log level now that settings are loaded (the logger starts
@@ -457,6 +468,13 @@ func (p *program) run(ctx context.Context) {
 						p.log.Warn("settings reload on signal", "err", err)
 					} else {
 						p.log.Info("settings reloaded on signal")
+						// A SIGHUP is a THIRD path (besides boot and the retry loop)
+						// that takes an unloaded controller to loaded - e.g. a first
+						// boot whose settings load failed, recovered by SIGHUP before
+						// the retry ticked. Materialize the first-run decision here too,
+						// or a fresh install would never get its offer clock (and its
+						// consent hold) and would start probing unasked.
+						p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
 					}
 				}
 			}
@@ -514,7 +532,28 @@ func (p *program) run(ctx context.Context) {
 	var qsOnHoldRelease func()
 	monitoringLive := func() bool {
 		if !qsHoldReleased.Load() {
-			if settings.QuickSetupHold(set.QuickSetupDone(), set.QuickSetupOfferSince(ctx), time.Now().Unix()) {
+			// Until settings load, the first-run decision can't be made and the
+			// offer clock isn't seeded - QuickSetupHold below would then read a bare
+			// offer_since==0 and fail OPEN. Hold a GENUINELY FRESH install (nothing
+			// in the store: no history, anchor, or config) instead, so it can't
+			// start probing unasked - but do NOT latch the release, so the normal
+			// hold takes over once the retry loads settings and seeds the clock. An
+			// established install already consented and keeps running; a store-read
+			// error holds too (the fresh direction).
+			if !set.Loaded() {
+				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
+					return false
+				}
+				return set.Monitoring()
+			}
+			// Read the offer clock with its error surfaced: a transient store read
+			// error must HOLD, not read as "no clock -> release" and then latch that
+			// release forever off a single failed read.
+			since, err := set.QuickSetupOfferSinceErr(ctx)
+			if err != nil {
+				return false
+			}
+			if settings.QuickSetupHold(set.QuickSetupDone(), since, time.Now().Unix()) {
 				return false
 			}
 			if qsHoldReleased.CompareAndSwap(false, true) && qsOnHoldRelease != nil {
@@ -854,8 +893,7 @@ func (p *program) run(ctx context.Context) {
 		}
 	}
 	srv.DBPath = p.cfg.DBPath             // /metrics reports the on-disk DB size
-	srv.InContainer = containerized       // relax the loopback-only filter (unenforceable in a container)
-	srv.Bridged = util.BridgedContainer() // only a bridged container defeats the loopback test; host-net still enforces
+	srv.InContainer = containerized       // informational only (status "containerized"); no longer gates access
 	srv.SessionKey = sessionKey           // key-file-bound secret folded into session-token MACs (see tokenKey)
 	srv.MetricsToken = p.cfg.MetricsToken // optional read-only scrape credential for /metrics
 	srv.Update = upd                      // update status on /api/status + powers the toggle
@@ -933,6 +971,17 @@ func seedKnownCounters() {
 		// counter a persistently dead nearby server was invisible unless it
 		// killed the entire round.
 		"speed.bestof_candidate_failed",
+		// A candidate was excluded from ranking because its optional HTTP Legacy
+		// Fallback is absent - every transfer against it would fail. Climbing means
+		// the reachable pool is shrinking; all_servers_no_fallback means it is empty
+		// and runs are proceeding against servers that will fail.
+		"speed.server_no_fallback", "speed.all_servers_no_fallback",
+		// An upload retried single-stream because no chunk completed in the capture
+		// window - the uplink is slower than the parallel chunk set needs.
+		"speed.upload_starvation_retry", "speed.upload_starvation_rescued",
+		// A server the user was offered for pinning has no HTTP legacy fallback -
+		// they are about to choose one that fails every run.
+		"speed.pinned_server_no_fallback",
 		// A scheduled run dropped because another trigger (manual, reconnect,
 		// degraded) already held the single-flight. The slot is not retried, so a
 		// climbing rate explains gaps in an otherwise regular history.
@@ -987,6 +1036,25 @@ func seedKnownCounters() {
 	stats.Seed(names...)
 }
 
+// materializeQuickSetup records the first-run decision on a LOADED controller:
+// consent-by-flags (or -quick-setup=skip) marks Quick Setup answered, then
+// EnsureQuickSetupOffer seeds the offer clock for a genuinely fresh install or
+// marks an established one answered. Idempotent. Both boot and the settings-retry
+// loop call it - the retry is the ONLY path that runs it when a first boot's
+// settings load failed, and without it a fresh install would never get its offer
+// clock or its consent hold and would start probing unasked. warn(message, err)
+// lets boot defer logging (logger not up yet) while the retry logs immediately.
+func (p *program) materializeQuickSetup(ctx context.Context, set *settings.Controller, warn func(string, error)) {
+	if (p.cfg.MonitoringConsent || p.cfg.QuickSetupSkip) && !set.QuickSetupDone() {
+		if err := set.SetQuickSetupDone(ctx, true); err != nil {
+			warn("quick setup consent-by-flags mark failed; retaken next boot", err)
+		}
+	}
+	if err := set.EnsureQuickSetupOffer(ctx, time.Now().Unix()); err != nil {
+		warn("quick setup offer decision failed; retaken next boot", err)
+	}
+}
+
 // retrySettingsLoad re-attempts the initial settings read until it succeeds.
 //
 // It exists because the web guard fails CLOSED when settings never loaded: that
@@ -1014,6 +1082,10 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 		}
 		if err := set.Reload(ctx); err == nil || errors.Is(err, settings.ErrLegacyReseal) {
 			p.log.Warn("settings loaded on retry; serving normally again")
+			// The boot path skipped the first-run decision on the failed load. Take
+			// it now: a fresh install must get its offer clock (and stay held for
+			// consent) rather than having started probing unasked while unloaded.
+			p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
 			return
 		} else {
 			p.log.Error("settings retry failed; still refusing to serve", "err", err, "next_try_in", wait)
@@ -1351,10 +1423,13 @@ func resetAuthCmd(args []string) error {
 // literal has three same-typed retention durations and two same-typed intervals
 // side by side, so a field swap compiles and every package-level test still
 // passes; only asserting the mapping catches it. See TestDefaultSettings.
-func defaultSettings(cfg config.Config, containerized bool) settings.Values {
-	// Local-only is a sensible default for a native install (LAN access is opt-in),
-	// but inside a container the dashboard is only reachable over the network, and
-	// the filter can't be enforced there anyway - so default it off in containers.
+func defaultSettings(cfg config.Config) settings.Values {
+	// Access is loopback-only by default EVERYWHERE (native, host-net, bridged) -
+	// fail closed. Opening the dashboard to the LAN is an explicit operator choice
+	// (-access network / PINGULARITY_ACCESS=network), never inferred from the
+	// container's network mode. A container that publishes a port sets it; the
+	// tradeoff (a published port 403s until then) is deliberate - we never guess.
+	networkAccess := cfg.Access == "network"
 	return settings.Values{
 		Latency: cfg.Interval, LatencyEnabled: cfg.LatencyEnabled,
 		DNSProbe: true, // measure DNS-resolution latency by default (toggle in the Latency tab)
@@ -1366,7 +1441,7 @@ func defaultSettings(cfg config.Config, containerized bool) settings.Values {
 		Timeout: cfg.Timeout, DownAfter: cfg.DownAfter, UpAfter: cfg.UpAfter,
 		SpeedtestEnabled:     cfg.SpeedtestEnabled,
 		SpeedtestOnReconnect: cfg.SpeedtestOnReconnect, IPv6Mode: cfg.IPv6Mode, Monitoring: true,
-		AccessLocalOnly:    !containerized, // loopback-only on native (LAN opt-in); off in containers (see above)
+		AccessLocalOnly:    !networkAccess, // loopback-only unless the operator explicitly opted into network access
 		ExitTarget:         "1.1.1.1",      // default exit-discovery destination (overridable in settings)
 		UpdateCheckEnabled: true,           // default on; daily release poll, opt-out in the About tab
 		LogRedactPII:       true,           // default on; censor PII in logs, opt-out in the About tab

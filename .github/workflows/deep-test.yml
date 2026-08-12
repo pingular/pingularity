@@ -245,7 +245,7 @@ jobs:
           # No host networking here: under QEMU we only care that the arm64
           # binary starts, opens its port and serves - the measurements it takes
           # inside an emulated container are meaningless either way.
-          docker run -d --name ping-a64 -p 9111:9000 ping-arm64
+          docker run -d --name ping-a64 -e PINGULARITY_ACCESS=network -p 9111:9000 ping-arm64
           ok=""
           for i in $(seq 1 30); do
             curl -fsS --max-time 3 http://127.0.0.1:9111/metrics >/dev/null 2>&1 && { ok=1; break; }
@@ -308,6 +308,8 @@ jobs:
               image: ghcr.io/pingular/pingularity:0.7.0
               container_name: pingularity
               network_mode: host
+              environment:
+                - PINGULARITY_ACCESS=network
               cap_add:
                 - NET_RAW
               volumes:
@@ -357,7 +359,8 @@ jobs:
             # (-metrics-token) and must never surface in any log; the allow-host
             # part is what the inertness 403 is asserted against. Do NOT sentinel
             # on the domain - the Host guard legitimately logs rejected Hosts.
-            sed -i 's/^    command: \["-allow-host=ping.example.com"\]$/    environment:\n      - PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL/' compose.yaml
+            sed -i '/^    command: \["-allow-host=ping.example.com"\]$/d' compose.yaml
+            sed -i 's/^      - PINGULARITY_ACCESS=network$/      - PINGULARITY_ACCESS=network\n      - PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL/' compose.yaml
             docker compose up -d
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
             eh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9000/ || echo FAIL)
@@ -408,7 +411,7 @@ jobs:
             [ "$perm" = "700" ] || note "iperf image data dir is $perm, want 700"
             docker run --rm --entrypoint iperf3 ping-iperf --version \
               || note "iperf3 does not run in the image that exists to carry it"
-            docker run -d --name ping-iperf -p 9112:9000 ping-iperf
+            docker run -d --name ping-iperf -e PINGULARITY_ACCESS=network -p 9112:9000 ping-iperf
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9112/metrics >/dev/null 2>&1 && break; sleep 2; done
             im=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:9112/metrics || echo FAIL)
             echo "iperf image metrics -> $im"
@@ -419,7 +422,7 @@ jobs:
             echo "--- iperf container logs ---"; tail -15 <<<"$ilogs"
             docker rm -fv ping-iperf
             echo "--- issue #16 parity: same Host-guard pair on the variant the report used ---"
-            docker run -d --name ping-iperf-cmd -p 9113:9000 ping-iperf -allow-host=ping.example.com
+            docker run -d --name ping-iperf-cmd -e PINGULARITY_ACCESS=network -p 9113:9000 ping-iperf -allow-host=ping.example.com
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9113/metrics >/dev/null 2>&1 && break; sleep 2; done
             iah=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9113/ || echo FAIL)
             ioh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: other.example.com' http://127.0.0.1:9113/ || echo FAIL)
@@ -429,7 +432,7 @@ jobs:
             [ "$ioh" = "403" ] || note "iperf image: unlisted public Host not rejected (got $ioh, want 403)"
             case "$iargs" in *"-allow-host=ping.example.com"*) ;; *) note "iperf image: run-arg flag missing from container argv";; esac
             docker rm -fv ping-iperf-cmd
-            docker run -d --name ping-iperf-env -p 9113:9000 -e "PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL" ping-iperf
+            docker run -d --name ping-iperf-env -p 9113:9000 -e PINGULARITY_ACCESS=network -e "PINGULARITY_OPTS=-allow-host=ping.example.com -metrics-token=DEEP_SECRET_SENTINEL" ping-iperf
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9113/metrics >/dev/null 2>&1 && break; sleep 2; done
             ieh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Host: ping.example.com' http://127.0.0.1:9113/ || echo FAIL)
             echo "iperf env-var: Host -> $ieh (must stay 403)"

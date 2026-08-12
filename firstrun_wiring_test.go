@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +110,62 @@ func TestFirstRunReadyFnComposition(t *testing.T) {
 	set, ni = mk(settings.Values{NetinfoEnabled: true, SpeedEngine: "iperf3"})
 	if got, want := newFirstRunReadyFn(set, ni)(), speedtest.IperfAvailable(); got != want {
 		t.Errorf("iperf3 engine readiness = %v, want %v (IperfAvailable on this host)", got, want)
+	}
+}
+
+// The pending->PUBLISHED half of the readiness truth table. TestFirstRunReadyFnComposition
+// only pins the pending (false) side, so a mutation that leaves readiness
+// permanently false AFTER netinfo publishes slips past it. This drives a real
+// publish (even a failed lookup stamps UpdatedAt) and asserts readiness flips.
+func TestFirstRunReadyFnReleasesAfterPublish(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	set, err := settings.New(ctx, st, settings.Values{Monitoring: true, NetinfoEnabled: true})
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	ni := netinfo.NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ni.EnabledFn = func() bool { return set.Monitoring() && set.NetinfoEnabled() }
+	ready := newFirstRunReadyFn(set, ni)
+
+	if ready() {
+		t.Fatal("must NOT be ready before netinfo publishes (UpdatedAt still 0)")
+	}
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	defer func() { loopCancel(); <-done }()
+	go func() { defer close(done); ni.Loop(loopCtx, time.Hour) }()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatalf("readiness never released after netinfo published (UpdatedAt=%d)", ni.Get().UpdatedAt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The wiring lives in main.go's run() assembly, which isn't unit-testable, and
+// the tests above re-create it locally - so deleting it from main.go leaves them
+// green (the exact gap that shipped). This source-presence guard fails if the
+// production wiring is removed or renamed. It is deliberately literal.
+func TestMainWiresFirstRunAndOptsHooks(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ni.WakeFn = set.Changed",                     // #3: first speedtest must not race an empty netinfo
+		"sched.ReadyFn = newFirstRunReadyFn(set, ni)", // #3: selection readiness predicate
+		"replayIgnoredOpts(",                          // #7: ignored-PINGULARITY_OPTS warning is replayed at boot
+	} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("main.go no longer wires %q - package tests won't catch it; the behavior is silently dead", want)
+		}
 	}
 }

@@ -110,10 +110,10 @@ The default is `-listen :9000`, which binds every interface. On its own that
 would put an unauthenticated dashboard on your LAN, so there are three layers
 in front of it:
 
-1. **The access filter, on by default for native installs.** A fresh install
-   sets local-only access, and every request from a non-loopback peer is
-   refused with a 403. LAN access is something you turn on deliberately in the
-   Access tab.
+1. **The access filter, on by default everywhere.** A fresh install starts
+   local-only - native or in a container - and every request from a non-loopback
+   peer is refused with a 403. LAN access is something you turn on deliberately:
+   `-access network`, `-e PINGULARITY_ACCESS=network`, or the Access tab.
 2. **The login.** Optional, off until you set a password. Passwords are stored
    as bcrypt hashes, and password checks are rate limited per client: five
    consecutive failures buy a 30-second block, keyed on the peer address (an
@@ -131,16 +131,16 @@ in front of it:
 
 Two things worth knowing about the filter:
 
-- **In a bridged container it is off, because it cannot work.** A bridged
-  container NATs every external request to the gateway, so the loopback test
-  cannot tell a local user from a LAN one, and enforcing it would lock you out
-  of your own dashboard. So it defaults off there, and **if you turn it on
-  anyway it is ignored rather than enforced**: the Access tab still shows it as
-  on, but no request is refused. Do not rely on it in a bridged container - the
-  real boundary there is how you publish the port (`-p`) and the login
-  password. A `--network=host` container sees real peer addresses, so the
-  filter enforces there exactly as it does natively. The daemon
-  says so in the log.
+- **In a container it is on, and fail-closed.** Access is an explicit setting,
+  never guessed from the network layout, so a container starts local-only like
+  everything else. A bridged container NATs external traffic through the gateway,
+  so even its own published port (`-p`) reaches the daemon as a non-loopback peer
+  and gets a 403 until you opt in with `-access network` (or `-e
+  PINGULARITY_ACCESS=network`) - set a login at the same time. A `--network=host`
+  container sees real peer addresses, so local-only there behaves exactly as it
+  does natively. Pingularity still detects a bridged container, but only to warn
+  that container DNS may distort the reported upstream resolver; that detection
+  has no say over access.
 - **A same-host reverse proxy passes it.** Traffic arriving through a proxy on
   the same machine looks local, because it is. The filter cannot block a remote
   visitor arriving that way, and the daemon warns once when it detects the
