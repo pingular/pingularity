@@ -1,0 +1,76 @@
+name: Server fleet probe
+
+# Watches Ookla's server fleet, which we do not control and which changes under
+# us. Issues #17/#18 were both caused by Ookla migrating servers behind
+# *.prod.hosts.ooklaserver.net while the list's legacy `url` field kept pointing
+# at the old hostname - which now answers the upload POST with a 307 that Go
+# cannot follow (a POST body is not replayable). Nothing in our code changed; the
+# world did. Only a job that talks to the real fleet can see that coming.
+#
+# Scheduled rather than per-PR: it is a canary on third-party infrastructure, not
+# a test of a diff, and it makes several hundred outbound requests. Actions are
+# pinned to commit SHAs, matching the other workflows.
+on:
+  workflow_dispatch:
+  schedule:
+    # Thursdays 05:23 UTC - offset from ci.yml's Monday slot so a fleet change
+    # and a vuln-scan change never land in the same morning's noise.
+    - cron: '23 5 * * 4'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      # The probe asserts two things. STRUCTURAL: every server is
+      # http://host:8080/speedtest/upload.php, and the host/url-host partition
+      # holds (identical on non-migrated servers, different on migrated ones) -
+      # that partition is what lets the rewrite be a no-op where it is not needed,
+      # with no guard. RELATIVE: no server accepts the legacy URL while rejecting
+      # the host-derived one. The relative check is the real gate; absolute
+      # success rate is dominated by third-party rot (~12% of the fleet answers
+      # 500 to any upload, full-size chunk included) and would only flap.
+      - name: probe the live Ookla fleet
+        env:
+          FLEET_PROBE: "1"
+        run: |
+          set -o pipefail
+          go test ./internal/speedtest/ -run TestServerFleetProbe -v -count=1 -timeout 25m 2>&1 | tee fleet-probe.log
+
+      # Kept even on failure: the log carries the migration percentage and the
+      # per-server verdicts, which is the evidence for what changed and how far
+      # it has spread. Retained long enough to compare consecutive runs.
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fleet-probe-report
+          path: fleet-probe.log
+          retention-days: 90
+
+      # A one-glance summary on the run page, so a red run does not require
+      # opening an artifact to see whether it is our bug or the fleet's.
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '## Ookla fleet probe'
+            echo '```'
+            grep -E 'fleet:|legacy `url`|host-derived|RESCUES|BREAKS|success rate|MIGRATION WATCH' fleet-probe.log || echo 'no summary lines - see artifact'
+            echo '```'
+            if grep -q 'REWRITE REGRESSION' fleet-probe.log; then
+              echo '> **Servers accept the legacy URL but reject ours.** The `host` field is no longer a safe substitute - see artifact.'
+            fi
+            if grep -qE 'PARTITION BROKEN|STRUCTURE:' fleet-probe.log; then
+              echo '> **The server-list shape changed.** URL construction assumes http://host:8080/speedtest/upload.php and the host/url partition; one of those no longer holds.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

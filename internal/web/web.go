@@ -140,16 +140,11 @@ type Server struct {
 	// /metrics uses the normal admin auth. Only consulted when Require login is on.
 	MetricsToken string
 
-	// InContainer relaxes the loopback-only access filter: a bridged container
-	// NATs every request to the gateway, so the filter can't be enforced by peer
-	// IP and must not lock the dashboard out. Set by main before Serve.
+	// InContainer is informational only now (surfaced as "containerized" in the
+	// status/settings payloads for UI hints). It no longer gates the access
+	// filter: local-only is enforced for everyone, and a container opts into
+	// network reach with -access network. Set by main before Serve.
 	InContainer bool
-
-	// Bridged is true only for a container that does NOT share the host netns
-	// (util.BridgedContainer): there the loopback filter cannot tell a local user
-	// from a LAN one. A host-networked container has Bridged=false and enforces
-	// local-only normally. Set by main before Serve.
-	Bridged bool
 
 	// DBPath is the on-disk database path, used only for its size on /metrics.
 	// Set by main before Serve; empty (or ":memory:") skips the gauge.
@@ -366,6 +361,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/netinfo", s.handleNetinfo)
 	mux.HandleFunc("/api/access", s.handleAccess)
+	mux.HandleFunc("/api/quick-setup", s.handleQuickSetup)
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/metrics", s.handleMetrics)
@@ -1039,24 +1035,32 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	speedRunning, speedRun, speedServer := speedRunStatus(s.speed)
 
 	resp := map[string]any{
-		"version":              s.version,
-		"online":               online,
-		"state_seconds":        int(now.Sub(since).Seconds()),
-		"runtime_seconds":      int(now.Sub(s.started).Seconds()),
-		"latency_ms":           latency,
-		"dns_ms":               dnsMS,
-		"uptime":               uptimeRatios,       // up-fraction per window (6h/24h/7d/30d/1y/all) for the selectable pill
-		"uptime_coverage":      uptimeCoverage,     // the same windows' observation coverage - the pill must not show a % for a 0 here
-		"uptime_24h":           uptime.H24.Ratio(), // kept for back-compat / metrics parity
-		"uptime_7d":            uptime.D7.Ratio(),
-		"targets":              targets,
-		"speed":                speed,          // nil until the first test completes
-		"speedtest":            s.speed != nil, // whether manual triggering is available
-		"speedtest_running":    speedRunning,
-		"speedtest_run_id":     speedRun, // 0 when idle; pass back to abort THIS run
-		"speedtest_server":     speedServer,
-		"speedtest_auto":       s.settings.SpeedServerID() == "", // auto-select fastest server
-		"speedtest_auto_label": s.settings.SpeedAutoLabel(),      // the city the USER searched, which overrides the race; empty when auto races for its own centre (speedtest.raceCities) - a centre decided per run, which this snapshot cannot name in advance
+		"version":           s.version,
+		"online":            online,
+		"state_seconds":     int(now.Sub(since).Seconds()),
+		"runtime_seconds":   int(now.Sub(s.started).Seconds()),
+		"latency_ms":        latency,
+		"dns_ms":            dnsMS,
+		"uptime":            uptimeRatios,       // up-fraction per window (6h/24h/7d/30d/1y/all) for the selectable pill
+		"uptime_coverage":   uptimeCoverage,     // the same windows' observation coverage - the pill must not show a % for a 0 here
+		"uptime_24h":        uptime.H24.Ratio(), // kept for back-compat / metrics parity
+		"uptime_7d":         uptime.D7.Ratio(),
+		"targets":           targets,
+		"speed":             speed,          // nil until the first test completes
+		"speedtest":         s.speed != nil, // whether manual triggering is available
+		"speedtest_running": speedRunning,
+		"speedtest_run_id":  speedRun, // 0 when idle; pass back to abort THIS run
+		"speedtest_server":  speedServer,
+		// True only when a run will ACTUALLY race candidates: no pinned Ookla
+		// server AND the Ookla engine is the one that will run. iperf3 connects to
+		// the server the operator configured - it has no candidate pool and does
+		// no selection - so reporting "auto" there made the UI announce
+		// server-finding that never happens. The IperfAvailable() check mirrors
+		// the scheduler's own fallback: a selected-but-missing iperf3 binary means
+		// Ookla runs after all, and then selection IS happening.
+		"speedtest_auto": s.settings.SpeedServerID() == "" &&
+			!(s.settings.SpeedEngine() == "iperf3" && speedtest.IperfAvailable()),
+		"speedtest_auto_label": s.settings.SpeedAutoLabel(), // the city the USER searched, which overrides the race; empty when auto races for its own centre (speedtest.raceCities) - a centre decided per run, which this snapshot cannot name in advance
 		"speedtest_enabled":    s.settings.SpeedtestEnabled(),
 		"speed_interval_s":     int(s.settings.SpeedInterval().Seconds()),
 		"data_used_bytes":      dataBytes,                  // cumulative speedtest data (down+up)
@@ -1112,6 +1116,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if util.BridgedContainer() {
 		resp["bridged_container"] = true
 	}
+	// The current access mode, so Quick Setup can default its access choice to
+	// match how the install actually booted. Without this a container started with
+	// -access network would show "This machine only" selected, and accepting the
+	// default would lock the operator out of the port they just opened.
+	resp["access_local_only"] = s.settings.AccessLocalOnly()
 	// Connection info off means the panel below is frozen: no automatic lookup
 	// will refresh it, so the dashboard has to say so rather than present stale
 	// figures as current. Only sent when off, so the common case costs nothing.
@@ -2359,6 +2368,147 @@ func (s *Server) quickSetupPending(ctx context.Context) bool {
 		s.settings.QuickSetupOfferSince(ctx), time.Now().Unix())
 }
 
+// handleQuickSetup applies the whole first-run answer in ONE atomic operation:
+// cadence, update check, access scope, optional login, and the answered marker,
+// persisting ONLY those keys (the settings-form path would freeze every default,
+// which then shadows CLI-seeded and later config). Replaces the client's old
+// sequence of partial /api/settings + /api/access + marker POSTs, which froze
+// settings, committed opposite choices on a mid-sequence retry, and could leave a
+// half-applied setup marked done.
+func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Serialize against a restore reconcile, exactly as the settings/access
+	// mutations do - a Quick Setup landing mid-import must not race it.
+	s.importMu.Lock()
+	defer s.importMu.Unlock()
+
+	// Idempotent: once answered, a retry (a lost response after the server
+	// committed) is a no-op success, never a second apply over now-real settings.
+	if s.settings.QuickSetupDone() {
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
+
+	var in struct {
+		Dismiss          bool   `json:"dismiss"`
+		SpeedtestEnabled *bool  `json:"speedtest_enabled"`
+		SpeedSeconds     int    `json:"speed_seconds"`
+		UpdateCheck      *bool  `json:"update_check"`
+		LocalOnly        *bool  `json:"local_only"`
+		AuthEnabled      *bool  `json:"auth_enabled"` // pointer: distinguish omitted from explicit false
+		Username         string `json:"username"`
+		Password         string `json:"password"`
+	}
+	if err := decodeJSONBody(w, r, &in); err != nil {
+		return // 415/400 already written
+	}
+
+	// Decline: mark answered, change nothing else. No access mutation, so it is
+	// safe even with a login active - and it must be, or a dismissed dialog on
+	// an out-of-band-secured install could never close.
+	if in.Dismiss {
+		if err := s.settings.ApplyQuickSetup(r.Context(), settings.QuickSetupAnswer{Dismiss: true}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
+
+	// A full answer changes access/auth. Once a login is ACTIVE, that is a
+	// step-up-protected operation (see handleAccess) - this endpoint has no
+	// current-password proof, so refuse rather than let a cookie-only session
+	// rotate the password or disable login. Quick Setup is a first-run flow;
+	// auth active here means access was configured out-of-band, so send the
+	// operator to Settings > Access for any further change. The normal fresh
+	// install (auth inactive) is unaffected, and once this endpoint enables
+	// auth it also marks done in the same transaction, so a later call no-ops.
+	// Checked BEFORE completeness so a re-run on a secured install gets the clear
+	// "already configured" message, not a confusing missing-field error.
+	if s.settings.AuthActive() {
+		http.Error(w, "a login is already configured; change access under Settings > Access", http.StatusForbidden)
+		return
+	}
+
+	// A full (non-dismiss) answer must be COMPLETE: booleans/ints can't tell an
+	// omitted field from an explicit false/zero, so decode the required choices
+	// as pointers and reject any that are missing. Otherwise a stray POST {} would
+	// mark setup done and silently flip access/update to zero values.
+	if in.SpeedtestEnabled == nil || in.UpdateCheck == nil || in.LocalOnly == nil {
+		http.Error(w, "incomplete Quick Setup answer: speedtest_enabled, update_check, and local_only are required", http.StatusBadRequest)
+		return
+	}
+	if *in.SpeedtestEnabled && in.SpeedSeconds <= 0 {
+		http.Error(w, "speed_seconds is required (and > 0) when speedtests are enabled", http.StatusBadRequest)
+		return
+	}
+	// A login is active iff a password is set. When the client sends auth_enabled
+	// explicitly, it MUST agree with that - reject a mismatch in EITHER direction:
+	// "enable a login, no password" (would complete setup with an inert login,
+	// network-open despite asking for one) and "password with auth explicitly off"
+	// (would silently activate a login the operator turned off). An omitted flag
+	// just derives from the password. AuthEnabled below is the password truth, so
+	// no inconsistent "enabled but no hash" / "hash but disabled" state persists.
+	if in.AuthEnabled != nil && *in.AuthEnabled != (in.Password != "") {
+		http.Error(w, "auth_enabled must match whether a password is provided", http.StatusBadRequest)
+		return
+	}
+
+	ans := settings.QuickSetupAnswer{
+		SpeedtestEnabled: *in.SpeedtestEnabled,
+		SpeedSeconds:     in.SpeedSeconds,
+		UpdateCheck:      *in.UpdateCheck,
+		LocalOnly:        *in.LocalOnly,
+		AuthEnabled:      in.Password != "", // auth is on iff a password was supplied
+		AuthUser:         strings.TrimSpace(in.Username),
+	}
+
+	// Validate + hash BEFORE any write, so a rejected input never leaves the
+	// answer half-applied (the whole point of the atomic endpoint). Only when a
+	// password was actually supplied.
+	if in.Password != "" {
+		if u := ans.AuthUser; u != "" {
+			if !utf8.ValidString(u) {
+				http.Error(w, "username must be valid UTF-8", http.StatusBadRequest)
+				return
+			}
+			if len(u) > maxUsernameBytes {
+				http.Error(w, fmt.Sprintf("username too long: at most %d bytes", maxUsernameBytes), http.StatusBadRequest)
+				return
+			}
+		}
+		if len(in.Password) > 72 {
+			http.Error(w, "password too long: at most 72 bytes", http.StatusBadRequest)
+			return
+		}
+		hash, err := hashPassword(in.Password)
+		if err != nil {
+			http.Error(w, "could not hash password", http.StatusInternalServerError)
+			return
+		}
+		ans.AuthHash = hash
+	}
+
+	if err := s.settings.ApplyQuickSetup(r.Context(), ans); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// A new hash re-keys the session token, and enabling login would otherwise
+	// lock out the very browser that just set it - re-issue the cookie so the
+	// operator stays signed in.
+	if ans.AuthHash != "" {
+		s.setSessionCookie(w, s.secureCookie(r))
+		s.rememberGood(s.settings.AuthUser(), in.Password)
+	}
+	s.log.Info("quick setup applied", "speedtest", ans.SpeedtestEnabled, "local_only", ans.LocalOnly, "auth", s.settings.AuthActive())
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -2411,48 +2561,53 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			SpeedtestOnReconnect: in.SpeedtestOnReconnect,
 			IPv6Mode:             in.IPv6Mode,
 			WebhookFormat:        in.WebhookFormat,
-			QuickSetupDone:       in.QuickSetupDone,
-			ExitTarget:           in.ExitTarget,
-			SpeedtestAdaptive:    in.SpeedtestAdaptive,
-			SpeedtestOnDegraded:  in.SpeedtestOnDegraded,
-			DegradedPingMS:       in.DegradedPingMS,
-			SpeedtestSkipBusy:    in.SpeedtestSkipBusy,
-			SpeedBusyMbps:        in.SpeedBusyMbps,
-			SpeedEngine:          in.SpeedEngine,
-			IperfServer:          in.IperfServer,
-			IperfDur:             in.IperfDur,
-			IperfStreams:         in.IperfStreams,
-			OoklaConnections:     in.OoklaConnections,
-			OoklaLoss:            in.OoklaLoss,
-			SpeedBestOf:          in.SpeedBestOf,
-			IperfOmit:            in.IperfOmit,
-			SpeedDirection:       in.SpeedDirection,
-			IperfDirection:       in.IperfDirection,
-			IperfUDP:             in.IperfUDP,
-			IperfUDPRate:         in.IperfUDPRate,
-			IperfWindow:          in.IperfWindow,
-			SpeedRetries:         in.SpeedRetries,
-			IperfRetries:         in.IperfRetries,
-			IperfCongestion:      in.IperfCongestion,
-			IperfNoDelay:         in.IperfNoDelay,
-			IperfDSCP:            in.IperfDSCP,
-			IperfMSS:             in.IperfMSS,
-			ThreshDownMbps:       in.ThreshDownMbps,
-			ThreshUpMbps:         in.ThreshUpMbps,
-			ThreshPingMS:         in.ThreshPingMS,
-			ThreshJitterMS:       in.ThreshJitterMS,
-			ThreshLossPct:        in.ThreshLossPct,
-			ThreshConsec:         in.ThreshConsec,
-			ThreshBloatDownMS:    in.ThreshBloatDownMS,
-			ThreshBloatUpMS:      in.ThreshBloatUpMS,
-			AlertOnOutage:        in.AlertOnOutage,
-			WebhookURL:           in.WebhookURL,
-			HeartbeatURL:         in.HeartbeatURL,
-			DigestFreq:           in.DigestFreq,
-			SchedLatEnabled:      in.SchedLatEnabled,
-			SchedLatWindows:      in.SchedLatWindows,
-			SchedSpeedEnabled:    in.SchedSpeedEnabled,
-			SchedSpeedWindows:    in.SchedSpeedWindows,
+			// NOTE: quick_setup_done is intentionally NOT routed from the settings
+			// form into the Patch. It is a server-owned, monotonic first-run marker
+			// (written only by boot, /api/quick-setup, and the power-on answer); a
+			// generic settings POST must not be able to flip it back to false and
+			// reopen Quick Setup (or re-freeze defaults through it). The GET
+			// response still reports it for the client's read.
+			ExitTarget:          in.ExitTarget,
+			SpeedtestAdaptive:   in.SpeedtestAdaptive,
+			SpeedtestOnDegraded: in.SpeedtestOnDegraded,
+			DegradedPingMS:      in.DegradedPingMS,
+			SpeedtestSkipBusy:   in.SpeedtestSkipBusy,
+			SpeedBusyMbps:       in.SpeedBusyMbps,
+			SpeedEngine:         in.SpeedEngine,
+			IperfServer:         in.IperfServer,
+			IperfDur:            in.IperfDur,
+			IperfStreams:        in.IperfStreams,
+			OoklaConnections:    in.OoklaConnections,
+			OoklaLoss:           in.OoklaLoss,
+			SpeedBestOf:         in.SpeedBestOf,
+			IperfOmit:           in.IperfOmit,
+			SpeedDirection:      in.SpeedDirection,
+			IperfDirection:      in.IperfDirection,
+			IperfUDP:            in.IperfUDP,
+			IperfUDPRate:        in.IperfUDPRate,
+			IperfWindow:         in.IperfWindow,
+			SpeedRetries:        in.SpeedRetries,
+			IperfRetries:        in.IperfRetries,
+			IperfCongestion:     in.IperfCongestion,
+			IperfNoDelay:        in.IperfNoDelay,
+			IperfDSCP:           in.IperfDSCP,
+			IperfMSS:            in.IperfMSS,
+			ThreshDownMbps:      in.ThreshDownMbps,
+			ThreshUpMbps:        in.ThreshUpMbps,
+			ThreshPingMS:        in.ThreshPingMS,
+			ThreshJitterMS:      in.ThreshJitterMS,
+			ThreshLossPct:       in.ThreshLossPct,
+			ThreshConsec:        in.ThreshConsec,
+			ThreshBloatDownMS:   in.ThreshBloatDownMS,
+			ThreshBloatUpMS:     in.ThreshBloatUpMS,
+			AlertOnOutage:       in.AlertOnOutage,
+			WebhookURL:          in.WebhookURL,
+			HeartbeatURL:        in.HeartbeatURL,
+			DigestFreq:          in.DigestFreq,
+			SchedLatEnabled:     in.SchedLatEnabled,
+			SchedLatWindows:     in.SchedLatWindows,
+			SchedSpeedEnabled:   in.SchedSpeedEnabled,
+			SchedSpeedWindows:   in.SchedSpeedWindows,
 		}
 		if in.IperfServers != nil { // nil = keep the saved list (and its passwords)
 			pat.IperfServers = iperfServersFromDTO(in.IperfServers) // blank pw kept by Update
@@ -2549,21 +2704,18 @@ func (s *Server) handleMonitoring(w http.ResponseWriter, r *http.Request) {
 		if err := decodeJSONBody(w, r, &in); err != nil {
 			return // response already written (415/400)
 		}
-		if err := s.settings.SetMonitoring(r.Context(), in.Enabled); err != nil {
+		// An explicit power-ON is an answer to the first-run offer: without it the
+		// boot hold would keep monitoring off while the button optimistically flips
+		// on, then snaps back. Set the power state AND answer the offer in ONE
+		// transaction - splitting them (and suppressing the marker error, as an
+		// earlier version did) could report monitoring enabled while the hold still
+		// blocked probes because the marker never landed.
+		markedDone, err := s.settings.SetMonitoringAnsweringSetup(r.Context(), in.Enabled)
+		if err != nil {
 			s.internalError(w, err)
 			return
 		}
-		// An explicit power-ON is an answer to the first-run offer: without
-		// this, the boot hold would keep monitoring off while the button
-		// optimistically flips on, then snaps back - a power button that
-		// visibly refuses to work. Best-effort: a failed write leaves the
-		// offer open, which is the state we were already in.
-		if in.Enabled && !s.settings.QuickSetupDone() {
-			if err := s.settings.SetQuickSetupDone(r.Context(), true); err != nil {
-				s.log.Warn("power-on could not answer the quick-setup offer", "err", err)
-			}
-		}
-		s.log.Info("monitoring toggled", "enabled", in.Enabled)
+		s.log.Info("monitoring toggled", "enabled", in.Enabled, "answered_setup", markedDone)
 	}
 	writeJSON(w, map[string]bool{"enabled": s.settings.Monitoring()})
 }

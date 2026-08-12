@@ -520,6 +520,67 @@ func TestSchedulerCompletedRunServesArmedSlot(t *testing.T) {
 	}
 }
 
+// The 7b race: a run that completes BEFORE the latch is entered (its completion
+// baked into latchEntryCompletions, its runWake token still pending because the
+// loop reached the latch WITHOUT going through the main select - e.g. straight
+// from the settle sleep) must still serve the slot. The counter check alone
+// misses it (equal==equal); honoring the drained token is what closes it.
+// Deterministic: the manual run and the enable both land during the settle
+// sleep, so the first for-iteration enters the latch directly.
+func TestSchedulerRunBeforeLatchEntryServesSlot(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 300 * time.Millisecond // a real settle window to act inside
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool // gated at boot
+	s.EnabledFn = func() bool { return enabled.Load() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	// Inside the settle sleep: a manual run completes (completions 0->1, runWake
+	// token queued), then consent lands. The loop is still asleep, so neither the
+	// main select nor a prior iteration consumed the token.
+	time.Sleep(60 * time.Millisecond)
+	if _, err := s.RunOnce(ctx, "manual"); err != nil {
+		t.Fatalf("manual run: %v", err)
+	}
+	<-runs
+	enabled.Store(true)
+
+	// When the settle sleep ends, the first iteration enters the latch directly
+	// (startupPending && enabled), snapshot already includes the manual run, and
+	// the token is pending. The slot must be served - NO startup run.
+	select {
+	case <-runs:
+		t.Fatal("a startup run fired although a run completed before latch entry served the slot")
+	case <-time.After(400 * time.Millisecond):
+	}
+	if got := stats.Lifetime().Counters["speed.run.startup"]; got != 0 {
+		t.Errorf("speed.run.startup = %d, want 0 (the pre-latch manual run served the slot)", got)
+	}
+	if got := stats.Lifetime().Counters["speed.run.manual"]; got != 1 {
+		t.Errorf("speed.run.manual = %d, want 1", got)
+	}
+}
+
 // The same rule inside the pause: a run that completes during firstEnableDelay
 // serves the slot (the post-pause drain), and the deadline withdrawn at latch
 // entry must be republished - not left absent for the rest of the interval.
@@ -1457,4 +1518,107 @@ func TestScheduledRunSkippedByACollisionIsCounted(t *testing.T) {
 	close(release)
 	<-manualDone
 	<-loopDone
+}
+
+// A boot with the scheduler ALREADY enabled must still yield its one startup
+// slot to a manual/reconnect run that lands during the settle window - otherwise
+// it stacks a redundant back-to-back test right after the out-of-band one. The
+// enabled-at-boot path used to fire unconditionally, ignoring completions.
+func TestSchedulerEnabledBootSkipsStartupAfterCompletedRun(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, f time.Duration) { startupDelay, firstEnableDelay = d, f }(startupDelay, firstEnableDelay)
+	startupDelay = 300 * time.Millisecond // a real settle window to act inside
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 16)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+
+	var enabled atomic.Bool
+	enabled.Store(true) // ENABLED at boot
+	s.EnabledFn = func() bool { return enabled.Load() }
+	var wakeMu sync.Mutex
+	wakeCh := make(chan struct{})
+	s.WakeFn = func() <-chan struct{} { wakeMu.Lock(); defer wakeMu.Unlock(); return wakeCh }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	// Let Loop snapshot completions before the settle sleep, then fire a manual
+	// run that lands DURING the remaining window (well before the 300ms mark).
+	time.Sleep(30 * time.Millisecond)
+	if _, err := s.RunOnce(ctx, "manual"); err != nil {
+		t.Fatalf("manual run: %v", err)
+	}
+	<-runs // the manual run executed
+
+	// After the settle window elapses, the enabled-boot startup run must NOT fire.
+	select {
+	case <-runs:
+		t.Fatal("enabled boot fired a startup run right after a completed manual run (redundant back-to-back)")
+	case <-time.After(400 * time.Millisecond): // comfortably past the remaining startupDelay
+	}
+	if got := stats.Lifetime().Counters["speed.run.startup"]; got != 0 {
+		t.Errorf("speed.run.startup = %d, want 0 (the manual run served the boot slot)", got)
+	}
+}
+
+// The startup-latch recheck poll (scheduler.go:878): when the scheduler boots
+// DISABLED (startupPending armed) and the window later opens by the CLOCK with
+// nothing broadcasting, only the recheck poll catches it - otherwise the armed
+// startup run sleeps through a full interval. No WakeFn here, a big interval, and
+// the window opened silently: the run must still fire promptly. Removing line 878
+// makes it wait the full interval (test times out).
+func TestSchedulerStartupLatchPollsForClockOpenedWindow(t *testing.T) {
+	stats.ResetForTest()
+	defer func(d, r, f time.Duration) { startupDelay, scheduleRecheck, firstEnableDelay = d, r, f }(startupDelay, scheduleRecheck, firstEnableDelay)
+	startupDelay = 0
+	scheduleRecheck = 20 * time.Millisecond
+	firstEnableDelay = 0
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	runs := make(chan struct{}, 4)
+	tester := testerFunc(func(context.Context) (Result, error) {
+		runs <- struct{}{}
+		return Result{DownloadMbps: 1, Server: "fake"}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Big interval so a full-interval sleep is unmistakably distinct from the poll.
+	s := NewScheduler(tester, st, 30*time.Second, log)
+
+	var enabled atomic.Bool // starts DISABLED -> boot is startupPending (latch armed)
+	s.EnabledFn = func() bool { return enabled.Load() }
+	// Deliberately NO WakeFn: the window opens by clock, nothing broadcasts, so
+	// only the startup-latch recheck poll can catch it.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() { cancel(); <-done }()
+	go func() { defer close(done); s.Loop(ctx) }()
+
+	time.Sleep(60 * time.Millisecond)
+	enabled.Store(true) // window opens by CLOCK, silently
+
+	select {
+	case <-runs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup run never fired after the window opened by clock - the startup-latch recheck poll (scheduler.go:878) is dead")
+	}
 }

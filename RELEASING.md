@@ -18,9 +18,13 @@ git push origin v1.2.3
 
 The `-X main.version=` ldflag is set from the tag, so `pingularity version`
 reports `1.2.3`. Use a valid SemVer tag with a leading `v`
-(`vMAJOR.MINOR.PATCH`, optionally `-prerelease`/`+build`). The release workflow
-guards the tag with a SemVer regex and refuses the obviously malformed shapes
-(bare `v`, `v1.2`, leading-zero identifiers) before it does anything - but that
+(`vMAJOR.MINOR.PATCH`, optionally `-prerelease`). Do **not** append `+build`
+metadata: SemVer allows it, but the workflow rejects it, because the hyphen in
+a value like `+build-1` makes the stable-vs-prerelease shell test misfire (a
+stable tag would skip the immutable-release guard) and Docker tags cannot carry
+`+` at all. The release workflow guards the tag with a SemVer regex and refuses
+the obviously malformed shapes (bare `v`, `v1.2`, leading-zero identifiers, and
+any `+build` metadata) before it does anything - but that
 regex is *close to*, not exactly, SemVer, so a pathological tag can still slip
 past it and is then rejected by GoReleaser itself. Either way, a tag that is not
 valid SemVer would never register as "newer" with running installs, because the

@@ -239,6 +239,36 @@ func openAt(path string, nowU int64) (*Store, error) {
 	return openAtClock(path, nowU, time.Now())
 }
 
+// containerDataDir is the image's own data directory - the Dockerfile VOLUME,
+// with the ENTRYPOINT pinning -db inside it. The container carve-out below
+// fires only for exactly this path. Var so tests can point it at a temp dir.
+var containerDataDir = "/var/lib/pingularity"
+
+// inContainerFn is util.InContainer, a var so tests can force either answer.
+var inContainerFn = util.InContainer
+
+// realDirNoSymlink reports whether path is an actual directory and not a
+// symlink - the carve-out must never chmod THROUGH a link (the pre-existence
+// probe above deliberately Lstats for the same reason).
+func realDirNoSymlink(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0
+}
+
+// imageLineageMarker reports whether dir carries our image's data-dir marker:
+// both Dockerfiles plant .pingularity-image-dir, and Docker's volume copy-up
+// carries it into a fresh named volume, while an empty PVC or a plain bind mount
+// does not. It is a strong heuristic, not a proof of volume TYPE: a bind mount
+// restored or copied FROM a marker-bearing volume would carry the marker too and
+// so be tightened. That is an acceptable outcome (the content is genuinely ours,
+// owned by our uid, at our path); the marker exists to exclude the COMMON unsafe
+// cases - a host directory or PVC that never held our data - not to prove the
+// mount is a named volume.
+func imageLineageMarker(dir string) bool {
+	fi, err := os.Lstat(filepath.Join(dir, ".pingularity-image-dir"))
+	return err == nil && fi.Mode().IsRegular()
+}
+
 // openAtClock is the full seam: the judging clock AND the wall/monotonic
 // reading the step detector baselines on, as one pair.
 func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
@@ -271,7 +301,33 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 			// and its WAL/SHM sidecars are still locked to the owner below, so
 			// the data stays private; warn that the parent is world/group
 			// reachable so an operator can move to a dedicated directory.
-			log.Printf("pingularity: data directory %s is group/world-accessible and was not created by pingularity; leaving its permissions unchanged (the database file itself is owner-only). Consider a dedicated -db directory.", dir)
+			//
+			// ONE narrow exception, all three conditions required: inside a
+			// container, at exactly the image's own data path, owned by our
+			// user. The image ships /var/lib/pingularity locked 0700, but
+			// Linux Docker engines recreate a fresh named volume's root
+			// group/world-accessible during copy-up - so every Linux docker
+			// install warned on every start about a directory that IS ours by
+			// construction. The shared-system-directory hazard this rule
+			// guards against cannot apply there: nothing else lives at that
+			// path in a single-process container. Tighten it and say so; if
+			// the chmod fails, fall through to the honest warning.
+			tightened := false
+			if inContainerFn() && dir == containerDataDir && realDirNoSymlink(dir) &&
+				osperm.OwnedByThisUser(dir) && imageLineageMarker(dir) {
+				// Verify the chmod TOOK before claiming it: on a filesystem that
+				// accepts-but-ignores chmod the honest warning must survive, and
+				// must not be replaced by a false "tightened" every boot.
+				if err := osperm.SecureDir(dir); err == nil {
+					if still, known := osperm.GroupOrWorldAccessible(dir); known && !still {
+						tightened = true
+						log.Printf("pingularity: tightened data directory %s to owner-only (the image ships it that way; the build or volume setup had loosened it)", dir)
+					}
+				}
+			}
+			if !tightened {
+				log.Printf("pingularity: data directory %s is group/world-accessible and was not created by pingularity; leaving its permissions unchanged (the database file itself is owner-only). Consider a dedicated -db directory.", dir)
+			}
 		}
 		// A database that predates the secured directory (a restored backup, a
 		// db copied in from elsewhere) may hold only ACEs inherited from its old
@@ -575,6 +631,11 @@ func repairInsanePausesAt(db *sql.DB, nowU int64) error {
 // Shared by the at-Open path and the lazy first-plausible-write path
 // (maybeRepairFuturePausesAt): both must apply the identical judgement, or the
 // hardware that never Opens under a plausible clock keeps the rows forever.
+// pauseRepairFn is the deferred-repair call the Prune path routes through, a var
+// so a test can force the repair to fail and exercise Prune's defer-the-delete
+// guard. Production always uses the real implementation.
+var pauseRepairFn = repairFutureReachingPausesAt
+
 func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
 	horizon := nowU + pauseRepairFutureSkew
 	// One transaction: a half-applied move either loses a row (deleted from pauses,
@@ -703,7 +764,7 @@ func (s *Store) maybeRepairFuturePausesFn(nowFn func() int64) {
 	if nowU < plausibleEpoch {
 		return // stays armed; the first plausible write judges
 	}
-	if err := repairFutureReachingPausesAt(s.db, nowU); err != nil {
+	if err := pauseRepairFn(s.db, nowU); err != nil {
 		// Stays armed (done not advanced) - the DELETE is idempotent and a
 		// later write retries. The write itself is never failed for it.
 		log.Printf("pingularity: deferred pause repair failed (a later write retries): %v", err)
@@ -3884,6 +3945,15 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		stats.Inc("db.prune_skipped_clock")
 		return 0, nil
 	}
+	// A settle-completing clockStepped (above) ARMS the deferred pause
+	// re-judgement and returns false, letting this same Prune proceed. Run the
+	// judgement HERE, before the destructive sweep below deletes future-reaching
+	// pause rows outright: the repair MOVES them to pauses_quarantine (which the
+	// sweep never touches), so a later correction can restore them. Without this
+	// the settle-completing prune armed the repair and then, in the same call,
+	// deleted the very rows it would have quarantined. A no-op fast path (two
+	// atomic loads) when nothing is armed.
+	s.maybeRepairFuturePauses()
 	cuts := []struct {
 		table  string
 		before time.Time
@@ -3968,8 +4038,20 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// dedups pause rows on (see exportTables): a split row re-imported next to the
 	// unsplit original in an older backup would land as a SECOND overlapping span
 	// and double-subtract that time from the denominator.
-	res, err = s.db.ExecContext(ctx,
-		`DELETE FROM pauses WHERE ts > ? OR ts + duration_s < ?`, horizon, eventsCut)
+	// The future-reaching half (ts > horizon) is deleted only when the deferred
+	// pause repair is HEALED. If the repair above failed or parked (still armed),
+	// deleting those rows now would destroy exactly what the repair would have
+	// quarantined for a later clock correction - so leave them and let the next
+	// prune (hourly) retry the repair first. The retention-floor half (rows whose
+	// END predates the window) is always safe to sweep.
+	var pauseDel string
+	if s.pauseRepairArmed() {
+		stats.Inc("db.prune_pauses_future_deferred")
+		pauseDel = `DELETE FROM pauses WHERE ts + duration_s < ?`
+		res, err = s.db.ExecContext(ctx, pauseDel, eventsCut)
+	} else {
+		res, err = s.db.ExecContext(ctx, `DELETE FROM pauses WHERE ts > ? OR ts + duration_s < ?`, horizon, eventsCut)
+	}
 	if err != nil {
 		recordDBErr(err)
 		return total, err

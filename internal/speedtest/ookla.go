@@ -7,13 +7,18 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
+	"path"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -83,6 +88,17 @@ type Ookla struct {
 	// Log, if set, records which servers a best-of-N run tried and which won.
 	// Nil is fine - the losing runs are discarded either way.
 	Log *slog.Logger
+
+	// upRec records upload POST statuses for the run in flight, so a failed
+	// upload can say WHY (see uploadRecorder). Set by RunReason; safe as a plain
+	// field because the scheduler runs one measurement at a time (single-flight)
+	// and best-of measures its candidates sequentially on one client.
+	upRec *uploadRecorder
+
+	// uc is the run's UserConfig, kept so a per-attempt client can be rebuilt
+	// with the same location, user agent and connection count. Set by RunReason;
+	// safe as a plain field for the same single-flight reason as upRec.
+	uc *ookla.UserConfig
 }
 
 // logf records a best-of-N step when a logger is wired, and is a no-op otherwise.
@@ -132,12 +148,37 @@ func (o *Ookla) serverID() string {
 // global once while loading its built-in default config (before the options
 // run), so the tail check undoes exactly that stamp - and only that stamp.
 func newOoklaClient(uc *ookla.UserConfig) *ookla.Speedtest {
+	c, _ := newOoklaClientRec(uc)
+	return c
+}
+
+// newOoklaClientRec is newOoklaClient plus the upload recorder wired into the
+// transport chain. Only the measurement path needs the recorder; every other
+// caller (server browse, search, city race) uses the plain constructor.
+func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder) {
 	// New writes http.DefaultClient.Transport (the stamp) and the tail check
 	// clears it; both are unsynchronized writes to a process-global. Serialize
 	// them so concurrent newOoklaClient calls don't race each other on it -
 	// go test -race stays clean.
 	ooklaClientMu.Lock()
 	defer ooklaClientMu.Unlock()
+	// Install the SSRF dial guard on the library's OWN dialer before New runs.
+	// UserConfig.DialerControl feeds both the tcp and ip dialers the library
+	// builds (speedtest.go NewUserConfig), so this guards every destination this
+	// client reaches - the upload/download transfer, the ranking ping, and the
+	// catalogue fetches - not just the probes. Those destinations are all
+	// THIRD-PARTY chosen (a catalogue Host, a by-ID resolve, a redirect target
+	// probeEndpoint copied into s.URL), so without this a hostile entry could
+	// steer the bytes-moving transfer at loopback (incl. the daemon's own UI), a
+	// LAN service, or cloud metadata - the probe guard alone never covered the
+	// transfer. Enforced at dial time, like probeClient, so a name that RESOLVES
+	// to an internal address is caught too. probeDialControl (not probeDialGuard)
+	// so allowLoopbackProbes relaxes it for loopback-served tests; only set when
+	// unset, so a caller-supplied control (e.g. a future source-interface bind)
+	// still wins.
+	if uc != nil && uc.DialerControl == nil {
+		uc.DialerControl = probeDialControl
+	}
 	doer := &http.Client{}
 	client := ookla.New(ookla.WithDoer(doer), ookla.WithUserConfig(uc))
 	if _, ok := http.DefaultClient.Transport.(*ookla.Speedtest); ok {
@@ -153,8 +194,609 @@ func newOoklaClient(uc *ookla.UserConfig) *ookla.Speedtest {
 	if ooklaTransportHook != nil {
 		base = ooklaTransportHook(base)
 	}
-	doer.Transport = panicSafeTransport{base: base, panics: &panicThrottle{}}
-	return client
+	// Beneath the panic containment, so a panic is still converted to an error
+	// before it reaches us, and above nothing else - this must see the real
+	// status the server returned.
+	// ABOVE the panic containment, not below it. panicSafeTransport converts a
+	// panic under the real transport into an error; a recorder beneath it would
+	// be unwound straight past (it has no recover of its own) and would report
+	// "no upload requests were issued" for a run whose POSTs all panicked.
+	rec := &uploadRecorder{}
+	doer.Transport = recordingTransport{
+		base: panicSafeTransport{base: base, panics: &panicThrottle{}},
+		rec:  rec,
+	}
+	return client, rec
+}
+
+// currentEndpoint rewrites a server's URL to the location the catalogue says is
+// CURRENT (the Host field) instead of the legacy `url` field the library uses
+// verbatim.
+//
+// Ookla is migrating servers behind *.prod.hosts.ooklaserver.net while `url`
+// keeps pointing at the old hostname, which now answers the upload POST with a
+// 307. Go will not follow that for a POST - the body (io.NopCloser over the
+// library's chunk reader) has no GetBody, so it cannot be replayed - and the 3xx
+// comes back to the caller. Downloads survive because a GET body IS replayable
+// and Go follows the redirect; only upload breaks. That asymmetry is issues
+// #17/#18: speedtest-go v1.7.10 ignored the status and reported the bytes it had
+// pushed into the socket (an inflated number), v1.7.11 checks the status and
+// reports N/A.
+//
+// Measured across 1127 catalogue entries in 38 countries: on all 408
+// non-migrated servers Host == the url's host, so this is a provable NO-OP
+// there; on all 719 migrated ones it differs. That partition is why this needs
+// no feature flag or guard - it cannot change a server that has not moved.
+// serverfleet_probe_test.go asserts the partition still holds.
+func currentEndpoint(s *ookla.Server) {
+	if s == nil || s.Host == "" {
+		return
+	}
+	// Scheme stays http: every catalogue entry is http on :8080, and rewriting to
+	// https breaks hosts with no working TLS listener (measured: server 1993
+	// answers 200 on http and fails the TLS handshake outright).
+	u := "http://" + s.Host + "/speedtest/upload.php"
+	if s.URL != u {
+		s.URL = u
+	}
+}
+
+// currentEndpoints applies currentEndpoint across a fetched list.
+func currentEndpoints(servers ookla.Servers) ookla.Servers {
+	for _, s := range servers {
+		currentEndpoint(s)
+	}
+	return servers
+}
+
+// uploadRecorder counts what actually happened on the wire during an upload
+// phase. It exists because the library throws the information away: its handler
+// does `if err := uploadRequest(...); err != nil { errorTimes++ }` and discards
+// err, so a failed run reports "server returned N/A" with no status code, no
+// attempt count, and no way to tell WHICH failure occurred.
+//
+// Three different faults produce that identical message:
+//
+//   - rejection - every POST answered non-2xx (retired endpoint, redirect, WAF)
+//   - starvation - a slow uplink where no chunk finishes inside the capture
+//     window, so all in-flight requests are cancelled at window close
+//   - a genuinely dead link
+//
+// Attempt count separates them for free, and this is where it becomes visible:
+// rejection makes THOUSANDS of attempts (each fails instantly), starvation makes
+// exactly min(NumCPU, 8) - one per worker, none ever finishing. Measured: 2336
+// vs 8.
+type uploadRecorder struct {
+	mu         sync.Mutex
+	ceiling    int // starvation signature bound; 0 = not set
+	attempts   int
+	byStatus   map[int]int
+	lastStatus int
+	lastErr    string
+}
+
+func (r *uploadRecorder) note(status int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts++
+	if r.byStatus == nil {
+		r.byStatus = map[int]int{}
+	}
+	r.byStatus[status]++
+	if err != nil {
+		r.lastErr = err.Error()
+		return
+	}
+	if status < 200 || status >= 300 {
+		r.lastStatus = status
+	}
+}
+
+// snapshot returns attempts so far and how many of them were confirmed (2xx).
+// The retry loop uses the delta across one attempt to tell STARVATION (nothing
+// ever completed) from REJECTION (thousands completed and were refused).
+func (r *uploadRecorder) snapshot() (attempts, confirmed int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for c, n := range r.byStatus {
+		if c >= 200 && c < 300 {
+			confirmed += n
+		}
+	}
+	return r.attempts, confirmed
+}
+
+func (r *uploadRecorder) reset(ceiling int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts, r.byStatus, r.lastStatus, r.lastErr = 0, map[int]int{}, 0, ""
+	r.ceiling = ceiling
+}
+
+// summary renders the diagnosis. Deliberately short: it is appended to an error
+// that reaches the UI banner and the log line, so it has to earn its width.
+func (r *uploadRecorder) summary() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.attempts == 0 {
+		return "no upload requests were issued"
+	}
+	codes := make([]int, 0, len(r.byStatus))
+	for c := range r.byStatus {
+		codes = append(codes, c)
+	}
+	sort.Ints(codes)
+	parts := make([]string, 0, len(codes))
+	for _, c := range codes {
+		if c == 0 {
+			parts = append(parts, fmt.Sprintf("%d transport-error", r.byStatus[c]))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%dx HTTP %d", r.byStatus[c], c))
+	}
+	out := fmt.Sprintf("%d upload attempts: %s", r.attempts, strings.Join(parts, ", "))
+	// The interpretation, not just the numbers - this is the line that turns a
+	// bug report into a diagnosis.
+	switch {
+	case r.lastStatus >= 300 && r.lastStatus < 400:
+		out += "; server redirects the upload POST (Go cannot follow it - body not replayable)"
+	case r.lastStatus != 0:
+		out += "; server rejects the upload endpoint"
+	case r.ceiling > 0 && r.attempts <= r.ceiling && r.lastErr != "":
+		out += "; no attempt completed inside the capture window - the uplink is too slow for the parallel chunk set, or the server accepted and stalled"
+	case r.lastErr != "":
+		out += "; last transport error: " + r.lastErr
+	}
+	return out
+}
+
+// recordingTransport feeds the recorder. It only watches upload POSTs; download
+// GETs and the ping probes ride through untouched.
+type recordingTransport struct {
+	base http.RoundTripper
+	rec  *uploadRecorder
+}
+
+func (t recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/speedtest/upload.php") {
+		return t.base.RoundTrip(req)
+	}
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		t.rec.note(0, err)
+		return resp, err
+	}
+	t.rec.note(resp.StatusCode, nil)
+	return resp, err
+}
+
+// starvationCeiling bounds what counts as the starvation signature: at most one
+// attempt per worker, i.e. nothing ever finished and came back for more.
+//
+// Derived, never constant. The library runs min(NumCPU, uploadMaxWorkers)
+// uploaders by default, but MaxConnections overrides it and settings allow up to
+// MaxOoklaConnections (16). A fixed 12 silently excluded every 13-16 connection
+// configuration from the rescue AND from the diagnosis - a starved 16-stream
+// transfer made ~16 attempts, missed the predicate, and retried into the same
+// starvation. The slack absorbs a straggler that started just before the window
+// closed.
+func starvationCeiling(conns int) int {
+	// SetNThread(n) for n >= 1 sets BOTH nThread and uploadMaxWorkers to n, so a
+	// configured value is the worker count outright - the 8 cap applies only to
+	// the default path, where the library uses min(NumCPU, 8). Clamping a
+	// configured 16 down to 8 was exactly the bug this function exists to fix.
+	workers := conns
+	if conns < 1 {
+		workers = runtime.NumCPU()
+		if workers > uploadDefaultWorkerCap {
+			workers = uploadDefaultWorkerCap
+		}
+	}
+	return workers + starvationSlack
+}
+
+const (
+	// uploadDefaultWorkerCap mirrors the library's uploadMaxWorkers default,
+	// which applies ONLY when no connection count is configured.
+	uploadDefaultWorkerCap = 8
+	starvationSlack        = 4
+)
+
+// configuredConnections is the parallelism the user asked for: 0 means "library
+// default", which is what SetNThread(0) restores.
+func (o *Ookla) configuredConnections() int {
+	if o.ConnectionsFn == nil {
+		return 0
+	}
+	return o.ConnectionsFn()
+}
+
+// runConnections is the parallelism THIS run's transfers actually use. RunReason
+// snapshots the live ConnectionsFn once into o.uc.MaxConnections, and every
+// freshManager reuses that snapshot; the starvation ceiling and diagnosis must
+// be derived from the SAME value, not a second live read. Otherwise a setting
+// saved mid-run (discovery or the download phase can be in flight when the user
+// lowers the count) would size the ceiling for a different worker count than the
+// upload ran with - so a genuinely starved run slips past the rescue predicate
+// (it retries into the same starvation) and is mislabelled a transport error
+// instead of starvation. Direct measure() callers (tests, non-RunReason) leave
+// o.uc nil, where the live configured value is the right stand-in.
+func (o *Ookla) runConnections() int {
+	if o.uc != nil {
+		return o.uc.MaxConnections
+	}
+	return o.configuredConnections()
+}
+
+// uploadRescueSettle is how long the rescue waits for the failed attempt's
+// transfers to drain before measuring. Measured: they linger ~5 s past their
+// window close.
+const uploadRescueSettle = 5 * time.Second
+
+// ---- HTTP Legacy Fallback health -------------------------------------------
+//
+// /speedtest/upload.php is not part of the OoklaServer daemon. It ships in the
+// optional "HTTP Legacy Fallback" bundle an operator installs separately (it
+// wants a web server; Apache+PHP is typical). The daemon's own native protocol
+// on TCP/UDP 5060+8080 is what the official Speedtest CLI uses and needs none of
+// it. speedtest-go, and therefore we, can ONLY talk to the fallback.
+//
+// So a sizeable slice of the catalogue is unusable to us while being perfectly
+// healthy for Ookla's own client: measured 2026-08-11, ~12% of migrated and ~18%
+// of non-migrated servers answer 500, and the official CLI measures those same
+// hosts at 170-290 Mbps. This is attrition (a component never installed, or a
+// web server that rotted), NOT a deprecation programme - migrated servers are
+// HEALTHIER than non-migrated ones, which is the opposite of what a planned
+// retirement would look like.
+//
+// Ranking cannot see any of this on its own. speedtest-go's HTTPPing GETs
+// /speedtest/latency.txt - the same bundle - and NEVER CHECKS THE STATUS CODE,
+// so a server answering 500 to everything returns a fast, plausible latency and
+// sorts normally. Left alone it wins the race, and every run against it fails.
+//
+// The check is therefore just reading the status of a request ranking already
+// makes. Measured over 200 random servers, latency.txt and upload.php agreed on
+// health 200/200 - no misses, no false exclusions - so the cheap GET stands in
+// for the POST.
+type fallbackVerdict struct {
+	state   endpointState
+	expires time.Time
+	fails   int // consecutive definite failures; see fallbackHealth
+}
+
+// probeDialGuard refuses to connect anywhere a speedtest server has no business
+// sending us. Both probes act on a destination a THIRD PARTY chose - the
+// catalogue's host, or a Location header from a server that may be compromised
+// or simply listed by anyone - and probeEndpoint follows that redirect with a
+// POST. Without this, a hostile entry could steer the daemon at 127.0.0.1:9000
+// (its own UI), a private LAN service, or cloud metadata.
+//
+// Enforced at DIAL time rather than by parsing the URL, so a name that resolves
+// to a blocked address is caught too - URL inspection alone loses to DNS
+// rebinding. Mirrors internal/notify's dialGuard, widened to loopback and
+// private ranges because unlike a webhook these destinations are never
+// legitimate for a speedtest server.
+func probeDialGuard(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("blocked probe to unresolved address %q", address)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	switch {
+	case ip.IsLoopback():
+		return fmt.Errorf("blocked probe to loopback %s", ip)
+	case ip.IsPrivate():
+		return fmt.Errorf("blocked probe to private address %s", ip)
+	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		return fmt.Errorf("blocked probe to link-local %s", ip)
+	case ip.IsUnspecified(), ip.IsMulticast():
+		return fmt.Errorf("blocked probe to %s", ip)
+	}
+	for _, n := range blockedProbeNets {
+		if n.Contains(ip) {
+			return fmt.Errorf("blocked probe to reserved address %s", ip)
+		}
+	}
+	return nil
+}
+
+// blockedProbeNets are ranges net.IP.IsPrivate does NOT cover but that a
+// speedtest server still has no business steering us to. Chiefly RFC 6598
+// shared address space (100.64.0.0/10) - Tailscale's default CGNAT range and
+// common in the self-host/homelab deployments pingularity targets, so a
+// redirect into it would otherwise sail past the guard on its way to an
+// internal tailnet service. The reserved documentation/benchmark blocks come
+// along for the same reason: never a legitimate speedtest destination. Parsed
+// once; the loopback/link-local/RFC1918/multicast cases stay on net.IP's own
+// predicates above. To4() has already normalized IPv4-mapped forms (e.g.
+// ::ffff:100.64.0.5), so Contains catches those too.
+var blockedProbeNets = func() []*net.IPNet {
+	nets := make([]*net.IPNet, 0, 4)
+	for _, cidr := range []string{
+		"100.64.0.0/10",  // RFC 6598 shared address space (CGNAT / Tailscale)
+		"192.0.2.0/24",   // RFC 5737 TEST-NET-1
+		"198.18.0.0/15",  // RFC 2544 benchmarking
+		"203.0.113.0/24", // RFC 5737 TEST-NET-3
+	} {
+		if _, n, err := net.ParseCIDR(cidr); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}()
+
+// probeDialControl is the dial guard the probes AND the measurement client
+// install (see probeClient and newOoklaClientRec). A package var for the same
+// reason as ooklaPing and fetchServerList: the offline tests serve their fakes
+// on loopback, which the guard exists to refuse, so allowLoopbackProbes relaxes
+// this one var to cover both the probes and the real transfer. Production never
+// reassigns it, and TestProbeRefusesInternalDestinations exercises the real
+// probeDialGuard directly so relaxing this in a test cannot hide a regression
+// in the guard itself.
+var probeDialControl = probeDialGuard
+
+// probeClient is the only client the endpoint probes use. Its dialer refuses
+// internal destinations (see probeDialGuard) on every hop, redirects included -
+// enforced at dial time, so a hostname that RESOLVES to an internal address is
+// caught too.
+func probeClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: timeout, Control: probeDialControl}).DialContext,
+		},
+	}
+}
+
+const (
+	// fallbackTTL: a missing component is stable, but an operator CAN install it,
+	// so this expires rather than being permanent. Long enough that a scheduled
+	// run never re-probes the same server twice in a day.
+	fallbackTTL = 12 * time.Hour
+	// fallbackUnknownTTL: a probe that failed at transport level proves nothing
+	// about the endpoint - retry it soon rather than trusting the non-answer.
+	fallbackUnknownTTL = 10 * time.Minute
+	// fallbackProbeTimeout keeps one silent server from stalling selection. The
+	// probes run concurrently with the ping race, so this is a ceiling on the
+	// phase, not a per-server addition to it.
+	fallbackProbeTimeout = 6 * time.Second
+	// annotateFallbackBudget caps the picker's total annotation wait (see
+	// annotateFallback). Short on purpose: a decorated list arriving late is
+	// worse than an undecorated one arriving now.
+	annotateFallbackBudget = 3 * time.Second
+	// fallbackStrikes is how many consecutive definite failures retire a server.
+	// One is not enough: transient 5xx and rate limiting are indistinguishable
+	// from a missing bundle in a single response.
+	fallbackStrikes = 2
+	// fallbackMapCap bounds the cache the way plMapCap bounds the loss map:
+	// cycling through many servers must not grow it forever.
+	fallbackMapCap = 512
+)
+
+var (
+	fbMu  sync.Mutex
+	fbMap = map[string]fallbackVerdict{} // server ID -> verdict
+)
+
+// fallbackHealth returns the cached verdict for a server, probing if needed.
+// A package var so tests can drive selection without a network.
+var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
+	if s == nil || s.ID == "" {
+		return endpointUnknown
+	}
+	now := time.Now()
+	fbMu.Lock()
+	prevFails := 0
+	if v, ok := fbMap[s.ID]; ok {
+		prevFails = v.fails
+		if now.Before(v.expires) {
+			fbMu.Unlock()
+			return v.state
+		}
+	}
+	fbMu.Unlock()
+
+	st := probeFallback(ctx, s)
+	if ctx.Err() != nil {
+		// The caller gave up (annotation budget, aborted run). That is a fact
+		// about us, not the server: returning it is fine, caching it would let a
+		// picker timeout suppress a real probe for the next several minutes.
+		return endpointUnknown
+	}
+
+	// A single definite failure is NOT a retirement. 429, 500, 502, 503 and a
+	// maintenance window all look like a missing bundle for one request, and a
+	// 12h exclusion on one bad moment removes a healthy server for half a day.
+	// Two consecutive strikes are required, the same rule plState uses for the
+	// loss probe; the first is held briefly so the retry happens soon.
+	fails := 0
+	ttl := fallbackTTL
+	switch st {
+	case endpointRetired:
+		fails = prevFails + 1
+		if fails < fallbackStrikes {
+			st, ttl = endpointUnknown, fallbackUnknownTTL
+		}
+	case endpointUnknown:
+		fails = prevFails // a probe that never landed is not a strike either way
+		ttl = fallbackUnknownTTL
+	}
+	fbMu.Lock()
+	if len(fbMap) >= fallbackMapCap {
+		for k, v := range fbMap { // expired entries first - they cost nothing to lose
+			if now.After(v.expires) {
+				delete(fbMap, k)
+			}
+		}
+		// Then evict until there is room. A single eviction per insert holds the
+		// steady state, but cannot recover if the map is ever ALREADY over cap,
+		// so drain rather than nudge.
+		for k := range fbMap {
+			if len(fbMap) < fallbackMapCap {
+				break
+			}
+			delete(fbMap, k)
+		}
+	}
+	fbMap[s.ID] = fallbackVerdict{state: st, expires: now.Add(ttl), fails: fails}
+	fbMu.Unlock()
+	return st
+}
+
+// probeFallback GETs the bundle's latency probe and judges by STATUS, which is
+// exactly what the library's ping omits.
+var probeFallback = func(ctx context.Context, s *ookla.Server) endpointState {
+	u, err := url.Parse(s.URL)
+	if err != nil || u.Host == "" {
+		return endpointUnknown
+	}
+	// Derive the path the way the library's HTTPPing does rather than hardcoding
+	// /speedtest/latency.txt: a catalogue entry with a non-standard path and an
+	// empty Host (so currentEndpoint no-ops) would otherwise be probed at a path
+	// it does not serve, and cached as unusable for fallbackTTL despite
+	// measuring fine.
+	probeURL := *u
+	probeURL.Scheme = "http"
+	probeURL.Path = path.Join(path.Dir(u.Path), "latency.txt")
+	pctx, cancel := context.WithTimeout(ctx, fallbackProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, probeURL.String(), nil)
+	if err != nil {
+		return endpointUnknown
+	}
+	req.Header.Set("User-Agent", ookla.DefaultUserAgent)
+	// Follow redirects. A 3xx means the bundle MOVED, not that it is gone -
+	// treating it as gone would exclude a perfectly usable server for
+	// fallbackTTL, and "the legacy hostname redirects to the current one" is
+	// exactly the situation that produced issues #17/#18. Go follows a GET
+	// redirect natively (unlike the POST, whose body is not replayable), so this
+	// only needs the default client behaviour rather than a manual hop.
+	resp, err := probeClient(fallbackProbeTimeout).Do(req)
+	if err != nil {
+		return endpointUnknown // says nothing about the endpoint; retry soon
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return endpointOK
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		// A redirect that was NOT followed (a loop, or too many hops). Unresolved
+		// rather than absent: do not condemn the server on it.
+		return endpointUnknown
+	default:
+		return endpointRetired
+	}
+}
+
+// endpointState is what a probe learned about one server's upload endpoint.
+type endpointState int
+
+const (
+	endpointOK      endpointState = iota // answered 2xx: usable
+	endpointRetired                      // answered non-2xx, non-3xx: the legacy
+	// /speedtest/upload.php is gone. Measured 2026-08-10: ~14% of the catalogue,
+	// and those servers are NOT broken - the official Ookla CLI measures them at
+	// full speed over its own protocol. They have dropped the legacy PHP endpoint
+	// speedtest-go requires, permanently. Retrying them is pure waste.
+	endpointUnknown // the probe itself failed (timeout, DNS, reset): decide nothing
+)
+
+// String keeps log lines and test failures readable - "retired" rather than "1".
+func (e endpointState) String() string {
+	switch e {
+	case endpointOK:
+		return "ok"
+	case endpointRetired:
+		return "no-legacy-fallback"
+	default:
+		return "unknown"
+	}
+}
+
+// probeEndpointBody is deliberately tiny. A 1 KB POST returns the same status as
+// the ~1 MB chunk a real transfer sends - verified against migrated,
+// non-migrated and redirecting hosts - so a probe costs a round trip, not a
+// measurement.
+const probeEndpointBody = 1024
+
+// probeEndpointTimeout bounds a probe so a silent server cannot stall selection.
+const probeEndpointTimeout = 8 * time.Second
+
+// probeEndpoint asks a server whether its upload endpoint still works, and
+// follows ONE redirect hop by hand.
+//
+// The manual hop exists because Go will not redirect a POST whose body is not
+// replayable, which is exactly the shape the library builds (io.NopCloser over
+// its chunk reader, so GetBody is nil). That is the whole of issues #17/#18. On
+// a 3xx the server's Location names its current home, so we rewrite s.URL to it
+// - self-correcting, unlike deriving a hostname from the ID, which was measured
+// to fail (server-46433.prod.hosts.ooklaserver.net does not resolve).
+//
+// Only needed where the catalogue's Host field is unavailable: the by-ID
+// endpoint (api/ios-config.php) returns Host="" and cannot be fixed by
+// currentEndpoint. List-derived servers carry Host and need no probe.
+//
+// A package var so tests can drive selection without a network.
+var probeEndpoint = func(ctx context.Context, s *ookla.Server) endpointState {
+	if s == nil || s.URL == "" {
+		return endpointUnknown
+	}
+	pctx, cancel := context.WithTimeout(ctx, probeEndpointTimeout)
+	defer cancel()
+
+	do := func(target string) (int, string) {
+		req, err := http.NewRequestWithContext(pctx, http.MethodPost, target,
+			strings.NewReader(strings.Repeat("\xAA", probeEndpointBody)))
+		if err != nil {
+			return 0, ""
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		c := probeClient(probeEndpointTimeout)
+		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		resp, err := c.Do(req)
+		if err != nil {
+			return 0, ""
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode, resp.Header.Get("Location")
+	}
+
+	code, loc := do(s.URL)
+	if code >= 300 && code < 400 && loc != "" {
+		// Take the redirect's HOST but keep our own scheme and path: the target
+		// advertises https, and plain http on the same host works everywhere it
+		// was measured, while https fails outright on hosts with no TLS listener.
+		if u, err := url.Parse(loc); err == nil && u.Host != "" {
+			// Adopt the redirect target into s.URL only AFTER the guarded re-probe
+			// gets a real response (code != 0). A guard refusal or transport
+			// failure leaves code == 0; writing s.URL then would poison it with an
+			// internal address that the separately-built measurement client could
+			// later dial - the retained-URL half of the SSRF. Holding the candidate
+			// local until it answers closes that even if the measurement-side dial
+			// guard were ever removed. A public host answering non-2xx still gets
+			// adopted and classified retired, exactly as before.
+			candidate := "http://" + u.Host + "/speedtest/upload.php"
+			if code, _ = do(candidate); code != 0 {
+				s.URL = candidate
+			}
+		}
+	}
+	switch {
+	case code >= 200 && code < 300:
+		return endpointOK
+	case code == 0:
+		return endpointUnknown // transport failure says nothing about the endpoint
+	default:
+		return endpointRetired
+	}
 }
 
 // ooklaTransportHook, if set, interposes on the transport the library stamped
@@ -467,6 +1109,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		if err != nil {
 			return Result{}, fmt.Errorf("fetch server %s: %w", id, err)
 		}
+		currentEndpoint(p) // a pinned server needs the same rewrite as a listed one
 		pinned = p
 	}
 	if lat, lon, label, ok := listCentre(id, want, pinned, searchedCity); ok {
@@ -481,7 +1124,30 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			uc.Location = newAnchoredLocation("auto", win.Lat, win.Lon)
 		}
 	}
-	client := newOoklaClient(uc)
+	client, rec := newOoklaClientRec(uc)
+	o.upRec = rec
+	o.uc = uc
+
+	// Re-home the pin onto THIS client. It had to be resolved earlier, before the
+	// location was known, so it was fetched with a throwaway client - which left
+	// two holes: its uploads rode a transport whose recorder nobody reads (so
+	// diagnostics and the starvation rescue were blind to the pinned candidate),
+	// and it never met probeEndpoint, because pickServers only probes when it has
+	// to resolve the pin ITSELF. The by-ID endpoint returns Host="" so
+	// currentEndpoint cannot help it either - a migrated pinned server therefore
+	// kept the legacy URL and 307'd on every upload, which is issue #18 on the
+	// one path that looked covered.
+	if pinned != nil {
+		pinned.Context = client
+		switch probeEndpoint(ctx, pinned) {
+		case endpointRetired:
+			o.logf("pinned speedtest server has no HTTP legacy fallback",
+				"server", serverLabel(pinned), "server_id", pinned.ID)
+		case endpointUnknown:
+			o.logf("pinned speedtest server did not answer the endpoint probe",
+				"server", serverLabel(pinned), "server_id", pinned.ID)
+		}
+	}
 
 	servers, err := fetchServerList(ctx, client)
 	if err != nil {
@@ -861,6 +1527,19 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 			if err != nil {
 				return nil, nil, fmt.Errorf("fetch server %s: %w", id, err)
 			}
+			// This endpoint (api/ios-config.php) returns Host="" - measured - so
+			// currentEndpoint cannot help and a migrated pin would 307 on every
+			// upload forever. Probe it and follow the hop instead. Only this
+			// fallback pays the round trip; a pin found in the list above already
+			// carries the catalogue's current Host.
+			switch probeEndpoint(ctx, s) {
+			case endpointRetired:
+				o.logf("pinned speedtest server has retired its upload endpoint",
+					"server", serverLabel(s), "server_id", s.ID, "url", s.URL)
+			case endpointUnknown:
+				o.logf("pinned speedtest server did not answer the endpoint probe",
+					"server", serverLabel(s), "server_id", s.ID)
+			}
 			pinned = s
 		}
 		if want <= 1 {
@@ -872,7 +1551,22 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	if o.ISPFn != nil {
 		isp = o.ISPFn()
 	}
-	ranked, rankPings := rankedServers(ctx, servers, isp)
+	ranked, rankPings, noFallback, allNoFallback := rankedServers(ctx, servers, isp)
+	if allNoFallback {
+		// Every nearby server lacks the fallback, so none was excluded - the run
+		// goes ahead and will probably fail. Silence here would make the worst
+		// case the only one with no signal.
+		o.logf("every nearby speedtest server lacks the HTTP legacy fallback; measuring anyway",
+			"candidates", len(ranked))
+		stats.Inc("speed.all_servers_no_fallback")
+	}
+	for _, id := range noFallback {
+		// Not slow, not flaky: the optional HTTP Legacy Fallback is absent, so
+		// every transfer would fail. Excluded from ranking - an explicit pin is
+		// unaffected, it never passes through here.
+		o.logf("skipping speedtest server with no HTTP legacy fallback", "server_id", id)
+		stats.Inc("speed.server_no_fallback")
+	}
 	// One Debug line per candidate - the phase had zero logging before the
 	// 2026-08-02 incident. Per-candidate rather than one joined line so the
 	// `server` key masks correctly (logfilter masks by key).
@@ -925,6 +1619,38 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	return out, sel, nil
 }
 
+// freshManager gives the NEXT attempt its own DataManager instead of resetting
+// the shared one.
+//
+// Reset() rebuilds the direction state but keeps the manager, so two Start()
+// calls touch the same manager.running - and Start writes that field WITHOUT the
+// RWMutex every reader holds (data_manager.go:224 vs :314). The previous
+// attempt's adaptUploadWorkers goroutine only notices the window closed on its
+// own 1s tick, so it is still reading while the next attempt writes: a data race
+// on the production default of one retry. No amount of waiting fixes it - the
+// missing happens-before edge is the defect, not the timing.
+//
+// Swapping in a new client removes the SHARED STATE the race needs, from our
+// side, without patching the library. srv.Context is only ever the client that
+// fetched the server (see runTransfer's note), and everything a transfer touches
+// goes through it, so the swap is total.
+//
+// The caller must read any per-attempt totals off the OLD manager first - they
+// do not carry over. That is the same discipline Reset() already required.
+func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
+	if uc == nil {
+		// A direct measure() call (tests, or any caller that did not come through
+		// RunReason) has no run config. The library's own default is the right
+		// stand-in; the alternative is a nil deref inside NewUserConfig.
+		uc = &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent}
+	}
+	client, rec := newOoklaClientRec(uc)
+	srv.Context = client
+	if o != nil {
+		o.upRec = rec // diagnostics follow the client the transfer actually uses
+	}
+}
+
 // ooklaTransfer is one direction's library transfer. The two implementations are
 // package vars so a test can stand in for the network without one - the same
 // swap-a-var seam as iperfExec - and so measure's two directions read alike.
@@ -938,6 +1664,24 @@ var (
 		return srv.UploadTestContext(ctx)
 	}
 )
+
+// ooklaPing is the ranking latency probe, a swap-a-var seam (like ooklaDownload/
+// ooklaUpload) so rankedServers' selection logic - which reachable/failed server
+// wins - is testable without a live server.
+var ooklaPing = func(ctx context.Context, srv *ookla.Server, cb func(time.Duration)) error {
+	return srv.PingTestContext(ctx, cb)
+}
+
+// uploadSpent is the data an upload attempt actually pushed across the (possibly
+// metered) link, for data-usage accounting. It is confirmed bytes (GetTotalUpload)
+// PLUS the backlog (GetUploadBacklog): bytes read into the socket but not
+// server-confirmed. speedtest-go v1.7.11 counts only confirmed bytes in
+// GetTotalUpload - correct for the RATE (ULSpeed) but it drops the bytes a FAILED
+// or aborted attempt already sent, which "data used" must still include. Download
+// has no equivalent gap (GetTotalDownload counts bytes actually received).
+func uploadSpent(srv *ookla.Server) int64 {
+	return srv.Context.GetTotalUpload() + srv.Context.GetUploadBacklog()
+}
 
 // errTransferAbandoned marks a transfer we walked away from because the context
 // died first (see runTransfer). It travels alongside the context error - both are
@@ -1116,7 +1860,8 @@ var measureServer = func(o *Ookla, ctx context.Context, srv *ookla.Server, dir s
 // its own. Stubbing it lets a test reach measureServer THROUGH RunReason, so
 // the loop around both is exercised rather than mirrored.
 var fetchServerList = func(ctx context.Context, client *ookla.Speedtest) (ookla.Servers, error) {
-	return client.FetchServerListContext(ctx)
+	servers, err := client.FetchServerListContext(ctx)
+	return currentEndpoints(servers), err
 }
 
 // measure runs one full measurement against an already-chosen server.
@@ -1125,7 +1870,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	// Same ten samples the library already sends - the callback only keeps the
 	// fastest alongside the mean it returns, so this costs no extra probe.
 	var bestPing time.Duration
-	if err := srv.PingTestContext(ctx, keepFastestPing(&bestPing)); err != nil {
+	if err := ooklaPing(ctx, srv, keepFastestPing(&bestPing)); err != nil {
 		return Result{}, fmt.Errorf("ping: %w", err)
 	}
 	// Idle baseline for latency-under-load: same method/target as the loaded
@@ -1151,7 +1896,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	var downBytes, upBytes int64
 	if dir != "up" {
 		err = withRetryPred(ctx, retries, anyErr, func() error {
-			srv.Context.Reset()
+			freshManager(o, srv, o.uc) // per-attempt manager; see freshManager
 			stop := startLoadSampler(ctx, probeAddr)
 			finished, e := runTransfer(ctx, srv, ooklaDownload)
 			loadedDown = stop() // our own sampler, always joined
@@ -1179,15 +1924,101 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		}
 	}
 	if dir != "down" {
+		// The rescue predicate and the diagnosis must agree, so both take the same
+		// derived bound (see starvationCeiling), sized to the connection count THIS
+		// run's transfers actually use (see runConnections) rather than a fresh
+		// live read that a mid-run settings change could have moved.
+		wantConns := o.runConnections()
+		ceiling := starvationCeiling(wantConns)
+		// Starvation rescue. min(NumCPU, 8) workers each POST a ~1 MB chunk
+		// CONCURRENTLY into a fixed capture window; sharing one uplink they
+		// advance in lockstep, so the first confirmation needs the whole parallel
+		// set through - about 6.4 Mbps on an 8-worker host. Below that nothing
+		// ever confirms and the run reports N/A for a link that is uploading
+		// perfectly well, just slowly.
+		//
+		// The rescue is DEFERRED to a retry rather than applied up front, because
+		// fewer workers is actively harmful on a healthy link: measured at 25 ms
+		// RTT, throughput is linear in worker count (8 -> 1684 Mbps, 4 -> 837,
+		// 2 -> 417, 1 -> 208), so a blanket reduction would under-report every
+		// fast connection - recreating #17 inverted. The trigger below cannot
+		// fire on a healthy run: it requires ZERO confirmed chunks, and a healthy
+		// run confirms thousands within seconds.
+		//
+		// One worker rescues down to ~0.53 Mbps, and a single stream saturates a
+		// slow link fine (the parallelism penalty is a high-BDP effect), so the
+		// rescued measurement is accurate rather than merely non-empty.
+		// The window in force before any rescue changes it. Restoring a hardcoded
+		// constant would clobber a caller that set its own (tests do).
+		attempt := 0
+		rescued := false
 		err = withRetryPred(ctx, retries, anyErr, func() error {
-			srv.Context.Reset()
+			attempt++
+			starved := false
+			if attempt > 1 && o.upRec != nil {
+				if a, c := o.upRec.snapshot(); c == 0 && a > 0 && a <= ceiling {
+					starved = true
+					// Nothing completed, and attempts never exceeded one per
+					// worker - the signature of starvation, not rejection
+					// (rejection racks up thousands of instant failures).
+					o.logf("retrying upload with a single stream after no chunk completed",
+						"server", serverLabel(srv), "attempts", a)
+
+					// A longer window as well as fewer streams. One stream needs
+					// chunk/uplink seconds to land - 4 s at 2 Mbps - and it does not
+					// get a clean link to do it in: the previous attempt's transfers
+					// keep pulling bytes after their window closes (the same orphan
+					// behaviour awaitQuietTransfers exists for), so the rescue starts
+					// while the link is still busy. Doubling the window absorbs that
+					// without changing anything for a healthy run, which never
+					// reaches this branch.
+					// NOT extended past ooklaCaptureTime: both orphan-drain waits are
+					// sized at ooklaCaptureTime+5s, so a longer window would let an
+					// abandoned rescue outlive the wait meant to outlast it.
+
+					// Let the link settle first. The previous attempt's transfers
+					// keep pulling bytes after their window closed, and the rescue
+					// has a hard deadline of its own: the library ends the window
+					// early once its rate series looks converged, and a series of
+					// zeroes converges fast. Starting the single stream into a busy
+					// link means it may not land a chunk before that fires. Measured:
+					// without this wait the rescue still reported N/A.
+					//
+					select {
+					case <-ctx.Done():
+					case <-time.After(uploadRescueSettle):
+					}
+					stats.Inc("speed.upload_starvation_retry")
+				}
+			}
+			// Fresh manager per attempt, not Reset() on a shared one - see
+			// freshManager. This is what removes the v1.7.11 data race from our
+			// side: two Start() calls no longer touch the same manager.running.
+			// It also means there is nothing to "restore" afterwards, because the
+			// next attempt and the next best-of candidate each start from the
+			// run's UserConfig rather than inheriting a rescue's settings.
+			freshManager(o, srv, o.uc)
+			if o.upRec != nil {
+				// The swap installs a NEW recorder, so the signature bound has to
+				// travel with it - otherwise the diagnosis silently falls through to
+				// the generic transport-error wording in exactly the starved case
+				// it exists to describe. Counts are per-attempt now rather than
+				// cumulative, which matches the bound (one attempt per worker).
+				o.upRec.reset(ceiling)
+			}
+			if starved {
+				// Applied to the NEW client; setting it before the swap would have
+				// been thrown away with the old one.
+				srv.Context.SetNThread(1)
+				rescued = true
+			}
 			stop := startLoadSampler(ctx, probeAddr)
 			finished, e := runTransfer(ctx, srv, ooklaUpload)
 			loadedUp = stop()
 			if !finished { // abandoned: srv belongs to the orphan now (see above)
 				return e
 			}
-			upBytes += srv.Context.GetTotalUpload() // count this attempt before the next Reset zeroes it
+			upBytes += uploadSpent(srv) // confirmed + backlog: a FAILED attempt's pushed bytes aren't in GetTotalUpload alone
 			if e == nil && ctx.Err() != nil {
 				e = ctx.Err()
 			}
@@ -1196,9 +2027,25 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			}
 			return e
 		})
+		if rescued && err == nil {
+			// The rescue fired AND the run survived. Without this the only trace
+			// is the retry counter, which cannot distinguish a rescue that saved
+			// a measurement from one that merely tried.
+			o.logf("single-stream retry rescued the upload measurement",
+				"server", serverLabel(srv))
+			stats.Inc("speed.upload_starvation_rescued")
+		}
 		if err != nil {
 			// As above: the download that preceded this failed upload moved real
 			// bytes; they travel out with the error.
+			//
+			// The recorder's summary is APPENDED, not substituted: %w keeps
+			// errMeasurementNA in the chain and the "upload:" prefix stays first,
+			// so speedFailStage still classifies this exactly as before.
+			if o.upRec != nil {
+				return Result{DownloadBytes: downBytes, UploadBytes: upBytes},
+					fmt.Errorf("upload: %w [%s]", err, o.upRec.summary())
+			}
 			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w", err)
 		}
 	}
@@ -1479,25 +2326,68 @@ func sponsorMatchesISP(sponsor, isp string) bool {
 //
 // Best-of-N reads ranks 2 and 3 straight off this list: the pings already
 // happened to choose rank 1, so the extra servers cost nothing to identify.
-func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64) {
+// rankPingLatency decides what a ranking ping recorded and whether it counts as
+// answered. A SUCCESSFUL ping (nil error, at least one sample) whose mean rounds
+// to zero on a coarse clock - the sub-millisecond Windows case - is clamped to
+// the smallest positive duration, so the fastest server still ranks first and
+// its selection-report row reads answered (~0ms) rather than unanswered below
+// every slower server. A failed or unsampled ping is not answered: its Latency
+// holds a stale list-fetch echo that must never enter the ranking.
+func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Duration, bool) {
+	if err != nil || !sampled {
+		return 0, false
+	}
+	if latency <= 0 {
+		return time.Nanosecond, true
+	}
+	return latency, true
+}
+
+// rankedServers returns the ranked candidates, their ranking pings, and the IDs
+// dropped for having no HTTP Legacy Fallback (see fallbackHealth) so the caller
+// can say so in the log.
+func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64, []string, bool) {
 	if len(servers) == 0 {
-		return nil, nil
+		return nil, nil, nil, false
 	}
 	// Sort a copy so the caller's slice order is untouched.
 	sorted := append(ookla.Servers(nil), servers...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Distance < sorted[j].Distance })
 	cand := autoCandidates(sorted, isp)
 
+	// Reserves: the next servers past the candidate cap, so health filtering can
+	// REPLENISH rather than merely subtract. autoCandidates caps at autoPingMax,
+	// and filtering afterwards used to shrink that set with nothing to refill it
+	// - if the nearest 12 all lacked the fallback, a working 13th was never
+	// considered and the run fell back to measuring the known-bad 12. Partial
+	// attrition could likewise leave a best-of-3 with fewer than three targets.
+	// Reserves are pinged and probed in the SAME fan-out, so they cost latency
+	// only when the pool actually needs them.
+	inPool := make(map[string]bool, len(cand))
+	for _, s := range cand {
+		inPool[s.ID] = true
+	}
+	reserve := make(ookla.Servers, 0, autoPingMax)
+	for _, s := range sorted {
+		if len(reserve) == cap(reserve) {
+			break
+		}
+		if !inPool[s.ID] {
+			reserve = append(reserve, s)
+		}
+	}
+	probeSet := append(append(ookla.Servers(nil), cand...), reserve...)
+
 	// The explicit per-server ranking outcome, for the selection report. The
-	// Latency FIELD cannot carry it: the library assigns the ~10-sample mean
-	// only on success, and a failed ranking ping leaves whatever the list
-	// fetch wrote there - often a stale positive echo sample - so "Latency>0"
-	// cannot distinguish answered from unanswered. The SORT below still keys
-	// on the field exactly as it always has (stale values included): ranking
-	// order is behavior, this capture is observability.
-	pings := make([]*float64, len(cand))
+	// Latency FIELD alone cannot carry it: the library assigns the ~10-sample
+	// mean only on success, and a failed ranking ping leaves whatever the list
+	// fetch wrote there - often a stale positive echo sample. applyRankPing both
+	// records the honest outcome here AND fixes the field (measured on success,
+	// ZERO on failure) so the sort below can't rank a stale value first.
+	pings := make([]*float64, len(probeSet))
+	health := make([]endpointState, len(probeSet))
 	var wg sync.WaitGroup
-	for i, s := range cand {
+	for i, s := range probeSet {
 		wg.Add(1)
 		go func(i int, s *ookla.Server) {
 			defer wg.Done()
@@ -1508,33 +2398,82 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 			// value - so "err == nil && Latency > 0" would record a one-shot
 			// echo as an answered ten-sample ranking ping.
 			sampled := false
-			err := s.PingTestContext(ctx, func(time.Duration) { sampled = true }) // sets s.Latency on success
-			if err == nil && sampled && s.Latency > 0 {
-				ms := pingMSOf(s.Latency)
-				pings[i] = &ms
-			}
+			err := ooklaPing(ctx, s, func(time.Duration) { sampled = true }) // sets s.Latency on success
+			pings[i] = applyRankPing(s, err, sampled)
+			// Same fan-out, so this costs the phase nothing it was not already
+			// spending: judge the fallback by STATUS, which the library's ping
+			// does not do (see fallbackHealth).
+			health[i] = fallbackHealth(ctx, s)
 		}(i, s)
 	}
 	wg.Wait()
-	rankPings := make(map[string]*float64, len(cand))
-	for i, s := range cand {
+	rankPings := make(map[string]*float64, len(probeSet))
+	for i, s := range probeSet {
 		rankPings[s.ID] = pings[i]
 	}
 
-	out := append(ookla.Servers(nil), cand...)
-	// Stable so unpinged servers keep their nearest-first order among themselves.
-	sort.SliceStable(out, func(i, j int) bool {
-		li, lj := out[i].Latency, out[j].Latency
-		switch {
-		case li > 0 && lj > 0:
-			return li < lj
-		case li > 0:
-			return true // a measured server always beats an unreachable one
-		default:
-			return false
+	// Drop servers whose legacy fallback is gone. They are not slow or flaky -
+	// every transfer against them fails - so ranking them at all only guarantees
+	// a wasted run, and because their 500 is served instantly they otherwise sort
+	// as if healthy.
+	usable := make(ookla.Servers, 0, len(cand))
+	var dropped []string
+	for i, s := range probeSet {
+		if health[i] == endpointRetired {
+			if inPool[s.ID] {
+				dropped = append(dropped, s.ID) // only report what was actually in the pool
+			}
+			continue
 		}
-	})
-	return out, rankPings
+		if len(usable) == len(cand) {
+			break // replenished to the pool's intended size, no further
+		}
+		usable = append(usable, s) // endpointUnknown stays: a failed probe is not a verdict
+	}
+	// Never rank nothing. A whole region can lack the fallback, and a measurement
+	// that probably fails still beats "no speedtest servers available" - the
+	// failure will at least carry a diagnosis naming the cause.
+	allDead := false
+	if len(usable) == 0 {
+		usable = append(ookla.Servers(nil), cand...)
+		dropped = nil
+		allDead = true // reported below; silence here would hide the worst case
+	}
+
+	out := usable
+	// Stable so unpinged servers keep their nearest-first order among themselves.
+	sort.SliceStable(out, func(i, j int) bool { return rankLess(out[i], out[j]) })
+	return out, rankPings, dropped, allDead
+}
+
+// applyRankPing records a ranking-ping outcome on the server and returns the
+// measured latency (ms) for the selection report, or nil on failure. On success
+// it writes the measured value (a clamped near-zero, never 0, so the fastest
+// server still sorts first); on FAILURE it zeros Latency, so a stale discovery
+// echo can't rank an unreachable server ahead of a reachable one measured slower.
+func applyRankPing(s *ookla.Server, err error, sampled bool) *float64 {
+	if lat, answered := rankPingLatency(err, sampled, s.Latency); answered {
+		s.Latency = lat
+		ms := pingMSOf(lat)
+		return &ms
+	}
+	s.Latency = 0
+	return nil
+}
+
+// rankLess orders ranked servers: a measured server (Latency>0) always before an
+// unreachable one (Latency==0, including a failed ranking ping), lowest latency
+// first among the measured.
+func rankLess(a, b *ookla.Server) bool {
+	la, lb := a.Latency, b.Latency
+	switch {
+	case la > 0 && lb > 0:
+		return la < lb
+	case la > 0:
+		return true
+	default:
+		return false
+	}
 }
 
 // serverLabel is the human name for a server, as stored on the run.
@@ -1933,6 +2872,81 @@ type ServerInfo struct {
 	// own position on sparse records and must never centre anything.
 	Lat float64 `json:"-"`
 	Lon float64 `json:"-"`
+
+	// FallbackOK reports whether this server still serves the HTTP Legacy
+	// Fallback that speedtest-go requires (see fallbackHealth). nil = not
+	// determined. false means every speedtest against it WILL fail, while the
+	// server may be perfectly healthy for Ookla's own client - so the picker
+	// should mark it rather than pretend it is a normal choice. Users can still
+	// pin one by ID on purpose; nothing here blocks that.
+	FallbackOK *bool `json:"fallback_ok,omitempty"`
+}
+
+// annotateFallback fills FallbackOK for a browse/search list, probing verdicts
+// concurrently. Cached, so the cost lands on the first listing of a server and
+// not on every keystroke. Bounded concurrency keeps a picker open from fanning
+// out 60+ sockets at once.
+func annotateFallback(ctx context.Context, servers ookla.Servers, out []ServerInfo) {
+	if len(servers) != len(out) {
+		return // caller built the slices differently; do not guess at pairing
+	}
+	// Hard budget for the WHOLE annotation. Per-probe timeouts are not enough:
+	// a 63-server list at 12 concurrent is 6 waves, so an unresponsive metro
+	// would hang the picker for 6 x fallbackProbeTimeout = ~36 s. This is a
+	// decoration on a list the user is waiting to see - whatever has not
+	// answered by the deadline simply stays nil (undetermined), which is both
+	// the honest verdict and the safe one, since ranking never excludes unknown.
+	ctx, cancel := context.WithTimeout(ctx, annotateFallbackBudget)
+	defer cancel()
+
+	sem := make(chan struct{}, 12)
+	states := make([]endpointState, len(servers))
+	var wg sync.WaitGroup
+	for i, srv := range servers {
+		wg.Add(1)
+		go func(i int, srv *ookla.Server) {
+			defer wg.Done()
+			// Context-aware: once the annotation budget expires, queued probes must
+			// abandon rather than run against a dead context. Otherwise they fail
+			// instantly, cache endpointUnknown for fallbackUnknownTTL, and a real
+			// speedtest moments later reuses that non-verdict instead of probing.
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				states[i] = endpointUnknown
+				return
+			}
+			if ctx.Err() != nil {
+				states[i] = endpointUnknown
+				return
+			}
+			states[i] = fallbackHealth(ctx, srv)
+		}(i, srv)
+	}
+	wg.Wait()
+	undetermined := 0
+	for _, st := range states {
+		if st == endpointUnknown {
+			undetermined++
+		}
+	}
+	if undetermined > 0 {
+		// The picker is best-effort under a hard budget; say when it came back
+		// partly unverified rather than letting the list look authoritative.
+		slog.Debug("speedtest server list partially unverified",
+			"undetermined", undetermined, "of", len(states), "budget", annotateFallbackBudget)
+	}
+	for i := range out {
+		switch states[i] {
+		case endpointOK:
+			ok := true
+			out[i].FallbackOK = &ok
+		case endpointRetired:
+			bad := false
+			out[i].FallbackOK = &bad
+		} // endpointUnknown leaves it nil - a failed probe is not a verdict
+	}
 }
 
 // ListOoklaServers returns the Ookla servers the API reports for a location,
@@ -1961,6 +2975,7 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 	if err != nil {
 		return nil, err
 	}
+	currentEndpoints(servers)
 	out := make([]ServerInfo, 0, len(servers))
 	for _, s := range servers {
 		lat, lon, _ := serverCoord(s)
@@ -1969,6 +2984,9 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
 		})
 	}
+	// Before the sort: annotateFallback pairs by index with `servers`, and the
+	// sort reorders `out` only.
+	annotateFallback(ctx, servers, out)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
 	return out, nil
 }
@@ -1987,6 +3005,7 @@ func SearchOoklaServers(ctx context.Context, keyword string) ([]ServerInfo, erro
 	if err != nil {
 		return nil, err
 	}
+	currentEndpoints(servers)
 	out := make([]ServerInfo, 0, len(servers))
 	for _, s := range servers {
 		lat, lon, _ := serverCoord(s)
@@ -1995,6 +3014,9 @@ func SearchOoklaServers(ctx context.Context, keyword string) ([]ServerInfo, erro
 			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
 		})
 	}
+	// Before the sort: annotateFallback pairs by index with `servers`, and the
+	// sort reorders `out` only.
+	annotateFallback(ctx, servers, out)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
 	return out, nil
 }
@@ -2012,5 +3034,27 @@ func GetOoklaServer(ctx context.Context, id string) (ServerInfo, error) {
 	// coordinates in the server's lat/lon attributes, so nothing here may
 	// treat its position or distance as the server's. The browse handler
 	// centres by the Name label through SearchOoklaServers instead.
-	return ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance}, nil
+	info := ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance}
+
+	// Pinning is a deliberate act and nothing here blocks it - but the user
+	// deserves to know BEFORE they pin that this server will fail every run.
+	// This endpoint returns Host="" (measured), so fallbackHealth has nothing to
+	// build a probe URL from; probeEndpoint works off the URL and follows the
+	// migration hop, which is why the pinned selection path already uses it. One
+	// extra round trip on an explicit user action is a fair trade.
+	switch probeEndpoint(ctx, srv) {
+	case endpointOK:
+		ok := true
+		info.FallbackOK = &ok
+	case endpointRetired:
+		bad := false
+		info.FallbackOK = &bad
+		// Deliberately no log line here: this is package-level code with no access
+		// to the run's logger, and a package-global slog call would bypass the
+		// About-page ring buffer and logfilter's masking of the `server` key while
+		// still printing to stderr. The verdict reaches the user through
+		// FallbackOK, which is where the decision is actually made.
+		stats.Inc("speed.pinned_server_no_fallback")
+	} // endpointUnknown leaves it nil - a failed probe is not a verdict
+	return info, nil
 }
