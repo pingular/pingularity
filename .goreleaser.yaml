@@ -99,9 +99,13 @@ dockers_v2:
       - linux/arm64
     tags:
       - "{{ .Version }}"
-      # Empty template on a prerelease tag drops `latest` entirely: an rc must not
-      # move what `docker pull` (latest) serves.
-      - "{{ if not .Prerelease }}latest{{ end }}"
+      # `latest` is NOT pushed here. GoReleaser runs before the attestation
+      # steps, so tagging latest at build time publishes the channel most users
+      # pull from BEFORE its provenance exists - and a run that dies at an
+      # attestation leaves latest pointing at an unattested image with no
+      # obvious symptom. The release workflow promotes latest by digest AFTER
+      # every attestation succeeds (see "Promote the floating tags"). A
+      # prerelease never moves it at all.
     # Version/revision attribution is stamped here, at build time, because only
     # the release knows them; the static OCI labels (title/description/source/
     # licenses) live in the Dockerfile itself. Labels go into the image config,
@@ -130,9 +134,7 @@ dockers_v2:
       - linux/arm64
     tags:
       - "{{ .Version }}-iperf"
-      # Same rc guard as the default image: an empty template on a prerelease tag
-      # drops `latest-iperf`, so an rc never moves the iperf `latest` either.
-      - "{{ if not .Prerelease }}latest-iperf{{ end }}"
+      # latest-iperf is promoted after attestation, like latest above.
     # Same version/revision stamping as the default image above.
     labels:
       org.opencontainers.image.version: "{{ .Version }}"
@@ -196,16 +198,37 @@ winget:
 release:
   # RC/prerelease tags (v*-rc1, -beta) are published as GitHub pre-releases.
   prerelease: auto
+  # Draft-until-complete. GoReleaser publishes this release, the GHCR images,
+  # the brew cask, and the winget branch BEFORE release.yml's attestation steps
+  # run, so with an auto-published release any late failure (attestation, OIDC
+  # hiccup, registry flake) stranded a PUBLIC release that the stable-
+  # immutability guard then refused to complete (release run 31756904642:
+  # assets public, image attestation failed). With draft: true GoReleaser
+  # leaves the release unpublished - its own undraft step (which is also what
+  # applies make_latest) is a no-op - and release.yml flips it public as its
+  # FINAL step, only after every attestation has succeeded. Any earlier
+  # failure leaves an invisible draft, which the guard treats as resumable:
+  # GitHub's "get a release by tag name" returns published releases only, so
+  # a stranded draft reads as 404 there. `latest` is therefore applied
+  # exclusively by the flip step in release.yml.
+  draft: true
+  # A resumed run must never mix assets from two different builds (the
+  # binaries are not bit-identical across runs, and checksums.txt is attested
+  # as a set), so a stranded draft is deleted and re-created wholesale rather
+  # than topped up or reused.
+  replace_existing_draft: true
   # Re-cut policy. The rc tag is re-pushed on the same name after every
-  # rolling-commit amend, so the GitHub pre-release already exists with same-named
-  # assets and the re-run would 422 on upload without this overwrite. A STABLE
-  # release, by contrast, is cut once and must stay immutable: its checksums are
-  # attested in release.yml, and silently overwriting a published stable
-  # asset would invalidate that provenance. This field is a plain bool (not
-  # templateable), so the prerelease-vs-stable split is enforced upstream in
-  # release.yml - the "Forbid re-cutting a published stable release" guard fails the
-  # run if a stable tag's release already exists, so this overwrite is only ever
-  # exercised by the rc re-cut loop.
+  # rolling-commit amend, so the GitHub pre-release already exists PUBLISHED
+  # with same-named assets (draft: true shapes only release CREATION; updating
+  # an existing release keeps its published state) and the re-run would 422 on
+  # upload without this overwrite. A STABLE release, by contrast, is cut once
+  # and must stay immutable once published: its checksums are attested in
+  # release.yml, and silently overwriting a published stable asset would
+  # invalidate that provenance. This field is a plain bool (not templateable),
+  # so the prerelease-vs-stable split is enforced upstream in release.yml -
+  # the "Forbid re-cutting a published stable release" guard fails the run if
+  # a stable tag's release is already PUBLISHED - and this overwrite is only
+  # ever exercised by the rc re-cut loop.
   replace_existing_artifacts: true
   github:
     owner: pingular

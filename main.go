@@ -274,7 +274,8 @@ func (p *program) run(ctx context.Context) {
 	// bridged alike (see defaultSettings): network reach is an explicit operator
 	// choice (-access network / PINGULARITY_ACCESS=network), never inferred from
 	// the environment. containerized feeds the status payload, the ignored-OPTS
-	// warning, and the pre-0.62 grandfather below - it no longer decides access.
+	// warning, and the ambiguous-provenance WARNING below - nothing about the
+	// environment, the store's age, or its shape ever decides access.
 	containerized := util.InContainer()
 	def := defaultSettings(p.cfg)
 	// Seal the stored iperf3 passwords at rest (key file beside the DB, 0600). If the key
@@ -311,6 +312,12 @@ func (p *program) run(ctx context.Context) {
 		// alone (the prior behavior).
 		sessionKey = box.DeriveSubkey("session-token-v1")
 	}
+	// Name the release that initializes a brand-new store in its birth marker
+	// (settings.KeyInstallBornVersion); the marker's presence - not this value -
+	// is forward provenance: a store carrying it was born under the fail-closed
+	// default, so its missing access key means "never chose", and the
+	// ambiguity warning below stays quiet for it.
+	setOpts = append(setOpts, settings.WithBornVersion(version))
 	set, err := settings.New(ctx, p.store, def, setOpts...)
 	if errors.Is(err, settings.ErrLegacyReseal) {
 		// Settings loaded and are in effect; only re-encrypting old plaintext
@@ -341,6 +348,22 @@ func (p *program) run(ctx context.Context) {
 		})
 		spawnLoop("settings-retry", func() { p.retrySettingsLoad(ctx, set) })
 	}
+	// A birth marker that is not on disk survives this boot only as long as the
+	// process does (see settings.Controller.BornMarkerErr): the controller that
+	// saw the store brand-new can still complete the stamp on a later reload or
+	// settings write, but a restart is a controller that did not see it, and it
+	// must refuse forever. Settings already said so on stderr - before this
+	// logger existed - but repeat it here, or the ambiguity warning below recurs
+	// forever on this install with no recorded cause. Nothing is DECIDED by the
+	// missing marker (an unmarked store never opens access), so the daemon
+	// carries on monitoring.
+	if berr := set.BornMarkerErr(); berr != nil {
+		earlyLog = append(earlyLog, func() {
+			p.log.Warn("could not record this install's birth version at boot",
+				"err", berr, "key", settings.KeyInstallBornVersion,
+				"effect", "monitoring and access are unaffected. This daemon retries the stamp while it runs, but if it restarts unmarked, the install's provenance is unprovable from then on: in a container it warns about ambiguous access provenance on every boot until -access/PINGULARITY_ACCESS is passed explicitly")
+		})
+	}
 	// Materialize the first-run Quick Setup decision - but only on a LOADED
 	// controller (ErrLegacyReseal means loaded; a failed load must not take a
 	// sticky decision from defaults: the offer-clock write has no loaded-guard,
@@ -359,20 +382,17 @@ func (p *program) run(ctx context.Context) {
 		})
 		// A pre-0.62 container install never STORED an access choice (the filter
 		// was defaulted off by an unpersisted seed), so 0.62's fail-closed
-		// default would flip it to loopback-only on upgrade and 403 its own
-		// published port. Grandfather it ONCE: keep it reachable, persist that
-		// as its stored choice, and say so loudly. Runs before reconcileAccess,
-		// though ordering cannot matter: the grandfather yields to any explicit
-		// -access/PINGULARITY_ACCESS, the only input reconcile acts on.
-		if migrated, gerr := grandfatherContainerAccess(ctx, p.cfg, p.store, set, containerized); gerr != nil {
+		// default 403s its published port on upgrade. That install is
+		// INDISTINGUISHABLE on disk from an early-0.62 (rc.1-rc.3) container
+		// that was born private, so the daemon only SAYS so - it never opens
+		// access on the guess (see warnAmbiguousContainerAccess). The WARN rides
+		// earlyLog like the rest, so it survives the default "off" level.
+		if werr := warnAmbiguousContainerAccess(ctx, p.cfg, p.store, set, containerized,
+			func(msg string, args ...any) {
+				earlyLog = append(earlyLog, func() { p.log.Warn(msg, args...) })
+			}); werr != nil {
 			earlyLog = append(earlyLog, func() {
-				p.log.Warn("container access grandfather could not be decided; nothing changed, re-judged next boot", "err", gerr)
-			})
-		} else if migrated {
-			earlyLog = append(earlyLog, func() {
-				p.log.Warn("upgraded a pre-0.62 container install: kept its network-reachable access",
-					"why", "pre-0.62 containers ran with the loopback-only filter off by default and never stored it; turning it on during an upgrade would 403 the published port, with no shell in the image to recover from",
-					"hint", "set a password, or turn Local-only on in the Access tab; new installs start private")
+				p.log.Warn("container access provenance could not be judged; nothing changed, re-judged next boot", "err", werr)
 			})
 		}
 		// An EXPLICIT -access / PINGULARITY_ACCESS is authoritative over a
@@ -394,9 +414,23 @@ func (p *program) run(ctx context.Context) {
 	}
 
 	// The one always-on startup line, straight to stdout past the level gate.
-	// After the grandfather/reconcile above so the access mode it states is the
-	// one actually in force this boot.
+	// After the access reconcile above so the mode it states is the one actually
+	// in force this boot.
 	fmt.Fprintln(os.Stdout, startupLine(version, p.cfg.ListenAddr, set.AccessLocalOnly()))
+
+	// A fresh install measures NOTHING while the Quick Setup offer is open (see
+	// newMonitoringLiveFn), and the startup line above is what a healthy install
+	// prints too - so a headless or package install used to look fine, answer its
+	// health endpoint, and collect nothing for up to two days with not one word
+	// about why. Say it once, on the same stdout past the level gate that the
+	// startup line uses, because the install this is for runs with logging "off".
+	// It reads the SAME hold the measurement loops obey, so it cannot announce a
+	// hold that isn't there; the one rough edge is a fresh install whose settings
+	// failed to load, which is also held and gets this line while its dashboard
+	// is still refusing to serve - the WARNING above is what explains that.
+	if quickSetupHoldState(ctx, set) == qsHeld {
+		fmt.Fprintln(os.Stdout, firstRunHoldLine(p.cfg.ListenAddr))
+	}
 
 	// Apply the saved log level now that settings are loaded (the logger starts
 	// pinned to logLevelOff so "off" is truly silent), and keep it synced: the
@@ -463,11 +497,11 @@ func (p *program) run(ctx context.Context) {
 		"access_local_only", set.AccessLocalOnly())
 
 	// Warn when the control plane is actually reachable from the network without
-	// auth: a non-loopback listen AND the loopback filter off. Every fresh
-	// install defaults the filter ON (fail closed), so this fires only where it
-	// was turned off on purpose (-access network, the Access tab) or by the
-	// pre-0.62 container grandfather above - exactly the installs this warning
-	// is for.
+	// auth: a non-loopback listen AND the loopback filter off. Every install
+	// defaults the filter ON (fail closed) and nothing but explicit operator
+	// input ever turns it off, so this fires only where it was opened on purpose
+	// (-access network / PINGULARITY_ACCESS, the Access tab) - exactly the
+	// installs this warning is for.
 	if nonLoopbackListen(p.cfg.ListenAddr) && !set.AccessLocalOnly() && !set.AuthActive() {
 		// Also straight to stderr, bypassing the log level: the default install
 		// runs with logging "off", and this warning targets exactly that install.
@@ -662,18 +696,7 @@ func (p *program) run(ctx context.Context) {
 	// auto-select ping race (an on-net server is the most likely winner). A
 	// stale or empty name is harmless - it only adds or skips one racer.
 	tester.ISPFn = func() string { return ni.Get().ISP }
-	// Whether there is any speed history yet. The first best-of round on a fresh
-	// install is the one that seeds the baseline later checks read, so it is
-	// decided on ping alone rather than on throughput nothing can vet yet (see
-	// firstRunByPing). Counted, not cached: it flips false->true after one run
-	// and the query is one indexed count per run, not per sample.
-	tester.PriorDataFn = func() bool {
-		c, err := p.store.TableCounts(context.Background())
-		if err != nil {
-			return true // cannot tell: assume history exists rather than re-seeding
-		}
-		return c["speed"] > 0
-	}
+	tester.PriorDataFn = newPriorDataFn(p.store)
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer    // surface the live server during a run
 	tester.DirectionFn = set.SpeedDirection     // Ookla direction (per-engine; iperf3 has its own)
@@ -853,7 +876,12 @@ func (p *program) run(ctx context.Context) {
 	}
 	m.OnDegraded = func() {
 		if set.SpeedAllowed(time.Now()) {
-			spawn(func() { sched.RunOnce(ctx, "degraded") })
+			// Read on the monitor goroutine, inside the callback: this names THIS
+			// dispatch, so a bounce reported late - after the episode ended, or after a
+			// later dispatch replaced it - is ignored instead of re-firing an episode
+			// that has already been served.
+			id := m.DegradedDispatch()
+			spawn(func() { degradedDispatch(ctx, sched.RunOnce, func() { m.RetryDegraded(id) }) })
 		}
 	}
 	// Alert on every confirmed up/down transition, when enabled. Delivery is
@@ -1064,53 +1092,90 @@ func newMonitoringLiveFn(ctx context.Context, set *settings.Controller, onHoldRe
 	var qsHoldReleased atomic.Bool
 	return func() bool {
 		if !qsHoldReleased.Load() {
-			// Until settings load, the first-run decision can't be made and the
-			// offer clock isn't seeded - QuickSetupHold below would then read a bare
-			// offer_since==0 and fail OPEN. Hold a GENUINELY FRESH install (nothing
-			// in the store: no history, anchor, or config) instead, so it can't
-			// start probing unasked - but do NOT latch the release, so the normal
-			// hold takes over once the retry loads settings and seeds the clock. An
-			// established install already consented and keeps running; a store-read
-			// error holds too (the fresh direction).
-			if !set.Loaded() {
-				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
-					return false
-				}
-				return set.Monitoring()
-			}
-			// Read the offer clock with its error surfaced: a transient store read
-			// error must HOLD, not read as "no clock -> release" and then latch that
-			// release forever off a single failed read.
-			since, err := set.QuickSetupOfferSinceErr(ctx)
-			if err != nil {
+			switch quickSetupHoldState(ctx, set) {
+			case qsHeld:
 				return false
-			}
-			// LOADED with Quick Setup unanswered and NO offer clock is the same
-			// bare-zero hazard one step later: the first-run decision has not been
-			// materialized yet (a late/SIGHUP Reload flips Loaded and broadcasts
-			// before the offer clock lands - the recovery paths pre-seed to close
-			// that window, but this must not depend on it - or the offer write
-			// failed at boot). QuickSetupHold reads the bare zero as "never
-			// offered", and the CAS below would latch that release PERMANENTLY -
-			// a fresh install probing without first-run consent. Same treatment
-			// as the unloaded case: hold a genuinely fresh install, keep an
-			// established one running, and latch nothing so the real hold takes
-			// over once the clock is seeded.
-			if !set.QuickSetupDone() && since == 0 {
-				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
-					return false
-				}
+			case qsProvisional:
+				// Latch nothing here (see quickSetupHoldState): the real hold has
+				// to take over once the offer clock is seeded.
 				return set.Monitoring()
-			}
-			if settings.QuickSetupHold(set.QuickSetupDone(), since, time.Now().Unix()) {
-				return false
-			}
-			if qsHoldReleased.CompareAndSwap(false, true) && onHoldRelease != nil && *onHoldRelease != nil {
-				(*onHoldRelease)()
+			case qsReleased:
+				// Permanent, so latch it and stop paying for the offer-clock read
+				// every round; the one-shot nudge is the 48h edge (see above).
+				if qsHoldReleased.CompareAndSwap(false, true) && onHoldRelease != nil && *onHoldRelease != nil {
+					(*onHoldRelease)()
+				}
 			}
 		}
 		return set.Monitoring()
 	}
+}
+
+// qsHoldState is what the first-run consent hold says about monitoring right
+// now: held, released for good, or a provisional pass that nothing may latch.
+type qsHoldState int
+
+const (
+	// qsHeld: the first-run offer is open (or the state cannot be read and the
+	// install looks genuinely fresh) - measure nothing.
+	qsHeld qsHoldState = iota
+	// qsProvisional: the hold does not apply to THIS install, but the decision
+	// rests on state that is still settling (settings unloaded, or loaded with
+	// the offer clock not yet seeded), so a caller must not record it as final.
+	qsProvisional
+	// qsReleased: answered, or the grace expired. Permanent - the hold can only
+	// release, never come back - so a caller may latch this and stop asking.
+	qsReleased
+)
+
+// quickSetupHoldState is the ONE reading of the first-run hold. The monitoring
+// predicate obeys it and the boot notice reports it, and those two must never
+// disagree: a boot line announcing a hold the loops don't have (or, worse, a
+// silent boot that measures nothing) is exactly the confusion this line exists
+// to end.
+func quickSetupHoldState(ctx context.Context, set *settings.Controller) qsHoldState {
+	// Until settings load, the first-run decision can't be made and the
+	// offer clock isn't seeded - QuickSetupHold below would then read a bare
+	// offer_since==0 and fail OPEN. Hold a GENUINELY FRESH install (nothing
+	// in the store: no history, anchor, or config) instead, so it can't
+	// start probing unasked - but do NOT latch the release, so the normal
+	// hold takes over once the retry loads settings and seeds the clock. An
+	// established install already consented and keeps running; a store-read
+	// error holds too (the fresh direction).
+	if !set.Loaded() {
+		if est, err := set.EstablishedInStore(ctx); err != nil || !est {
+			return qsHeld
+		}
+		return qsProvisional
+	}
+	// Read the offer clock with its error surfaced: a transient store read
+	// error must HOLD, not read as "no clock -> release" and then latch that
+	// release forever off a single failed read.
+	since, err := set.QuickSetupOfferSinceErr(ctx)
+	if err != nil {
+		return qsHeld
+	}
+	// LOADED with Quick Setup unanswered and NO offer clock is the same
+	// bare-zero hazard one step later: the first-run decision has not been
+	// materialized yet (a late/SIGHUP Reload flips Loaded and broadcasts
+	// before the offer clock lands - the recovery paths pre-seed to close
+	// that window, but this must not depend on it - or the offer write
+	// failed at boot). QuickSetupHold reads the bare zero as "never
+	// offered", and a caller latching that release would make it PERMANENT -
+	// a fresh install probing without first-run consent. Same treatment
+	// as the unloaded case: hold a genuinely fresh install, keep an
+	// established one running, and latch nothing so the real hold takes
+	// over once the clock is seeded.
+	if !set.QuickSetupDone() && since == 0 {
+		if est, err := set.EstablishedInStore(ctx); err != nil || !est {
+			return qsHeld
+		}
+		return qsProvisional
+	}
+	if settings.QuickSetupHold(set.QuickSetupDone(), since, time.Now().Unix()) {
+		return qsHeld
+	}
+	return qsReleased
 }
 
 // seedQuickSetupOfferEarly seeds the first-run offer clock on a controller
@@ -1193,6 +1258,17 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 			// install must get its consent hold rather than having started probing
 			// unasked while unloaded.
 			p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
+			// This Reload is where a fresh install whose first load failed gets
+			// its birth marker - the boot path already passed, and this loop stops
+			// as soon as settings load, so it is this process's last SCHEDULED
+			// attempt (a settings write can still complete a pending stamp). A
+			// stamp still missing HERE is reported for the same reason (the
+			// boot-path report above could not have run: it only reaches here when
+			// New itself failed).
+			if berr := set.BornMarkerErr(); berr != nil {
+				p.log.Warn("could not record this install's birth version on the settings retry",
+					"err", berr, "key", settings.KeyInstallBornVersion)
+			}
 			return
 		} else {
 			p.log.Error("settings retry failed; still refusing to serve", "err", err, "next_try_in", wait)
@@ -1266,22 +1342,39 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// autoOrigins enumerates the candidate cities auto server selection races. Kept
-// as a plain function so the enumeration itself is tested rather than a copy of
-// it - the same reason listCentre is one.
+// newPriorDataFn reports whether this install has any speed history yet. The
+// first best-of round on a fresh install is the one that seeds the baseline
+// later checks read, so it is decided on ping alone rather than on throughput
+// nothing can vet yet (see firstRunByPing). Counted, not cached: it flips
+// false->true after one run, and it is read at most once per speedtest run
+// (RunReason asks firstRunByPing once, and only on a best-of round) - never per
+// latency sample.
 //
-// Each origin yields its OWN Ookla server list, and those lists are disjoint
-// rather than reordered: measured on a live connection, three candidate cities
-// returned 29, 20 and 20 servers with an empty pairwise intersection.
-// So choosing a centre decides which servers EXIST at all - which is why the
-// centre is raced (see speedtest.raceCities) rather than taken from a priority
-// cascade that measures nothing. Order here decides only what an unanswered
-// race falls back to (the exit router, the old cascade's answer); who wins is
-// decided by ping.
+// It is a SCAN, not the indexed count the TableCounts version was: nothing
+// indexes `failed`, so SQLite reads the speed table (EXPLAIN QUERY PLAN on
+// store.SpeedCount's query answers "SCAN speed", where a bare COUNT(*) answered
+// "SCAN speed USING COVERING INDEX idx_speed_ts"). Affordable because of WHAT it
+// scans, not how it scans it: speed holds one row per speedtest run and is
+// pruned by -retain-speed, so on the defaults (hourly, kept a year) the scan is
+// over ~8760 rows, once an hour.
 //
-// EVERY ORIGIN HERE IS DERIVED FROM THE CONNECTION. A searched city is not one
-// of them: it is a statement of intent, wired through AutoLocFn, and it
-// bypasses the race. A pinned server (speed_server_id) overrides both.
+// SpeedCount, not TableCounts["speed"]: the raw table count also includes the
+// usage-accounting rows a failed run leaves behind (store.speedNotFailed is
+// what SpeedCount filters on, and it is the same predicate that hides those
+// rows from every chart, table and threshold verdict). Counting them meant a
+// first speedtest that failed after moving bytes looked like history, and the
+// next run - the install's first actual measurement - skipped the ping-only
+// bootstrap and was judged against a baseline nothing had measured.
+func newPriorDataFn(st *store.Store) func() bool {
+	return func() bool {
+		n, err := st.SpeedCount(context.Background())
+		if err != nil {
+			return true // cannot tell: assume history exists rather than re-seeding
+		}
+		return n > 0
+	}
+}
+
 // newFirstRunReadyFn builds the consent run's selection-readiness predicate
 // (speedtest.Scheduler.ReadyFn): with a server pinned or a city searched the
 // race doesn't need netinfo; a working iperf3 engine measures its own
@@ -1319,6 +1412,22 @@ func newFirstRunReadyFn(set *settings.Controller, ni *netinfo.Manager) func() bo
 	}
 }
 
+// autoOrigins enumerates the candidate cities auto server selection races. Kept
+// as a plain function so the enumeration itself is tested rather than a copy of
+// it - the same reason listCentre is one.
+//
+// Each origin yields its OWN Ookla server list, and those lists are disjoint
+// rather than reordered: measured on a live connection, three candidate cities
+// returned 29, 20 and 20 servers with an empty pairwise intersection.
+// So choosing a centre decides which servers EXIST at all - which is why the
+// centre is raced (see speedtest.raceCities) rather than taken from a priority
+// cascade that measures nothing. Order here decides only what an unanswered
+// race falls back to (the exit router, the old cascade's answer); who wins is
+// decided by ping.
+//
+// EVERY ORIGIN HERE IS DERIVED FROM THE CONNECTION. A searched city is not one
+// of them: it is a statement of intent, wired through AutoLocFn, and it
+// bypasses the race. A pinned server (speed_server_id) overrides both.
 func autoOrigins(i netinfo.Info) []speedtest.Origin {
 	var out []speedtest.Origin
 	// The exit-node city: the last hop still inside the ISP, and the truest
@@ -1460,6 +1569,26 @@ func (g *reconnectGate) release(now time.Time) {
 	}
 }
 
+// degradedDispatch runs the degradation-triggered speedtest and hands the episode
+// back when the run never started. Extracted from run() for the same reason as
+// reconnectGate: the ErrBusy branch is the whole point and no test can reach it
+// inside the closure.
+//
+// RunOnce answers ErrBusy the moment another run (scheduled, manual, reconnect)
+// owns the runner. That dispatch measured nothing, and the monitor's
+// once-per-episode latch otherwise re-arms only when latency RECOVERS - so one
+// collision costs the entire brownout its measurement. retry re-arms the episode
+// instead, and the next confirmed degraded round dispatches again.
+//
+// Any other error is a real attempt (it reached the network, and may even have
+// moved billable bytes), so it keeps the episode consumed: a link that is broken
+// rather than busy must not be re-tested every round for the length of a brownout.
+func degradedDispatch(ctx context.Context, run func(context.Context, string) (store.SpeedSample, error), retry func()) {
+	if _, err := run(ctx, "degraded"); errors.Is(err, speedtest.ErrBusy) {
+		retry()
+	}
+}
+
 // heartbeatInterval is how often the dead-man's-switch URL is pinged. A steady
 // cadence lets an external watchdog (Healthchecks.io, Uptime Kuma push, etc.)
 // alert when Pingularity or the whole host goes silent.
@@ -1578,51 +1707,90 @@ func reconcileAccess(ctx context.Context, cfg config.Config, set *settings.Contr
 	return true, set.SetAccessLocalOnly(ctx, wantLocalOnly)
 }
 
-// grandfatherContainerAccess keeps an UPGRADING pre-0.62 container install
-// reachable. Pre-0.62, containers defaulted the loopback-only filter OFF via an
-// unpersisted seed, so an install that never touched the Access tab has no
-// stored access_local_only - and 0.62's fail-closed default would flip it to
-// loopback-only on upgrade, 403ing its own published port with no shell in the
-// distroless image to fix it from. One-time and evidence-based, never a guess:
-// it acts only when ALL of these hold -
+// accessAmbiguousWarnMsg is the one WARN warnAmbiguousContainerAccess emits.
+// Kept as a constant so the wiring test can pin the exact line an operator has
+// to find in the log when their published port starts answering 403.
+const accessAmbiguousWarnMsg = "container install with no recorded access choice: access stays LOCAL-ONLY, so a published port answers 403 until you opt in"
+
+// warnAmbiguousContainerAccess EXPLAINS a container boot whose access
+// provenance cannot be established. It decides nothing and writes NOTHING - it
+// only calls warn (at most once) with the situation and the way out.
+//
+// Pre-0.62 containers defaulted the loopback-only filter OFF through an
+// unpersisted seed, so an install that never touched the Access tab stored no
+// access_local_only and its dashboard answered the network. 0.62 flipped that
+// default closed, which 403s such an install's published port on upgrade - and
+// the distroless image has no shell to repair it from. An earlier release tried
+// to spare those installs by PERSISTING access_local_only=false whenever the
+// store looked pre-0.62 (established, no birth marker, no stored access key).
+// That inference is unsound and has been removed:
+//
+//   - the birth marker (settings.KeyInstallBornVersion) only exists as of
+//     0.62-rc.4, while the fail-closed default shipped in rc.1. A container
+//     first installed on rc.1/rc.2/rc.3 was therefore born PRIVATE yet carries
+//     no marker - byte-identical on disk to a genuine pre-0.62 install, as is
+//     any pre-marker database copied into a container;
+//   - so the migration's evidence proved only age, not that anything was ever
+//     reachable, and on that whole population it silently persisted
+//     network-reachable access. The default listen is every interface and auth
+//     is usually off, so the cost of guessing wrong is an unannounced,
+//     unauthenticated dashboard on the LAN;
+//   - no other on-disk signal separates the two: date heuristics (install
+//     anchor, oldest sample) re-open the same hole through a restored backup.
+//
+// Ambiguity therefore fails CLOSED. The cost is bounded and self-announcing:
+// the 403 body names the three ways to open access, an explicit
+// -access/PINGULARITY_ACCESS is authoritative at EVERY boot (reconcileAccess)
+// so `-e PINGULARITY_ACCESS=network` restores a locked-out container without a
+// shell, and the recovery is documented. A recoverable, self-diagnosing lockout
+// beats a silent open port; a heuristic may advise, never persist.
+//
+// The detection below is the removed migration's, minus the write - it fires
+// only when ALL of these hold:
 //
 //   - the process runs in a container (natively the filter always defaulted ON,
-//     so there is nothing to grandfather);
-//   - the STORE is established (settings.EstablishedInStore - the same signal
-//     the quick-setup upgrade gate keys on), so a genuinely fresh container
-//     stays fail-closed;
+//     so nothing about the upgrade changed);
 //   - no access_local_only key is STORED. Key PRESENCE, not the overlaid value:
 //     the overlay answers the flag-seeded default when nothing is stored, which
 //     is indistinguishable from a stored agreement. A stored key - the
-//     operator's, quick setup's, or this migration's own earlier write - always
-//     wins. The persist below stores the key, which is what makes the migration
-//     one-time: the next boot short-circuits here;
+//     operator's or quick setup's - means the choice was made, so there is
+//     nothing to explain;
+//   - no birth marker is STORED. Present means the store was initialized by
+//     0.62+ under the fail-closed default, so its missing access key means
+//     "never chose" and the install was never reachable to begin with;
+//   - the STORE is established (settings.EstablishedInStore - the same signal
+//     the quick-setup upgrade gate keys on), so a genuinely fresh container,
+//     which was never reachable either, is not lectured;
 //   - no EXPLICIT -access/PINGULARITY_ACCESS was passed. Explicit operator
-//     input beats the grandfather in either direction (reconcileAccess persists
-//     a disagreeing one on its own).
+//     input settles access in either direction (reconcileAccess persists it),
+//     so there is no ambiguity left to report.
 //
-// A store read error decides nothing and writes nothing - the same boot logic
-// runs again next start (the EnsureQuickSetupOffer failure direction). Reports
-// whether it migrated so the caller can log the one WARN this deserves.
-func grandfatherContainerAccess(ctx context.Context, cfg config.Config, st *store.Store, set *settings.Controller, inContainer bool) (bool, error) {
+// A store read error reports nothing and is returned, so the caller can log it
+// and the same judgement runs again next boot (the EnsureQuickSetupOffer
+// failure direction).
+func warnAmbiguousContainerAccess(ctx context.Context, cfg config.Config, st *store.Store, set *settings.Controller, inContainer bool, warn func(msg string, args ...any)) error {
 	if !inContainer || cfg.AccessExplicit {
-		return false, nil
+		return nil
 	}
 	all, err := st.AllSettings(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if _, stored := all["access_local_only"]; stored { // settings' keyAccessLocalOnly
-		return false, nil
+		return nil
+	}
+	if _, born := all[settings.KeyInstallBornVersion]; born {
+		return nil
 	}
 	est, err := set.EstablishedInStore(ctx)
 	if err != nil || !est {
-		return false, err
+		return err
 	}
-	if err := set.SetAccessLocalOnly(ctx, false); err != nil {
-		return false, err
-	}
-	return true, nil
+	warn(accessAmbiguousWarnMsg,
+		"why", "this store carries no birth marker and no stored access choice - the shape left behind BOTH by a pre-0.62 container, whose dashboard answered the network by default, and by an early-0.62 one that was born private; nothing on disk tells them apart, and guessing open would put an unauthenticated dashboard on the LAN",
+		"fix", "if this dashboard was reachable from the network before, restart with -access network (-e PINGULARITY_ACCESS=network) - it is authoritative at every boot - and set a password at the same time; you can also turn network access on from the machine itself in the Access tab",
+		"access_local_only", true)
+	return nil
 }
 
 // defaultSettings is the fresh-install configuration: the seed values a brand-new
@@ -2095,6 +2263,36 @@ func startupLine(version, listenAddr string, localOnly bool) string {
 		version, listenAddr, access, dashboardURL(listenAddr))
 }
 
+// quickSetupHoldGrace is how long the first-run hold lasts before it expires on
+// its own - the same window settings.QuickSetupHold enforces, restated here
+// because the settings constant is unexported. NOTHING decides on this value:
+// it is wording for the boot notice only, and TestFirstRunHoldNoticeStatesTheRealGrace
+// pins it against the real predicate so the two cannot drift apart.
+const quickSetupHoldGrace = 48 * time.Hour
+
+// quickSetupHoldGraceText renders that window the way an operator reads it
+// ("48h", not Go's "48h0m0s"). Both places that quote the deadline to an
+// OPERATOR - the boot notice and the -quick-setup entry in usage() - render it
+// from the constant through here, so neither can end up stating a deadline the
+// daemon does not enforce (the constant itself is pinned to the real predicate
+// by TestFirstRunHoldNoticeStatesTheRealGrace, and the usage entry to the
+// constant by TestUsageDocumentsEveryFlagTheHoldNoticeAdvertises).
+func quickSetupHoldGraceText() string {
+	return strings.TrimSuffix(quickSetupHoldGrace.String(), "0m0s")
+}
+
+// firstRunHoldLine renders the boot notice for the one state that otherwise
+// looks exactly like a healthy install while collecting nothing: the first-run
+// Quick Setup hold. Same shape as startupLine - one line, operational facts
+// only - and it names both exits (answer the dialog, or -quick-setup=skip) plus
+// when the hold gives up on its own, so nobody has to find that in the docs.
+func firstRunHoldLine(listenAddr string) string {
+	return fmt.Sprintf("pingularity: first run: monitoring is on hold - nothing is being measured yet. "+
+		"Open %s and answer Quick Setup to start it, or restart with -quick-setup=skip; "+
+		"left unanswered it starts on its own %s after first launch.",
+		dashboardURL(listenAddr), quickSetupHoldGraceText())
+}
+
 // dashboardURL renders a friendly local URL for a listen address (a bare port,
 // empty host, or wildcard all resolve to localhost), for the post-install pointer.
 func dashboardURL(addr string) string {
@@ -2280,6 +2478,11 @@ Run flags (all optional - defaults work with no flags):
                             (default 720h = 30 days; 0 = forever)
   -retain-speed dur         Prune speed history older than this (default 8760h = 1 year)
   -retain-downtime dur      Prune outage history older than this (default 8760h = 1 year)
+  -quick-setup s            First-run Quick Setup, for headless installs:
+                            'skip' marks it answered, so monitoring starts at
+                            boot; 'prompt' (default) leaves it to the browser
+                            dialog, and monitoring stays held until that is
+                            answered or %s passes
 
 These flags only seed the initial values - almost everything (intervals,
 thresholds, retention, alert webhooks, …) is adjustable live in the settings
@@ -2290,5 +2493,5 @@ Service commands (install/start/stop/uninstall) must be run %s.
 Examples:
   pingularity                  # run in foreground; UI on http://localhost:9000
   %s     # install as a service and start it; DB -> %s, UI on :9000
-`, db, elevationHint(), elevate("pingularity install"), filepath.Dir(db))
+`, db, quickSetupHoldGraceText(), elevationHint(), elevate("pingularity install"), filepath.Dir(db))
 }

@@ -34,21 +34,44 @@ On that tag push, the release workflow runs GoReleaser, which builds the full
 matrix (linux/windows/darwin × amd64/arm64, `CGO_ENABLED=0`) and publishes:
 
 - **GitHub Releases** - the `.tar.gz` archives (`.zip` on Windows), the `.deb`
-  and `.rpm` packages, and a `checksums.txt` covering all of them. Each artifact
+  and `.rpm` packages, and a `checksums.txt` covering all of them. The release
+  is created as a **draft** and only flipped public by the workflow's final
+  step, after every attestation has succeeded - see
+  [Draft until complete](#draft-until-complete-and-resuming-a-failed-run).
+  Each artifact
   gets a signed build-provenance attestation (keyless, via the workflow's OIDC
   token), so a download can be verified with
   `gh attestation verify <file> --repo pingular/pingularity`.
 - **GHCR** - two multi-arch images (amd64 + arm64 under each tag), pushed to
-  the same `ghcr.io/pingular/pingularity` repo: the default distroless image,
-  tagged with the version and `latest`, and the iperf3-enabled variant
-  (`Dockerfile.iperf`), tagged `<version>-iperf` and `latest-iperf`. Both
-  indexes get registry-pushed build-provenance attestations keyed on their
-  pushed digests (the release workflow resolves and attests them after the
-  push).
+  the same `ghcr.io/pingular/pingularity` repo: the default distroless image
+  tagged with the version, and the iperf3-enabled variant (`Dockerfile.iperf`)
+  tagged `<version>-iperf`. Both indexes get registry-pushed build-provenance
+  attestations keyed on their pushed digests (the release workflow resolves and
+  attests them after the push).
+
+  The floating `latest` / `latest-iperf` tags are **not** pushed by GoReleaser.
+  They are moved by digest in a later workflow step, after every attestation has
+  succeeded and only for a stable tag, then re-inspected to confirm they landed
+  on the digest that was attested. GoReleaser runs before the attestation steps,
+  so tagging `latest` at build time would publish the channel most people pull
+  from while its provenance did not yet exist - and a run that died at an
+  attestation would leave it there, unattested and symptomless. Now a failed run
+  leaves `latest` on the previous release, which is where it should be.
 - **Homebrew tap** - a cask commit to `pingular/homebrew-tap` so
   `brew install pingular/tap/pingularity` resolves to the new version. (It is a
   cask, not a formula - casks are macOS-only; Linux users take the deb/rpm
   packages or the container image.)
+
+  **Known window, and the one channel the draft flow does not cover.** The cask
+  is committed by GoReleaser, i.e. before the attestations and before the
+  release is flipped public, and it points at `releases/download/` URLs that
+  return 404 while the release is still a draft. If a run dies between the cask
+  commit and the flip, `brew install` is broken until someone finishes the
+  release - which a plain re-run does, since the stable guard treats a stranded
+  draft as resumable. Deferring the cask would mean committing to the tap by
+  hand from the workflow instead of through GoReleaser, and getting that wrong
+  breaks `brew upgrade` for everyone; the recoverable window was judged the
+  smaller risk. **If a release run fails, re-run it before announcing.**
 - **winget** - GoReleaser pushes a manifest branch
   (`pingularity-<version>`) to the `pingular/winget-pkgs` fork. It does NOT
   open the upstream PR: the maintainer opens (and later merges) the PR from
@@ -65,16 +88,68 @@ winget manifest are skipped (`skip_upload: auto`), and the GHCR `latest` and
 (the re-cut-on-amend loop) republishes into the existing GitHub release;
 `replace_existing_artifacts: true` makes that overwrite the old assets instead
 of failing with `422 already_exists`. That overwrite is confined to prerelease
-tags: a **stable** release is immutable, so the workflow refuses to re-cut a
-stable tag whose release already exists (its artifacts are provenance-attested,
-and overwriting them would break that). To re-issue a stable build, bump the
-version. Cutting the stable tag on the same commit as its final rc (the
+tags: a **stable** release is immutable once published, so the workflow
+refuses to re-cut a stable tag whose release is already public (its artifacts
+are provenance-attested, and overwriting them would break that). A stable tag
+whose only release is a stranded **draft** does not trip that guard: a draft
+is an incomplete run, and re-running it is the supported resume path (see
+[Draft until complete](#draft-until-complete-and-resuming-a-failed-run)). To
+re-issue a published stable build, bump the version. Cutting the stable tag on the same commit as its final rc (the
 promote) is fully supported: the workflow asserts the pushed tag is *among*
 the tags pointing at HEAD - a second tag on the commit doesn't confuse it -
 and pins GoReleaser to exactly that tag via `GORELEASER_CURRENT_TAG`.
 
 None of this touches `latest.json` or `internal/update` - the running fleet is
 not notified yet (see [Update notifications](#update-notifications)).
+
+## Draft until complete (and resuming a failed run)
+
+The artifacts, images, and attestations cannot all land atomically, so the
+release itself is the last thing that becomes visible. GoReleaser creates the
+GitHub release as a **draft** (`release.draft` in `.goreleaser.yaml`), and the
+workflow's final step - after the archive attestation and both image
+attestations have succeeded - flips it public with `gh release edit
+--draft=false`, adding `--latest` for stable tags. That flip is the only place
+`latest` is applied: GoReleaser skips its own undraft/`make_latest` handling
+for draft releases, and GitHub refuses to mark a draft or prerelease as
+latest.
+
+**What you see during a run:** the releases page shows the version marked
+"Draft" - visible to repo maintainers only. Everyone else sees nothing:
+`releases/latest` does not move, the API's get-release-by-tag answers 404,
+and the draft's asset URLs are not publicly downloadable. The other channels
+still publish during the GoReleaser step: the version-tagged GHCR images
+(and, on a stable tag, the brew cask commit and the winget fork branch) land
+moments before the flip, so on the success path there is a short window
+where `brew install` already resolves the new version but its download URLs
+answer 404 - loud and harmless, never wrong bits, because the cask pins
+sha256s. winget has no such window: only the fork branch moves, and the
+upstream PR is opened by hand after the release completes.
+
+**A failed run strands a draft, and a stranded draft is resumable.** If
+anything after GoReleaser fails (an image attestation, an API outage, the
+flip itself), the release stays an invisible draft: the releases page and
+`releases/latest` show nothing, and the update feed was never touched.
+Whatever GoReleaser had already published stays public, though - the
+version-pinned GHCR images, and, on a stable tag, a brew cask whose download
+URLs 404 until the release completes. `latest` / `latest-iperf` are NOT among
+them: they are promoted in their own step after every attestation, so a run
+that dies earlier leaves them pointing at the previous release, which is where
+they should be. To resume, **re-run the failed workflow run for the same tag** -
+nothing to clean up first. The
+stable-immutability guard blocks only a *published* stable release: GitHub's
+get-release-by-tag returns published releases only, so a stranded draft
+answers 404 there and the guard proceeds. The re-run then replaces the draft
+**wholesale** (`replace_existing_draft: true`) rather than topping it up -
+binaries are not bit-identical across runs and `checksums.txt` is attested
+as a set, so mixing assets from two builds would be dishonest provenance -
+and re-commits the brew cask with the fresh checksums, healing the tap on
+its own.
+
+If only the **final flip** fails, the run's last step says exactly that: the
+release is complete - assets, images, attestations all in place - but still
+a draft. Re-run the workflow once the API is healthy; the guard treats that
+draft as resumable like any other.
 
 ## Container base images (CVE cadence)
 
@@ -97,14 +172,30 @@ The tag publishes artifacts; the GitHub release's notes are where behavior
 changes for *running installs* get called out, above the generated changelog.
 Checklist for what earns a note: a changed default, a changed upgrade path, a
 one-time migration, anything an operator would otherwise discover as a
-surprise. The 0.62 access change is the standing example - its notes must say:
+surprise. The 0.62 access change is the standing example - its notes must say,
+in this order, because the first bullet is what a skimming operator has to
+leave with:
 
-- fresh container installs start private: a published port answers 403 until
-  `-access network` / `-e PINGULARITY_ACCESS=network` (or the Access tab);
-- existing pre-0.62 container installs are grandfathered once at first boot -
-  kept network-reachable, with a warning in the log;
-- an explicit `-access`/`PINGULARITY_ACCESS` now overrides a disagreeing
-  stored setting at every start, which is also the lockout recovery.
+- **Upgrading a container from 0.61 or earlier? It is NOT grandfathered.** A
+  container that answered the LAN before the upgrade stops answering it after,
+  until you add `-e PINGULARITY_ACCESS=network` (or `-access network`) and
+  recreate it. Nothing else is lost - the volume, database and history carry
+  over - but the dashboard goes dark until that opt-in. Write it as the
+  headline, not a footnote: this is the single most important upgrade note in
+  the release. The why, in one clause if the notes have room: the daemon cannot
+  tell an upgraded pre-0.62 store from one born private under an earlier,
+  unreleased 0.62 build (before the birth marker existed) that simply ran for a
+  while - neither stored an access choice - and guessing open would put an
+  unauthenticated dashboard on the LAN, so it fails closed and logs one WARN
+  naming the state and the fix;
+- **every install starts private, containers included** - no exception for
+  fresh ones either: a published port answers 403 until the operator opts in
+  with `-access network` / `-e PINGULARITY_ACCESS=network`, or turns Network
+  access on in the Access tab from the machine itself;
+- an explicit `-access`/`PINGULARITY_ACCESS` overrides a disagreeing stored
+  setting at **every** start, in either direction. That is the recovery for a
+  container locked out of its own published port, and it matters because the
+  default image has no shell to repair it from.
 
 ## Prerequisites (secrets & repos)
 

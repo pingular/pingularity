@@ -22,8 +22,18 @@ func TestUploadSpentCountsFailedAttemptBacklog(t *testing.T) {
 	var read int64
 	// Drain the whole body (bytes really transit), then REJECT: a non-2xx means
 	// the library never marks the chunk confirmed.
+	//
+	// BOUNDED on purpose. An unthrottled loopback upload moves whatever the
+	// machine can manage - gigabytes inside the window - and this package runs
+	// under -race in CI, where that exhausted socket buffers and failed the run.
+	// The property under test is that pushed bytes go UNCONFIRMED, which needs
+	// bytes to move and be rejected, not bytes to be fast: so each request is
+	// read up to a small cap and then rejected immediately. Capping the READ
+	// (rather than throttling it) bounds wall-clock too - a rate-limited drain
+	// just makes httptest.Close wait longer for the handler to finish.
+	const perRequest = 256 << 10
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n, _ := io.Copy(io.Discard, r.Body)
+		n, _ := io.Copy(io.Discard, io.LimitReader(r.Body, perRequest))
 		atomic.AddInt64(&read, n)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -33,7 +43,11 @@ func TestUploadSpentCountsFailedAttemptBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CustomServer: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	// Bound the WINDOW as well as the per-request read. Loopback fills whatever
+	// window it is given, so this is what actually decides how many bytes the
+	// test costs CI; a fraction of a second still pushes plenty to be rejected.
+	srv.Context.SetCaptureTime(600 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	_ = srv.UploadTestContext(ctx) // every chunk is rejected; error is expected
 
@@ -83,8 +97,10 @@ func TestMeasureCountsFailedUploadBytesAtCallSite(t *testing.T) {
 	defer setResolved(origResolved)
 
 	var read int64
+	// Same bound as the helper test above: read a little, reject, keep CI cheap.
+	const perRequest = 256 << 10
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n, _ := io.Copy(io.Discard, r.Body)
+		n, _ := io.Copy(io.Discard, io.LimitReader(r.Body, perRequest))
 		atomic.AddInt64(&read, n)
 		w.WriteHeader(http.StatusInternalServerError) // never confirmed -> bytes land in backlog
 	}))
@@ -96,6 +112,7 @@ func TestMeasureCountsFailedUploadBytesAtCallSite(t *testing.T) {
 	// backlog left on srv.Context. Bounding the inner upload (not measure's ctx)
 	// keeps the finished=true path race-free.
 	ooklaUpload = func(ctx context.Context, srv *ookla.Server) error {
+		srv.Context.SetCaptureTime(600 * time.Millisecond)
 		upctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		_ = srv.UploadTestContext(upctx)

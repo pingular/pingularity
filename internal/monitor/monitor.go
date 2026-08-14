@@ -47,8 +47,12 @@ type Monitor struct {
 	frozenGap    time.Duration // wall seconds of this outage's booked suspend rows that the monotonic clock slept through; transition's widen adds them back so the read model's pause subtraction lands on seconds the pair holds (guarded by mu)
 	outageGen    uint64        // opaque token identifying the current accumulator incarnation; bumped as transition() resets the two gaps above, stamped into each pendingGap so a refusal/eviction surfacing in a LATER outage is not reversed out of THIS one's accumulators. Monitor-goroutine only, save for the under-mu bump/read in transition and the accumulator functions
 
-	degradedStreak int  // consecutive rounds over the degraded-latency threshold (monitor goroutine only)
-	degraded       bool // currently inside a degraded episode, so OnDegraded fires once (monitor goroutine only)
+	degradedStreak int           // consecutive rounds over the degraded-latency threshold (monitor goroutine only)
+	degraded       bool          // currently inside a degraded episode (monitor goroutine only)
+	degradedSent   bool          // this episode already dispatched a measurement, so OnDegraded fires once (monitor goroutine only)
+	degradedSeq    uint64        // dispatch ids handed out so far (monitor goroutine only)
+	degradedID     atomic.Uint64 // id of the dispatch that owns the current episode, 0 when none; published to the dispatcher
+	degradedRetry  atomic.Uint64 // dispatch that never started a measurement, stored from the dispatcher's goroutine
 
 	fams     map[string]*familyState // per-address-family state
 	famOrder []string                // stable display order of families
@@ -61,7 +65,9 @@ type Monitor struct {
 	// OnDegraded, if set, fires when the link is online but its base latency stays
 	// above DegradedPingFn()'s threshold for degradedRounds rounds - catching a
 	// brownout the reconnect hook would miss. Fires once per episode; re-arms when
-	// latency recovers below the threshold. Called synchronously, like OnReconnect.
+	// latency recovers below the threshold, or when the dispatch reports back that
+	// it never started a measurement (RetryDegraded). Called synchronously, like
+	// OnReconnect - so DegradedDispatch() read inside it names THIS dispatch.
 	OnDegraded func()
 
 	// DegradedPingFn, if set, supplies the latency (ms) above which the link counts
@@ -949,7 +955,7 @@ func (m *Monitor) resetStreaks() {
 	// Same "a streak can't survive a pause" contract for degradation: otherwise a
 	// host one round shy of the threshold before a pause could fire OnDegraded on
 	// the first post-resume round.
-	m.degradedStreak, m.degraded = 0, false
+	m.resetDegraded()
 }
 
 // notePause marks when a pause began while the link was down. On resume the
@@ -1206,15 +1212,18 @@ const degradedRounds = 2
 // failed quorum) - a blip that didn't down the link; that holds the current
 // episode rather than counting as a recovery, so one blip inside a continuous
 // brownout can't re-arm and re-fire. The latch re-arms only when a real reading
-// recovers below the threshold.
+// recovers below the threshold - or when the dispatch hands the episode back
+// because it never got a measurement started (see RetryDegraded).
+//
+// The episode and the dispatch are two states, not one: the episode counter must
+// count brownouts, so a re-dispatch inside one episode must not bump it again.
 func (m *Monitor) checkDegraded(best float64, haveReading, online bool) {
 	thr := 0.0
 	if m.DegradedPingFn != nil {
 		thr = m.DegradedPingFn()
 	}
 	if thr <= 0 || !online {
-		m.degradedStreak = 0
-		m.degraded = false
+		m.resetDegraded()
 		return
 	}
 	if !haveReading {
@@ -1222,17 +1231,82 @@ func (m *Monitor) checkDegraded(best float64, haveReading, online bool) {
 	}
 	if best > thr {
 		m.degradedStreak++
-		if m.degradedStreak >= degradedRounds && !m.degraded {
+		if m.degradedStreak < degradedRounds {
+			return
+		}
+		if !m.degraded {
 			m.degraded = true
 			stats.Inc("monitor.degraded_episodes") // brownout count for /metrics (monitor. is allow-listed)
-			if m.OnDegraded != nil {
-				m.OnDegraded()
-			}
+		}
+		// A dispatch that bounced off a speedtest already in flight measured nothing,
+		// so it must not consume the episode: re-arm, and the next confirmed round
+		// dispatches again. Reports are matched by dispatch id and ids never repeat,
+		// so one that arrives late - after its episode ended, or after a later
+		// dispatch replaced it - names an id nothing matches: it can neither re-fire
+		// an episode already served nor pile a second run on top of one in flight.
+		// The swap consumes the report as it is honoured.
+		if id := m.degradedID.Load(); m.degradedSent && m.degradedRetry.CompareAndSwap(id, 0) {
+			m.degradedSent = false
+		}
+		if !m.degradedSent && m.OnDegraded != nil {
+			m.degradedSent = true
+			// Published BEFORE the callback: it reads the id synchronously to name
+			// the dispatch a later bounce report is about.
+			m.degradedSeq++
+			m.degradedID.Store(m.degradedSeq)
+			m.OnDegraded()
 		}
 		return
 	}
-	m.degradedStreak = 0
-	m.degraded = false
+	m.resetDegraded()
+}
+
+// resetDegraded ends the current degraded episode: the next brownout counts and
+// dispatches as a new one. The pending-retry report is deliberately left alone -
+// it names a dispatch id that is now dead, and ids never repeat.
+func (m *Monitor) resetDegraded() {
+	m.degradedStreak, m.degraded, m.degradedSent = 0, false, false
+	m.degradedID.Store(0)
+}
+
+// DegradedDispatch returns the id of the dispatch that owns the degraded episode
+// in progress, or 0 when the link is not degraded. Read inside OnDegraded (on the
+// monitor goroutine) it names THAT dispatch, which is what RetryDegraded reports
+// against.
+func (m *Monitor) DegradedDispatch() uint64 { return m.degradedID.Load() }
+
+// RetryDegraded reports that dispatch id never started a measurement - it bounced
+// off a speedtest already running - so the episode is re-armed and the next
+// confirmed degraded round dispatches again. Without it a single collision costs
+// the whole brownout its measurement: the latch otherwise re-arms only when
+// latency RECOVERS, which is exactly when there is nothing left to measure. Safe
+// from any goroutine; ignored once that dispatch is no longer the live one.
+func (m *Monitor) RetryDegraded(id uint64) {
+	if id == 0 {
+		return
+	}
+	// The slot only moves FORWARD. Reports come back from another goroutine, so
+	// they can arrive out of order: dispatch 1 bounces, the episode re-arms,
+	// dispatch 2 goes out and bounces, and only then does 1's report land. A
+	// plain store let that late one overwrite the live report - and since the
+	// consumer honours only a report naming the CURRENT dispatch, it then
+	// matched nothing at all: the episode sat re-armed in name only and the
+	// brownout went unmeasured until latency recovered, which is precisely when
+	// there is nothing left to measure.
+	//
+	// Ids are handed out in increasing order and never repeat, so "newer" is
+	// just "larger", and a stale report can neither displace a live one nor
+	// resurrect an episode of its own (the consumer's id match still decides
+	// that).
+	for {
+		cur := m.degradedRetry.Load()
+		if cur >= id {
+			return // a same-or-newer report is already pending
+		}
+		if m.degradedRetry.CompareAndSwap(cur, id) {
+			return
+		}
+	}
 }
 
 // noteFamilies records which families this round actually probed, so the

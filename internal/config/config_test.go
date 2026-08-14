@@ -138,11 +138,17 @@ func TestDefaultSpeedtestSchedule(t *testing.T) {
 	}
 }
 
-// A -listen value the web server could never bind must fail at parse time, so
-// `pingularity install` catches it instead of installing a service that runs
-// forever with a dead dashboard.
+// A -listen value the web server could never bind - or could never ADVERTISE -
+// must fail at parse time, so `pingularity install` catches it instead of
+// installing a service that runs forever with a dead (or unfindable) dashboard.
+//
+// Port 0 is the "advertise" half: it binds fine, but the OS picks a random
+// ephemeral port while every display (the always-on startup line, the
+// reachable-URL panel, the non-loopback access warning) keeps quoting the
+// configured ":0", and the real port changes on every restart.
 func TestParseFlagsValidatesListen(t *testing.T) {
-	for _, bad := range []string{"9000", "127.0.0.1", ":notaport", ":99999", "localhost:"} {
+	for _, bad := range []string{"9000", "127.0.0.1", ":notaport", ":99999", "localhost:",
+		":0", "127.0.0.1:0", "[::1]:0", ":00"} {
 		if _, err := ParseFlags([]string{"-listen", bad}); err == nil {
 			t.Errorf("-listen %q must be rejected", bad)
 		}
@@ -370,6 +376,45 @@ func TestQuickSetupFlag(t *testing.T) {
 		if got.QuickSetupSkip != c.want {
 			t.Errorf("%s: QuickSetupSkip = %v, want %v", c.name, got.QuickSetupSkip, c.want)
 		}
+	}
+}
+
+// An EXPLICITLY passed -quick-setup=prompt is authoritative: the operator
+// asked for the first-visit dialog by name, so monitoring flags on the same
+// command line configure values WITHOUT consenting (MonitoringConsent stays
+// off and the dialog still gates monitoring). Implicit silence keeps the
+// monitoring-flags heuristic; explicit skip keeps its direct consent. Like
+// "-access local", explicitly naming the default ("" parses as prompt) is a
+// choice, distinct from silence.
+func TestExplicitQuickSetupPromptSuppressesFlagConsent(t *testing.T) {
+	cases := []struct {
+		name        string
+		args        []string
+		wantConsent bool
+		wantSkip    bool
+	}{
+		{"explicit prompt + interval", []string{"-quick-setup=prompt", "-interval", "1s"}, false, false},
+		{"explicit prompt + speedtest", []string{"-speedtest", "-quick-setup", "prompt"}, false, false},
+		{"explicit prompt + several monitoring flags", []string{"-quick-setup", "prompt", "-latency=false", "-speedtest-interval", "30m"}, false, false},
+		{"explicit empty value + interval", []string{"-quick-setup=", "-interval", "1s"}, false, false},
+		{"explicit prompt alone", []string{"-quick-setup", "prompt"}, false, false},
+		{"implicit + interval", []string{"-interval", "1s"}, true, false},
+		{"explicit skip + interval", []string{"-quick-setup=skip", "-interval", "1s"}, true, true},
+		{"explicit skip alone", []string{"-quick-setup=skip"}, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ParseFlags(c.args)
+			if err != nil {
+				t.Fatalf("ParseFlags: %v", err)
+			}
+			if got.MonitoringConsent != c.wantConsent {
+				t.Errorf("MonitoringConsent = %v, want %v", got.MonitoringConsent, c.wantConsent)
+			}
+			if got.QuickSetupSkip != c.wantSkip {
+				t.Errorf("QuickSetupSkip = %v, want %v", got.QuickSetupSkip, c.wantSkip)
+			}
+		})
 	}
 }
 

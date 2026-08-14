@@ -27,8 +27,11 @@ type Config struct {
 	// monitoring-configuring flag (-speedtest, -speedtest-interval, -latency,
 	// -interval). A headless service configured that way has consented to
 	// monitoring, so it must not be held behind the browser-only Quick Setup
-	// dialog for 48h - main marks Quick Setup answered at boot. Not persisted;
-	// derived from the argv every start.
+	// dialog for 48h - main marks Quick Setup answered at boot. An EXPLICITLY
+	// passed -quick-setup=prompt overrides the heuristic: the operator asked
+	// for the first-visit dialog by name, so those flags only configure values
+	// and this stays false (the dialog, or its 48h expiry, still gates
+	// monitoring). Not persisted; derived from the argv every start.
 	MonitoringConsent bool
 
 	// QuickSetupSkip is set by an explicit `-quick-setup=skip`. It is the
@@ -216,7 +219,7 @@ func ParseFlags(args []string) (Config, error) {
 	fs.DurationVar(&c.SpeedRetention, "retain-speed", c.SpeedRetention, "prune speed history older than this (0 = forever); also settable in the UI")
 	fs.DurationVar(&c.DowntimeRetention, "retain-downtime", c.DowntimeRetention, "prune outage history older than this (0 = forever); also settable in the UI")
 	quickSetup := ""
-	fs.StringVar(&quickSetup, "quick-setup", "", "first-run Quick Setup for headless installs: 'skip' marks it answered so the service starts monitoring immediately without waiting for the browser dialog; 'prompt' (default) leaves the dialog to a first visit")
+	fs.StringVar(&quickSetup, "quick-setup", "", "first-run Quick Setup for headless installs: 'skip' marks it answered so the service starts monitoring immediately without waiting for the browser dialog; 'prompt' (default) leaves the dialog to a first visit - passed explicitly it is authoritative, so monitoring flags on the same command line only configure values and no longer consent for you")
 	// Access mode is EXPLICIT, not guessed. Default loopback-only; 'network' opens
 	// the dashboard to the LAN. Env PINGULARITY_ACCESS seeds the default so Docker
 	// users can set it with -e (the image can't guess its own network mode); a
@@ -240,20 +243,32 @@ func ParseFlags(args []string) (Config, error) {
 	}
 	// Explicit monitoring flags = headless consent (see MonitoringConsent).
 	// -access actually passed counts as explicit even when it names the default
-	// value: "-access local" is an operator choice, distinct from silence.
+	// value: "-access local" is an operator choice, distinct from silence - and
+	// the same goes for -quick-setup below.
+	quickSetupExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "speedtest", "speedtest-interval", "latency", "interval":
 			c.MonitoringConsent = true
 		case "access":
 			accessExplicit = true
+		case "quick-setup":
+			quickSetupExplicit = true
 		}
 	})
 	c.AccessExplicit = accessExplicit
 	// -quick-setup is the explicit headless-consent knob (see QuickSetupSkip).
 	switch quickSetup {
 	case "", "prompt":
-		// leave the first-visit dialog in place
+		// Leave the first-visit dialog in place. Passed EXPLICITLY, that is an
+		// authoritative choice, not silence: the operator asked for the dialog
+		// by name, so monitoring flags beside it only configure values - they
+		// must not consent on the operator's behalf and suppress the dialog
+		// they just asked for. The implicit default keeps the consent-by-flags
+		// heuristic above unchanged.
+		if quickSetupExplicit {
+			c.MonitoringConsent = false
+		}
 	case "skip":
 		c.QuickSetupSkip = true
 	default:
@@ -401,9 +416,9 @@ func validateTrustedProxies(list string) error {
 }
 
 // validateListen rejects a -listen value the web server could never bind (e.g.
-// "9000" with the colon missing, or a bad port), so `pingularity install` fails
-// here with a clear message instead of installing a service whose dashboard is
-// dead.
+// "9000" with the colon missing, or a bad port) - or could never advertise
+// (port 0) - so `pingularity install` fails here with a clear message instead
+// of installing a service whose dashboard is dead or unfindable.
 func validateListen(addr string) error {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -412,8 +427,28 @@ func validateListen(addr string) error {
 	if port == "" {
 		return fmt.Errorf("invalid -listen %q: missing port", addr)
 	}
-	if _, err := net.LookupPort("tcp", port); err != nil {
+	p, err := net.LookupPort("tcp", port)
+	if err != nil {
 		return fmt.Errorf("invalid -listen %q: bad port %q", addr, port)
+	}
+	// Port 0 binds, but asks the OS for a random ephemeral port, and this daemon
+	// needs a port it can NAME. Teaching the startup line to report the address it
+	// actually bound would be easy and is not the reason this is refused: the
+	// health check cannot be taught. `pingularity healthz` is a separate process
+	// invocation with a fixed default of 127.0.0.1:9000, and the container image
+	// bakes it into HEALTHCHECK, so a port-0 container reports unhealthy forever
+	// however well the daemon is running. A scrape target, a published container
+	// port and a bookmark have the same problem, and all of them move on every
+	// restart.
+	//
+	// So this is refused rather than half-supported. It IS a behaviour change:
+	// v0.61.3 accepted port 0 and served on the ephemeral port - though it never
+	// printed which one, so the dashboard was unreachable by any means the
+	// operator had. An install carrying it was already broken; this makes the
+	// breakage loud, at startup, before the database is touched, with the fix in
+	// the message.
+	if p == 0 {
+		return fmt.Errorf("invalid -listen %q: port 0 asks the OS to pick a random port, so the dashboard address could not be reported or reused; choose a fixed port, e.g. \":9000\"", addr)
 	}
 	return nil
 }

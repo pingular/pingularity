@@ -591,6 +591,13 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	// actually measured.
 	retries := speedRetries(i.RetriesFn)
 	var rttMS float64
+	// Bytes this run actually moved, summed over EVERY attempt including the failed
+	// ones - a run that dies still billed the link, and the failure exits below hand
+	// this out with the error so the usage row is honest (Scheduler.recordFailedUsage).
+	// Deliberately separate from res.Download/UploadBytes, which record only the
+	// MEASURED transfer: on the success path a byte count is what tells the scheduler
+	// a direction ran, so a failed direction's spend must never land there.
+	var spentDown, spentUp int64
 	if dir == "bidir" {
 		// One transfer loads both directions at once, exposing contention a sequential run
 		// can't (half-duplex links, shared buffers). A failure sinks the whole run - no
@@ -601,11 +608,13 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			stop := startLoadSampler(ctx, probeAddr)
 			var e error
 			bd, e = runIperfBidir(ctx, host, port, tp, auth)
+			spentDown, spentUp = spentDown+bd.downBytes, spentUp+bd.upBytes
 			load = stop()
 			return e
 		})
 		if err != nil {
-			return Result{}, fmt.Errorf("bidir: %w", i.withEnvHint(err))
+			res.DownloadBytes, res.UploadBytes = spentDown, spentUp
+			return res, fmt.Errorf("bidir: %w", i.withEnvHint(err))
 		}
 		res.DownloadMbps, res.DownloadBytes = bd.downMbps, bd.downBytes
 		res.UploadMbps, res.UploadBytes = bd.upMbps, bd.upBytes
@@ -627,6 +636,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 				stop := startLoadSampler(ctx, probeAddr) // bufferbloat sampled during the transfer
 				var e error
 				dn, e = runIperf(ctx, host, port, tp, auth, true)
+				spentDown += dn.bytes
 				dnLoad = stop()
 				return e
 			})
@@ -644,6 +654,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 				stop := startLoadSampler(ctx, probeAddr)
 				var e error
 				up, e = runIperf(ctx, host, port, tp, auth, false)
+				spentUp += up.bytes
 				upLoad = stop()
 				return e
 			})
@@ -653,10 +664,11 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			}
 		}
 		if (dir == "down" && dnErr != nil) || (dir == "up" && upErr != nil) || (dir == "both" && dnErr != nil && upErr != nil) {
+			res.DownloadBytes, res.UploadBytes = spentDown, spentUp
 			if dnErr != nil {
-				return Result{}, fmt.Errorf("download: %w", i.withEnvHint(dnErr))
+				return res, fmt.Errorf("download: %w", i.withEnvHint(dnErr))
 			}
-			return Result{}, fmt.Errorf("upload: %w", i.withEnvHint(upErr))
+			return res, fmt.Errorf("upload: %w", i.withEnvHint(upErr))
 		}
 		// A cancelled or timed-out context must NOT be laundered into a "partial
 		// success": if a direction failed while the run's context was already done, the
@@ -665,7 +677,11 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		// finished cleanly and is only cancelled afterward has no direction error, so it
 		// is unaffected.
 		if ctx.Err() != nil && (dnErr != nil || upErr != nil) {
-			return Result{}, fmt.Errorf("iperf3 run cancelled before completion: %w", ctx.Err())
+			// The direction that COMPLETED before the cancellation moved real data;
+			// spent* carries it (and the killed direction's salvage) so an aborted run
+			// still bills what it used.
+			res.DownloadBytes, res.UploadBytes = spentDown, spentUp
+			return res, fmt.Errorf("iperf3 run cancelled before completion: %w", ctx.Err())
 		}
 		// A "both" run that lost ONE direction is kept as a partial success, so the
 		// surviving error never reaches the caller. Without a signal here, "upload has
@@ -688,10 +704,18 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		rttMS = pickRTT(dn.rttMS, up.rttMS)
 		// Family from whichever direction measured (a failed direction's zero
 		// struct carries ""); an "auto" run records what it actually resolved to.
-		if dn.family != "" {
-			res.IPFamily = dn.family
-		} else {
+		// These are two separate processes, so a dual-stack hostname can land
+		// them on DIFFERENT families - recording the download's would silently
+		// misdescribe the upload, so a real disagreement is stored as "mixed".
+		// An unknown side (no start.connected block) is not a disagreement: the
+		// known family speaks alone, and "" stays "" - never guessed.
+		switch {
+		case dn.family == "":
 			res.IPFamily = up.family
+		case up.family == "" || up.family == dn.family:
+			res.IPFamily = dn.family
+		default:
+			res.IPFamily = "mixed"
 		}
 	}
 	// Ping is the UNLOADED latency to the server. Prefer the pre-transfer handshake probe
@@ -750,6 +774,19 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			i.Log.Warn("iperf3 udp pass failed, loss and jitter unrecorded",
 				"err", i.withEnvHint(udpErr), "downstream", downstream, "rate_mbps", rate)
 		}
+	}
+	// Anything spent beyond what got MEASURED - a retried direction's earlier
+	// attempts, or a direction that failed while the other succeeded - is real
+	// traffic that a successful run would otherwise drop from data usage
+	// entirely (only the winning attempt's bytes reach Download/UploadBytes,
+	// deliberately, because a byte count there is what says a direction ran).
+	// Hand it out separately so the scheduler can bill it without inventing a
+	// measurement.
+	if d := spentDown - res.DownloadBytes; d > 0 {
+		res.ExtraDownBytes = d
+	}
+	if u := spentUp - res.UploadBytes; u > 0 {
+		res.ExtraUpBytes = u
 	}
 	return res, nil
 }
@@ -894,6 +931,19 @@ const (
 // comparisons, so no explicit finiteness check is needed.
 func plausibleMbps(mbps float64) bool {
 	return mbps > 0 && mbps <= maxPlausibleMbps
+}
+
+// billableBytes returns a transfer's byte total when the body reporting it is
+// self-consistent enough to put on the data-usage ledger: a positive count whose
+// rate clears the same plausibility bound the success path applies. A remote
+// iperf3 server is untrusted, and a failed run's totals get no second look from
+// the measurement checks - so an absurd body contributes nothing rather than
+// inflating "data used" (and, on a metered link, the operator's alarm).
+func billableBytes(sum iperfSum) int64 {
+	if sum.Bytes > 0 && plausibleMbps(sum.BitsPerSecond/1e6) {
+		return sum.Bytes
+	}
+	return 0
 }
 
 func pickRTT(a, b float64) float64 {
@@ -1264,20 +1314,24 @@ func runIperf(ctx context.Context, host, port string, tp iperfTunables, auth ipe
 	runErr = stalledErr(runErr, rctx, ctx, budget)
 	var j iperfJSON
 	jErr := json.Unmarshal(out, &j) // the error field is the primary signal; jErr guards a truncated body
+	sum := iperfUploadSum(j)        // forward: upload, the server's received aggregate
+	if reverse {
+		sum = j.End.SumReceived // download: this client is the receiver
+	}
 	if j.Error != "" {
-		return iperfRun{}, errors.New(strings.TrimSpace(j.Error))
+		return iperfRun{bytes: billableBytes(sum)}, errors.New(strings.TrimSpace(j.Error))
 	}
 	if runErr != nil {
-		return iperfRun{}, runErr
+		// A nonzero exit can still follow a body carrying real totals (data moved,
+		// then the control connection dropped). Those bytes are on the user's bill,
+		// so hand them back with the error for the failed-run usage row; mbps stays
+		// zero, because this is accounting and not a measurement.
+		return iperfRun{bytes: billableBytes(sum)}, runErr
 	}
 	if jErr != nil {
 		// A body that won't parse (or a field that overflows float64) leaves the
 		// numeric fields at zero; fail rather than record a confident 0 Mbps.
 		return iperfRun{}, errors.New("unparseable iperf3 output")
-	}
-	sum := iperfUploadSum(j) // forward: upload, the server's received aggregate
-	if reverse {
-		sum = j.End.SumReceived // download: this client is the receiver
 	}
 	if sum.Bytes <= 0 {
 		// A stalled transfer can exit 0 with no data; treat it as a failure rather
@@ -1314,17 +1368,20 @@ func runIperfBidir(ctx context.Context, host, port string, tp iperfTunables, aut
 	runErr = stalledErr(runErr, rctx, ctx, budget)
 	var j iperfJSON
 	jErr := json.Unmarshal(out, &j)
+	up := iperfUploadSum(j)             // forward: client -> server (upload), receiver side
+	dn := j.End.SumReceivedBidirReverse // reverse: server -> client (download)
+	// Same rule as runIperf: a failed transfer still hands out the bytes it moved,
+	// so the usage row bills them; only the measurement is discarded.
+	spent := iperfBidir{downBytes: billableBytes(dn), upBytes: billableBytes(up)}
 	if j.Error != "" {
-		return iperfBidir{}, errors.New(strings.TrimSpace(j.Error))
+		return spent, errors.New(strings.TrimSpace(j.Error))
 	}
 	if runErr != nil {
-		return iperfBidir{}, runErr
+		return spent, runErr
 	}
 	if jErr != nil {
 		return iperfBidir{}, errors.New("unparseable iperf3 output")
 	}
-	up := iperfUploadSum(j)             // forward: client -> server (upload), receiver side
-	dn := j.End.SumReceivedBidirReverse // reverse: server -> client (download)
 	if up.Bytes <= 0 || dn.Bytes <= 0 {
 		return iperfBidir{}, errors.New("no data transferred")
 	}

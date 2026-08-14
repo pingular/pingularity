@@ -19,6 +19,17 @@ type Result struct {
 	DownloadBytes int64    // bytes received during the download test
 	UploadBytes   int64    // bytes delivered during the upload test (sender-side for Ookla)
 
+	// Bytes this run spent BEYOND the ones above: a retried direction's earlier
+	// attempts, and a failed direction's traffic when the other direction
+	// succeeded. They cannot be folded into DownloadBytes/UploadBytes, because
+	// on a successful run a non-zero byte count is what tells the scheduler a
+	// direction actually ran - adding a failed attempt's spend there would
+	// invent a measurement. They are real traffic on a metered link all the
+	// same, so the scheduler records them as a usage-only row (see
+	// recordExtraUsage). Zero unless a retry or a half-failed run happened.
+	ExtraDownBytes int64
+	ExtraUpBytes   int64
+
 	// IPFamily is the address family the transfer actually used ("4"/"6"),
 	// read back from the run itself (iperf3: the control connection's peer
 	// literal); "" when unknown (Ookla, an old/errored JSON body). Recorded

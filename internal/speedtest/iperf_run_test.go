@@ -148,7 +148,7 @@ func TestIperfRunCancelledIsNotPartial(t *testing.T) {
 		cancel() // ...then the run is cancelled and the upload dies
 		return nil, errors.New("exit status 1")
 	})
-	_, err := newRunIperf("both", false).Run(ctx)
+	res, err := newRunIperf("both", false).Run(ctx)
 	if err == nil {
 		t.Fatal("Run returned nil; a cancelled run must not be reported as a partial success")
 	}
@@ -157,6 +157,16 @@ func TestIperfRunCancelledIsNotPartial(t *testing.T) {
 	}
 	if got := stats.Lifetime().Counters["speed.iperf_partial"]; got != 0 {
 		t.Fatalf("speed.iperf_partial = %d, want 0 (a cancellation is a failure, not a partial)", got)
+	}
+	// The download COMPLETED before the cancellation: its bytes moved and are
+	// billed, so they must ride out with the error for the usage row. The run is
+	// still a failure to every caller - the error above is what the scheduler acts
+	// on, and it stores this Result as accounting only (recordFailedUsage).
+	if res.DownloadBytes != 125000000 {
+		t.Errorf("cancelled run carries %d download bytes, want 125000000 - the completed transfer still used the link", res.DownloadBytes)
+	}
+	if res.Engine != "iperf3" {
+		t.Errorf("cancelled run engine = %q, want iperf3 - the usage row's engine column comes from here", res.Engine)
 	}
 }
 

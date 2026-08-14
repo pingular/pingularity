@@ -102,8 +102,38 @@ CREATE TABLE IF NOT EXISTS speed (
     loaded_down_p95_ms REAL,          -- p95 of the samples taken during the download phase
     loaded_up_p95_ms   REAL,          -- ... during the upload phase
     engine             TEXT,          -- test backend: ookla|iperf3 (NULL on old rows = ookla)
-    ip_family          TEXT,          -- address family the transfer actually used: 4|6 (NULL = unrecorded, never guessed)
-    udp_direction      TEXT           -- which way the UDP loss/jitter probe sampled: down|up (NULL = unrecorded)
+    ip_family          TEXT,          -- address family the transfer actually used: 4|6|mixed (NULL = unrecorded, never guessed)
+    udp_direction      TEXT,          -- which way the UDP loss/jitter probe sampled: down|up (NULL = unrecorded)
+    -- 1 = this row is ACCOUNTING, not a measurement: a run where every candidate
+    -- failed still moved real bytes, and they land on the user's bill, so the
+    -- usage is recorded (see speedtest.Scheduler.recordFailedUsage) - but nothing
+    -- was measured. NULL/0 = a real run (every row written before this existed).
+    -- A separate column rather than NULL speeds ON PURPOSE, twice over: every
+    -- consumer's "was this direction measured?" predicate is "bytes != nil", and
+    -- a usage row has real bytes; and scanSpeed reads down_mbps/up_mbps through
+    -- nzFinite, which collapses SQL NULL to 0 - so NULL speeds would come back
+    -- from the DB indistinguishable from a genuine 0 Mbps reading. Every
+    -- MEASUREMENT query filters this out (see speedNotFailed); the data-usage
+    -- sums deliberately do not.
+    failed             INTEGER,
+    -- The run whose spend an ACCOUNTING row bills: joins speed.ts, the same
+    -- manual-cascade shape as speed_servers.run_ts (no FK anywhere in this
+    -- schema). NULL on every measurement row, and on the accounting row a
+    -- WHOLLY failed run leaves behind - that run produced no measurement, so
+    -- there is nothing for it to point at (see
+    -- speedtest.Scheduler.recordFailedUsage).
+    --
+    -- Named for the usage rather than called plain 'run_ts' because this table
+    -- holds both kinds of row: beside its own 'ts', a bare 'run_ts' would read
+    -- as "when this run ran" on the very rows it is NULL for.
+    --
+    -- DeleteSpeed cascades on this. It used to find the row positionally - the
+    -- flagged row at ts+1 - which is a GUESS: a manual run that fails one second
+    -- after a scheduled measurement writes its own flagged row at exactly that
+    -- second, and deleting the scheduled run then destroyed the manual run's
+    -- record. No listing shows a flagged row, so nothing told the operator that
+    -- run existed or that its bytes had just been un-billed.
+    usage_run_ts       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
@@ -435,7 +465,13 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	// And the events-table twin: outage lengths a pre-guard import let in.
+	// And the events-table twin: outage lengths a pre-guard import let in, plus a
+	// count of the unreadable types sitting beside them (reported, never deleted -
+	// see the function).
+	if err := reportUnreadableEventTypes(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := repairInsaneEventDurations(db); err != nil {
 		db.Close()
 		return nil, err
@@ -518,6 +554,8 @@ func applySchema(db *sql.DB) error {
 		{"speed", "loaded_up_p95_ms", "REAL"},
 		{"speed", "ping_best_ms", "REAL"},
 		{"speed", "ip_family", "TEXT"}, {"speed", "udp_direction", "TEXT"},
+		{"speed", "failed", "INTEGER"},
+		{"speed", "usage_run_ts", "INTEGER"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -525,6 +563,18 @@ func applySchema(db *sql.DB) error {
 			!strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate %s.%s: %w", m.table, m.col, err)
 		}
+	}
+	// An index naming a MIGRATED column has to be created here, after the loop
+	// above has added it: a legacy database reaches this point with a speed table
+	// that has no usage_run_ts, and naming it in the base schema fails the whole
+	// migration with "no such column".
+	//
+	// This one carries the accounting row's reference to the run it bills for.
+	// DeleteSpeed cascades on it once per delete; without it that cascade scans
+	// every speedtest ever recorded. Partial, because only accounting rows carry a
+	// value and they are a small minority of the table.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_speed_usage_run_ts ON speed(usage_run_ts) WHERE usage_run_ts IS NOT NULL`); err != nil {
+		return fmt.Errorf("migrate index idx_speed_usage_run_ts: %w", err)
 	}
 	// Drop the unused (target, ts) index from existing DBs: no query filters by
 	// target, and the one per-target query pins idx_samples_ts - so it was pure
@@ -863,6 +913,44 @@ func repairInsaneEventDurations(db *sql.DB) error {
 	return nil
 }
 
+// reportUnreadableEventTypes counts rows whose `type` this build cannot
+// interpret - older versions accepted any string, and today's import door
+// refuses one, but a door is not a migration and nothing else revisits such a
+// row (applySchema migrates columns, not data, and re-importing a corrected
+// backup merges by (ts, type), so the poisoned key is never touched).
+//
+// It only COUNTS. This pass used to delete, which read as harmless tidy-up while
+// no third type existed - and the reasoning against it was already written here:
+// a build that deletes every type it does not recognise destroys a NEWER
+// build's events on a downgrade, which is precisely the data loss a repair pass
+// must not cause. The first release to add an event type would have made every
+// downgrade silently drop those rows at startup, with this log line calling it a
+// repair.
+//
+// Deleting bought nothing, because the fix was made in the QUERIES: every read
+// of this table selects only the two types it understands, so an uninterpretable
+// row is inert whether or not it is still on disk. Deliberately not enumerated here - the list went stale the
+// first time it was extended, and an enumeration in a doc comment is exactly the
+// kind of audit trail that rots quietly. TestEventTypeFilterCoversEveryEventRead
+// derives the real list from the source on every run, and fails when a reader
+// forgets the filter or an exemption names a function that no longer exists.
+//
+// What is left is worth saying out loud - a database holding
+// rows this build cannot read is usually a downgrade, and the operator should
+// know the rows are there and are being ignored, not silently removed.
+func reportUnreadableEventTypes(db *sql.DB) error {
+	var n int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE type NOT IN ('down', 'up')`).Scan(&n); err != nil {
+		recordDBErr(err)
+		return fmt.Errorf("count unreadable event types: %w", err)
+	}
+	if n > 0 {
+		stats.Add("db.event_types_unreadable", n)
+		log.Printf("pingularity: %d outage event(s) carry a type this build does not recognise (only 'down' and 'up' mean anything here); they are ignored by every uptime read and left untouched on disk - if this database was last used by a newer version, its events are still there for it", n)
+	}
+	return nil
+}
+
 // repairUnreadableIntColumns is the intCols allowlist applied at rest: a value in
 // an INTEGER-affinity column that no read can convert to a Go int64. The import
 // door has rejected such a row since the allowlist landed, but the door came with
@@ -1174,11 +1262,17 @@ func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int6
 func (s *Store) LastObservedTS(ctx context.Context) (int64, bool, error) {
 	now := time.Now().Unix()
 	var v sql.NullInt64
+	// The events arm counts only the two types this build reads. The answer is
+	// "when was this monitor last known to be observing", and a row it cannot
+	// interpret is not an observation it can vouch for - taking one as the anchor
+	// shortens the startup gap booked as unobserved, so the stretch between the
+	// last real evidence and that row is silently credited as watched time in the
+	// uptime denominator.
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT MAX(t) FROM (
 			SELECT MAX(ts) AS t FROM samples WHERE ts >= ? AND ts <= ?
 			UNION ALL
-			SELECT MAX(ts) AS t FROM events WHERE ts >= ? AND ts <= ?
+			SELECT MAX(ts) AS t FROM events WHERE ts >= ? AND ts <= ? AND type IN ('down','up')
 			UNION ALL
 			SELECT MAX(ts + duration_s) AS t FROM pauses WHERE ts >= ? AND ts <= ?)`,
 		plausibleEpoch, now, plausibleEpoch, now, plausibleEpoch, now).Scan(&v); err != nil {
@@ -1189,10 +1283,37 @@ func (s *Store) LastObservedTS(ctx context.Context) (int64, bool, error) {
 
 // InsertEvent records an up/down transition. For 'up' events, durationS is the
 // length of the outage that just ended; pass a negative value to store NULL.
+//
+// The live door holds eventRowSane's rule, and holds it the SAME WAY - one rule,
+// two doors (this one and the import guard). At rest there is no third door: a
+// row already on disk is only counted and reported, never deleted, because this
+// build cannot tell "corruption an old version let in" from "an event a newer
+// version understands" (see reportUnreadableEventTypes):
+//
+//   - an unreadable TYPE makes the whole row meaningless to this build, so it is
+//     refused at the door. Every reader selects exactly 'down'/'up', so a third
+//     value is inert once it is on disk - but keeping it OUT is still right,
+//     because nothing downstream can act on what it does not understand.
+//   - an impossible LENGTH does not make the row meaningless: its primary content
+//     is the transition. Refusing it would drop a recovery and leave the preceding
+//     'down' dangling, which every reader treats as an outage still running - a
+//     caller whose clock produced one absurd number would have its outage
+//     "corrected" into an unbounded one. The length alone is dropped.
 func (s *Store) InsertEvent(ctx context.Context, ts time.Time, typ string, durationS int, detail string) error {
+	if typ != "down" && typ != "up" {
+		return fmt.Errorf("insert event: unknown type %q (want \"down\" or \"up\")", typ)
+	}
 	var dur any
 	if durationS >= 0 {
-		dur = durationS
+		if int64(durationS) > maxPauseDuration {
+			// Counted, never silent: completedOutagesSince anchors an unpaired 'up' at
+			// ts-duration_s, so the row we are declining to write would have been an
+			// outage reaching back further than any retainable history, landing inside
+			// every window that asks.
+			stats.Inc("db.event_duration_dropped")
+		} else {
+			dur = durationS
+		}
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO events (ts, type, duration_s, detail) VALUES (?, ?, ?, ?)`,
@@ -1222,11 +1343,31 @@ const firstSeenKey = "first_seen_ts"
 func (s *Store) monitoringSince(ctx context.Context, nowU int64) (int64, error) {
 	anchor := nowU
 	var first sql.NullInt64
+	// Only events this build can read anchor the window FROM THE TABLE. This is
+	// the denominator behind every uptime figure, and MIN takes whatever is
+	// earliest, so one row carrying a type nothing here interprets drags the
+	// anchor back to its timestamp and every percentage is then computed over a
+	// span that includes time this install has no evidence it watched.
+	//
+	// It does not heal an anchor already PERSISTED from such a row. The stored
+	// first_seen_ts read below only ever ratchets down, and it carries no
+	// provenance - a build without this filter that ever ran an uptime read with
+	// an unreadable row on disk wrote that row's timestamp there, and it stays.
+	// Nothing can distinguish it from a legitimately old anchor after the fact,
+	// and discarding stored anchors to be safe would re-introduce the exact bug
+	// the stored anchor exists to prevent (sample retention walking MIN forward
+	// and silently shortening every long window). So: this stops new poisoning,
+	// and an install already carrying one keeps it.
+	//
+	// The type is not
+	// indexed, so it is tested row by row while the query walks idx_events_ts in
+	// ts order (EXPLAIN QUERY PLAN still reports SEARCH events USING INDEX
+	// idx_events_ts, not a table scan), and the table holds two rows per outage.
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT MIN(t) FROM (
 			SELECT MIN(ts) AS t FROM samples WHERE ts >= ?
 			UNION ALL
-			SELECT MIN(ts) AS t FROM events WHERE ts >= ?)`,
+			SELECT MIN(ts) AS t FROM events WHERE ts >= ? AND type IN ('down','up'))`,
 		plausibleEpoch, plausibleEpoch).Scan(&first); err != nil {
 		return 0, err
 	}
@@ -1267,11 +1408,24 @@ func (s *Store) monitoringSince(ctx context.Context, nowU int64) (int64, error) 
 // persists once a dashboard or digest computes uptime, so a headless install
 // or a speedtest-only one can carry months of rows and no anchor at all.
 // Cheap: three LIMIT-1 existence probes.
+//
+// The speed probe carries speedNotFailed like every other measurement read:
+// accounting rows are the one kind of speed row that measured nothing (see the
+// failed column), so an install whose every speedtest has failed has recorded
+// no history, however many bytes it spent doing it. EstablishedInStore keys on
+// this answer, and through it the ambiguous-container-access warning and the
+// first-run consent flow - all three ask "has this install ever measured
+// anything", not "has it ever written a row".
+//
+// The events probe names the two types for the same reason: a transition this
+// build cannot interpret is not history it can show, so an install holding
+// nothing else would answer "established" and skip the very flows that exist
+// for a fresh install.
 func (s *Store) HasHistory(ctx context.Context) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM samples LIMIT 1)
-		OR EXISTS(SELECT 1 FROM events LIMIT 1)
-		OR EXISTS(SELECT 1 FROM speed LIMIT 1)`).Scan(&n)
+		OR EXISTS(SELECT 1 FROM events WHERE type IN ('down','up') LIMIT 1)
+		OR EXISTS(SELECT 1 FROM speed WHERE `+speedNotFailed+` LIMIT 1)`).Scan(&n)
 	return n != 0, err
 }
 
@@ -1413,6 +1567,14 @@ func (s *Store) newestSampleAt(ctx context.Context, nowU int64) (int64, bool, er
 // wholly before the window - 0 overlap anyway - are skipped. UptimeSince and
 // ResolvedOutagesSince share this so both report the same downtime.
 //
+// It stops at currentHorizon at the top for the same reason, and it MUST be the
+// same bound their newest-event decision uses: both callers book the trailing
+// 'down' as an open outage once a future-dated row stops answering "what happened
+// most recently?", so a scan that still sees that row books the SAME seconds a
+// second time - as an orphan gap here and as an open outage there. Bounding one
+// end without the other is how the fix for the newest-event read doubled the
+// downtime it was meant to restore.
+//
 // recovered is the count of gaps whose leading outage PROVABLY ended (a quorum
 // recovery fell between the two 'down' events) and resolved within the window
 // (rec > sinceU). Such a gap is a DISTINCT resolved outage with no closing 'up'
@@ -1426,8 +1588,10 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (down
 			SELECT ts, type,
 			       LEAD(ts)   OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_ts,
 			       LEAD(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_type
-			FROM events WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?))
-		WHERE type='down' AND next_type='down'`, sinceU)
+			FROM events WHERE type IN ('down','up')
+			  AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE type IN ('down','up') AND ts <= ?)
+			                    AND ts <= ?)
+		WHERE type='down' AND next_type='down'`, sinceU, currentHorizon(nowU))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1628,6 +1792,12 @@ type completedOutage struct{ start, end, observed int64 }
 // contiguous [down, down+duration_s). Both then described the same outage in the
 // same digest line and disagreed, because a pause inside an outage puts the real
 // recovery later than the contiguous end.
+//
+// `to` is the present in both callers, and the scan stops at its currentHorizon:
+// an 'up' the clock has not reached has not closed anything yet, and counting it
+// here while the newest-event decision beside it (already bounded) still sees the
+// outage as open books the same seconds twice. Same bound, same answer, or the
+// uptime% and the heatmap disagree.
 func (s *Store) completedOutagesSince(ctx context.Context, from, to int64) ([]completedOutage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT o_start, ts, duration_s FROM (
@@ -1635,9 +1805,11 @@ func (s *Store) completedOutagesSince(ctx context.Context, from, to int64) ([]co
 			       CASE WHEN LAG(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) = 'down'
 			            THEN LAG(ts) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END)
 			            ELSE ts - duration_s END AS o_start
-			FROM events WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?))
+			FROM events WHERE type IN ('down','up')
+			  AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE type IN ('down','up') AND ts <= ?)
+			                    AND ts <= ?)
 		WHERE type='up' AND duration_s IS NOT NULL AND o_start < ? AND ts > ?`,
-		from, to, from)
+		from, currentHorizon(to), to, from)
 	if err != nil {
 		return nil, err
 	}
@@ -1966,10 +2138,18 @@ func (s *Store) UptimeSince(ctx context.Context, since time.Time, retention time
 	// majority of either family's targets up - the live monitor's rule) proves
 	// recovery; bound the outage there rather than running it to now and pinning
 	// uptime low.
+	//
+	// "Latest" means latest AT THE PRESENT (currentHorizon). This decision is the
+	// one place a single future-dated row does not merely add noise but SUBTRACTS a
+	// real outage: an 'up' stamped ahead of the clock (a clock-ahead import, an RTC
+	// years out) wins the ordering, answers "not down", and the ongoing outage
+	// vanishes from the uptime figure for as long as the clock takes to catch up.
 	var lastType string
 	var lastTS int64
 	switch err := s.db.QueryRowContext(ctx,
-		`SELECT type, ts FROM events ORDER BY ts DESC, CASE type WHEN 'up' THEN 0 ELSE 1 END LIMIT 1`).Scan(&lastType, &lastTS); {
+		`SELECT type, ts FROM events WHERE ts <= ? AND type IN ('down','up')
+		 ORDER BY ts DESC, CASE type WHEN 'up' THEN 0 ELSE 1 END LIMIT 1`,
+		currentHorizon(nowU)).Scan(&lastType, &lastTS); {
 	case err == sql.ErrNoRows: // no events recorded → no outages
 	case err != nil:
 		return Observation{}, err
@@ -2041,13 +2221,28 @@ type Event struct {
 }
 
 // EventCount returns the total number of recorded transition events.
+//
+// Same type filter as EventsPage, and it has to be: this is the TOTAL the pager
+// divides into pages, so counting rows the page hides offers the operator a
+// final page that comes back empty.
 func (s *Store) EventCount(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE type IN ('down','up')`).Scan(&n)
 	return n, err
 }
 
 // EventsPage returns a page of transitions, newest first.
+//
+// Only the two types this build understands, like every other read of this
+// table. A row carrying some other string in `type` used to be impossible to
+// meet here because Open deleted it before anything ran; that deletion is gone
+// (it destroyed a newer build's events on a downgrade - see
+// reportUnreadableEventTypes), so the rows older versions accepted are now on
+// disk while the reads run. Unfiltered, this one hands them to two consumers
+// that cannot do anything sane with them: the outages table renders a
+// transition it has no meaning for, and monitor.go asks for the single newest
+// event to seed its event-clock guard - so an unreadable row that happens to be
+// newest becomes the floor under every transition that process then records.
 func (s *Store) EventsPage(ctx context.Context, limit, offset int) ([]Event, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 50
@@ -2056,7 +2251,8 @@ func (s *Store) EventsPage(ctx context.Context, limit, offset int) ([]Event, err
 		offset = 0
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ts, type, duration_s FROM events ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
+		`SELECT ts, type, duration_s FROM events WHERE type IN ('down','up')
+		 ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -2097,7 +2293,7 @@ type TargetLatency struct {
 // pin the window and freeze the pills on pre-step readings. grace <= 0
 // disables the cutoff.
 //
-// A future-dated row is also excluded outright (ts <= now + metricsFutureSkew):
+// A future-dated row is also excluded outright (ts <= currentHorizon):
 // the wall-now clamp above only stops a future row shifting the window START, but
 // within the window a future row for a still-live target would still win ORDER BY
 // ts DESC and show a not-yet-real reading until the clock caught up. The small
@@ -2110,7 +2306,7 @@ func (s *Store) LatestPerTarget(ctx context.Context, grace time.Duration) ([]Tar
 		cut = `MIN((SELECT COALESCE(MAX(ts), 0) FROM samples), ?) - ?`
 		args = append(args, now, int64(grace.Seconds()))
 	}
-	args = append(args, now+int64(metricsFutureSkew.Seconds()))
+	args = append(args, currentHorizon(now))
 	// Range-seek the recent window via idx_samples_ts, then take the newest row
 	// per target from that small slice. The old form scanned the whole table for
 	// MAX(ts) per target on every status poll (~130ms at a week of samples); this
@@ -2288,21 +2484,22 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 	// An absolute window bounds BOTH aggregates below. Bounding only the samples
 	// one would leave the DNS line on a different window than the latency line it
 	// is drawn beside - wrong data rather than a visible break.
-	upper := ""
+	//
+	// An open-ended window still ends: at the present (currentHorizon), not at
+	// whatever the newest row on disk claims. Left unbounded, a sample stamped
+	// ahead of the clock draws a latency point - and, through fam_online, an
+	// outage band - in a bucket the wall clock has not reached, and it stays there
+	// until it does.
+	upperTS := currentHorizon(time.Now().Unix())
 	if !until.IsZero() {
-		upper = " AND ts < ?"
+		upperTS = until.Unix()
 	}
-	args = append(args, since.Unix())
-	if !until.IsZero() {
-		args = append(args, until.Unix())
-	}
+	const upper = " AND ts < ?"
+	args = append(args, since.Unix(), upperTS)
 	// The DNS line rides the same buckets via a LEFT JOIN on a parallel aggregate
 	// of the dns table (mean resolve time per bucket), so the chart plots ping +
 	// DNS on one axis.
-	args = append(args, bucketSec, bucketSec, since.Unix())
-	if !until.IsZero() {
-		args = append(args, until.Unix())
-	}
+	args = append(args, bucketSec, bucketSec, since.Unix(), upperTS)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ping.bts, MIN(ping.lat) AS lat, MAX(ping.fam_online) AS online, d.dns
 		FROM (
@@ -2391,11 +2588,35 @@ type SpeedSample struct {
 	// Engine is the test backend: ookla|iperf3 (empty on older rows = ookla).
 	// Lets the chart mark engine switchovers.
 	Engine string `json:"engine,omitempty"`
-	// IPFamily is the address family the transfer actually used ("4"/"6") -
-	// family "auto" resolves invisibly, so it's read back from the run itself
-	// (see speedtest.Result.IPFamily). Empty on rows recorded before it was
-	// captured and on engines that don't report it; never backfilled.
+	// IPFamily is the address family the transfer actually used ("4"/"6", or
+	// "mixed" when the run's connections really did split across both and no
+	// single family describes the row) - family "auto" resolves invisibly, so
+	// it's read back from the run itself (see speedtest.Result.IPFamily). Empty
+	// on rows recorded before it was captured and on engines that don't report
+	// it; never backfilled.
 	IPFamily string `json:"ip_family,omitempty"`
+	// Failed marks a row that is ACCOUNTING, not a measurement: a run whose every
+	// candidate failed still moved DownBytes/UpBytes real bytes onto the user's
+	// bill, so the usage is recorded while no speed, ping or verdict was ever
+	// produced. Set only by the scheduler's failure path. Rows carrying it are
+	// invisible to every measurement read on this type (see speedNotFailed) and
+	// counted by the data-usage sums; a consumer that reads one out of an export
+	// must treat it as "nothing was measured", NOT as a 0 Mbps reading.
+	Failed bool `json:"failed,omitempty"`
+	// UsageRunTS is the ts of the measurement row an accounting row bills for -
+	// the reference DeleteSpeed cascades on, so removing a run takes the spend of
+	// its abandoned attempts with it and NOTHING else. nil on measurements, on
+	// the row a wholly failed run leaves (no measurement exists to point at), and
+	// on accounting rows written before the column existed.
+	//
+	// WRITE-SIDE ONLY: InsertSpeed stores it, the cascade compares it in SQL, and
+	// no read scans it back - speedCols does not carry it. Nothing in the app or
+	// the API needs it (the rows holding it are hidden from every measurement
+	// read by design), and a column absent from the scan list cannot wedge every
+	// speed read the way an unreadable `healthy` once did - see
+	// repairUnreadableIntColumns, which exists because one such row broke the
+	// speed panel and the status table permanently.
+	UsageRunTS *int64 `json:"usage_run_ts,omitempty"`
 	// UDPDirection is which way the UDP loss/jitter probe sampled ("down"/"up");
 	// empty when loss/jitter went unmeasured or the row predates the field. Loss
 	// on an asymmetric path differs by direction, so a sample without it stays
@@ -2419,7 +2640,55 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	packet_loss, healthy, jitter_ms, download_bytes, upload_bytes,
 	COALESCE(cf_colo,''), COALESCE(exit_summary,''), COALESCE(run_trigger,''),
 	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
-	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,'')`
+	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,''), failed`
+
+// speedNotFailed is the predicate every MEASUREMENT read of the speed table
+// carries, and the reason the accounting rows recordFailedUsage writes cannot
+// reach a chart, a table, a threshold verdict or a /metrics gauge: this package
+// holds all the SQL, so filtering here covers every consumer at once.
+//
+// Written positively (NULL or 0 is a real run) rather than as `failed IS NOT 1`
+// so an unreadable value - only reachable through a crafted import - HIDES the
+// row instead of showing it. Hiding a row we cannot classify loses a
+// measurement; showing it invents one, and inventing a 0 Mbps reading is the
+// exact failure this column exists to prevent.
+//
+// The usage sums (SpeedDataUsage, SpeedDataUsageSince), Prune, DeleteSpeed and
+// export/import deliberately do NOT carry it: the row exists for those.
+const speedNotFailed = `(failed IS NULL OR failed = 0)`
+
+// speedIsAccounting is the same question from the other side - "is this row
+// accounting rather than a measurement?" - DERIVED from the predicate above
+// instead of restated, so the two can never drift apart. DeleteSpeed's usage
+// cascade is the caller: it must reach exactly the rows every measurement read
+// hides, no more (a row it wrongly matches is a reading destroyed with no way
+// back) and no fewer (a row it misses bills bytes for a speedtest that is gone,
+// and no listing shows it for the operator to remove by hand).
+//
+// Two spellings of this complement have already disagreed in this file: written
+// `failed = 1`, the export's in-use check reported a hand-edited marker of 2 as
+// "no row uses this column" while every read treated that row as accounting.
+// (SpeedColumnsPastSchema4InUse still spells the complement out inline - it
+// tests one column among several in a single SELECT - so it is the place to
+// check first if this predicate ever changes.)
+const speedIsAccounting = `NOT ` + speedNotFailed
+
+// speedWindow renders the half-open [since, until) ts filter the speed-history
+// reads share, with its bound args. Shared so the two cannot answer the same
+// question differently: SpeedHistoryBudget's `total` is the disclosure that a
+// response was thinned, and it is only true if the counting pass and the reading
+// pass agree on where the window ENDS.
+//
+// A zero `until` does not mean "no upper bound" - it means "up to the present",
+// and the present is currentHorizon, never whatever the newest row on disk
+// claims. An explicit end is honoured exactly as given (see currentHorizon).
+func speedWindow(since, until time.Time) (string, []any) {
+	upper := currentHorizon(time.Now().Unix())
+	if !until.IsZero() {
+		upper = until.Unix()
+	}
+	return ` AND ts >= ? AND ts < ?`, []any{since.Unix(), upper}
+}
 
 // nzFinite returns a float column's value, or 0 when NULL or non-finite
 // (NaN/±Inf) - the safe sentinel for always-present scalars.
@@ -2451,12 +2720,12 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	// EVERY speed read. nzFinite/ptrFinite collapse both to 0 / nil.
 	var down, up, ping sql.NullFloat64
 	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest sql.NullFloat64
-	var healthy, downB, upB sql.NullInt64
+	var healthy, downB, upB, failed sql.NullInt64
 	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
 		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
-		&sp.IPFamily, &sp.UDPDirection)
+		&sp.IPFamily, &sp.UDPDirection, &failed)
 	sp.DownMbps, sp.UpMbps, sp.PingMS = nzFinite(down), nzFinite(up), nzFinite(ping)
 	sp.IdleMS = ptrFinite(idle)
 	sp.LoadedDownMS = ptrFinite(loadDown)
@@ -2478,6 +2747,7 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 		v := upB.Int64
 		sp.UpBytes = &v
 	}
+	sp.Failed = failed.Valid && failed.Int64 == 1
 	return sp, err
 }
 
@@ -2537,18 +2807,25 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 	// overflow.
 	downBytes := clampSpeedBytes(sp.DownBytes)
 	upBytes := clampSpeedBytes(sp.UpBytes)
+	// NULL rather than 0 for a real run: identical to every row written before
+	// the column existed, so "not an accounting row" has ONE representation in
+	// the table instead of two.
+	var failed any
+	if sp.Failed {
+		failed = int64(1)
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id,
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
 			packet_loss, healthy, jitter_ms, download_bytes, upload_bytes, cf_colo, exit_summary, run_trigger,
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
-			ping_best_ms, ip_family, udp_direction)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
-		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection)
+		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS))
 	recordDBErr(err)
 	return err
 }
@@ -2629,7 +2906,10 @@ func (s *Store) InsertSpeedServers(ctx context.Context, rows []SpeedServerRow) e
 // selection report" (which is normal for pre-feature and iperf3 history).
 func (s *Store) SpeedRunExists(ctx context.Context, ts int64) (bool, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE ts = ?`, ts).Scan(&n)
+	// Accounting rows are not runs: /api/speed/runs/servers must 404 for one,
+	// exactly as it does for a ts that never existed - and it can only be asked
+	// about a ts the paged/charted history handed out, which those rows are not in.
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed+` AND ts = ?`, ts).Scan(&n)
 	if err != nil {
 		recordDBErr(err)
 		return false, err
@@ -2741,10 +3021,16 @@ func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, d
 	// trailing-down branch: if the newest event is a 'down' with a provable quorum
 	// recovery in (down, now] that lands inside the window, count it once and add
 	// its in-window downtime.
+	// Bounded at currentHorizon exactly as UptimeSince's twin is, and it has to be
+	// the same bound: these two print the outage count and the uptime% in one
+	// sentence, so a future row hiding the trailing outage from one of them is how
+	// that sentence contradicts itself.
 	var lastType string
 	var lastTS int64
 	switch e := s.db.QueryRowContext(ctx,
-		`SELECT type, ts FROM events ORDER BY ts DESC, CASE type WHEN 'up' THEN 0 ELSE 1 END LIMIT 1`).Scan(&lastType, &lastTS); {
+		`SELECT type, ts FROM events WHERE ts <= ? AND type IN ('down','up')
+		 ORDER BY ts DESC, CASE type WHEN 'up' THEN 0 ELSE 1 END LIMIT 1`,
+		currentHorizon(nowU)).Scan(&lastType, &lastTS); {
 	case e == sql.ErrNoRows: // no events → nothing to reconcile
 	case e != nil:
 		return 0, 0, e
@@ -2817,11 +3103,17 @@ func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
 // LatestConnInfo returns the most recent speedtest run that recorded a public
 // IP or ISP - a persisted last-known connection context the Connection panel
 // falls back on when a live lookup is failing (e.g. an outage). nil when none.
+//
+// Bounded at currentHorizon for the same reason LatestSpeed is: this is the
+// fallback shown precisely when the live lookup fails, so a future-dated import
+// winning it would replace the operator's last KNOWN ISP/IP with one the link has
+// never actually had, at the one moment nothing else can contradict it.
 func (s *Store) LatestConnInfo(ctx context.Context) (*SpeedSample, error) {
 	sp, err := scanSpeed(s.db.QueryRowContext(ctx,
 		`SELECT `+speedCols+` FROM speed
-		 WHERE COALESCE(isp,'') <> '' OR COALESCE(public_ipv4,'') <> ''
-		 ORDER BY ts DESC LIMIT 1`))
+		 WHERE `+speedNotFailed+` AND ts <= ?
+		   AND (COALESCE(isp,'') <> '' OR COALESCE(public_ipv4,'') <> '')
+		 ORDER BY ts DESC LIMIT 1`, currentHorizon(time.Now().Unix())))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2833,11 +3125,11 @@ func (s *Store) LatestConnInfo(ctx context.Context) (*SpeedSample, error) {
 
 // LatestSpeed returns the most recent speedtest, or nil if none exist.
 func (s *Store) LatestSpeed(ctx context.Context) (*SpeedSample, error) {
-	// ts <= now + skew: a future-dated import must not win "latest" and pin the
-	// speed pills/metrics on a not-yet-real run (see metricsFutureSkew).
+	// ts <= currentHorizon: a future-dated import must not win "latest" and pin the
+	// speed pills/metrics on a not-yet-real run.
 	sp, err := scanSpeed(s.db.QueryRowContext(ctx,
-		`SELECT `+speedCols+` FROM speed WHERE ts <= ? ORDER BY ts DESC LIMIT 1`,
-		time.Now().Add(metricsFutureSkew).Unix()))
+		`SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` AND ts <= ? ORDER BY ts DESC LIMIT 1`,
+		currentHorizon(time.Now().Unix())))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -2848,9 +3140,10 @@ func (s *Store) LatestSpeed(ctx context.Context) (*SpeedSample, error) {
 	return &sp, nil
 }
 
-// SpeedHistory returns every speedtest since the given time, oldest first, with
-// no upper bound and no downsampling - the digest reads each run, so it wants
-// them all.
+// SpeedHistory returns every speedtest from the given time up to the present,
+// oldest first, with no downsampling - the digest reads each run, so it wants
+// them all. "The present" is speedWindow's, not the newest row's: the digest
+// summarises what has happened, and a run stamped ahead of the clock has not.
 func (s *Store) SpeedHistory(ctx context.Context, since time.Time) ([]SpeedSample, error) {
 	return s.SpeedHistoryRange(ctx, since, time.Time{}, 1)
 }
@@ -2865,9 +3158,14 @@ func (s *Store) SpeedHistory(ctx context.Context, since time.Time) ([]SpeedSampl
 // clustered. Rank has no such failure mode; the answer is exactly
 // min(rows-in-window, budget), for every window, on every distribution.
 //
-// Two passes, both cheap. The first reads ts alone, which idx_speed_ts satisfies
-// without touching the table, and yields both the count and the timestamps to
-// keep. The second re-reads only the chosen rows whole. The kept rows are REAL
+// Two passes, both cheap. The first reads ts alone - idx_speed_ts drives the
+// range, with a row visit only to read the accounting marker - and yields both
+// the count and the timestamps to keep, so `total` counts what a caller can
+// actually be handed rather than every row in the window (the two differing is
+// what tells a client its history was thinned, so it must not include rows no
+// pass could ever return). The second re-reads only the chosen rows whole,
+// carrying the same filter so a marker written between the passes cannot slip a
+// non-measurement into the result. The kept rows are REAL
 // rows and the newest run in the window is always among them - the dashboard's
 // stat tiles read the final point, and clicking a point looks its ts up with
 // SpeedRunOffset, so a synthetic timestamp would scroll the runs table to a row
@@ -2882,13 +3180,9 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 	if budget < 1 {
 		budget = 1
 	}
-	win := ` WHERE ts >= ?`
-	winArgs := []any{since.Unix()}
-	if !until.IsZero() {
-		win += ` AND ts < ?`
-		winArgs = append(winArgs, until.Unix())
-	}
-	// Pass 1: timestamps only - an index-only scan of idx_speed_ts.
+	clause, winArgs := speedWindow(since, until)
+	win := ` WHERE ` + speedNotFailed + clause
+	// Pass 1: timestamps only, over the ts index.
 	rows, err := s.db.QueryContext(ctx, `SELECT ts FROM speed`+win+` ORDER BY ts`, winArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -2928,7 +3222,7 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 		args = append(args, ts)
 	}
 	rows2, err := s.db.QueryContext(ctx,
-		`SELECT `+speedCols+` FROM speed WHERE ts IN (`+ph+`) GROUP BY ts ORDER BY ts`, args...)
+		`SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` AND ts IN (`+ph+`) GROUP BY ts ORDER BY ts`, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2944,11 +3238,11 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 }
 
 // SpeedHistoryRange returns speedtests in [since, until), oldest first. A zero
-// until means no upper bound, which is what every caller outside the chart
-// wants. The interval is half-open so a run stamped exactly on a boundary
-// belongs to one side only - speedtests land on schedule, so a run at local
-// midnight is ordinary, and a closed bound would show it in both neighbouring
-// day ranges.
+// until means "up to the present" (see speedWindow), which is what every caller
+// outside the chart wants. The interval is half-open so a run stamped exactly on
+// a boundary belongs to one side only - speedtests land on schedule, so a run at
+// local midnight is ordinary, and a closed bound would show it in both
+// neighbouring day ranges.
 //
 // bucketSec downsamples the result the way Series does, and for the same reason:
 // a chart window is wide but a canvas is not, so the response has to be bounded
@@ -2965,12 +3259,11 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 // exist. Picking the newest per bucket makes the final point the newest run by
 // construction, so neither behaviour needs a special case.
 func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, bucketSec int) ([]SpeedSample, error) {
-	win := ` WHERE ts >= ?`
-	winArgs := []any{since.Unix()}
-	if !until.IsZero() {
-		win += ` AND ts < ?`
-		winArgs = append(winArgs, until.Unix())
-	}
+	// The filter rides `win`, so both the outer select and the bucket subquery
+	// carry it: a bucket whose newest row is an accounting row must yield the
+	// newest MEASUREMENT in that bucket, not an empty bucket.
+	clause, winArgs := speedWindow(since, until)
+	win := ` WHERE ` + speedNotFailed + clause
 	q := `SELECT ` + speedCols + ` FROM speed` + win
 	args := append([]any(nil), winArgs...)
 	if bucketSec > 1 {
@@ -3005,7 +3298,7 @@ func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, b
 // at O(1) memory over a full history instead of building the entire slice. fn is
 // called per row; returning an error stops the scan and propagates it.
 func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) error) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+` FROM speed ORDER BY ts DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC`)
 	if err != nil {
 		return err
 	}
@@ -3025,7 +3318,7 @@ func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) e
 // SpeedCount returns the total number of recorded speedtests.
 func (s *Store) SpeedCount(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed).Scan(&n)
 	return n, err
 }
 
@@ -3035,7 +3328,7 @@ func (s *Store) SpeedCount(ctx context.Context) (int, error) {
 // chart point is clicked.
 func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE ts > ?`, ts).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed+` AND ts > ?`, ts).Scan(&n)
 	return n, err
 }
 
@@ -3045,6 +3338,29 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 // gone), which the caller treats as an idempotent no-op, not an error. Runs are
 // serialized, so ts is effectively unique; a same-second collision would delete
 // both, consistent with ts-as-identity everywhere else.
+//
+// A run that retried a direction also has a usage-accounting row one second
+// later (the scheduler writes it at measuredTS+1 so a backup's ts merge key
+// cannot collapse the two records into one), and that row goes too. It has to:
+// it is invisible to every listing - they all carry speedNotFailed - so the only
+// place it appears is the data-usage total, and the only timestamp any surface
+// ever shows the operator is the measurement's. Left behind it would bill bytes
+// for a run that no longer exists, with nothing to delete it by.
+//
+// That row is found by the reference it CARRIES (speed.usage_run_ts), not by its
+// position. The position - "the flagged row at ts+1" - was a guess, and it was
+// wrong whenever a second run landed on that second: a manual run that fails one
+// second after a scheduled measurement writes its own flagged row at exactly
+// ts+1, and deleting the scheduled run then destroyed the manual run's whole
+// record, silently, since nothing ever lists a flagged row.
+//
+// The positional sweep is GONE rather than kept as a fallback for accounting
+// rows written before the column existed. Keeping it would reintroduce the
+// defect in full - it is the same blind DELETE, and a row it wrongly matches is
+// unrecoverable - to clean up after rows that exist in no released build: the
+// accounting row and the column that references it are both unreleased work. An
+// unreferenced row in a developer database is simply not swept, which costs a
+// stale usage total there and nothing anywhere else.
 func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 	// One transaction with the run's selection report (speed_servers has no FK;
 	// the cascade is manual): a run deleted without its report rows would leave
@@ -3056,12 +3372,41 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `DELETE FROM speed WHERE ts = ?`, ts)
+	// `ts` identifies the run, but it does not identify EVERY row at that second.
+	// An accounting row lands one second after the run it bills for, so the row at
+	// this exact timestamp may belong to the PREVIOUS run - a manual run that
+	// failed a second after a scheduled one finished is enough. Deleting it here
+	// would destroy that run's usage the same way the positional sweep this
+	// method used to end with did, only from the other direction.
+	//
+	// So a row that names a DIFFERENT run is left alone. A row naming this one, or
+	// naming none at all (every measurement), is the run being deleted.
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM speed WHERE ts = ? AND (usage_run_ts IS NULL OR usage_run_ts = ?)`, ts, ts)
 	if err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM speed_servers WHERE run_ts = ?`, ts); err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	// Still scoped to a FLAGGED row, belt to the reference's braces, so this can
+	// never eat a reading: the daemon sets usage_run_ts only on accounting rows,
+	// but a crafted import could put one on a measurement, and destroying a
+	// reading is the worse outcome by far. speedIsAccounting rather than a
+	// hand-written `failed = 1` so this and the reads that hide these rows judge
+	// every marker the same way.
+	//
+	// The guard cannot strand a row the reference would have found, because the
+	// two columns travel together through a backup: the export drops a
+	// post-schema-4 column only when NO row uses it, and any row carrying
+	// usage_run_ts carries `failed` as well.
+	//
+	// The count returned stays the measurement's - the caller's "was there a run"
+	// signal - so removing the accounting row cannot read as a second run.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM speed WHERE usage_run_ts = ? AND `+speedIsAccounting, ts); err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
@@ -3184,14 +3529,20 @@ func (s *Store) SpeedAvgBytes(ctx context.Context) (avgDown, avgUp int64, err er
 	// data-conserving users who run a single direction the estimate fell back to a
 	// fabricated constant. A per-direction average uses each partial run for the
 	// direction it actually measured.
+	// Accounting rows are excluded even though they carry bytes: this average is
+	// a PROJECTION of what the next run will cost ("at this interval you'll use
+	// X/month"), and a total failure aborts partway - its bytes are a fraction of
+	// a real run's, so counting them predicts a bill no schedule produces. The
+	// bytes still count in what was ACTUALLY used (SpeedDataUsage), which is the
+	// number they belong to.
 	err = s.db.QueryRowContext(ctx, `
 		SELECT
 		  (SELECT COALESCE(CAST(AVG(download_bytes) AS INTEGER), 0)
 		     FROM (SELECT download_bytes FROM speed
-		           WHERE download_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20)),
+		           WHERE `+speedNotFailed+` AND download_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20)),
 		  (SELECT COALESCE(CAST(AVG(upload_bytes) AS INTEGER), 0)
 		     FROM (SELECT upload_bytes FROM speed
-		           WHERE upload_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20))`).Scan(&avgDown, &avgUp)
+		           WHERE `+speedNotFailed+` AND upload_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20))`).Scan(&avgDown, &avgUp)
 	if err != nil {
 		recordDBErr(err)
 		return 0, 0, err
@@ -3301,18 +3652,22 @@ func (s *Store) SpeedDataUsage(ctx context.Context, now time.Time) (DataUsage, e
 		FROM (SELECT ts, COALESCE(download_bytes,0)+COALESCE(upload_bytes,0) AS b FROM speed WHERE ts <= ?)`,
 		cut(6*time.Hour), cut(24*time.Hour), cut(7*24*time.Hour),
 		cut(30*24*time.Hour), cut(365*24*time.Hour),
-		now.Add(metricsFutureSkew).Unix()).
+		currentHorizon(now.Unix())).
 		Scan(&u.H6, &u.H24, &u.D7, &u.D30, &u.Y1, &u.All)
 	return u, err
 }
 
 // SpeedDataUsageSince returns the speedtest bytes (download+upload) transferred
 // since t - backs the dashboard data bubble's custom (arbitrary-window) range.
+// Bounded at currentHorizon like the preset windows beside it: the custom range
+// is the same question over a different span, so a future-dated run must not
+// inflate one bubble while the presets exclude it.
 func (s *Store) SpeedDataUsageSince(ctx context.Context, since time.Time) (int64, error) {
 	var b int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(COALESCE(download_bytes,0)+COALESCE(upload_bytes,0)),0) FROM speed WHERE ts>=?`,
-		since.Unix()).Scan(&b)
+		`SELECT COALESCE(SUM(COALESCE(download_bytes,0)+COALESCE(upload_bytes,0)),0)
+		 FROM speed WHERE ts>=? AND ts<=?`,
+		since.Unix(), currentHorizon(time.Now().Unix())).Scan(&b)
 	return b, err
 }
 
@@ -3325,7 +3680,7 @@ func (s *Store) SpeedRuns(ctx context.Context, limit, offset int) ([]SpeedSample
 		offset = 0
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+speedCols+` FROM speed ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
+		`SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -3389,11 +3744,28 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 	// spanning the boundary) is invisible here and its in-window downtime is lost,
 	// disagreeing with the uptime%. A pre-window boundary event is used only to
 	// anchor proration; it is never counted as an in-window outage (guarded below).
+	//
+	// The scan stops at currentHorizon for the same reason UptimeSince's
+	// newest-event decision does, and it MUST be the same bound: the trailing-down
+	// branch at the end of this function is what credits an ongoing outage, and it
+	// fires only when no 'up' followed. A future-dated 'up' read as the closing one
+	// would silently switch that branch off here while uptime and the digest still
+	// credit the outage - the heatmap drawing a clean square beside a percentage
+	// that is not.
+	nowU := time.Now().Unix()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, type, COALESCE(duration_s, 0)
+		-- type IN ('down','up') here and in the anchor: consistency with the
+		-- newest-event probes, which DO depend on it (see UptimeSince). The Go
+		-- loop below already ignores an unrecognised type - its switch has no
+		-- default - so this filter is belt-and-braces rather than the thing the
+		-- tally rests on, and no fixture I could build makes it change an answer.
+		-- It is here so every reader of this table agrees about what it reads,
+		-- which is what stopped being true when only the probes were filtered.
 		FROM events
-		WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE ts <= ?)
-		ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END`, since.Unix())
+		WHERE type IN ('down','up')
+		  AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE type IN ('down','up') AND ts <= ?) AND ts <= ?
+		ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END`, since.Unix(), currentHorizon(nowU))
 	if err != nil {
 		return nil, err
 	}
@@ -3430,7 +3802,6 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 		return &out[i]
 	}
 	sinceU := since.Unix()
-	nowU := time.Now().Unix()
 	// The window's pause spans, fetched ONCE for both loops below. prorate used to
 	// ask pausedOverlap per day-segment, which is the round trip per day that this
 	// function's own pauseSpans comment argues against - and it is worse than that
@@ -3758,14 +4129,28 @@ const pruneFutureSlack = 48 * time.Hour
 const FutureSlack = pruneFutureSlack
 
 // metricsFutureSkew is how far ahead of wall-now a row may sit and still count as
-// "current" in the latest-reading and usage reads (LatestPerTarget, LatestSpeed,
-// SpeedDataUsage). Prune's 48h slack is deliberately generous so a stepped-back
+// "current" in a read of the present. Read it through currentHorizon below, never
+// by restating the sum. Prune's 48h slack is deliberately generous so a stepped-back
 // clock never deletes real rows - but that same slack lets a future-dated import
 // win a "latest" read and freeze current metrics until wall time catches up. This
 // tight bound excludes such rows from the live reads while still tolerating a
 // slightly-fast importer's just-now timestamps. Rows beyond it stay in the DB
 // (Prune owns deletion); they are only hidden from the current-state reads.
 const metricsFutureSkew = 2 * time.Minute
+
+// currentHorizon is the newest timestamp a read of the PRESENT may consider: the
+// wall clock plus the skew above. Every such read goes through this one function
+// rather than restating the sum, because the defect it exists to stop was never a
+// missing bound in general - it was the bound holding on SOME surfaces and not
+// others, so a single future-dated row answered for "now" on the pills, the
+// charts, the digest and the uptime figures in different combinations depending
+// on which read you asked.
+//
+// It bounds the OPEN-ENDED reads only. A caller naming an absolute end gets
+// exactly the window it named, future or not: the UI accepts a typed range that
+// ends ahead of now (it clamps at now+366d), and quietly answering a narrower
+// question than the one asked is its own wrong answer.
+func currentHorizon(nowU int64) int64 { return nowU + int64(metricsFutureSkew.Seconds()) }
 
 // resolveDanglingDowns makes the events log self-sufficient BEFORE the evidence
 // samples are pruned. An orphaned or dangling 'down' (a restart mid-outage never
@@ -3779,20 +4164,56 @@ const metricsFutureSkew = 2 * time.Minute
 // second: the outage becomes a completed event and no longer needs the samples.
 func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int64) error {
 	// Dangling downs: a 'down' immediately followed by another 'down' (orphan gap)
-	// or the final event being a 'down'. Mirrors UptimeSince's pairing.
+	// or the final event being a 'down'. Mirrors UptimeSince's pairing, because
+	// this is the write side of that agreement and a disagreement here is
+	// permanent - but on the FUTURE side it deliberately reaches further than the
+	// readers do, for the reason below.
+	//
+	// The horizon: the question here is not "what answers for now?" but "will
+	// anything still be on disk to close this outage after the sweep below runs?",
+	// so the bound is this prune's own future horizon (nowU + pruneFutureSlack),
+	// the same one the events sweep deletes at, and not currentHorizon.
+	//
+	//   - An 'up' beyond pruneFutureSlack is deleted by that sweep a few lines
+	//     below, so it closes nothing. Pairing a 'down' with one would skip the
+	//     synthetic recovery while every reader - which ignores it too, see
+	//     currentHorizon - still sees the outage open, and the samples that were
+	//     its only other proof go in this same call. The outage would be left open
+	//     forever and uptime would collapse toward zero.
+	//   - An 'up' inside pruneFutureSlack SURVIVES, and closes the outage by itself
+	//     once the wall clock reaches it. Bounding at currentHorizon hid exactly
+	//     those rows (past two minutes ahead, inside 48 hours) and wrote a
+	//     synthetic recovery beside one, leaving TWO closing events for one outage:
+	//     the readers then report one outage as two and book its downtime twice,
+	//     permanently, because the samples are gone and every later prune sees two
+	//     complete outages and leaves them alone.
+	//
+	// Derived from nowU, which is the same clock reading the sweep's `horizon`
+	// below is derived from, so the two cannot drift apart.
+	//
+	// The type filter: same reason the readers grew one. An event type this build
+	// cannot interpret must not silently close an outage.
+	pruneHorizon := currentHorizon(nowU)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, next_ts, next_type FROM (
 			SELECT ts, type,
 			       LEAD(ts)   OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_ts,
 			       LEAD(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_type
-			FROM events)
-		WHERE type='down' AND (next_type='down' OR next_type IS NULL)`)
+			FROM events WHERE type IN ('down','up') AND ts <= ?)
+		WHERE type='down' AND (next_type='down' OR next_type IS NULL)`, pruneHorizon)
 	if err != nil {
 		return err
 	}
 	// Collect the pairs before the per-gap recovery lookups: a query inside an
 	// open rows scan deadlocks the single-connection (":memory:") pool.
-	type gap struct{ down, end int64 }
+	type gap struct {
+		down, end int64
+		// final: nothing follows this 'down' inside the bound at all, as opposed
+		// to another 'down' following it. Only a final gap can be the one a
+		// future-dated 'up' belongs to, because any 'up' the clock has reached
+		// would have paired with this 'down' and it would not be dangling.
+		final bool
+	}
 	var gaps []gap
 	for rows.Next() {
 		var down int64
@@ -3802,17 +4223,20 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			rows.Close()
 			return err
 		}
-		end := nowU
+		end, final := nowU, true
 		if nextType.Valid && nextType.String == "down" && nextTS.Valid {
-			end = nextTS.Int64
+			end, final = nextTS.Int64, false
 		}
-		gaps = append(gaps, gap{down: down, end: end})
+		gaps = append(gaps, gap{down: down, end: end, final: final})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	type synthUp struct{ ts, dur int64 }
+	type synthUp struct {
+		ts, dur, down int64
+		final         bool
+	}
 	var synth []synthUp
 	for _, g := range gaps {
 		rec, ok, err := s.firstQuorumRecovery(ctx, g.down, g.end)
@@ -3847,10 +4271,53 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			if dur -= paused; dur < 0 {
 				dur = 0
 			}
-			synth = append(synth, synthUp{ts: rec, dur: dur})
+			synth = append(synth, synthUp{ts: rec, dur: dur, down: g.down, final: g.final})
 		}
 	}
 	for _, u := range synth {
+		// An outage gets ONE closing event. A 'down' can look dangling while an
+		// 'up' for it already exists, dated ahead of the clock - an import from a
+		// host whose clock ran fast, or a clock excursion here. The reads
+		// deliberately ignore such a row (it has not happened yet), which is why
+		// the pairing above does not see it either, and that is the safe reading:
+		// the samples are about to be pruned, so something must record the
+		// recovery before the evidence goes.
+		//
+		// But INSERTING beside it leaves two closing events for one outage. Once
+		// the clock passes the future row, the second one anchors its own outage
+		// at ts-duration_s (completedOutagesSince) and the history reports an
+		// outage that never happened, permanently, with the samples that would
+		// disprove it already gone.
+		//
+		// So the future row is CORRECTED rather than duplicated. It is not
+		// credible as written - it claims a recovery later than the samples prove,
+		// at a time that has not arrived - and moving it to the proven second
+		// keeps the operator's event, keeps the count at one, and puts the row in
+		// the past where no future sweep can remove it. That last part matters:
+		// declining to write anything at all was tried, and a backward clock step
+		// then deleted the future row and left the outage open forever.
+		moved := false
+		if u.final {
+			var at int64
+			switch err := s.db.QueryRowContext(ctx,
+				`SELECT ts FROM events WHERE type = 'up' AND ts > ? ORDER BY ts LIMIT 1`, u.down).Scan(&at); {
+			case err == nil:
+				if _, err := s.db.ExecContext(ctx,
+					`UPDATE events SET ts = ?, duration_s = ? WHERE type = 'up' AND ts = ?`, u.ts, u.dur, at); err != nil {
+					recordDBErr(err)
+					return err
+				}
+				log.Printf("pingularity: an outage recovery was recorded %ds in the future (a clock that ran fast, or an import from one); moved it back to the second the probe history proves the link returned", at-u.ts)
+				moved = true
+			case errors.Is(err, sql.ErrNoRows):
+			default:
+				recordDBErr(err)
+				return err
+			}
+		}
+		if moved {
+			continue
+		}
 		if err := s.InsertEvent(ctx, time.Unix(u.ts, 0), "up", int(u.dur), "recovered while unmonitored"); err != nil {
 			return err
 		}
@@ -4287,13 +4754,20 @@ var exportTables = map[string]struct {
 		"public_ipv4", "public_ipv6", "isp", "isp_location", "dns_ip", "dns_provider", "dns_location",
 		"packet_loss", "healthy", "jitter_ms", "download_bytes", "upload_bytes", "cf_colo", "exit_summary", "run_trigger",
 		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
-		"ping_best_ms", "ip_family", "udp_direction"},
+		"ping_best_ms", "ip_family", "udp_direction", "failed", "usage_run_ts"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted
 		// as NULL, which once wedged every speed read with a Scan error.
 		notNull: []string{"server"},
-		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes"},
+		// failed is on the int allowlist so the marker cannot arrive as text: an
+		// unreadable marker is a row no read can classify, and speedNotFailed
+		// then hides it for good rather than showing a run that measured nothing.
+		// usage_run_ts is there for the same reason one step on: a reference that
+		// arrives as text no `usage_run_ts = ?` can match is an accounting row
+		// deleting its run will never find, billing bytes for a speedtest that no
+		// longer exists with nothing in the UI to remove them.
+		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes", "failed", "usage_run_ts"},
 		realCols: []string{"down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms", "packet_loss",
 			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms"}},
 	// The per-run selection reports ride the speed category (they are the
@@ -4354,6 +4828,36 @@ var settingsExportDeny = map[string]bool{
 	// stale/crafted value could suppress or force a digest, so it's neither
 	// exported nor accepted. The cadence preference (digest_freq) stays exportable.
 	"digest_last_sent": true,
+	// The install's birth provenance: "the daemon that wrote this created this
+	// database". Every rule around it exists to keep that claim honest - only
+	// the process that read the empty store may write it, an established store
+	// is never stamped retroactively, a restart drops the pending witness, a
+	// restore voids it. A backup that carried the marker would route around all
+	// of that: any destination could be handed a birth it never had.
+	//
+	// And a FORGED marker is worse than a missing one. Absent, it reads as
+	// "unknown" and the install fails closed - the ambiguous-container access
+	// warning fires and access stays local-only. Present, it is believed: the
+	// warning goes quiet and anything later keyed on the marker (a 0.63 upgrade
+	// decision, say) trusts a birth nobody witnessed. Denied in BOTH directions
+	// by this one list, so neither an export nor a crafted file can move it.
+	"install_born_version": true,
+	// Who may reach the dashboard at all. Install-scoped in the strongest sense:
+	// it describes ONE host's network posture - whether that machine's port is
+	// safe to answer on - and says nothing about the history in the file.
+	//
+	// The daemon refuses to write this key on evidence far better than a backup.
+	// warnAmbiguousContainerAccess will not persist an open posture even when
+	// every container tell agrees, because a wrong answer either publishes a
+	// dashboard or locks the operator out of their own container; it warns and
+	// leaves the decision to a human. A file an attacker may craft, or simply
+	// last month's backup from another machine, must not be the one path that
+	// writes it - in either direction. Opening one is a silent exposure with no
+	// warning in the response; closing one makes a container 403 its own
+	// published port with nothing saying why.
+	//
+	// Restoring a backup moves the DATA. The destination decides who can see it.
+	"access_local_only": true,
 	// When THIS box started watching. It lives in the settings table but it is
 	// evidence, not configuration: monitoringSince takes the MIN of it and the
 	// earliest row on disk, making it the denominator behind every uptime figure.
@@ -4468,6 +4972,90 @@ func (s *Store) HasQuarantinedPausesTx(ctx context.Context, tx *sql.Tx) (bool, e
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pauses_quarantine)`).Scan(&n)
 	return n != 0, err
 }
+
+// speedColumnsPastSchema4 are the `speed` columns added after envelope schema 4
+// - the ones no shipped build that accepts a stamp of 4 or lower has ever heard
+// of. They are the reason the speed category needs a content check at all:
+// unlike pauses_quarantine, a COLUMN lives inside a category every file already
+// carries, so the key-driven stamp cannot see it.
+//
+// The stakes are higher than "the column is lost". An older build does NOT skip
+// what it does not recognise - ImportTableBatch aborts the category with
+// `unknown column`, and it does so partway through a restore that has already
+// committed latency. So a file carrying any of these must stamp above what
+// those builds accept, and a file stamping low must carry none of them.
+//
+// usage_run_ts belongs on this list and not on a list of its own: the newest tag
+// is v0.61.3, which accepts 4, and the stamp of 5 was added in the same
+// unreleased campaign as this column - so "the builds that have never heard of
+// it" is the same set for all four, and one more version would separate files
+// that no build in the wild tells apart. It must ride in the export at all
+// (rather than being left a local-only column) because it is what a delete
+// cascades on: a restored backup that dropped it would put every accounting row
+// back beyond the reach of deleting its run, billing bytes for speedtests the
+// operator has removed.
+func speedColumnsPastSchema4() []string {
+	return []string{"ip_family", "udp_direction", "failed", "usage_run_ts"}
+}
+
+// SpeedColumnsPastSchema4InUse reports which of those columns actually carry a
+// value in the snapshot an export streams from - not which exist in the schema,
+// which is always all of them. An install that has never recorded one keeps its
+// backup restorable on older builds; one that has stamps 5, and those builds
+// refuse it at the envelope check instead of failing mid-restore.
+//
+// NULL is "unrecorded" for every one of them, and `failed = 0` says the same thing as
+// NULL everywhere else (see speedNotFailed), so neither counts as carrying
+// anything. The answer must describe the exact instant the rows do, hence the
+// caller's snapshot rather than the live table.
+//
+// The `failed` test is the exact complement of speedNotFailed - not NULL and not
+// 0 - and has to be, because the two answer one question from opposite sides:
+// "is this row hidden as accounting?" and "must the file carry the column that
+// hides it?". Written as `failed = 1` they disagreed about every other non-zero
+// marker (reachable only through a crafted or hand-edited backup - the daemon
+// writes 1 or NULL - since `failed` sits on the import allowlist as a whole
+// number). Such a row was hidden from every measurement read AND reported as
+// "nothing here uses this column", so the export dropped the column from it and
+// stamped low; restoring that backup brought the row back with no marker at all,
+// which is a 0.00 Mbps speedtest in the chart, the history table, the CSV, the
+// run count and the averages, on a box that measured nothing.
+// usage_run_ts has only ONE spelling of "unset" - NULL - so unlike `failed` it
+// needs no second exclusion: any value at all is a reference some delete could
+// cascade on, and a backup that shed it would restore the row beyond the reach
+// of deleting its run. Erring toward "in use" is the safe direction anyway; the
+// cost is a file older builds refuse up front.
+func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	var ipFamily, udpDirection, failed, usageRunTS bool
+	err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM speed WHERE ip_family IS NOT NULL AND ip_family <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE udp_direction IS NOT NULL AND udp_direction <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE failed IS NOT NULL AND failed <> 0),
+		EXISTS(SELECT 1 FROM speed WHERE usage_run_ts IS NOT NULL)`).Scan(&ipFamily, &udpDirection, &failed, &usageRunTS)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]bool{"ip_family": ipFamily, "udp_direction": udpDirection,
+		"failed": failed, "usage_run_ts": usageRunTS}, nil
+}
+
+// AllSpeedColumnsPastSchema4InUse is what a caller must assume when the check
+// above fails: every new column is in use, so the file stamps high and an older
+// build refuses it. "An older build refuses the backup" is a safe failure;
+// "a column is silently shed" is the one this machinery exists to prevent.
+func AllSpeedColumnsPastSchema4InUse() map[string]bool {
+	m := map[string]bool{}
+	for _, c := range speedColumnsPastSchema4() {
+		m[c] = true
+	}
+	return m
+}
+
+// SpeedColumnsPastSchema4 exposes the column list to the web layer, which drops
+// the unused ones from the rows it streams. The list and the stamp decision must
+// come from the same place, or a file could omit a column while still claiming
+// to need it - or worse, carry one while claiming not to.
+func SpeedColumnsPastSchema4() []string { return speedColumnsPastSchema4() }
 
 // ExportTableRowsTx is ExportTableRows scoped to a caller-provided read snapshot.
 func (s *Store) ExportTableRowsTx(ctx context.Context, tx *sql.Tx, table string, fn func(map[string]any) error) error {
@@ -4696,6 +5284,42 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 					continue
 				}
 				r[c] = *clampSpeedBytes(&n)
+			}
+			// Normalise the accounting marker to the 1 the daemon writes. `failed` is
+			// on the int allowlist below, which keeps it from arriving as text, but
+			// the allowlist is a TYPE check with no range: a crafted or hand-edited
+			// file can carry any whole number, and every value but 1 is a marker
+			// nothing in this codebase has a meaning for.
+			//
+			// Clamped, not dropped, and the row kept - the other two options are both
+			// losses. Dropping the field leaves NULL, which every read then serves as
+			// a real 0.00 Mbps run, the exact fabrication the column exists to
+			// prevent; dropping the row throws away the bytes it exists to record,
+			// which are on the user's bill either way. Clamping is also what the byte
+			// guard above does with an out-of-range number, and 1 is already how every
+			// measurement read treats a non-zero marker (see speedNotFailed), so this
+			// changes no row's meaning - only whether the rest of the code can read it.
+			//
+			// normVal decides what "a whole number" is here so this agrees with the
+			// intCol guard below rather than second-guessing it: a value that is not
+			// one (a fraction, NaN, out of int64 range) is left exactly as it came and
+			// that guard skips the row, as it does today.
+			//
+			// This does NOT stand in for the predicate agreement in
+			// SpeedColumnsPastSchema4InUse - a row stored before this clamp existed
+			// keeps its value forever, since nothing rewrites rows at rest. What it
+			// buys is that `failed` means one thing at rest: the reads that hide these
+			// rows, the export check that decides whether a backup must carry the
+			// column, and the delete that clears a run's usage all judge the same
+			// values. They agree today whatever the marker is - each one asks "is it
+			// non-zero" rather than "is it 1" - and the clamp is what keeps a future
+			// `failed = 1` written somewhere new from quietly disagreeing with them.
+			if v, ok := r["failed"]; ok && v != nil {
+				if nv, ok := normVal(v); ok {
+					if n, isInt := nv.(int64); isInt && n != 0 {
+						r["failed"] = int64(1)
+					}
+				}
 			}
 		}
 		// Reject a row whose ts isn't a finite number >= 0: imported JSON is

@@ -16,10 +16,12 @@ on:
 # upload collision the cancel was added for (422 already_exists / http2
 # REFUSED_STREAM) - two runs never upload at once - WITHOUT the hazard cancel
 # introduced: a workflow_dispatch (or a late-delivered throttled tag webhook)
-# sharing this group could otherwise cancel a run mid-publish, leaving a
-# half-uploaded release that the stable guard then refuses to complete. The cost
-# is only that an rc re-cut waits for the previous run to finish instead of
-# aborting it - cheap next to corrupting a shipped stable release.
+# sharing this group could otherwise cancel a run mid-publish. Releases are
+# draft-until-complete, so a cancelled run strands only an invisible draft that
+# a re-run resumes - but for stable it can also leave the brew cask pointing at
+# download URLs that stay 404 until that re-run completes and flips the release
+# public. The cost is only that an rc re-cut waits for the previous run to
+# finish instead of aborting it - cheap next to a dangling stable window.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -73,12 +75,21 @@ jobs:
               ;;
           esac
 
-      # Stable releases are immutable: their checksums are attested in the publish
-      # job, so silently overwriting a published stable asset would invalidate that
-      # provenance. .goreleaser.yaml keeps replace_existing_artifacts: true for the
-      # rc re-cut loop (a plain bool there, not templateable per channel), so this
-      # guard confines that overwrite to prerelease tags - it fails the run if a
-      # STABLE tag's GitHub release already exists. Cut a new version instead.
+      # Stable releases are immutable ONCE PUBLISHED: their checksums are attested
+      # in the publish job, so silently overwriting a published stable asset would
+      # invalidate that provenance. .goreleaser.yaml keeps
+      # replace_existing_artifacts: true for the rc re-cut loop (a plain bool
+      # there, not templateable per channel), so this guard confines that
+      # overwrite to prerelease tags - it fails the run if a STABLE tag's GitHub
+      # release is already published. Cut a new version instead.
+      #
+      # Published, not merely existing: releases are created as DRAFTS and only
+      # flipped public by the publish job's final step, after every attestation
+      # succeeds, so a stranded draft from an incomplete run must be RESUMABLE.
+      # It is, by the API's own semantics: "get a release by tag name" returns
+      # "a published release with the specified tag" (GitHub REST docs), so a
+      # draft answers HTTP 404 here and the re-run replaces it wholesale via
+      # release.replace_existing_draft.
       #
       # FAIL CLOSED: `gh release view` (and `gh api`) exit non-zero for a genuine
       # 404 AND for auth failures, rate limiting, and outages alike, so treating
@@ -97,11 +108,11 @@ jobs:
           esac
           for attempt in 1 2 3; do
             if out=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1); then
-              echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets. Cut a new version instead."
+              echo "::error::stable release '$tag' is already published; refusing to overwrite published, attested assets. Cut a new version instead."
               exit 1
             fi
             case "$out" in
-              *"HTTP 404"*) echo "stable tag ($tag): no existing release - ok to publish"; exit 0 ;;
+              *"HTTP 404"*) echo "stable tag ($tag): no published release - ok to publish (a stranded draft, if any, is replaced and resumed)"; exit 0 ;;
             esac
             echo "attempt $attempt: could not determine release state for '$tag' (not a 404): $out"
             sleep 5
@@ -158,7 +169,9 @@ jobs:
       # jobs" skips an already-passed guard - so a transient API blip that let the
       # guard pass must not carry through to the actual overwrite. Same fail-closed
       # logic as the guard job (kept inline because the guard job deliberately runs
-      # before any checkout, so the two cannot share a script without weakening it).
+      # before any checkout, so the two cannot share a script without weakening
+      # it), and the same published-only semantics: a stranded DRAFT answers 404
+      # here and is resumed, only a PUBLISHED stable release blocks.
       - name: Recheck no published stable release before publishing
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,11 +182,11 @@ jobs:
           esac
           for attempt in 1 2 3; do
             if out=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1); then
-              echo "::error::stable release '$tag' already exists; refusing to overwrite published, attested assets."
+              echo "::error::stable release '$tag' is already published; refusing to overwrite published, attested assets."
               exit 1
             fi
             case "$out" in
-              *"HTTP 404"*) echo "stable tag ($tag): still no existing release - ok to publish"; exit 0 ;;
+              *"HTTP 404"*) echo "stable tag ($tag): still no published release - ok to publish (a stranded draft, if any, is replaced and resumed)"; exit 0 ;;
             esac
             echo "attempt $attempt: could not determine release state for '$tag' (not a 404): $out"
             sleep 5
@@ -194,6 +207,57 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+      # Re-cutting an rc replaces the assets of a release that is already PUBLIC
+      # (replace_existing_artifacts, the amend loop this repo actually uses), so
+      # for the length of that run the rc's download URLs served bytes whose new
+      # digests nothing had attested yet - the draft-until-complete flow covered
+      # the first cut of a tag and not its second. Putting the release back into
+      # draft first restores the property for re-cuts too: the tag goes dark
+      # while it is incomplete, and the same final step that publishes a first
+      # cut publishes this one. A tag with no published release yet is untouched
+      # (the normal case), and a stable tag never reaches here - its own guard
+      # refuses a re-cut outright.
+      - name: Re-draft a published prerelease before replacing its bytes
+        if: ${{ contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Only a PUBLISHED release answers here; a draft is already invisible
+          # (the tags endpoint returns published releases only), so it needs no
+          # action and a definite 404 is the first-cut case.
+          #
+          # Same fail-closed discipline as the stable guard: `gh api` exits
+          # non-zero for auth failures, rate limits and outages as well as for a
+          # genuine 404, so treating every error as "absent" would skip the
+          # re-draft exactly when the API is unhealthy - and then replace a live
+          # release's bytes anyway. Only a definite 404 may proceed.
+          if out=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>&1); then
+            :
+          else
+            case "$out" in
+              *"HTTP 404"*)
+                echo "no published release for '$tag' - nothing to re-draft"
+                exit 0 ;;
+              *)
+                echo "::error::could not determine whether '$tag' is already published ($out); refusing to replace its assets blind"
+                exit 1 ;;
+            esac
+          fi
+          echo "'$tag' is already published; putting it back to draft while its assets are replaced"
+          for attempt in 1 2 3; do
+            if gh release edit "$tag" --draft=true --repo "${GITHUB_REPOSITORY}"; then
+              exit 0
+            fi
+            echo "attempt $attempt: could not re-draft '$tag'"
+            sleep 5
+          done
+          # Fail closed: continuing would publish replacement bytes into a live
+          # release with no attestation, which is the thing this step exists to
+          # prevent.
+          echo "::error::could not put '$tag' back to draft before replacing its assets; refusing to overwrite a published prerelease in place"
+          exit 1
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
         with:
@@ -209,7 +273,9 @@ jobs:
           # one tag - letting it publish/overwrite a DIFFERENT release than was
           # checked. This is the real guarantee behind the assert step above.
           GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
-          # Creates the GitHub Release and pushes the GHCR image.
+          # Creates the GitHub Release as a DRAFT (release.draft in
+          # .goreleaser.yaml; the final step below flips it public once the
+          # attestations are in) and pushes the GHCR image.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Publishing the Homebrew tap and winget manifests writes to OTHER
           # repos, which GITHUB_TOKEN cannot reach. Provide a token for that, and
@@ -233,9 +299,11 @@ jobs:
 
       # Image provenance needs the digest of what was actually PUSHED - the
       # multi-arch index digest is minted by the registry, so it can only be read
-      # back, never precomputed. Resolve both variants' version tags ({{.Version}}
+      # back, never precomputed. Resolve both variants' VERSION tags ({{.Version}}
       # is the tag minus the leading v, so this works on prerelease and stable
-      # alike; `latest`/`latest-iperf` are the same manifests when they exist).
+      # alike). Only those: the floating tags still point at the previous release
+      # at this point in the run, and are moved onto these digests further down,
+      # after the attestations below have succeeded.
       # Fail closed on anything that does not parse as a digest: publishing an
       # image without its attestation would be silent, and silent is the failure
       # mode this step exists to remove.
@@ -273,3 +341,88 @@ jobs:
           subject-name: ghcr.io/pingular/pingularity
           subject-digest: ${{ steps.image_digests.outputs.iperf }}
           push-to-registry: true
+
+      # Promote the floating tags LAST, and only for a stable release. GoReleaser
+      # pushes the immutable version tags; `latest` and `latest-iperf` are moved
+      # here, by digest, once every attestation above has succeeded - so the
+      # channel `docker pull` serves by default can never point at an image whose
+      # provenance does not exist yet. A run that dies at an attestation leaves
+      # latest exactly where it was, on the previous release, which is the safe
+      # place for it to be. imagetools create re-points a tag at an existing
+      # multi-arch index without rebuilding or re-pushing any layer.
+      - name: Promote the floating tags (stable only)
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          version="${GORELEASER_CURRENT_TAG#v}"
+          repo="ghcr.io/pingular/pingularity"
+          for pair in "latest:${version}" "latest-iperf:${version}-iperf"; do
+            floating="${pair%%:*}"
+            pinned="${pair#*:}"
+            echo "promoting ${floating} -> ${pinned}"
+            docker buildx imagetools create --tag "${repo}:${floating}" "${repo}:${pinned}"
+          done
+          # Prove the move landed on the digest we just attested. Read each digest
+          # through a helper that FAILS on anything but a real one: comparing the
+          # raw command output would pass when BOTH reads fail, since two empty
+          # strings are equal - a verification step that cannot fail is worse than
+          # none, because it is quoted as evidence. The pipeline's exit status is
+          # `tr`'s, so `set -e` does not catch it either.
+          digest_of() {
+            ref="$1"
+            if ! out=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>&1); then
+              echo "::error::could not read the digest of $ref: $out" >&2
+              return 1
+            fi
+            out=$(printf '%s' "$out" | tr -d '"' | tr -d '[:space:]')
+            case "$out" in
+              sha256:*) printf '%s' "$out" ;;
+              *) echo "::error::unexpected digest for $ref: '$out'" >&2; return 1 ;;
+            esac
+          }
+          for pair in "latest:${version}" "latest-iperf:${version}-iperf"; do
+            floating="${pair%%:*}"
+            pinned="${pair#*:}"
+            a=$(digest_of "${repo}:${floating}") || exit 1
+            b=$(digest_of "${repo}:${pinned}")   || exit 1
+            if [ "$a" != "$b" ]; then
+              echo "::error::${floating} resolves to $a but ${pinned} is $b; the floating tag did not move"
+              exit 1
+            fi
+          done
+
+      # The step that COMPLETES the release: everything above - assets, images,
+      # and all three attestations - has succeeded, so flip the draft release
+      # public. Deliberately the FINAL step, so a failure anywhere earlier
+      # strands only an invisible draft (which the stable guard treats as
+      # resumable - a plain re-run finishes the job), never a public-but-
+      # incomplete release. --latest is applied here and ONLY here, for STABLE
+      # tags: GoReleaser skips its own undraft/make_latest handling when
+      # release.draft is true, and GitHub refuses to mark drafts or prereleases
+      # as latest. On an rc re-cut the release is already published and this
+      # edit is a harmless no-op (gh resolves drafts by their pending tag name,
+      # published releases by tag). Same fail-closed retry shape as the guards:
+      # if the flip cannot be confirmed, fail loudly - the release is still a
+      # draft and a re-run resumes it.
+      - name: Publish the release (flip out of draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          set -- release edit "$tag" --draft=false
+          case "$tag" in
+            *-*) ;; # prerelease: GitHub cannot mark it latest
+            *) set -- "$@" --latest ;;
+          esac
+          set -- "$@" --repo "${GITHUB_REPOSITORY}"
+          for attempt in 1 2 3; do
+            if gh "$@"; then
+              echo "release '$tag' is published"
+              exit 0
+            fi
+            echo "attempt $attempt: could not flip release '$tag' out of draft"
+            sleep 5
+          done
+          echo "::error::release '$tag' is complete but still a DRAFT: assets and attestations are all in place, only the flip failed. Re-run this workflow once the API is healthy - the stable guard treats a draft as resumable."
+          exit 1

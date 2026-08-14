@@ -15,10 +15,11 @@ import (
 )
 
 type fakeSender struct {
-	calls   int
-	lastMsg string
-	lastF   map[string]any
-	fail    bool // when true, simulate a delivery failure
+	calls        int
+	lastMsg      string
+	lastF        map[string]any
+	fail         bool // when true, simulate a delivery failure
+	unconfigured bool // when true, simulate no webhook URL set
 }
 
 func (f *fakeSender) Send(_ context.Context, msg string, fields map[string]any) error {
@@ -30,6 +31,10 @@ func (f *fakeSender) Send(_ context.Context, msg string, fields map[string]any) 
 	}
 	return nil
 }
+
+// Configured defaults to true (zero value = a working webhook) so every existing
+// case still exercises the send path.
+func (f *fakeSender) Configured() bool { return !f.unconfigured }
 
 func newManager(t *testing.T) (*Manager, *store.Store, *fakeSender) {
 	t.Helper()

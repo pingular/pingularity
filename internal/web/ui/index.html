@@ -229,6 +229,11 @@
      arrow user can see which option is active. Inset so it isn't clipped by the
      group's overflow:hidden. */
   .qs-seg b:focus-visible{outline:2px solid var(--accent);outline-offset:-3px;}
+  /* The SELECTED segment is filled with --accent, so an --accent ring on it is
+     invisible - and a roving-tabindex radiogroup focuses exactly that one, so
+     the keyboard ring vanished on the only element that needed it. --on-accent
+     is the colour chosen for contrast against that fill. */
+  .qs-seg b.on:focus-visible{outline-color:var(--on-accent);}
   .qs-note{margin-top:7px;color:var(--muted);font-size:12px;}
   .qs-pw{margin-top:10px;display:none;gap:8px;}
   .qs-pw input{flex:1;min-width:0;box-sizing:border-box;background:var(--bg);border:1px solid var(--line2);
@@ -572,8 +577,9 @@
   /* Offset by the log window's actual scrollbar width so the pills never sit on top of the
      scrollbar (--log-sbw is measured in JS; it's 0 where scrollbars overlay). */
   .log-tools{position:absolute;top:8px;right:calc(9px + var(--log-sbw,0px));display:flex;gap:5px;z-index:2;}
-  /* padding:0 - see .chart-save. Two of these three pills are <button>s and were
-     being squeezed; the third is an <a> and never was, so they disagreed. */
+  /* padding:0 - see .chart-save: all three pills are native <button>s (the
+     download included, so Space activates it), and UA button padding would
+     squeeze the glyph. text-decoration:none is inert on them but kept harmless. */
   .log-ic{display:inline-flex;align-items:center;justify-content:center;width:25px;height:25px;padding:0;border-radius:7px;
     border:1px solid var(--line2);background:color-mix(in srgb,var(--bg2) 90%,transparent);color:var(--muted);
     font-size:13px;line-height:1;cursor:pointer;text-decoration:none;transition:color .12s,border-color .12s;}
@@ -1972,7 +1978,7 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
             </div>
             <div class="afield">
               <span class="lbl">Password <span class="muted" id="pwState" style="font-weight:400"></span>
-                <span class="info" tabindex="0" data-tip="Set or change the login password (up to 72 bytes - the bcrypt limit; accented, CJK, or emoji characters count as several bytes). Leave blank to keep the current one. Applied on Save. Forgot it? Run pingularity reset-auth on the host to clear it and disable auth.">i</span></span>
+                <span class="info" tabindex="0" id="pwInfo" data-tip="Set or change the login password (up to 72 bytes - the bcrypt limit; accented, CJK, or emoji characters count as several bytes). Leave blank to keep the current one. Applied on Save. Forgot it? Run pingularity reset-auth on the host to clear it and disable auth.">i</span></span>
               <input type="password" id="authPass" autocomplete="new-password" placeholder="Set a password" maxlength="72">
             </div>
             <div class="afield" id="curPassField" style="display:none">
@@ -2142,7 +2148,7 @@ Applies live and persists.">i</span></span>
           <div class="log-wrap">
             <div class="log-tools">
               <button class="log-ic" id="logCopy" type="button" title="Copy logs" aria-label="Copy logs">⧉</button>
-              <a class="log-ic" id="logDownload" href="#" role="button" title="Download logs" aria-label="Download logs">⤓</a>
+              <button class="log-ic" id="logDownload" type="button" title="Download logs" aria-label="Download logs">⤓</button>
               <button class="log-ic" id="logClear" type="button" title="Clear logs" aria-label="Clear logs"></button>
             </div>
             <pre class="log-window" id="logWindow" aria-live="polite" tabindex="0">Open this tab to load recent logs…</pre>
@@ -2299,7 +2305,7 @@ The window button takes a duration (7d) or a date range typed how you like it - 
             <option selected>10</option><option>25</option><option>50</option><option>100</option><option>250</option>
           </select>
         </label>
-        <a class="btn ghost" id="csvDownload" href="#" role="button" style="text-decoration:none">⤓ CSV</a>
+        <button class="btn ghost" id="csvDownload" type="button">⤓ CSV</button>
         <span style="flex:1"></span>
         <button class="btn ghost" id="runsPrev" type="button">‹ Prev</button>
         <span class="mono" id="runsPageInfo"></span>
@@ -4734,6 +4740,13 @@ function spMeasured(p,key){
   if(key==='up_mbps') return p.upload_bytes!=null && isNum(p[key]);
   return isNum(p[key]);
 }
+// The ping half of that predicate. ping_ms==0 is the "not probed" sentinel, not a
+// zero-latency sample (a real measurement is never 0), and an iperf3 run that moved
+// real bytes with the latency probe off carries exactly that - so byte presence
+// cannot stand in for it. Every surface rendering a SINGLE run's ping gates on this
+// (chart, tooltip, runs table, tiles via pingText, the range average), or the same
+// row reads as "-" in one place and a perfect 0.0 ms in the next.
+function pingMeasured(p){ return isNum(p.ping_ms) && p.ping_ms>0; }
 // spdAverages reduces the rows the speed/quality charts are drawing - spdData, which
 // is whatever /api/speed returned for the current selection, so a rolling window and
 // a pinned span are both covered without asking which is in force - to one mean per
@@ -4777,7 +4790,7 @@ function spdAverages(rows){
     // Per METRIC, never per row - see above.
     if(spMeasured(p,'down_mbps')){ dn+=p.down_mbps; dc++; }
     if(spMeasured(p,'up_mbps')){ up+=p.up_mbps; uc++; }
-    if(isNum(p.ping_ms) && p.ping_ms>0){ pg+=p.ping_ms; pc++; }
+    if(pingMeasured(p)){ pg+=p.ping_ms; pc++; }
   }
   return {down: dc?dn/dc:null, up: uc?up/uc:null, ping: pc?pg/pc:null};
 }
@@ -4911,21 +4924,23 @@ function drawQualityChart(points){
   const mine=TC.xLab && axisWorthDrawing(realRuns) && spdAxisOwner(points)==='qualityChart';
   const pad={l:padL(40),r:padR(10),t:2,b:mine?AX_PAD:0}, H=h-pad.t-pad.b, X=xMap(points,pad.l,pad.r,w), bot=pad.t+H;
   drawYTitle(x,"PING (ms)",w,pad,H);
-  const env=points.map(p=>isNum(p.ping_ms)?p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0):NaN).filter(isNum);
+  // pingMeasured, not isNum: a ping_ms of 0 is "not probed", and drawing it would
+  // put a perfect zero-latency point (and a 0-anchored jitter band) on the chart.
+  const env=points.map(p=>pingMeasured(p)?p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0):NaN).filter(isNum);
   const maxV=Math.max(10, ...(env.length?env:[10]))*1.2, Y=v=>pad.t+(1-v/maxV)*H;
   x.font='11px ui-monospace,monospace';
   // Only the middle reference line - the top/bottom edge gridlines read as a divider
   // rule above the chart, so they are dropped.
   { const yy=pad.t+H/2; if(TC.gridOn){ x.strokeStyle=TC.grid; x.beginPath(); x.moveTo(pad.l,yy); x.lineTo(w-pad.r,yy); x.stroke(); }
     if(TC.yLab){ x.fillStyle=TC.axis; x.textAlign='left'; x.fillText((maxV/2).toFixed(0),6,yy+3); } }
-  const pp=points.filter(p=>isNum(p.ping_ms));
+  const pp=points.filter(pingMeasured);
   if(pp.length){
     x.beginPath();
     pp.forEach((p,i)=>{ const yu=Y(p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0)); i?x.lineTo(X(p.ts),yu):x.moveTo(X(p.ts),yu); });
     for(let i=pp.length-1;i>=0;i--){ const p=pp[i]; x.lineTo(X(p.ts),Y(Math.max(0,p.ping_ms-(isNum(p.jitter_ms)?p.jitter_ms:0)))); }
     x.closePath(); x.fillStyle=TC.jit; x.fill();
-    spdLine(x,points,X,Y,'ping_ms',TC.ping,TC.lw);
-    if(oneRun){ const p=points[points.length-1]; if(isNum(p.ping_ms)) chartDot(x,X(p.ts),Y(p.ping_ms),TC.ping); }
+    spdLine(x,pp,X,Y,'ping_ms',TC.ping,TC.lw);   // pp, not points: spdLine's own filter is isNum, which keeps the 0 sentinel
+    if(oneRun){ const p=points[points.length-1]; if(pingMeasured(p)) chartDot(x,X(p.ts),Y(p.ping_ms),TC.ping); }
   }
   // Max-ping threshold: not folded into the axis (it's usually well above the
   // data, and flattening the chart to fit it would hide the useful detail), so
@@ -5418,12 +5433,23 @@ const lossStr = v => (typeof v==='number') ? (v>0&&v<0.1 ? '<0.1%' : v.toFixed(1
 const msStr = v => (typeof v==='number') ? (v>0&&v<0.1 ? '<0.1 ms' : v.toFixed(1)+' ms') : '-';
 // The address family a run actually measured. Family "auto" resolves invisibly
 // (a dual-stack native host lands on IPv6 where a v4-only path silently measures
-// IPv4), so the detailed run views name it. '' = unrecorded (older rows, engines
-// that don't report it) - shown as nothing, never guessed.
-function famLabel(f){ return f==='6' ? 'IPv6' : f==='4' ? 'IPv4' : ''; }
+// IPv4), so the detailed run views name it. 'mixed' = the two directions really
+// used different families (iperf runs them as separate processes, and a
+// dual-stack hostname can resolve differently for each) - named as both, since
+// neither may claim the row. '' = unrecorded (older rows, engines that don't
+// report it) - shown as nothing, never guessed.
+function famLabel(f){ return f==='6' ? 'IPv6' : f==='4' ? 'IPv4' : f==='mixed' ? 'IPv4+IPv6' : ''; }
+// Extra context only 'mixed' needs: its label alone reads like one dual-stack
+// transfer. Engine-scoped, because 'mixed' means different things: iperf3 runs
+// each direction as its own process, so the two directions really did use
+// different families; Ookla records ONE family set across both directions and
+// every retry, so all it can honestly say is that both showed up somewhere.
+// '' for every other value = no tooltip attribute at all.
+function famTitle(f, eng){ return f!=='mixed' ? '' : eng==='iperf3' ? 'Download and upload were measured over different IP families' : 'Both IP families carried traffic during this run, across its directions and any retries'; }
 // Which way the UDP loss/jitter probe sampled. Loss on an asymmetric path
 // differs by direction, so surfaces showing loss/jitter carry this label - but
-// ONLY when the sample recorded one ('' otherwise: older rows, Ookla).
+// ONLY when the sample recorded one ('' otherwise: older rows, or a run whose
+// loss probe never succeeded).
 function udpDirLabel(d){ return d==='down' ? 'download path' : d==='up' ? 'upload path' : ''; }
 // The run tooltip's Quality readouts. The probe-direction label rides along
 // exactly when the sample carries one AND something the probe measured
@@ -5431,7 +5457,7 @@ function udpDirLabel(d){ return d==='down' ? 'download path' : d==='up' ? 'uploa
 // probe for.
 function qualityParts(p){
   const ext=[];
-  if(typeof p.ping_ms==='number') ext.push(p.ping_ms.toFixed(1)+' ms ping');
+  if(pingMeasured(p)) ext.push(p.ping_ms.toFixed(1)+' ms ping');   // 0 = not probed, so the line is omitted rather than read as 0.0 ms
   if(typeof p.jitter_ms==='number') ext.push(p.jitter_ms.toFixed(1)+' ms jitter');
   if(typeof p.packet_loss==='number') ext.push(lossStr(p.packet_loss)+' loss'); // same 1-decimal readout as the card and runs table
   const dir=udpDirLabel(p.udp_direction);
@@ -5486,13 +5512,13 @@ async function loadRuns(){
       <td class="mono">${fmtTime(r.ts)}</td>
       <td class="mono">${spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
       <td class="mono">${spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
-      <td class="mono">${num1(r.ping_ms)}</td>
+      <td class="mono">${pingMeasured(r)?num1(r.ping_ms):'-'}</td>
       <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${msStr(r.jitter_ms)}</td>
       <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${lossStr(r.packet_loss)}</td>
       <td class="mono">${bloatCell(r.idle_ms, r.loaded_down_ms, r.loaded_up_ms)}</td>
       <td class="mono">${bytesStr(r.download_bytes)}</td>
       <td class="mono">${bytesStr(r.upload_bytes)}</td>
-      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}${famLabel(r.ip_family)?' <span class="muted">· '+famLabel(r.ip_family)+'</span>':''}</td>
+      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}${famLabel(r.ip_family)?' <span class="muted"'+(famTitle(r.ip_family,engOf(r))?' title="'+famTitle(r.ip_family,engOf(r))+'"':'')+'>· '+famLabel(r.ip_family)+'</span>':''}</td>
       <td class="mono">${esc(r.server_id)}</td>
       <td>${esc(r.isp)}</td>
       <td>${esc(r.isp_location)}</td>
@@ -5601,11 +5627,50 @@ $('outagesToggle').addEventListener('click', () => {
   const open = $('outagesSection').style.display==='none';
   setOutagesOpen(open);
   if(open) loadOutages();
-  else if(outageSelDay){ outageSelDay=null; drawHeatmap(); } // closing drops the day pin
+  else if(outageSelDay){ outageSelDay=null; outageSelTs=0; drawHeatmap(); } // closing drops the day pin
 });
 // Clicking a heatmap day pins it: opens the outages table, pages to that day's
 // events and highlights them (same ts-keyed linking the speed charts use).
-let outageSelDay=null;
+// outageSelTs is the row that day mapped to, needed because a continuation day's
+// row is dated OUTSIDE the day (see hmScanDay).
+let outageSelDay=null, outageSelTs=0;
+// Local midnight bounds [from,to) of a heatmap day key. Built from the parts and
+// via day+1 - Date.parse("2026-07-15") is UTC, and month ends/DST make arithmetic
+// on the seconds wrong - so these are the same local days the backend bucketed in.
+function hmDayRange(day){ const p=(day||'').split('-').map(Number);
+  return [Math.floor(new Date(p[0],p[1]-1,p[2]).getTime()/1000), Math.floor(new Date(p[0],p[1]-1,p[2]+1).getTime()/1000)]; }
+// Which outages-table row a pinned heatmap day points at. Fed one newest-first
+// page of events at a time (the API has no day-locate); `st` carries the walk
+// across page boundaries. Returns the row's GLOBAL index + its ts, and done=true
+// once the answer is settled (idx<0 = this day has no locatable row).
+//
+// A day usually holds its own event - the outage started, or recovered, on it.
+// A CONTINUATION day holds none: the backend prorates a multi-day outage's
+// downtime onto every day it spans but counts the outage only on the day it began
+// (store.go DowntimeByDay), so Tuesday of a Mon 23:00 -> Wed 01:00 outage is
+// shaded, and clickable, with no event dated inside it. It maps to the outage
+// ENCLOSING it - the recovery that closed it, or, for one still running, the
+// 'down' that opened it - rather than being made inert: a day the operator can
+// see was offline should reach the outage that made it so, and the alternative
+// (only days with their own event stay clickable) cannot be expressed here,
+// since a recovery day is also outages=0 and its click has always worked.
+// Walking newest-first, st.up is always the nearest recovery AFTER the event in
+// hand, which is what pairs a 'down' with its own 'up' even when a restart
+// re-detected the outage and left extra 'down' rows between them.
+function hmScanDay(evs, off, from, to, st){
+  for(let i=0;i<evs.length;i++){
+    const e=evs[i];
+    if(e.ts>=from && e.ts<to) return {idx:off+i, ts:e.ts, done:true};   // the day's own event
+    if(e.type==='up'){ st.up=off+i; st.upTs=e.ts; continue; }
+    if(e.ts<from){
+      // The first 'down' older than the day decides it: with no in-day event, the
+      // day is covered exactly when that outage was still running when it began.
+      if(st.up==null) return {idx:off+i, ts:e.ts, done:true};           // never recovered - still down
+      return st.upTs>from ? {idx:st.up, ts:st.upTs, done:true} : {idx:-1, ts:0, done:true};
+    }
+  }
+  return {idx:-1, ts:0, done:false};   // this page settles nothing - keep paging
+}
 // Keyboard activation: Enter/Space on a focused outage cell fires the same click
 // path (so all the pin/paging logic stays in one place).
 $('heatmap').addEventListener('keydown', e=>{
@@ -5616,20 +5681,22 @@ $('heatmap').addEventListener('keydown', e=>{
 $('heatmap').addEventListener('click', async e=>{
   const cell=e.target.closest('.cell.ev'); if(!cell) return;
   outageSelDay = outageSelDay===cell.dataset.day ? null : cell.dataset.day; // re-click unpins
+  outageSelTs=0;
   drawHeatmap();
   if(!outageSelDay){ loadOutages(); return; }
   setOutagesOpen(true);
   // No day-locate on the API, and it caps limit at 1000 - so page through in
-  // 1000-event chunks (events are tiny) until the selected day appears,
+  // 1000-event chunks (events are tiny) until the selected day resolves,
   // accumulating the global index. Fetching a single 5000 page silently saw
   // only the newest 1000, so days older than that never located.
   try{
+    const [from,to]=hmDayRange(outageSelDay), st={up:null,upTs:0};
     let found=-1;
     for(let off=0; off<50000; off+=1000){
       const d=await (await fget('api/events?limit=1000&offset='+off)).json();
       const evs=d.events||[];
-      const idx=evs.findIndex(ev=>fmtLocalDate(new Date(ev.ts*1000))===outageSelDay);
-      if(idx>=0){ found=off+idx; break; }
+      const r=hmScanDay(evs, off, from, to, st);
+      if(r.done){ found=r.idx; outageSelTs=r.ts; break; }
       if(evs.length<1000) break; // reached the end of the list
     }
     if(found>=0) outagesPage=Math.floor(found/outagesPerPage)+1;
@@ -5646,6 +5713,12 @@ let outagesSeq=0; // only the newest in-flight outages poll repaints the table (
 // a real outage the server will delete, so duration must NOT gate the affordance.
 // Shared by this table's render and the delete handler's confirm below.
 function outageDeletable(e){ return !!e && e.type==='up'; }
+// Rows the pinned heatmap day highlights: everything dated inside the day, plus
+// the row that day mapped to. The second half is what a continuation day needs -
+// its enclosing outage closes on a LATER day, so a date match alone highlighted
+// nothing and the click looked broken (see hmScanDay).
+function evHighlighted(e){ return !!outageSelDay &&
+  (fmtLocalDate(new Date(e.ts*1000))===outageSelDay || (!!outageSelTs && e.ts===outageSelTs)); }
 async function loadOutages(){
   const my=++outagesSeq;
   let data; try{ data=await (await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`)).json(); }catch(e){ return; }
@@ -5653,7 +5726,7 @@ async function loadOutages(){
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(); } // page emptied
   $('events').innerHTML = ev.length ? ev.map(e=>`
-    <tr${outageSelDay&&fmtLocalDate(new Date(e.ts*1000))===outageSelDay?' class="ev-hl"':''}><td class="act">${outageDeletable(e)?`<button class="run-del" type="button" data-ts="${e.ts}"${e.has_duration?` data-dur="${e.duration_s}"`:''} title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
+    <tr${evHighlighted(e)?' class="ev-hl"':''}><td class="act">${outageDeletable(e)?`<button class="run-del" type="button" data-ts="${e.ts}"${e.has_duration?` data-dur="${e.duration_s}"`:''} title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
         <td>${fmtTime(e.ts)}</td>
         <td class="${e.type==='up'?'ev-up':'ev-down'}">${e.type==='up'?'Reconnected':'Link down'}</td>
         <td>${e.type==='up'&&e.has_duration?fmtDur(e.duration_s):'-'}</td></tr>`).join('')
@@ -5765,7 +5838,12 @@ function drawHeatmap(){
     // there is nothing for a click to open.
     if(hasEv || unobs){
       const parts=[];
-      if(hasEv) parts.push(`${rec.outages} outage(s), ${fmtDur(s)} down`);
+      // outages counts only the outages that BEGAN here, so a day carrying nothing
+      // but prorated downtime - a continuation day, or the day one recovered - has
+      // 0 of them; printing "0 outage(s)" over hours of downtime reads as a bug.
+      // Its click resolves to the enclosing outage (hmScanDay), so it stays live.
+      if(hasEv) parts.push(rec.outages>0 ? `${rec.outages} outage(s), ${fmtDur(s)} down`
+        : `${fmtDur(s)} down, from an outage that began earlier`);
       if(dark) parts.push('not monitored');
       else if(unobs) parts.push(`monitored ${fmtDur(obsS)} of ${fmtDur(winS)}`);
       const what = parts.join(' · ');
@@ -6190,23 +6268,35 @@ function setServerLoading(on){
   w.classList.toggle('loading', on);
   $('setServer').disabled=on;
 }
+// Every list request takes the next generation and only the NEWEST one may write
+// the page's scope/list state - the same rule runsSeq/outagesSeq/heatmapSeq apply
+// to their polls. These requests overlap for real: ticking Auto starts the auto
+// refetch while a city search is still in flight, and a settings reload (drawer
+// reopen, import) refetches under a running search. Without the generation the
+// slower response lands last and restores city scope - and a city list - under a
+// checked Auto box, or the older of two searches wins.
+let serversGen=0;
 async function fetchServers(opts){
   opts=opts||{};
   let u='api/speedtest/servers';
   if(opts.id) u+='?id='+encodeURIComponent(opts.id);
   else if(opts.city) u+='?city='+encodeURIComponent(opts.city);
   else if(opts.lat) u+=`?lat=${encodeURIComponent(opts.lat)}&lon=${encodeURIComponent(opts.lon)}`;
+  const my=++serversGen;
   setServerLoading(true);
   try{
     // POST with a JSON content type, not a bare GET: the daemon requires both
     // before it will reach out to Ookla/the geocoder, so a page on another site
     // cannot aim this at someone's localhost (see handleSpeedtestServers).
     const d=await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'}})).json();
+    if(my!==serversGen) return;   // superseded while in flight: this answer is no longer the page's truth
     if(opts.id){ pendingServer=String(opts.id); autoLoc=''; autoLabel=''; } // pin a specific server (not a location scope)
     else if(opts.city){ autoLoc=`${d.lat},${d.lon}`; autoLabel=shortPlace(d.location); pendingServer=''; } // a fresh city search sets the auto scope, clearing any pinned server
     else { autoDefaultLoc=shortPlace(d.location||''); autoCentreLastRun = d.centre==='last_run'; } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
     populateServers(d.servers);
-  }finally{ setServerLoading(false); }
+    // Scoped to the newest request too: an abandoned one finishing must not clear
+    // the spinner the live request is still showing.
+  }finally{ if(my===serversGen) setServerLoading(false); }
 }
 const serverTabActive = () => { const at=document.querySelector('.tab.active');
   return _drawer.classList.contains('open') && at && at.dataset.tab==='server'; };
@@ -6237,15 +6327,19 @@ async function searchServers(){
   const b=$('serverSearchBtn'); if(b.disabled) return; // a search is already running (re-entrant Enter)
   b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
   const opts = /^\d+$/.test(q) ? {id:q} : {city:q};   // all-digits = pin an exact Ookla server ID
-  const p=fetchServers(opts);
+  const p=fetchServers(opts), myGen=serversGen;   // fetchServers takes its generation synchronously, so this names THIS request
   serverSearchInFlight=p; serverSearchFailed=false;
   // On success the query is consumed (the scope note carries it now) - clear the
   // box so Save's leftover-text re-search can't wipe a later dropdown pick, and
   // drop any error styling left by an earlier failed attempt.
-  try{ await p; $('serverCity').value=''; clearServerFieldError(); }
-  catch(e){ serverFieldError(opts.id ? ('server '+q+' not found') : 'city not found'); serverSearchFailed=true; }
-  finally{ if(serverSearchInFlight===p) serverSearchInFlight=null; }
-  b.disabled=false; b.innerHTML=t;
+  // Both arms are generation-guarded: a search abandoned mid-flight (Auto ticked,
+  // a newer request started) must not touch the box or paint "city not found" over
+  // a page that has moved on - fetchServers already dropped its answer.
+  try{ await p; if(myGen!==serversGen) return; $('serverCity').value=''; clearServerFieldError(); }
+  catch(e){ if(myGen!==serversGen) return;
+    serverFieldError(opts.id ? ('server '+q+' not found') : 'city not found'); serverSearchFailed=true; }
+  finally{ if(serverSearchInFlight===p) serverSearchInFlight=null;
+    b.disabled=false; b.innerHTML=t; }   // in the finally so an abandoned search still releases the button
 }
 function applyPendingServer(){
   const sel=$('setServer');
@@ -6295,6 +6389,9 @@ $('serverCity').addEventListener('input', clearServerFieldError);
 // auto), so no separate setting is needed.
 function chooseAutoServer(){
   $('serverCity').value=''; clearServerFieldError(); // else a prior search error lingers in the footer under a now-hidden box
+  // An in-flight city search is abandoned by the refetch below - it takes the next
+  // generation, so the city answer lands superseded (see fetchServers). Reachable
+  // only from the open Server tab, so that refetch always happens.
   pendingServer=''; autoLoc=''; autoLabel='';
   $('setServer').value='';
   updateScopeNote();
@@ -6492,6 +6589,7 @@ function applySettings(s){
   iperfAvailable = s.iperf3_available !== false;
   iperfVersion = s.iperf3_version || ''; // "" when absent/unparseable; drives the version note
   iperfInContainer = s.containerized === true; // picks the "how to enable iperf3" note: package vs -iperf image
+  updateResetAuthHint(); // and the forgot-the-password recovery advice, which names a different machine in a container
   iperfBridged = s.bridged === true; // keys the loopback-target trap: only a BRIDGED container's localhost is the container itself
   iperfWanted = (s.speed_engine==='iperf3');
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable;
@@ -6975,40 +7073,39 @@ function getCats(id){ return Array.from(document.querySelectorAll('#'+id+' .cat.
 // GET carries the cookie but NOT X-Pingularity-UI, so on an expired session it
 // draws the browser's Basic prompt instead of the SPA login. fetch()->blob()
 // goes through window.fetch (marked), whose 401 handler shows the login overlay.
-// Buffer at most this before giving up. downloadVia routes through the marked
-// fetch (so an expired session shows OUR login, not the Basic prompt), which
-// means holding the body in memory - fine for logs/CSV (ring / retention bounded)
-// and normal exports, but a giant backup would exhaust the browser. Past this
-// cap we abort and tell the operator to use the streaming route (the DB file /
-// CLI) rather than letting the tab hang. A real in-browser streaming download
-// needs a session-bound token; this is the honest cheap guard until then.
-const downloadCapBytes = 100*1024*1024; // 100 MiB
+// A sanity ceiling on a DECLARED response size, not a buffer budget. It only
+// fires when the server sends a Content-Length above it; the export streams
+// chunked and declares none, so a real backup is never refused by size.
+//
+// It used to be a 100 MiB buffer cap, and that was the wrong shape twice over:
+// the body was accumulated in the JS heap (the browser's own blob store spills
+// to disk and holds far more), and 100 MiB is well inside NORMAL use. Measured:
+// a default install at its own 30-day retention - the shipped 3 probe targets
+// at 5s, DNS probing on - exports about 150 MiB, so the guard fired during
+// ordinary operation and refused the backup an operator takes precisely before
+// doing something risky. A guard that trips on the happy path is worse than no
+// guard: it teaches people the feature is broken.
+const downloadCapBytes = 2*1024*1024*1024; // 2 GiB, declared-size only
 async function downloadVia(url, fallbackName){
-  // Returns 'ok' | 'toobig' | 'fail'. Streams into a bounded buffer instead of
-  // r.blob() so an oversized response is caught BEFORE it eats all of memory.
+  // Returns 'ok' | 'toobig' | 'fail'. 'toobig' means the SERVER declared a size
+  // past downloadCapBytes - not that we gave up buffering.
   try{
     const r=await fetch(url);
     if(!r.ok) return 'fail'; // 401 already triggered showLogin() in the fetch wrapper
     const cd=r.headers.get('Content-Disposition')||'';
     const m=/filename="?([^"';]+)"?/i.exec(cd);
     const name=(m&&m[1])||fallbackName||'download';
-    let b;
-    if(r.body && r.body.getReader){
-      const reader=r.body.getReader(), chunks=[]; let total=0;
-      for(;;){
-        const {done, value}=await reader.read();
-        if(done) break;
-        total+=value.byteLength;
-        if(total>downloadCapBytes){ await reader.cancel(); return 'toobig'; }
-        chunks.push(value);
-      }
-      b=new Blob(chunks, {type: r.headers.get('Content-Type')||'application/octet-stream'});
-    } else {
-      // No streaming API (very old browser): can't cap mid-read, so refuse up
-      // front if the server declared a size over the cap; else fall back to blob.
-      if(parseInt(r.headers.get('Content-Length')||'0',10) > downloadCapBytes) return 'toobig';
-      b=await r.blob();
-    }
+    // Refuse only what the SERVER declares to be absurd; the export streams
+    // chunked and declares nothing, so in practice this never fires.
+    if(parseInt(r.headers.get('Content-Length')||'0',10) > downloadCapBytes) return 'toobig';
+    // Let the BROWSER own the bytes. r.blob() is backed by the blob store,
+    // which spills to disk; accumulating chunks in a JS array instead held the
+    // whole file in the JS heap and turned a routine backup into a refusal.
+    // Measured on a default install held at its OWN 30-day retention - 3 probe
+    // targets at 5s plus DNS - a full export is ~150 MiB, so the old 100 MiB
+    // buffer cap fired during normal use, on the one feature an operator
+    // reaches for right before doing something risky.
+    const b=await r.blob();
     const u=URL.createObjectURL(b), a=document.createElement('a');
     a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(u), 60000);
@@ -7298,7 +7395,12 @@ let saveInFlight=false;
       // I1, judged on the SAVED list (applySettings just re-baselined it): the save
       // went through - a loopback target is never a gate - but the drawer is closing
       // over the warn bubble, so the trap gets said out loud where the operator is.
-      { const lb=iperfLoopbackTrap();
+      // Gated on the engine, which the drawer's own bubble gets for free from the
+      // markup it sits in (#iperfServerRow is hidden under Ookla). Without it an
+      // Ookla install that still has an iperf3 server saved - added while trying
+      // it out, or kept for later - was warned on every save about an engine that
+      // never runs.
+      { const lb=$('setSpeedEngine').checked ? iperfLoopbackTrap() : null;
         if(lb) flashStatus('Saved - but '+(lb.label||lb.addr)+' points at localhost, which inside this bridged container is the container itself, not the machine running your iperf3 server. Use the host\'s LAN IP or host.docker.internal.'); } }
     // Access was POSTed first (and applied); if the settings POST fails, say so -
     // so Discard isn't mistaken for "nothing was saved".
@@ -7429,6 +7531,51 @@ $('loginForm').addEventListener('submit', async e=>{
   }catch(_){ err.textContent='Sign-in failed'; }
 });
 
+// The locked-out recovery advice, adapted to where the daemon actually runs.
+// "On the host" is the wrong machine for a containerized daemon: `pingularity`
+// lives in the image and its database on the volume, so a host shell either has
+// no such command or opens some other (empty) database, prints success, and
+// leaves the login that locked the operator out exactly where it was. The
+// container recipe is the README's (see its Docker section): a one-off container
+// sharing the volume, then a restart, because the running daemon holds settings
+// in memory and would otherwise keep demanding the password just cleared. The
+// text names that section instead of spelling the command out: the real command
+// needs an --entrypoint override (the image pins the `run` subcommand), the
+// pinned -db path, and the operator's own volume name and image tag - the page
+// knows none of those, and a guessed command that opens the wrong database
+// would report success and leave the operator locked out anyway.
+// Rewriting the one clause - rather than storing two whole sentences here -
+// keeps the markup the single source of the native wording; the tests drive this
+// with the strings the page actually ships, so a reword that this no longer
+// matches fails there instead of silently leaving the host-only advice up.
+function resetAuthText(s, containerized){
+  return containerized===true
+    ? String(s).replace('on the host to clear it and disable auth',
+        'from a one-off container sharing the volume to clear it and disable auth, then restart the container - see the README Docker section for the exact command')
+    : String(s);
+}
+// Repaint both places the advice appears. The native wording is cached on the
+// first call because the repaint overwrites it: once the container clause is in,
+// the element no longer holds the "on the host" clause resetAuthText rewrites,
+// so a repaint that read the element back would be rewriting its own output.
+// Working from the stashed copy, what is shown depends on the flag alone and
+// never on what the repaint before it left behind.
+function updateResetAuthHint(){
+  const hint=$('resetHint'), info=$('pwInfo');
+  if(hint){
+    if(hint.dataset.native===undefined) hint.dataset.native=hint.innerHTML;
+    hint.innerHTML=resetAuthText(hint.dataset.native, iperfInContainer);
+  }
+  if(info){
+    if(info.dataset.native===undefined) info.dataset.native=info.dataset.tip;
+    const tip=resetAuthText(info.dataset.native, iperfInContainer);
+    info.dataset.tip=tip;
+    // labelInfoBubbles copied the tooltip into aria-label once at startup and
+    // skips bubbles that already carry one, so the accessible name has to be
+    // rewritten here too or a screen reader keeps reading "on the host".
+    info.setAttribute('aria-label', tip);
+  }
+}
 // loadAccess populates the Access tab and shows the login overlay if required.
 async function loadAccess(){
   let a; try{ a=await (await fetch('api/access')).json(); }catch(_){ return; }

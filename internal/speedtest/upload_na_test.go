@@ -432,6 +432,91 @@ func TestUploadStarvationRescueNoopWhenHealthy(t *testing.T) {
 	t.Logf("healthy link unaffected: %.0f Mbps", res.UploadMbps)
 }
 
+// The harness's capture window must actually govern the transfers. measure()
+// swaps in a fresh DataManager per attempt (freshManager), and a rebuild that
+// does not carry the caller-configured window silently reverts to the
+// library's 15s default: a case advertising a short window still transferred
+// (and in the opt-in live probes, billed) at production length. The
+// discriminator is wall clock - a 1s window ends the upload phase in ~1s,
+// while the 15s default's earliest exit is the Welford early-close minimum of
+// ~10s (2x its 5s stabilizing window) even on an instantly-rejecting server.
+func TestFreshManagerCarriesCaptureWindow(t *testing.T) {
+	allowLoopbackProbes(t)
+	s := &naServer{mode: "403"}
+	base := s.start(t)
+
+	client, rec := newOoklaClientRec(&ookla.UserConfig{UserAgent: ookla.DefaultUserAgent})
+	srv, err := client.CustomServer(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Context.SetCaptureTime(time.Second)
+
+	// No real latency probes: the idle burst against an unreachable default
+	// target can spend up to lulIdleBudget, which would swamp the bound below.
+	lulResolveMu.Lock()
+	origResolved := lulResolved
+	lulResolved = "127.0.0.1:1"
+	lulResolveMu.Unlock()
+	t.Cleanup(func() {
+		lulResolveMu.Lock()
+		lulResolved = origResolved
+		lulResolveMu.Unlock()
+	})
+
+	oldPing := ooklaPing
+	ooklaPing = func(ctx context.Context, sv *ookla.Server, cb func(time.Duration)) error {
+		cb(10 * time.Millisecond)
+		sv.Latency = 10 * time.Millisecond
+		return nil
+	}
+	t.Cleanup(func() { ooklaPing = oldPing })
+
+	o := &Ookla{LossFn: func() bool { return false }, upRec: rec}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = o.measure(ctx, srv, "up", 0)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("harness: the all-403 upload should fail")
+	}
+	if s.posts.Load() == 0 {
+		t.Fatal("no POSTs reached the server - harness fault, not the regression")
+	}
+	t.Logf("configured 1s window: upload phase took %.2fs over %d POSTs", elapsed.Seconds(), s.posts.Load())
+	if elapsed >= 6*time.Second {
+		t.Fatalf("upload phase ran %.2fs on a 1s capture window - the rebuild discarded the configured window", elapsed.Seconds())
+	}
+}
+
+// The state half of the carry: the rebuilt manager reports the configured
+// window. This is also the canary for the reflection read managerCaptureTime
+// depends on - a speedtest-go upgrade that renames the private captureTime
+// field makes the FIRST assertion fail, naming the real cause, instead of the
+// carry silently degrading to the library default.
+func TestFreshManagerCarriesCaptureWindowState(t *testing.T) {
+	client, _ := newOoklaClientRec(&ookla.UserConfig{UserAgent: ookla.DefaultUserAgent})
+	srv, err := client.CustomServer("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Context.SetCaptureTime(4 * time.Second)
+	if got := managerCaptureTime(srv.Context); got != 4*time.Second {
+		t.Fatalf("managerCaptureTime read %v, want the 4s just set - the library's captureTime field moved (upgrade?)", got)
+	}
+	freshManager(&Ookla{}, srv, nil)
+	if got := managerCaptureTime(srv.Context); got != 4*time.Second {
+		t.Fatalf("rebuilt manager's window = %v, want the caller's 4s carried across", got)
+	}
+	// And a client that never configured one keeps the library default: the
+	// carry must not invent a value.
+	fresh, _ := newOoklaClientRec(&ookla.UserConfig{UserAgent: ookla.DefaultUserAgent})
+	if got := managerCaptureTime(fresh); got != ooklaCaptureTime {
+		t.Fatalf("unconfigured manager reports %v, want the library default %v", got, ooklaCaptureTime)
+	}
+}
+
 // Regression for a threshold mismatch: the rescue trigger counts attempts
 // cumulatively against starvationAttemptCeiling, but summary() used a separate
 // hardcoded 8. At the production default of one retry a starved 8-worker attempt
