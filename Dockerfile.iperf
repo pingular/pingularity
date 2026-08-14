@@ -22,7 +22,7 @@
 # in the default Dockerfile so the two bases stay in lock-step.
 
 # --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
-FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS setcap
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS setcap
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -45,7 +45,13 @@ COPY $TARGETPLATFORM/pingularity /pingularity
 RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data && touch /data/.pingularity-image-dir
 
 # --- final image: debian-slim carrying iperf3 + the capped binary ---
-FROM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+FROM debian:13-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+# Static attribution; version/revision are stamped per build by goreleaser
+# (dockers_v2 labels/annotations in .goreleaser.yaml), not hardcoded here.
+LABEL org.opencontainers.image.title="pingularity" \
+      org.opencontainers.image.description="Single-binary internet-connectivity monitor (iperf3-enabled image variant)." \
+      org.opencontainers.image.source="https://github.com/pingular/pingularity" \
+      org.opencontainers.image.licenses="MIT"
 # iperf3 gives the opt-in engine a binary to exec (pingularity looks it up on PATH
 # via exec.LookPath; the debian package installs /usr/bin/iperf3, pulling libiperf0
 # as a dependency). ca-certificates + tzdata are bundled by the distroless/static
@@ -80,7 +86,18 @@ COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
 RUN chmod 0700 /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity
+# Start in the writable data dir rather than / (unwritable for uid 65532), the
+# same guarantee the distroless base gives the default image via /home/nonroot:
+# anything that resolves a relative path lands somewhere the process can write.
+WORKDIR /var/lib/pingularity
 USER pingularity
+# Same healthcheck as the default image, exec form for parity (this image has a
+# shell, but the contract is one probe in both variants). The subcommand probes
+# http://127.0.0.1:9000/healthz; operators who change -listen must override this
+# healthcheck (or disable it), or the container reports unhealthy while the
+# daemon is fine.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD ["/pingularity", "healthz"]
 # Pin the database onto the volume, exactly as the default image does: without this
 # the path is chosen from the effective uid and a --user override would fall back to
 # a temp dir inside the writable layer, leaving the mounted volume empty so updates

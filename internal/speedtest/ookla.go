@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"runtime"
 	"runtime/debug"
@@ -99,6 +100,13 @@ type Ookla struct {
 	// with the same location, user agent and connection count. Set by RunReason;
 	// safe as a plain field for the same single-flight reason as upRec.
 	uc *ookla.UserConfig
+
+	// attemptT is the http.Transport behind the CURRENT attempt's client (see
+	// freshManager), kept so the next rebuild can CloseIdleConnections on the
+	// client it abandons - its keep-alive sockets would otherwise linger for the
+	// library transport's full 90s IdleConnTimeout. Safe as a plain field for
+	// the same single-flight reason as upRec.
+	attemptT *http.Transport
 }
 
 // logf records a best-of-N step when a logger is wired, and is a no-op otherwise.
@@ -483,8 +491,31 @@ func probeDialGuard(_, address string, _ syscall.RawConn) error {
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
+		if isConfiguredProxy(address) {
+			return nil
+		}
 		return fmt.Errorf("blocked probe to unresolved address %q", address)
 	}
+	if err := blockedIP(ip); err != nil {
+		// The ONE internal endpoint a dial may legitimately reach: the
+		// operator's own forward proxy. HTTP(S)_PROXY/ALL_PROXY are trusted
+		// local configuration, and when they are set net/http routes every
+		// library request THROUGH that endpoint, so refusing its (often
+		// loopback or LAN) address broke every catalogue fetch, ranking ping
+		// and transfer behind such a proxy. Exact host:port only - the rest of
+		// the proxy's network stays refused. Consulted only on a refusal, so
+		// the public fast path never reads the environment.
+		if isConfiguredProxy(address) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// blockedIP is the guard's verdict on one resolved IP, shared by the dial-time
+// guard and the proxied-destination pre-check (see guardProxiedDestination).
+func blockedIP(ip net.IP) error {
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
 	}
@@ -517,12 +548,15 @@ func probeDialGuard(_, address string, _ syscall.RawConn) error {
 // predicates above. To4() has already normalized IPv4-mapped forms (e.g.
 // ::ffff:100.64.0.5), so Contains catches those too.
 var blockedProbeNets = func() []*net.IPNet {
-	nets := make([]*net.IPNet, 0, 4)
+	nets := make([]*net.IPNet, 0, 7)
 	for _, cidr := range []string{
-		"100.64.0.0/10",  // RFC 6598 shared address space (CGNAT / Tailscale)
-		"192.0.2.0/24",   // RFC 5737 TEST-NET-1
-		"198.18.0.0/15",  // RFC 2544 benchmarking
-		"203.0.113.0/24", // RFC 5737 TEST-NET-3
+		"100.64.0.0/10",   // RFC 6598 shared address space (CGNAT / Tailscale)
+		"192.0.0.0/24",    // RFC 6890 IETF protocol assignments (DS-Lite CPE, ...)
+		"192.0.2.0/24",    // RFC 5737 TEST-NET-1
+		"198.18.0.0/15",   // RFC 2544 benchmarking
+		"198.51.100.0/24", // RFC 5737 TEST-NET-2
+		"203.0.113.0/24",  // RFC 5737 TEST-NET-3
+		"240.0.0.0/4",     // RFC 1112 class E reserved (incl. 255.255.255.255)
 	} {
 		if _, n, err := net.ParseCIDR(cidr); err == nil {
 			nets = append(nets, n)
@@ -530,6 +564,275 @@ var blockedProbeNets = func() []*net.IPNet {
 	}
 	return nets
 }()
+
+// ---- Operator proxy handling -------------------------------------------------
+//
+// HTTP(S)_PROXY/ALL_PROXY are operator-trusted local configuration. Two sides:
+//
+//   - the dial guard must ALLOW the configured proxy endpoint (see
+//     probeDialGuard), or nothing works behind a loopback/LAN proxy;
+//   - a proxied request's dial only ever names the proxy - the real
+//     destination rides inside the request (CONNECT target / absolute URL) -
+//     so the LOGICAL destination must be validated separately (see
+//     guardProxiedDestination), or a hostile catalogue entry naming an
+//     internal host tunnels straight past the dial guard.
+
+// proxyEnvVars are the variables net/http's ProxyFromEnvironment consults,
+// uppercase preferred - the same precedence it applies.
+var proxyEnvVars = [][2]string{
+	{"HTTP_PROXY", "http_proxy"},
+	{"HTTPS_PROXY", "https_proxy"},
+	{"ALL_PROXY", "all_proxy"},
+}
+
+// proxyAddrs returns the configured proxy endpoints as host:port, read fresh
+// from the environment on every call (three Getenvs - cheap, and it keeps
+// t.Setenv-driven tests honest where net/http's own once-cached copy is not).
+func proxyAddrs() []string {
+	var out []string
+	for _, kv := range proxyEnvVars {
+		v := os.Getenv(kv[0])
+		if v == "" {
+			v = os.Getenv(kv[1])
+		}
+		if v == "" {
+			continue
+		}
+		hp := proxyHostPort(v)
+		if hp == "" {
+			continue
+		}
+		dup := false
+		for _, have := range out {
+			if have == hp {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, hp)
+		}
+	}
+	return out
+}
+
+// proxyHostPort extracts host:port from one proxy environment value the way
+// net/http's environment parsing does: a bare "host[:port]" gets scheme http,
+// and a missing port gets the scheme's default (80/443/1080).
+func proxyHostPort(v string) string {
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" {
+		u, err = url.Parse("http://" + v)
+		if err != nil || u.Host == "" {
+			return ""
+		}
+	}
+	host, port := u.Hostname(), u.Port()
+	if host == "" {
+		return ""
+	}
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// isConfiguredProxy reports whether a dial address is one of the operator's
+// configured proxy endpoints. Dialer.Control sees the POST-DNS ip:port, so a
+// proxy configured by name is compared against both the name:port form and the
+// name's resolved addresses.
+func isConfiguredProxy(address string) bool {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	dip := net.ParseIP(host)
+	for _, hp := range proxyAddrs() {
+		phost, pport, err := net.SplitHostPort(hp)
+		if err != nil || pport != port {
+			continue
+		}
+		if strings.EqualFold(phost, host) {
+			return true
+		}
+		if pip := net.ParseIP(phost); pip != nil {
+			if dip != nil && pip.Equal(dip) {
+				return true
+			}
+			continue
+		}
+		if dip == nil {
+			continue
+		}
+		for _, rip := range resolvedProxyIPs(phost) {
+			if rip.Equal(dip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// proxyResolveTTL bounds the proxy-hostname cache below: long enough that a
+// refused dial does not pay a lookup every time, short enough that a proxy
+// that moves is picked up promptly.
+const proxyResolveTTL = time.Minute
+
+var (
+	proxyResolveMu    sync.Mutex
+	proxyResolveCache = map[string]proxyResolved{}
+)
+
+type proxyResolved struct {
+	ips     []net.IP
+	expires time.Time
+}
+
+// resolvedProxyIPs resolves a proxy HOSTNAME from the environment, cached (see
+// proxyResolveTTL). The key set is operator-controlled - at most one host per
+// proxy variable - so the cap below is belt-and-braces, not a working bound.
+// A failed lookup is cached too: a dead proxy name would otherwise re-resolve
+// on every refused dial.
+func resolvedProxyIPs(host string) []net.IP {
+	now := time.Now()
+	proxyResolveMu.Lock()
+	if e, ok := proxyResolveCache[host]; ok && now.Before(e.expires) {
+		proxyResolveMu.Unlock()
+		return e.ips
+	}
+	proxyResolveMu.Unlock()
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		ips = nil
+	}
+	proxyResolveMu.Lock()
+	if len(proxyResolveCache) >= 16 {
+		clear(proxyResolveCache)
+	}
+	proxyResolveCache[host] = proxyResolved{ips: ips, expires: now.Add(proxyResolveTTL)}
+	proxyResolveMu.Unlock()
+	return ips
+}
+
+// guardProxiedDestination validates the LOGICAL destination of a request that
+// will traverse the operator's proxy: internal IP-literals are refused
+// outright, hostnames are resolved here and every address checked before the
+// name is used. Our lookup and the proxy's are two separate resolutions, so a
+// DNS-rebinding window remains (documented in docs/security-model.md) - the
+// literal check, which is what a catalogue entry realistically carries, has no
+// such window. A hostname that does not resolve is refused rather than waved
+// through: allowing it would let a split-horizon name pass unvetted.
+//
+// hostport is "host" or "host:port". Inert when no proxy is configured - every
+// dial then carries the real destination ip:port and probeDialGuard covers it -
+// and under the same relaxation the dial guard honours (probeDialControl set
+// nil by allowLoopbackProbes), so loopback-served tests keep working.
+func guardProxiedDestination(ctx context.Context, hostport string) error {
+	if probeDialControl == nil || len(proxyAddrs()) == 0 {
+		return nil
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	if host == "" {
+		return fmt.Errorf("blocked proxied request with empty host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return blockedIP(ip)
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return fmt.Errorf("blocked proxied request to unresolvable host %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if e := blockedIP(ip); e != nil {
+			return fmt.Errorf("host %q resolves internal: %w", host, e)
+		}
+	}
+	return nil
+}
+
+// serverDestination is the network destination a server's requests will name:
+// the catalogue Host when present (currentEndpoint copies it into s.URL, and
+// the packet-loss analyzer dials it), else the URL's own host.
+func serverDestination(s *ookla.Server) string {
+	if s == nil {
+		return ""
+	}
+	if s.Host != "" {
+		return s.Host
+	}
+	if u, err := url.Parse(s.URL); err == nil {
+		return u.Host
+	}
+	return ""
+}
+
+// guardedServers drops catalogue entries whose logical destination a proxied
+// request must not name (see guardProxiedDestination): with a proxy configured
+// the ranking pings and transfers would otherwise carry a hostile entry's
+// internal Host through the proxy, past the dial guard. Without one the list
+// passes through untouched - direct dials stay covered at dial time.
+//
+// Both destinations an entry carries are vetted, not just serverDestination's
+// pick: the city race pings s.URL WITHOUT the currentEndpoints rewrite that
+// makes URL and Host name the same endpoint on the fetchServerList path, so a
+// benign Host paired with a hostile URL would otherwise keep its ping.
+func guardedServers(ctx context.Context, servers ookla.Servers) ookla.Servers {
+	if probeDialControl == nil || len(proxyAddrs()) == 0 {
+		return servers
+	}
+	out := make(ookla.Servers, 0, len(servers))
+	for _, s := range servers {
+		dest := serverDestination(s)
+		err := guardProxiedDestination(ctx, dest)
+		if err == nil {
+			if u, uerr := url.Parse(s.URL); uerr == nil && u.Host != "" && u.Host != dest {
+				err = guardProxiedDestination(ctx, u.Host)
+			}
+		}
+		if err != nil {
+			stats.Inc("speed.server_dest_blocked")
+			slog.Debug("dropping speedtest server with blocked destination",
+				"server_id", s.ID, "err", err)
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// rawOriginFetch is the city race's pool fetch as cityrace.go declared it,
+// captured before guardedFetchOriginServers is spliced in front (see init
+// below). Its own tests keep stubbing fetchOriginServers wholesale - their
+// fakes are the servers under test - so the splice must not sit between a
+// stub and the race.
+var rawOriginFetch func(context.Context, Origin) (ookla.Servers, error)
+
+// guardedFetchOriginServers is rawOriginFetch behind the proxied-destination
+// filter. The city race fetches its per-origin pools through its own seam
+// (fetchOriginServers) rather than fetchServerList, and racePing then GETs
+// each entry's URL - so without this splice a hostile catalogue entry naming
+// an internal host got its ranking probe carried through the operator's proxy,
+// past the dial guard, on this one path. A named function rather than a
+// closure so a test can assert the production wiring by identity.
+func guardedFetchOriginServers(ctx context.Context, o Origin) (ookla.Servers, error) {
+	servers, err := rawOriginFetch(ctx, o)
+	return guardedServers(ctx, servers), err
+}
+
+func init() {
+	rawOriginFetch = fetchOriginServers
+	fetchOriginServers = guardedFetchOriginServers
+}
 
 // probeDialControl is the dial guard the probes AND the measurement client
 // install (see probeClient and newOoklaClientRec). A package var for the same
@@ -550,6 +853,14 @@ func probeClient(timeout time.Duration) *http.Client {
 		Timeout: timeout,
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{Timeout: timeout, Control: probeDialControl}).DialContext,
+			// Every caller builds this client for a single request and drops it,
+			// so a kept-alive socket can never be reused - it would only sit in
+			// the abandoned transport's idle pool (zero IdleConnTimeout: forever)
+			// with its read/write-loop goroutines, until the REMOTE peer closes.
+			// rankedServers probes dozens of servers per scheduled pass and
+			// annotateFallback fans out over a whole picker page, so in a
+			// long-lived daemon that stranded fds and goroutines without bound.
+			DisableKeepAlives: true,
 		},
 	}
 }
@@ -579,12 +890,32 @@ const (
 	fallbackMapCap = 512
 )
 
+// fbFlight is one in-flight fallback probe. It exists because the expiry
+// check, fails snapshot and network probe cannot all run under fbMu, and
+// unserialized they were check-then-act: two concurrent callers for one
+// expired ID both probed and both wrote fails=prevFails+1 from the same stale
+// snapshot - losing a consecutive strike (so two-strike retirement never
+// accumulated under concurrency) and doubling probe traffic. The first caller
+// registers a flight and probes; later callers wait on done and reuse st. st
+// is written before done is closed, so the close is the happens-before edge
+// waiters read through.
+type fbFlight struct {
+	done chan struct{}
+	st   endpointState // valid once done is closed
+}
+
 var (
-	fbMu  sync.Mutex
-	fbMap = map[string]fallbackVerdict{} // server ID -> verdict
+	fbMu      sync.Mutex
+	fbMap     = map[string]fallbackVerdict{} // server ID -> verdict
+	fbProbing = map[string]*fbFlight{}       // server ID -> in-flight probe (see fbFlight)
 )
 
 // fallbackHealth returns the cached verdict for a server, probing if needed.
+// One probe per server ID at a time (see fbFlight): concurrent callers wait
+// for the in-flight result instead of duplicating it, and the fails
+// read-modify-write below is therefore serialized - only the registered
+// flight's owner writes this ID until it deregisters, so a strike can never
+// be lost to a stale snapshot.
 // A package var so tests can drive selection without a network.
 var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 	if s == nil || s.ID == "" {
@@ -600,6 +931,17 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 			return v.state
 		}
 	}
+	if fl, ok := fbProbing[s.ID]; ok {
+		fbMu.Unlock()
+		select {
+		case <-fl.done:
+			return fl.st
+		case <-ctx.Done():
+			return endpointUnknown // this caller gave up; the probe still lands in the cache
+		}
+	}
+	fl := &fbFlight{done: make(chan struct{})}
+	fbProbing[s.ID] = fl
 	fbMu.Unlock()
 
 	st := probeFallback(ctx, s)
@@ -607,6 +949,11 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 		// The caller gave up (annotation budget, aborted run). That is a fact
 		// about us, not the server: returning it is fine, caching it would let a
 		// picker timeout suppress a real probe for the next several minutes.
+		fbMu.Lock()
+		delete(fbProbing, s.ID)
+		fl.st = endpointUnknown
+		close(fl.done)
+		fbMu.Unlock()
 		return endpointUnknown
 	}
 
@@ -645,6 +992,9 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 		}
 	}
 	fbMap[s.ID] = fallbackVerdict{state: st, expires: now.Add(ttl), fails: fails}
+	delete(fbProbing, s.ID)
+	fl.st = st
+	close(fl.done)
 	fbMu.Unlock()
 	return st
 }
@@ -783,9 +1133,17 @@ var probeEndpoint = func(ctx context.Context, s *ookla.Server) endpointState {
 			// local until it answers closes that even if the measurement-side dial
 			// guard were ever removed. A public host answering non-2xx still gets
 			// adopted and classified retired, exactly as before.
-			candidate := "http://" + u.Host + "/speedtest/upload.php"
-			if code, _ = do(candidate); code != 0 {
-				s.URL = candidate
+			// The logical-destination pre-check comes first: a proxied transfer
+			// would carry an adopted internal host past the dial guard, so a
+			// refused target is treated exactly like a refused dial (code 0) -
+			// never probed, never adopted, verdict unknown.
+			if guardProxiedDestination(pctx, u.Host) != nil {
+				code = 0
+			} else {
+				candidate := "http://" + u.Host + "/speedtest/upload.php"
+				if code, _ = do(candidate); code != 0 {
+					s.URL = candidate
+				}
 			}
 		}
 	}
@@ -1644,10 +2002,28 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 		// stand-in; the alternative is a nil deref inside NewUserConfig.
 		uc = &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent}
 	}
-	client, rec := newOoklaClientRec(uc)
+	// Each attempt gets its OWN UserConfig value. The library aliases the
+	// pointer it is handed (NewUserConfig does s.config = uc, then writes
+	// uc.T), so passing the run's shared config into every rebuild meant
+	// constructing attempt N+1 repointed EVERY earlier client - including a
+	// not-yet-drained orphan reading s.config.T from its worker goroutines - at
+	// the new transport: an unsynchronized write of exactly the shared-state
+	// class this function exists to remove. The value copy severs the alias;
+	// the pointer fields it shares (Location, DialerControl) are only read by
+	// the library on the paths a rebuilt client uses.
+	attempt := *uc
+	client, rec := newOoklaClientRec(&attempt)
 	srv.Context = client
 	if o != nil {
-		o.upRec = rec // diagnostics follow the client the transfer actually uses
+		if o.attemptT != nil {
+			// The client this rebuild replaces is abandoned: nothing sends on it
+			// again, so release its idle sockets now rather than after the
+			// library's 90s idle timeout. Safe under an orphaned transfer too -
+			// CloseIdleConnections never touches an in-flight request's conn.
+			o.attemptT.CloseIdleConnections()
+		}
+		o.attemptT = attempt.T // the transport New stamped for THIS attempt
+		o.upRec = rec          // diagnostics follow the client the transfer actually uses
 	}
 }
 
@@ -1861,11 +2237,21 @@ var measureServer = func(o *Ookla, ctx context.Context, srv *ookla.Server, dir s
 // the loop around both is exercised rather than mirrored.
 var fetchServerList = func(ctx context.Context, client *ookla.Speedtest) (ookla.Servers, error) {
 	servers, err := client.FetchServerListContext(ctx)
-	return currentEndpoints(servers), err
+	// guardedServers before anything pings or measures them: with a proxy
+	// configured the dial guard never sees these third-party destinations.
+	return guardedServers(ctx, currentEndpoints(servers)), err
 }
 
 // measure runs one full measurement against an already-chosen server.
 func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retries int) (Result, error) {
+	// The target is third-party data on every path here (catalogue Host, by-ID
+	// resolve, an adopted redirect). When an operator proxy carries the
+	// requests the dial guard only ever sees the proxy's address, so the
+	// logical destination is vetted before the first request names it. Direct
+	// (unproxied) runs are covered at dial time and skip this.
+	if err := guardProxiedDestination(ctx, serverDestination(srv)); err != nil {
+		return Result{}, fmt.Errorf("refusing speedtest destination: %w", err)
+	}
 	var err error
 	// Same ten samples the library already sends - the callback only keeps the
 	// fastest alongside the mean it returns, so this costs no extra probe.
@@ -2129,8 +2515,16 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 
 	pctx, cancel := context.WithTimeout(ctx, packetLossSampleDuration+time.Second)
 	defer cancel()
+	// Both dialers carry the SSRF dial guard: srv.Host is third-party catalogue
+	// data like every other destination this file reaches, and left nil the
+	// analyzer builds bare dialers of its own, so its TCP sampler connect and
+	// UDP sends would bypass the guard entirely. probeDialControl rather than
+	// probeDialGuard so allowLoopbackProbes relaxes this path too. The timeout
+	// mirrors the library's own default (PacketSendingTimeout).
 	analyzer := ookla.NewPacketLossAnalyzer(&ookla.PacketLossAnalyzerOptions{
 		SamplingDuration: packetLossSampleDuration,
+		TCPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl},
+		UDPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl},
 	})
 	var loss *float64
 	// Upstream leak (speedtest-go v1.7.10): RunWithContext opens a TCP sampler conn
@@ -2361,8 +2755,11 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 	// - if the nearest 12 all lacked the fallback, a working 13th was never
 	// considered and the run fell back to measuring the known-bad 12. Partial
 	// attrition could likewise leave a best-of-3 with fewer than three targets.
-	// Reserves are pinged and probed in the SAME fan-out, so they cost latency
-	// only when the pool actually needs them.
+	// Reserves are contacted LAZILY, in shortfall-sized batches, only after
+	// exclusions actually leave the pool short: a healthy pool sends them zero
+	// traffic, and N exclusions ping/probe only ~N of them (a further batch per
+	// dead reserve), instead of doubling every selection pass's third-party
+	// fan-out unconditionally.
 	inPool := make(map[string]bool, len(cand))
 	for _, s := range cand {
 		inPool[s.ID] = true
@@ -2376,59 +2773,76 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 			reserve = append(reserve, s)
 		}
 	}
-	probeSet := append(append(ookla.Servers(nil), cand...), reserve...)
 
-	// The explicit per-server ranking outcome, for the selection report. The
-	// Latency FIELD alone cannot carry it: the library assigns the ~10-sample
-	// mean only on success, and a failed ranking ping leaves whatever the list
-	// fetch wrote there - often a stale positive echo sample. applyRankPing both
-	// records the honest outcome here AND fixes the field (measured on success,
-	// ZERO on failure) so the sort below can't rank a stale value first.
-	pings := make([]*float64, len(probeSet))
-	health := make([]endpointState, len(probeSet))
-	var wg sync.WaitGroup
-	for i, s := range probeSet {
-		wg.Add(1)
-		go func(i int, s *ookla.Server) {
-			defer wg.Done()
-			// The per-sample callback is the only honest success signal: the
-			// library can return a nil error WITHOUT collecting a single sample
-			// (every measured echo failing at transport level after a good
-			// warm-up), leaving Latency untouched at its stale fetch-echo
-			// value - so "err == nil && Latency > 0" would record a one-shot
-			// echo as an answered ten-sample ranking ping.
-			sampled := false
-			err := ooklaPing(ctx, s, func(time.Duration) { sampled = true }) // sets s.Latency on success
-			pings[i] = applyRankPing(s, err, sampled)
-			// Same fan-out, so this costs the phase nothing it was not already
-			// spending: judge the fallback by STATUS, which the library's ping
-			// does not do (see fallbackHealth).
-			health[i] = fallbackHealth(ctx, s)
-		}(i, s)
-	}
-	wg.Wait()
-	rankPings := make(map[string]*float64, len(probeSet))
-	for i, s := range probeSet {
-		rankPings[s.ID] = pings[i]
+	// probe pings one batch concurrently and judges each server's fallback in
+	// the same fan-out. rankPings is the explicit per-server ranking outcome,
+	// for the selection report: the Latency FIELD alone cannot carry it - the
+	// library assigns the ~10-sample mean only on success, and a failed ranking
+	// ping leaves whatever the list fetch wrote there, often a stale positive
+	// echo sample. applyRankPing both records the honest outcome AND fixes the
+	// field (measured on success, ZERO on failure) so the sort below can't rank
+	// a stale value first. Only contacted servers get an entry.
+	rankPings := make(map[string]*float64, len(cand))
+	probe := func(set ookla.Servers) []endpointState {
+		pings := make([]*float64, len(set))
+		health := make([]endpointState, len(set))
+		var wg sync.WaitGroup
+		for i, s := range set {
+			wg.Add(1)
+			go func(i int, s *ookla.Server) {
+				defer wg.Done()
+				// The per-sample callback is the only honest success signal: the
+				// library can return a nil error WITHOUT collecting a single sample
+				// (every measured echo failing at transport level after a good
+				// warm-up), leaving Latency untouched at its stale fetch-echo
+				// value - so "err == nil && Latency > 0" would record a one-shot
+				// echo as an answered ten-sample ranking ping.
+				sampled := false
+				err := ooklaPing(ctx, s, func(time.Duration) { sampled = true }) // sets s.Latency on success
+				pings[i] = applyRankPing(s, err, sampled)
+				// Same fan-out, so this costs the phase nothing it was not already
+				// spending: judge the fallback by STATUS, which the library's ping
+				// does not do (see fallbackHealth).
+				health[i] = fallbackHealth(ctx, s)
+			}(i, s)
+		}
+		wg.Wait()
+		for i, s := range set {
+			rankPings[s.ID] = pings[i]
+		}
+		return health
 	}
 
 	// Drop servers whose legacy fallback is gone. They are not slow or flaky -
 	// every transfer against them fails - so ranking them at all only guarantees
 	// a wasted run, and because their 500 is served instantly they otherwise sort
 	// as if healthy.
+	health := probe(cand)
 	usable := make(ookla.Servers, 0, len(cand))
 	var dropped []string
-	for i, s := range probeSet {
+	for i, s := range cand {
 		if health[i] == endpointRetired {
-			if inPool[s.ID] {
-				dropped = append(dropped, s.ID) // only report what was actually in the pool
-			}
+			dropped = append(dropped, s.ID)
 			continue
 		}
-		if len(usable) == len(cand) {
-			break // replenished to the pool's intended size, no further
-		}
 		usable = append(usable, s) // endpointUnknown stays: a failed probe is not a verdict
+	}
+	// Replenish only what the exclusions actually cost, one shortfall-sized
+	// batch at a time; a dead reserve just widens the next batch. Reserves
+	// dropped here are not reported - dropped names pool exclusions only, which
+	// is what the caller logs.
+	for len(usable) < len(cand) && len(reserve) > 0 {
+		n := len(cand) - len(usable)
+		if n > len(reserve) {
+			n = len(reserve)
+		}
+		batch := reserve[:n]
+		reserve = reserve[n:]
+		for i, st := range probe(batch) {
+			if st != endpointRetired {
+				usable = append(usable, batch[i])
+			}
+		}
 	}
 	// Never rank nothing. A whole region can lack the fallback, and a measurement
 	// that probably fails still beats "no speedtest servers available" - the

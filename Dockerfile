@@ -21,7 +21,7 @@
 # workflow already sets up buildx.
 
 # --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
-FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS setcap
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS setcap
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -42,6 +42,12 @@ RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data && touch /data/.pingula
 
 # --- final image: distroless nonroot, carrying the capped binary ---
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
+# Static attribution; version/revision are stamped per build by goreleaser
+# (dockers_v2 labels/annotations in .goreleaser.yaml), not hardcoded here.
+LABEL org.opencontainers.image.title="pingularity" \
+      org.opencontainers.image.description="Single-binary internet-connectivity monitor." \
+      org.opencontainers.image.source="https://github.com/pingular/pingularity" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=setcap /pingularity /pingularity
 # The data dir must exist owned by nonroot (65532) so a freshly created named
 # volume inherits that ownership and the unprivileged process can write to it.
@@ -57,6 +63,12 @@ COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity
 USER nonroot
+# Exec form is mandatory: distroless has no shell for the CMD-string form. The
+# subcommand probes http://127.0.0.1:9000/healthz; operators who change -listen
+# must override this healthcheck (or disable it), or the container reports
+# unhealthy while the daemon is fine.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD ["/pingularity", "healthz"]
 # Pin the database onto the volume. Without this the path is chosen from the
 # effective uid, and a --user override (or this non-root default) would fall
 # back to a temp dir inside the writable layer, so the mounted volume stays

@@ -39,6 +39,12 @@ type Iperf struct {
 	// speed.fail counters - without a line here they leave no trace at all.
 	// Optional: nil logs nothing.
 	Log *slog.Logger
+	// EnvHint, when set, maps a transfer/UDP-pass failure's text to an
+	// environment-specific explanation appended to the surfaced error or warn
+	// line (main.go injects a container-networking matcher when it knows it runs
+	// in one; the engine itself stays environment-blind). Text only - it never
+	// changes behavior or retry classification. An empty return appends nothing.
+	EnvHint func(errText string) string
 	// congestionSkipOnce coalesces the "ignored -C off Linux" warning so it
 	// logs once per Iperf, not once per transfer.
 	congestionSkipOnce sync.Once
@@ -432,6 +438,21 @@ func iperfServerName(label, host string) string {
 	return "iperf3: " + label
 }
 
+// withEnvHint appends the injected environment hint (EnvHint) to a transfer or
+// UDP-pass failure, keeping the original error in the %w chain - callers rely on
+// errors.Is (context cancellation) and on the raw text prefix (speedFailStage).
+// Applied only at the surfacing points, after withRetry, so the hint text can
+// never change retry classification.
+func (i *Iperf) withEnvHint(err error) error {
+	if err == nil || i.EnvHint == nil {
+		return err
+	}
+	if h := i.EnvHint(err.Error()); h != "" {
+		return fmt.Errorf("%w (%s)", err, h)
+	}
+	return err
+}
+
 // iperfBind resolves the source address/interface; nil/empty -> "" (default route).
 func iperfBind(fn func() string) string {
 	if fn == nil {
@@ -584,10 +605,11 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			return e
 		})
 		if err != nil {
-			return Result{}, fmt.Errorf("bidir: %w", err)
+			return Result{}, fmt.Errorf("bidir: %w", i.withEnvHint(err))
 		}
 		res.DownloadMbps, res.DownloadBytes = bd.downMbps, bd.downBytes
 		res.UploadMbps, res.UploadBytes = bd.upMbps, bd.upBytes
+		res.IPFamily = bd.family
 		// Both directions loaded at once, so the single sampled bloat applies to each -
 		// report it under both so the chart reads "latency under full load".
 		res.LoadedDownMS, res.LoadedDownP95MS = load.medPtr(), load.tailPtr()
@@ -632,9 +654,9 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		}
 		if (dir == "down" && dnErr != nil) || (dir == "up" && upErr != nil) || (dir == "both" && dnErr != nil && upErr != nil) {
 			if dnErr != nil {
-				return Result{}, fmt.Errorf("download: %w", dnErr)
+				return Result{}, fmt.Errorf("download: %w", i.withEnvHint(dnErr))
 			}
-			return Result{}, fmt.Errorf("upload: %w", upErr)
+			return Result{}, fmt.Errorf("upload: %w", i.withEnvHint(upErr))
 		}
 		// A cancelled or timed-out context must NOT be laundered into a "partial
 		// success": if a direction failed while the run's context was already done, the
@@ -655,15 +677,22 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			stats.Inc("speed.iperf_partial")
 			if i.Log != nil {
 				if dnErr != nil {
-					i.Log.Warn("iperf3 direction failed, partial result kept", "direction", "down", "err", dnErr)
+					i.Log.Warn("iperf3 direction failed, partial result kept", "direction", "down", "err", i.withEnvHint(dnErr))
 				}
 				if upErr != nil {
-					i.Log.Warn("iperf3 direction failed, partial result kept", "direction", "up", "err", upErr)
+					i.Log.Warn("iperf3 direction failed, partial result kept", "direction", "up", "err", i.withEnvHint(upErr))
 				}
 			}
 		}
 		// Unloaded RTT (min_rtt) from whichever direction reported it; else idle.
 		rttMS = pickRTT(dn.rttMS, up.rttMS)
+		// Family from whichever direction measured (a failed direction's zero
+		// struct carries ""); an "auto" run records what it actually resolved to.
+		if dn.family != "" {
+			res.IPFamily = dn.family
+		} else {
+			res.IPFamily = up.family
+		}
 	}
 	// Ping is the UNLOADED latency to the server. Prefer the pre-transfer handshake probe
 	// (empty queue); fall back to iperf3's min_rtt (upload/bidir and Linux only), then the
@@ -705,6 +734,13 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		})
 		if loss != nil {
 			res.PacketLoss, res.JitterMS = loss, jit
+			// Record which way the probe sampled: loss on an asymmetric path
+			// differs by direction, so a stored sample is ambiguous without it.
+			if downstream {
+				res.UDPDirection = "down"
+			} else {
+				res.UDPDirection = "up"
+			}
 		} else if udpErr != nil && i.Log != nil {
 			// The run still succeeds without loss/jitter, so this failure is
 			// invisible everywhere else. The message distinguishes the three cases
@@ -712,7 +748,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			// server rejecting the UDP pass ("authorization failed"), and a busy
 			// server - which need different answers from support.
 			i.Log.Warn("iperf3 udp pass failed, loss and jitter unrecorded",
-				"err", udpErr, "downstream", downstream, "rate_mbps", rate)
+				"err", i.withEnvHint(udpErr), "downstream", downstream, "rate_mbps", rate)
 		}
 	}
 	return res, nil
@@ -765,7 +801,13 @@ func measureUDP(ctx context.Context, host, port string, rateMbps int, downstream
 	pctx, cancel := context.WithTimeout(ctx, iperfUDPBudget)
 	defer cancel()
 	args := []string{"--client", host, "--json", "--udp",
-		"--bitrate", strconv.Itoa(rateMbps) + "M", "--time", strconv.Itoa(iperfUDPSecs), "--connect-timeout", "4000"}
+		"--bitrate", strconv.Itoa(rateMbps) + "M", "--time", strconv.Itoa(iperfUDPSecs),
+		// 1200-byte datagrams: 1200 + 8 (UDP) + 40 (IPv6) = 1248 stays under the
+		// 1280 IPv6 floor MTU, so the probe never fragments on any sane path.
+		// iperf3's ~1460-byte default fragments wherever the effective MTU dips
+		// below Ethernet (tunnel uplinks behind a bridge pinned at 1500), and
+		// dropped or reassembly-delayed fragments read back as loss/jitter.
+		"--length", "1200", "--connect-timeout", "4000"}
 	if downstream {
 		args = append(args, "--reverse")
 	}
@@ -967,9 +1009,10 @@ func measureServerRTT(ctx context.Context, host, port string, tp iperfTunables) 
 }
 
 type iperfRun struct {
-	mbps  float64
-	bytes int64
-	rttMS float64
+	mbps   float64
+	bytes  int64
+	rttMS  float64
+	family string // "4"/"6" from start.connected; "" unknown (see iperfFamily)
 }
 
 // iperfTunables are the per-run TCP knobs resolved from the configured settings.
@@ -1247,7 +1290,7 @@ func runIperf(ctx context.Context, host, port string, tp iperfTunables, auth ipe
 		// otherwise be stored verbatim and rescale the speed chart.
 		return iperfRun{}, errors.New("implausible iperf3 throughput")
 	}
-	r := iperfRun{mbps: mbps, bytes: sum.Bytes, rttMS: iperfStreamRTT(j)}
+	r := iperfRun{mbps: mbps, bytes: sum.Bytes, rttMS: iperfStreamRTT(j), family: iperfFamily(j)}
 	return r, nil
 }
 
@@ -1256,6 +1299,7 @@ type iperfBidir struct {
 	downMbps, upMbps   float64
 	downBytes, upBytes int64
 	rttMS              float64
+	family             string // "4"/"6" from start.connected; "" unknown
 }
 
 // runIperfBidir execs one --bidir transfer (download and upload at once) and splits the
@@ -1291,7 +1335,7 @@ func runIperfBidir(ctx context.Context, host, port string, tp iperfTunables, aut
 	b := iperfBidir{
 		downMbps: downMbps, downBytes: dn.Bytes,
 		upMbps: upMbps, upBytes: up.Bytes,
-		rttMS: iperfStreamRTT(j),
+		rttMS: iperfStreamRTT(j), family: iperfFamily(j),
 	}
 	return b, nil
 }
@@ -1299,7 +1343,14 @@ func runIperfBidir(ctx context.Context, host, port string, tp iperfTunables, aut
 // iperfJSON is the minimal slice of `iperf3 -J` output we read.
 type iperfJSON struct {
 	Error string `json:"error"`
-	End   struct {
+	Start struct {
+		// The control connection's peer as actually connected - the only record
+		// of which address family a family-"auto" run resolved to (see iperfFamily).
+		Connected []struct {
+			RemoteHost string `json:"remote_host"`
+		} `json:"connected"`
+	} `json:"start"`
+	End struct {
 		SumSent     iperfSum `json:"sum_sent"`
 		SumReceived iperfSum `json:"sum_received"`
 		// --bidir splits the two flows out into the *_bidir_reverse aggregates: the
@@ -1322,6 +1373,27 @@ type iperfJSON struct {
 			} `json:"sender"`
 		} `json:"streams"`
 	} `json:"end"`
+}
+
+// iperfFamily classifies the address family a run actually used ("4"/"6") from
+// the control connection's peer literal (start.connected[0].remote_host). Family
+// "auto" resolves invisibly - a dual-stack native host measures IPv6 where an
+// IPv6-less network (a default Docker bridge) silently measures IPv4 - and
+// nothing else in the JSON records which happened. Returns "" when the block is
+// absent (an error body) or the literal doesn't parse. A v4-mapped literal
+// (::ffff:a.b.c.d, from a dual-bound server socket) is IPv4 on the wire.
+func iperfFamily(j iperfJSON) string {
+	if len(j.Start.Connected) == 0 {
+		return ""
+	}
+	a, err := netip.ParseAddr(j.Start.Connected[0].RemoteHost)
+	if err != nil {
+		return ""
+	}
+	if a.Is4() || a.Is4In6() {
+		return "4"
+	}
+	return "6"
 }
 
 // iperfStreamRTT returns the lowest non-zero TCP_INFO min_rtt (ms) across streams - a

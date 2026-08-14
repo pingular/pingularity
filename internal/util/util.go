@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// InContainer reports whether the process is running inside a container (Docker or
-// Podman), detected once via the marker files those runtimes create. Used to relax
+// InContainer reports whether the process is running inside a container,
+// detected once via the markers the runtimes themselves plant. Used to relax
 // the loopback-only access filter: a bridged container NATs every external request
 // to the gateway, so the filter can't tell a local user from a LAN one and would
 // otherwise lock the dashboard out entirely.
@@ -22,24 +22,42 @@ var (
 	inContainerVal  bool
 )
 
+// containerMarkerFiles are the marker files runtimes create: Docker's
+// /.dockerenv, Podman/CRI-O's /run/.containerenv. A var so tests can point the
+// probe at paths they control (and a containerized CI runner's real markers
+// can't leak into the "native" case).
+var containerMarkerFiles = []string{"/.dockerenv", "/run/.containerenv"}
+
 func InContainer() bool {
-	inContainerOnce.Do(func() {
-		// Docker and Podman/CRI-O leave marker files; containerd (the default
-		// Kubernetes runtime) leaves neither, but the kubelet injects this env
-		// var into every pod - without it a bridged pod would boot with the
-		// loopback-only filter on and 403 every off-host request.
-		if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
-			inContainerVal = true
-			return
-		}
-		for _, p := range []string{"/.dockerenv", "/run/.containerenv"} {
-			if _, err := os.Stat(p); err == nil {
-				inContainerVal = true
-				return
-			}
-		}
-	})
+	inContainerOnce.Do(func() { inContainerVal = detectContainer() })
 	return inContainerVal
+}
+
+// detectContainer is the uncached probe behind InContainer, split out so tests
+// can drive each marker via t.Setenv and containerMarkerFiles.
+func detectContainer() bool {
+	// containerd (the default Kubernetes runtime) leaves no marker file, but
+	// the kubelet injects this env var into every pod - without it a bridged
+	// pod would boot with the loopback-only filter on and 403 every off-host
+	// request.
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return true
+	}
+	// Plain LXC/LXD, systemd-nspawn, and podman builds that don't write
+	// /run/.containerenv leave no marker file either; they set the standard
+	// `container` env var instead (container=lxc, =systemd-nspawn, =podman...).
+	// Deliberately NOT consulted: /proc/1/cgroup string sniffing - under
+	// cgroup v2 the unified hierarchy reads "0::/" inside most containers and
+	// on hosts alike, so the string proves nothing.
+	if os.Getenv("container") != "" {
+		return true
+	}
+	for _, p := range containerMarkerFiles {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // BridgedContainer reports whether we are in a container that does NOT share the
@@ -58,7 +76,8 @@ func InContainer() bool {
 // us - natively, or in a container that visibly shares the host's network
 // namespace. Proof of host networking is seeing an interface that exists only in
 // the host namespace: the Docker/Podman default bridge (docker0 / podman0), a
-// user-defined bridge (br-...), a CNI bridge (cni-...), or the host end of any
+// user-defined bridge (br-...), a CNI bridge (cni-... / cni0), a CNI host-side
+// device (cali*/cilium*/flannel*/vxlan.calico), or the host end of any
 // container's veth pair (veth...). A bridged container sees only its own eth0, so
 // it never matches and is treated as isolated (reachable by default) whatever its
 // subnet or interface count. A misread can only leave a host-net container
@@ -107,9 +126,25 @@ func sharesHostNet(names []string) bool {
 		switch {
 		case n == "docker0" || n == "podman0":
 			return true
+		// flannel's bridge and Calico's VXLAN device: fixed names, host-side only.
+		case n == "cni0" || n == "vxlan.calico":
+			return true
 		case strings.HasPrefix(n, "br-"),
 			strings.HasPrefix(n, "veth"),
 			strings.HasPrefix(n, "cni-"):
+			return true
+		// CNI host-side families: Calico's per-pod veth ends (cali...), Cilium's
+		// cilium_host/cilium_net/cilium_vxlan, flannel's flannel.1/flannel-v6.1.
+		// Without these a hostNetwork pod on such a cluster read as bridged
+		// (false banner, wrong default). tunl0 is deliberately NOT a tell:
+		// fallback tunnel devices (tunl0, sit0, ip6tnl0) are created in EVERY
+		// network namespace once their module loads, so a bridged pod on a
+		// Calico IPIP node sees tunl0 in its own namespace - matching it would
+		// flip such pods to loopback-only and lock them out of their own
+		// published port.
+		case strings.HasPrefix(n, "cali"),
+			strings.HasPrefix(n, "cilium"),
+			strings.HasPrefix(n, "flannel"):
 			return true
 		}
 	}

@@ -7,6 +7,16 @@
 # to whoever pulls them, silently and indefinitely. Verified: no CI job inspects
 # a base manifest, so this file is the only thing covering it.
 #
+# SUPPRESSION TRAP (this bit you every prior time): closing a Dependabot PR
+# without merging tells Dependabot "never offer THIS version/digest again" - all
+# 15 PRs it ever opened here were closed unmerged (including #9, the docker
+# one), which is why the pins sat stale with no re-offer. The suppression is
+# per-digest, so the NEXT upstream digest still gets a fresh PR - but if you
+# close that one too, the cycle repeats. To decline a bump without suppressing
+# the next one, just leave the PR open; to resurrect a closed one, comment
+# `@dependabot reopen` on it. Never close-unmerged as a "later" - there is no
+# later.
+#
 # The other two ecosystems were dropped deliberately, and the asymmetry is the
 # reason:
 #
@@ -25,3 +35,16 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # One PR for all base-image bumps: the debian:13-slim digest appears three
+    # times across the two Dockerfiles and dockerfiles_test.go fails the build
+    # if they drift apart, so any PR that moves fewer than all of them is red by
+    # construction - only the grouped PR (every pin moving together) can be green.
+    groups:
+      base-images:
+        patterns:
+          - "*"
+    # Default is 5; said out loud so nobody has to wonder whether a silent
+    # 0-limit is why no PRs appear. With the group above, one open PR is the
+    # steady state. No cooldown: a CVE-driven base rebuild should be offered
+    # the week it ships, which is the entire point of this file.
+    open-pull-requests-limit: 5

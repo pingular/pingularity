@@ -184,3 +184,151 @@ jobs:
         with:
           version: 'v2.17.0'
           args: check
+
+  # Image gate: builds BOTH Dockerfiles from the exact context layout goreleaser
+  # stages (linux/<arch>/pingularity, COPY'd via $TARGETPLATFORM) and proves the
+  # three properties a broken image would otherwise first show in a user's
+  # release: the CAP_NET_RAW xattr survives the COPY chain, the data dir ships
+  # 0700 65532:65532 with the volume-lineage marker BEFORE any daemon run, and a
+  # hardened `docker run` actually becomes healthy. Runs under buildx (the
+  # builder the release uses) because plain `docker build` was observed dropping
+  # COPY --chmod on directories - this job must measure what ships, not what a
+  # different builder happens to produce. release.yml gates on this via its `ci`
+  # job (workflow_call runs every job in this file).
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: build both images from the goreleaser context layout
+        run: |
+          mkdir -p linux/amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o linux/amd64/pingularity .
+          docker buildx build --load -t ping-ci:default .
+          docker buildx build --load -f Dockerfile.iperf -t ping-ci:iperf .
+
+      - name: xattr chain (security.capability must survive COPY into the final layer)
+        run: |
+          # setcap stamps the security.capability xattr in a throwaway stage and
+          # the final stage COPYs the binary across. If any link in that chain
+          # drops the xattr, the shipped binary silently loses CAP_NET_RAW and
+          # raw-socket traceroute dies for every non-root container. docker save
+          # exposes the layer tars, where the xattr rides as a PAX
+          # SCHILY.xattr.security.capability record on the /pingularity entry -
+          # assert it is present in every such entry, in BOTH images.
+          docker save ping-ci:default -o default.tar
+          docker save ping-ci:iperf -o iperf.tar
+          python3 - default.tar iperf.tar <<'EOF'
+          import sys, tarfile
+          failed = False
+          for path in sys.argv[1:]:
+              checked = missing = 0
+              with tarfile.open(path) as outer:
+                  for m in outer.getmembers():
+                      if not m.isfile():
+                          continue
+                      f = outer.extractfile(m)
+                      try:
+                          inner = tarfile.open(fileobj=f, mode="r:*")
+                      except tarfile.ReadError:
+                          continue  # manifest/config JSON, not a layer tar
+                      with inner:
+                          for e in inner:
+                              if e.isfile() and e.name.lstrip("./") == "pingularity":
+                                  checked += 1
+                                  if "SCHILY.xattr.security.capability" not in e.pax_headers:
+                                      missing += 1
+                                      print(f"{path}: layer {m.name}: /pingularity has NO security.capability PAX record")
+              if checked == 0:
+                  print(f"{path}: no /pingularity layer entry found - the check matched nothing")
+                  failed = True
+              elif missing:
+                  failed = True
+              else:
+                  print(f"{path}: {checked} /pingularity layer entry(ies), all carry security.capability")
+          sys.exit(1 if failed else 0)
+          EOF
+
+      - name: shipped permissions (docker export, BEFORE any daemon run)
+        run: |
+          # Measured on created-but-never-started containers on purpose: the
+          # daemon tightens its own container data dir at boot (store.go), so
+          # any post-run measurement passes even when the image ships 0755.
+          # docker export reads what the layers actually say.
+          docker create --name ci-default ping-ci:default
+          docker export ci-default -o default-rootfs.tar
+          docker rm ci-default
+          docker create --name ci-iperf ping-ci:iperf
+          docker export ci-iperf -o iperf-rootfs.tar
+          docker rm ci-iperf
+          python3 - default-rootfs.tar iperf-rootfs.tar <<'EOF'
+          import sys, tarfile
+          failed = False
+          for path in sys.argv[1:]:
+              entries = {}
+              with tarfile.open(path) as tf:
+                  for e in tf:
+                      entries[e.name.lstrip("./").rstrip("/")] = e
+              ok = True
+              d = entries.get("var/lib/pingularity")
+              if d is None or not d.isdir():
+                  print(f"{path}: /var/lib/pingularity missing from the exported image"); ok = False
+              else:
+                  mode = d.mode & 0o7777
+                  if mode != 0o700:
+                      print(f"{path}: /var/lib/pingularity mode {oct(mode)}, want 0700"); ok = False
+                  if (d.uid, d.gid) != (65532, 65532):
+                      print(f"{path}: /var/lib/pingularity owner {d.uid}:{d.gid}, want 65532:65532"); ok = False
+              if "var/lib/pingularity/.pingularity-image-dir" not in entries:
+                  print(f"{path}: volume-lineage marker .pingularity-image-dir missing"); ok = False
+              if ok:
+                  print(f"{path}: /var/lib/pingularity 0700 65532:65532 with marker - as shipped")
+              failed = failed or not ok
+          sys.exit(1 if failed else 0)
+          EOF
+
+      - name: smoke (hardened run must reach healthy via the baked-in HEALTHCHECK)
+        run: |
+          # distroless has no shell, so `docker exec ... curl` cannot exist and a
+          # CMD-string healthcheck could never run. The liveness mechanism is the
+          # image's own exec-form HEALTHCHECK (/pingularity healthz), which hits
+          # /healthz from inside the container's netns. Polling docker inspect's
+          # .State.Health proves the HEALTHCHECK wiring, the healthz subcommand,
+          # and the endpoint in one assertion - and fails if the HEALTHCHECK
+          # instruction is ever dropped (no .State.Health at all then). The
+          # interval is tightened at run time only so the poll converges fast.
+          smoke() {
+            name=$1 image=$2
+            docker run -d --name "$name" --cap-drop=ALL --cap-add=NET_RAW \
+              --health-interval=2s --health-timeout=5s --health-start-period=2s \
+              -v "$name-data:/var/lib/pingularity" "$image"
+            s=none
+            for i in $(seq 1 45); do
+              s=$(docker inspect -f '{{.State.Health.Status}}' "$name" 2>/dev/null || echo none)
+              [ "$s" = "healthy" ] && break
+              sleep 2
+            done
+            echo "--- $name health state ---"
+            docker inspect -f '{{json .State.Health}}' "$name" 2>/dev/null || true
+            echo "--- $name daemon logs ---"
+            docker logs "$name" 2>&1 | tail -10
+            docker rm -f "$name" >/dev/null
+            if [ "$s" != "healthy" ]; then
+              echo "::error::$image never reported healthy (last state: $s) - the HEALTHCHECK or the healthz subcommand is broken"
+              return 1
+            fi
+            echo "$image: healthy under --cap-drop=ALL --cap-add=NET_RAW"
+          }
+          smoke ping-ci-default ping-ci:default
+          smoke ping-ci-iperf ping-ci:iperf

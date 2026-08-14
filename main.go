@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -93,6 +94,8 @@ func main() {
 		fail(controlCmd(cmd, args))
 	case "reset-auth":
 		fail(resetAuthCmd(args))
+	case "healthz":
+		fail(healthzCmd(args))
 	case "version":
 		fmt.Println("pingularity", version)
 	case "help", "-h", "--help":
@@ -266,16 +269,13 @@ func (p *program) run(ctx context.Context) {
 			"interval", p.cfg.Interval.String(), "listen", p.cfg.ListenAddr)
 	})
 
-	// Runtime-adjustable settings (UI + persisted), seeded from config.
-	// Local-only is a sensible default for a native install (LAN access is opt-in),
-	// but inside a container the dashboard is only reachable over the network, and
-	// the filter can't be enforced there anyway - so default it off in containers.
+	// Runtime-adjustable settings (UI + persisted), seeded from config. Access
+	// defaults to loopback-only EVERYWHERE - native and containers, host-net and
+	// bridged alike (see defaultSettings): network reach is an explicit operator
+	// choice (-access network / PINGULARITY_ACCESS=network), never inferred from
+	// the environment. containerized feeds the status payload, the ignored-OPTS
+	// warning, and the pre-0.62 grandfather below - it no longer decides access.
 	containerized := util.InContainer()
-	// The local-only DEFAULT keys on BRIDGED, not merely containerized: a
-	// host-networked container CAN enforce loopback-only (the guard 403s LAN
-	// peers there), so it must default ON like native - otherwise a fresh
-	// host-net install is remotely reachable, and claimable, before setup. Only
-	// a bridged container, where the filter is unenforceable, defaults off.
 	def := defaultSettings(p.cfg)
 	// Seal the stored iperf3 passwords at rest (key file beside the DB, 0600). If the key
 	// can't be opened we carry on WITHOUT encryption rather than refuse to run: monitoring
@@ -357,7 +357,46 @@ func (p *program) run(ctx context.Context) {
 		p.materializeQuickSetup(ctx, set, func(msg string, e error) {
 			earlyLog = append(earlyLog, func() { p.log.Warn(msg, "err", e) })
 		})
+		// A pre-0.62 container install never STORED an access choice (the filter
+		// was defaulted off by an unpersisted seed), so 0.62's fail-closed
+		// default would flip it to loopback-only on upgrade and 403 its own
+		// published port. Grandfather it ONCE: keep it reachable, persist that
+		// as its stored choice, and say so loudly. Runs before reconcileAccess,
+		// though ordering cannot matter: the grandfather yields to any explicit
+		// -access/PINGULARITY_ACCESS, the only input reconcile acts on.
+		if migrated, gerr := grandfatherContainerAccess(ctx, p.cfg, p.store, set, containerized); gerr != nil {
+			earlyLog = append(earlyLog, func() {
+				p.log.Warn("container access grandfather could not be decided; nothing changed, re-judged next boot", "err", gerr)
+			})
+		} else if migrated {
+			earlyLog = append(earlyLog, func() {
+				p.log.Warn("upgraded a pre-0.62 container install: kept its network-reachable access",
+					"why", "pre-0.62 containers ran with the loopback-only filter off by default and never stored it; turning it on during an upgrade would 403 the published port, with no shell in the image to recover from",
+					"hint", "set a password, or turn Local-only on in the Access tab; new installs start private")
+			})
+		}
+		// An EXPLICIT -access / PINGULARITY_ACCESS is authoritative over a
+		// disagreeing stored access_local_only (see reconcileAccess) - the
+		// recovery path for a container whose stored local-only would 403 its
+		// own published port with no shell to fix it from.
+		if changed, aerr := reconcileAccess(ctx, p.cfg, set); aerr != nil {
+			earlyLog = append(earlyLog, func() {
+				p.log.Warn("explicit -access/PINGULARITY_ACCESS could not override the stored access setting", "err", aerr)
+			})
+		} else if changed {
+			localOnly := p.cfg.Access != "network"
+			earlyLog = append(earlyLog, func() {
+				p.log.Info("stored access setting overridden by explicit operator input",
+					"access", p.cfg.Access, "access_local_only", localOnly,
+					"why", "-access/PINGULARITY_ACCESS was passed explicitly, and explicit operator intent beats the stored value")
+			})
+		}
 	}
+
+	// The one always-on startup line, straight to stdout past the level gate.
+	// After the grandfather/reconcile above so the access mode it states is the
+	// one actually in force this boot.
+	fmt.Fprintln(os.Stdout, startupLine(version, p.cfg.ListenAddr, set.AccessLocalOnly()))
 
 	// Apply the saved log level now that settings are loaded (the logger starts
 	// pinned to logLevelOff so "off" is truly silent), and keep it synced: the
@@ -424,9 +463,11 @@ func (p *program) run(ctx context.Context) {
 		"access_local_only", set.AccessLocalOnly())
 
 	// Warn when the control plane is actually reachable from the network without
-	// auth: a non-loopback listen AND the loopback filter off (native installs
-	// default the filter ON, so a fresh install is quiet; containers default it
-	// off - the filter is unenforceable there - and do warn).
+	// auth: a non-loopback listen AND the loopback filter off. Every fresh
+	// install defaults the filter ON (fail closed), so this fires only where it
+	// was turned off on purpose (-access network, the Access tab) or by the
+	// pre-0.62 container grandfather above - exactly the installs this warning
+	// is for.
 	if nonLoopbackListen(p.cfg.ListenAddr) && !set.AccessLocalOnly() && !set.AuthActive() {
 		// Also straight to stderr, bypassing the log level: the default install
 		// runs with logging "off", and this warning targets exactly that install.
@@ -464,16 +505,21 @@ func (p *program) run(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-hup:
+					// A SIGHUP is a THIRD path (besides boot and the retry loop)
+					// that takes an unloaded controller to loaded - e.g. a first
+					// boot whose settings load failed, recovered by SIGHUP before
+					// the retry ticked. Seed the offer clock BEFORE Reload flips
+					// Loaded and broadcasts (a no-op on a loaded controller), for
+					// the same latch window the retry loop closes.
+					p.seedQuickSetupOfferEarly(ctx, set)
 					if err := set.Reload(ctx); err != nil {
 						p.log.Warn("settings reload on signal", "err", err)
 					} else {
 						p.log.Info("settings reloaded on signal")
-						// A SIGHUP is a THIRD path (besides boot and the retry loop)
-						// that takes an unloaded controller to loaded - e.g. a first
-						// boot whose settings load failed, recovered by SIGHUP before
-						// the retry ticked. Materialize the first-run decision here too,
-						// or a fresh install would never get its offer clock (and its
-						// consent hold) and would start probing unasked.
+						// Materialize the rest of the first-run decision here too
+						// (answer markers refuse while unloaded), or a fresh install
+						// would never get its consent hold and would start probing
+						// unasked.
 						p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
 					}
 				}
@@ -514,54 +560,17 @@ func (p *program) run(ctx context.Context) {
 	// (netinfo logs one under it) and the redactor censors it by key, so a mode
 	// string logged there reads as [redacted] and tells support nothing.
 	p.log.Info("family probing", "ipv4_mode", p.cfg.IPv4Mode, "ipv6_mode", set.IPv6Mode())
-	// monitoringLive is the master switch the loops actually obey: the power
-	// button AND the first-run hold. While the Quick Setup offer is open the
-	// daemon measures nothing - the dialog's button is called Start monitoring
-	// and it must be telling the truth. The hold can only release (answer or
-	// 48h expiry), so once seen released it is never re-checked: the settings
-	// read is cheap but the offer clock is a DB read, and this runs every round.
-	var qsHoldReleased atomic.Bool
-	// qsOnHoldRelease fires ONCE at the hold-release edge (CAS below). Wired
-	// after netinfo exists (assignment happens during single-threaded setup,
-	// before any loop that calls monitoringLive spawns): the 48h expiry is a
+	// qsOnHoldRelease fires ONCE at the hold-release edge (the CAS inside
+	// newMonitoringLiveFn). Wired after netinfo exists (assignment happens
+	// during single-threaded setup, before any loop that calls monitoringLive
+	// spawns; the predicate dereferences it at fire time): the 48h expiry is a
 	// pure clock event with NO settings broadcast, so without this poke
 	// netinfo would sit on its minute-long disabled poll while the consent
 	// speedtest's bounded readiness wait (sched.ReadyFn) runs out - and the
 	// first-ever run would auto-select unanchored after all. The answer-path
 	// release fires it too, where the loop's resume one-shot makes it a no-op.
 	var qsOnHoldRelease func()
-	monitoringLive := func() bool {
-		if !qsHoldReleased.Load() {
-			// Until settings load, the first-run decision can't be made and the
-			// offer clock isn't seeded - QuickSetupHold below would then read a bare
-			// offer_since==0 and fail OPEN. Hold a GENUINELY FRESH install (nothing
-			// in the store: no history, anchor, or config) instead, so it can't
-			// start probing unasked - but do NOT latch the release, so the normal
-			// hold takes over once the retry loads settings and seeds the clock. An
-			// established install already consented and keeps running; a store-read
-			// error holds too (the fresh direction).
-			if !set.Loaded() {
-				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
-					return false
-				}
-				return set.Monitoring()
-			}
-			// Read the offer clock with its error surfaced: a transient store read
-			// error must HOLD, not read as "no clock -> release" and then latch that
-			// release forever off a single failed read.
-			since, err := set.QuickSetupOfferSinceErr(ctx)
-			if err != nil {
-				return false
-			}
-			if settings.QuickSetupHold(set.QuickSetupDone(), since, time.Now().Unix()) {
-				return false
-			}
-			if qsHoldReleased.CompareAndSwap(false, true) && qsOnHoldRelease != nil {
-				qsOnHoldRelease()
-			}
-		}
-		return set.Monitoring()
-	}
+	monitoringLive := newMonitoringLiveFn(ctx, set, &qsOnHoldRelease)
 
 	m := monitor.New(p.cfg, pr, p.store, p.log)
 	m.IntervalFn = set.LatencyInterval
@@ -701,6 +710,13 @@ func (p *program) run(ctx context.Context) {
 		PKCS1Fn:      set.IperfPKCS1,
 	}
 	iperfTester.OnServer = sched.SetCurrentServer // surface the live server during an iperf3 run
+	// Container networking failures deserve an explanation the errno never gives
+	// (localhost is the container itself, host NICs/IPs don't exist in its network
+	// namespace, the default bridge has no IPv6). The engine stays container-blind:
+	// the matcher is injected only here, and only in a BRIDGED container (see
+	// iperfEnvHintFn) - natively, and in a host-network container where localhost
+	// IS the host, the same errors mean exactly what they say and get no hint.
+	iperfTester.EnvHint = iperfEnvHintFn(util.BridgedContainer(), set)
 	sched.TesterFn = func() speedtest.Tester {
 		if set.SpeedEngine() == "iperf3" {
 			if speedtest.IperfAvailable() {
@@ -1036,6 +1052,89 @@ func seedKnownCounters() {
 	stats.Seed(names...)
 }
 
+// newMonitoringLiveFn builds monitoringLive, the master switch the measurement
+// loops actually obey: the power button AND the first-run hold. While the Quick
+// Setup offer is open the daemon measures nothing - the dialog's button is
+// called Start monitoring and it must be telling the truth. The hold can only
+// release (answer or 48h expiry), so once seen released it is never re-checked:
+// the settings read is cheap but the offer clock is a DB read, and this runs
+// every round. onHoldRelease is a pointer so run() can wire the netinfo nudge
+// after the manager exists; it is dereferenced only at the release edge.
+func newMonitoringLiveFn(ctx context.Context, set *settings.Controller, onHoldRelease *func()) func() bool {
+	var qsHoldReleased atomic.Bool
+	return func() bool {
+		if !qsHoldReleased.Load() {
+			// Until settings load, the first-run decision can't be made and the
+			// offer clock isn't seeded - QuickSetupHold below would then read a bare
+			// offer_since==0 and fail OPEN. Hold a GENUINELY FRESH install (nothing
+			// in the store: no history, anchor, or config) instead, so it can't
+			// start probing unasked - but do NOT latch the release, so the normal
+			// hold takes over once the retry loads settings and seeds the clock. An
+			// established install already consented and keeps running; a store-read
+			// error holds too (the fresh direction).
+			if !set.Loaded() {
+				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
+					return false
+				}
+				return set.Monitoring()
+			}
+			// Read the offer clock with its error surfaced: a transient store read
+			// error must HOLD, not read as "no clock -> release" and then latch that
+			// release forever off a single failed read.
+			since, err := set.QuickSetupOfferSinceErr(ctx)
+			if err != nil {
+				return false
+			}
+			// LOADED with Quick Setup unanswered and NO offer clock is the same
+			// bare-zero hazard one step later: the first-run decision has not been
+			// materialized yet (a late/SIGHUP Reload flips Loaded and broadcasts
+			// before the offer clock lands - the recovery paths pre-seed to close
+			// that window, but this must not depend on it - or the offer write
+			// failed at boot). QuickSetupHold reads the bare zero as "never
+			// offered", and the CAS below would latch that release PERMANENTLY -
+			// a fresh install probing without first-run consent. Same treatment
+			// as the unloaded case: hold a genuinely fresh install, keep an
+			// established one running, and latch nothing so the real hold takes
+			// over once the clock is seeded.
+			if !set.QuickSetupDone() && since == 0 {
+				if est, err := set.EstablishedInStore(ctx); err != nil || !est {
+					return false
+				}
+				return set.Monitoring()
+			}
+			if settings.QuickSetupHold(set.QuickSetupDone(), since, time.Now().Unix()) {
+				return false
+			}
+			if qsHoldReleased.CompareAndSwap(false, true) && onHoldRelease != nil && *onHoldRelease != nil {
+				(*onHoldRelease)()
+			}
+		}
+		return set.Monitoring()
+	}
+}
+
+// seedQuickSetupOfferEarly seeds the first-run offer clock on a controller
+// that has NOT loaded yet, BEFORE a recovery Reload can flip Loaded()==true
+// and broadcast a wake (Reload does both internally). Seeding only after
+// Reload returns would leave a window where a woken monitoringLive sees a
+// loaded controller with a bare offer_since==0 - the fail-closed branch there
+// holds it, but the window must not exist in the first place, and the status
+// endpoint's quick_setup_pending has no such guard. EnsureQuickSetupOffer
+// reads the store directly (valid while unloaded) and the clock write has no
+// loaded-guard, so the fresh-install half works here; the established
+// install's answered marker is a settings write that refuses while unloaded
+// (ErrSettingsUnavailable) - expected and harmless, materializeQuickSetup
+// re-runs after the successful Reload and takes that half then. No-op once
+// loaded, so the SIGHUP path can call it on every signal.
+func (p *program) seedQuickSetupOfferEarly(ctx context.Context, set *settings.Controller) {
+	if set.Loaded() {
+		return
+	}
+	if err := set.EnsureQuickSetupOffer(ctx, time.Now().Unix()); err != nil && !errors.Is(err, settings.ErrSettingsUnavailable) {
+		p.log.Warn("quick setup offer pre-seed failed; retaken after reload", "err", err)
+	}
+}
+
 // materializeQuickSetup records the first-run decision on a LOADED controller:
 // consent-by-flags (or -quick-setup=skip) marks Quick Setup answered, then
 // EnsureQuickSetupOffer seeds the offer clock for a genuinely fresh install or
@@ -1080,11 +1179,19 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 		if set.Loaded() {
 			return // SIGHUP or an import beat us to it
 		}
+		// Offer clock FIRST, Reload second: Reload itself flips Loaded()==true
+		// and broadcasts the wake, so seeding only afterwards (in the
+		// materialize below) leaves a window where a woken monitoringLive sees
+		// a loaded controller, an open Quick Setup, and a bare offer clock -
+		// and would have latched its hold released for good.
+		p.seedQuickSetupOfferEarly(ctx, set)
 		if err := set.Reload(ctx); err == nil || errors.Is(err, settings.ErrLegacyReseal) {
 			p.log.Warn("settings loaded on retry; serving normally again")
 			// The boot path skipped the first-run decision on the failed load. Take
-			// it now: a fresh install must get its offer clock (and stay held for
-			// consent) rather than having started probing unasked while unloaded.
+			// the rest of it now (the offer clock was pre-seeded above; the answer
+			// markers are settings writes that refuse while unloaded): a fresh
+			// install must get its consent hold rather than having started probing
+			// unasked while unloaded.
 			p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
 			return
 		} else {
@@ -1418,6 +1525,106 @@ func resetAuthCmd(args []string) error {
 	return nil
 }
 
+// healthzDefaultAddr is where `pingularity healthz` probes when no -addr is
+// given: the daemon's default listen port, reached over loopback. CONTRACT: the
+// official images wire HEALTHCHECK ["/pingularity","healthz"] against exactly
+// this default - change it only together with the Dockerfiles.
+const healthzDefaultAddr = "127.0.0.1:9000"
+
+// healthzCmd implements `pingularity healthz`: probe a running instance's
+// /healthz and report by exit code - 0 when it answers 200, nonzero (with a
+// one-line stderr reason via fail) otherwise. Built for the container
+// HEALTHCHECK, where the image ships no curl/wget: plain HTTP, no auth
+// (/healthz is exempt from the guard, filters included), and a short timeout so
+// a hung daemon fails the probe instead of hanging it.
+func healthzCmd(args []string) error {
+	fs := flag.NewFlagSet("healthz", flag.ContinueOnError)
+	addr := fs.String("addr", healthzDefaultAddr, "host:port the running instance listens on")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + *addr + "/healthz")
+	if err != nil {
+		return fmt.Errorf("healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthz: %s answered %s", *addr, resp.Status)
+	}
+	return nil
+}
+
+// reconcileAccess makes an EXPLICITLY-passed -access flag / PINGULARITY_ACCESS
+// env authoritative over the stored access_local_only at boot, persisting the
+// operator's choice through the settings controller. cfg.Access normally only
+// seeds the FRESH-INSTALL default (defaultSettings; stored keys win via the
+// overlay), so a bridged container that persisted local_only=true under the old
+// warn-only regime was 403'd off its own published port on upgrade - including
+// the Access tab - and the distroless image has no shell to repair it. The
+// we-never-guess rule holds: only explicit input overrides (the silent "local"
+// default reconciles nothing), and it overrides in EITHER direction. Call only
+// on a LOADED controller - reconciling against compiled-in defaults would take
+// a persistent decision from values nobody chose.
+func reconcileAccess(ctx context.Context, cfg config.Config, set *settings.Controller) (changed bool, err error) {
+	if !cfg.AccessExplicit {
+		return false, nil
+	}
+	wantLocalOnly := cfg.Access != "network"
+	if set.AccessLocalOnly() == wantLocalOnly {
+		return false, nil
+	}
+	return true, set.SetAccessLocalOnly(ctx, wantLocalOnly)
+}
+
+// grandfatherContainerAccess keeps an UPGRADING pre-0.62 container install
+// reachable. Pre-0.62, containers defaulted the loopback-only filter OFF via an
+// unpersisted seed, so an install that never touched the Access tab has no
+// stored access_local_only - and 0.62's fail-closed default would flip it to
+// loopback-only on upgrade, 403ing its own published port with no shell in the
+// distroless image to fix it from. One-time and evidence-based, never a guess:
+// it acts only when ALL of these hold -
+//
+//   - the process runs in a container (natively the filter always defaulted ON,
+//     so there is nothing to grandfather);
+//   - the STORE is established (settings.EstablishedInStore - the same signal
+//     the quick-setup upgrade gate keys on), so a genuinely fresh container
+//     stays fail-closed;
+//   - no access_local_only key is STORED. Key PRESENCE, not the overlaid value:
+//     the overlay answers the flag-seeded default when nothing is stored, which
+//     is indistinguishable from a stored agreement. A stored key - the
+//     operator's, quick setup's, or this migration's own earlier write - always
+//     wins. The persist below stores the key, which is what makes the migration
+//     one-time: the next boot short-circuits here;
+//   - no EXPLICIT -access/PINGULARITY_ACCESS was passed. Explicit operator
+//     input beats the grandfather in either direction (reconcileAccess persists
+//     a disagreeing one on its own).
+//
+// A store read error decides nothing and writes nothing - the same boot logic
+// runs again next start (the EnsureQuickSetupOffer failure direction). Reports
+// whether it migrated so the caller can log the one WARN this deserves.
+func grandfatherContainerAccess(ctx context.Context, cfg config.Config, st *store.Store, set *settings.Controller, inContainer bool) (bool, error) {
+	if !inContainer || cfg.AccessExplicit {
+		return false, nil
+	}
+	all, err := st.AllSettings(ctx)
+	if err != nil {
+		return false, err
+	}
+	if _, stored := all["access_local_only"]; stored { // settings' keyAccessLocalOnly
+		return false, nil
+	}
+	est, err := set.EstablishedInStore(ctx)
+	if err != nil || !est {
+		return false, err
+	}
+	if err := set.SetAccessLocalOnly(ctx, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // defaultSettings is the fresh-install configuration: the seed values a brand-new
 // database is created with. Extracted from run() so a test can execute it - the
 // literal has three same-typed retention durations and two same-typed intervals
@@ -1504,6 +1711,74 @@ const ignoredOptsMsg = "PINGULARITY_OPTS is set, but Pingularity's official cont
 // (the most dangerous ignored flag) would never warn under token matching.
 func ignoredOptsWarning(opts string, inContainer bool) bool {
 	return strings.TrimSpace(opts) != "" && inContainer
+}
+
+// iperfEnvHintFn returns the matcher run() wires into Iperf.EnvHint, or nil
+// when no hint may ever fire. bridged is util.BridgedContainer() in production:
+// every hint below explains a BRIDGED-namespace failure (a private localhost,
+// missing host NICs/IPs, the v6-less default bridge), and every one of them is
+// WRONG in a host-network container, where localhost IS the host and its NICs
+// are visible - keying on merely "containerized" sent host-net operators
+// chasing host.docker.internal for a server plain 127.0.0.1 does reach. A named
+// constructor so the gate's key (bridged, not containerized) is pinned by test.
+func iperfEnvHintFn(bridged bool, set *settings.Controller) func(errText string) string {
+	if !bridged {
+		return nil
+	}
+	return func(errText string) string {
+		return iperfContainerHint(errText, set.IperfServer(), set.IperfBind(), set.IperfIPVer())
+	}
+}
+
+// iperfContainerHint maps an iperf3 transfer/UDP-probe failure onto the
+// container-networking mistake that produces it, so the surfaced error names the
+// fix instead of a bare errno. Wired into the engine (Iperf.EnvHint) ONLY in a
+// bridged container (see iperfEnvHintFn) - natively, and in a host-network
+// container, these errors mean what they say and get no hint.
+// server/bind/ipver are the settings the failed run used; the mapping is a pure
+// function over the error text plus those (never the environment), so it is
+// testable anywhere and the speedtest engine stays container-blind. Returns ""
+// for anything it doesn't recognize - hints are appended text, never behavior.
+func iperfContainerHint(errText, server, bind, ipver string) string {
+	s := strings.ToLower(errText)
+	has := func(sub string) bool { return strings.Contains(s, sub) }
+	switch {
+	// --bind-dev with a host NIC name: interface names don't cross network
+	// namespaces, so SO_BINDTODEVICE fails ENODEV inside the container.
+	case bind != "" && (has("no such device") || has("enodev") || has("bad interface")):
+		return fmt.Sprintf("host interface %q does not exist inside the container's network namespace; bind a container address instead, or run the container with host networking", bind)
+	// --bind with a host IP: the address isn't assigned in the container's
+	// namespace, so bind() fails EADDRNOTAVAIL. Checked before the -6 class:
+	// with an explicit bind set, the bind is the likelier direct cause.
+	case bind != "" && (has("cannot assign requested address") || has("eaddrnotavail")):
+		return fmt.Sprintf("bind address %q does not exist inside the container's network namespace; use the container's own address, or host networking to bind host IPs", bind)
+	// A forced -6 on the default Docker bridge, which carries no IPv6: connect
+	// fails unreachable (no route) or cannot-assign (no v6 source address).
+	case ipver == "6" && (has("unreachable") || has("cannot assign requested address") || has("eaddrnotavail")):
+		return "the default Docker bridge has no IPv6; enable IPv6 on the container network or use host networking"
+	// A loopback server target: inside a bridged container 127.0.0.1/localhost
+	// is the container itself, so a server on the host refuses the connection.
+	case has("connection refused") && loopbackIperfServer(server):
+		return "the container has its own localhost, so an iperf3 server on the host is not reachable at " + server + "; use host.docker.internal or the host's LAN IP"
+	}
+	return ""
+}
+
+// loopbackIperfServer reports whether the configured iperf3 server points at
+// loopback ("localhost", 127/8, ::1) - which inside a bridged container is the
+// container itself, not the machine the operator meant.
+func loopbackIperfServer(server string) bool {
+	host := strings.TrimSpace(server)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else {
+		host = strings.Trim(host, "[]") // bracketed IPv6 literal without a port
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // replayIgnoredOpts re-emits runCmd's ignored-PINGULARITY_OPTS finding into the
@@ -1804,6 +2079,22 @@ func statusString(s service.Status) string {
 	}
 }
 
+// startupLine renders the single always-on boot line. The default log level is
+// "off", so a healthy daemon - a container especially - would otherwise log
+// NOTHING and `docker logs` would show an empty stream indistinguishable from a
+// hung process. run() writes it straight to stdout, bypassing the level gate
+// (the same precedent as the stderr security warnings). Exactly one line,
+// operational shape only - version, listen address, access mode, dashboard URL -
+// never a secret.
+func startupLine(version, listenAddr string, localOnly bool) string {
+	access := "network"
+	if localOnly {
+		access = "local-only"
+	}
+	return fmt.Sprintf("pingularity %s: listening on %s, access %s, dashboard at %s",
+		version, listenAddr, access, dashboardURL(listenAddr))
+}
+
 // dashboardURL renders a friendly local URL for a listen address (a bare port,
 // empty host, or wildcard all resolve to localhost), for the post-install pointer.
 func dashboardURL(addr string) string {
@@ -1953,6 +2244,8 @@ Usage:
   pingularity restart|status   Restart / show service status
   pingularity uninstall [-y]   Remove the service (prompts first; -y to skip prompt)
   pingularity reset-auth       Clear the password + disable auth (forgot-password recovery)
+  pingularity healthz          Probe a running instance's /healthz (exit 0 = healthy;
+                               -addr host:port, default 127.0.0.1:9000)
   pingularity version          Print version
 
 Run flags (all optional - defaults work with no flags):

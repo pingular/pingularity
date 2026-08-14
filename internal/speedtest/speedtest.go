@@ -19,6 +19,17 @@ type Result struct {
 	DownloadBytes int64    // bytes received during the download test
 	UploadBytes   int64    // bytes delivered during the upload test (sender-side for Ookla)
 
+	// IPFamily is the address family the transfer actually used ("4"/"6"),
+	// read back from the run itself (iperf3: the control connection's peer
+	// literal); "" when unknown (Ookla, an old/errored JSON body). Recorded
+	// because family "auto" is otherwise invisible: a dual-stack native host
+	// measures IPv6 where an IPv6-less network silently measures IPv4.
+	IPFamily string
+	// UDPDirection is which way the UDP loss/jitter probe sampled
+	// ("down"/"up"); "" whenever loss/jitter went unmeasured. Loss on an
+	// asymmetric path differs by direction, so a sample without it is ambiguous.
+	UDPDirection string
+
 	// PingBestMS is the fastest of the samples PingMS averages; nil when the engine
 	// reports no per-sample values (iperf3). See store.SpeedSample.PingBestMS for
 	// why the decisions use the floor and the report keeps the mean.

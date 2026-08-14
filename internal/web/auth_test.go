@@ -1065,6 +1065,53 @@ func TestLocalOnlyEnforcedEverywhere(t *testing.T) {
 	}
 }
 
+// The local-only refusal must EXPLAIN itself: the person reading it is usually
+// the operator hitting their own fresh install's published port, and the 403
+// body is the only interface they have. It stays a 403, names the setting and
+// both ways out (Access tab from the machine itself; -access network /
+// PINGULARITY_ACCESS=network at start), and a loopback peer never sees it.
+func TestLocalOnly403ExplainsItself(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
+		t.Fatalf("SetAccessLocalOnly: %v", err)
+	}
+	h := s.Handler()
+
+	r := httptest.NewRequest("GET", "/api/access", nil)
+	r.Host = "192.0.2.10" // IP literal passes the DNS-rebinding guard
+	r.RemoteAddr = "192.0.2.10:5000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: %d, want 403", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"private (local-only",        // names the setting that refused them
+		"Access tab",                 // the from-the-machine way out
+		"-access network",            // the flag way out
+		"PINGULARITY_ACCESS=network", // the container-env way out
+		"password",                   // opening up should come with a login
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("403 body missing %q; body = %q", want, body)
+		}
+	}
+
+	// A loopback peer is untouched: admitted, and never shown the refusal text.
+	lr := httptest.NewRequest("GET", "/api/access", nil)
+	lr.Host = "127.0.0.1:9000"
+	lr.RemoteAddr = "127.0.0.1:55555"
+	lw := httptest.NewRecorder()
+	h.ServeHTTP(lw, lr)
+	if lw.Code != http.StatusOK {
+		t.Fatalf("loopback peer with local-only on: %d, want 200", lw.Code)
+	}
+	if strings.Contains(lw.Body.String(), "local-only access is on") {
+		t.Error("loopback response carries the refusal text")
+	}
+}
+
 // accessStatus reports enforcement straight from the toggle now: local-only is
 // live whenever it is on, with no container exception.
 func TestAccessStatusReportsLocalOnlyEnforcement(t *testing.T) {

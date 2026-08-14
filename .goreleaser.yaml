@@ -102,6 +102,17 @@ dockers_v2:
       # Empty template on a prerelease tag drops `latest` entirely: an rc must not
       # move what `docker pull` (latest) serves.
       - "{{ if not .Prerelease }}latest{{ end }}"
+    # Version/revision attribution is stamped here, at build time, because only
+    # the release knows them; the static OCI labels (title/description/source/
+    # licenses) live in the Dockerfile itself. Labels go into the image config,
+    # annotations onto the OCI manifest/index - registries read the latter, so
+    # both carry the pair.
+    labels:
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+    annotations:
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
 
   # iperf3-enabled variant. Same multi-arch binaries staged into a debian-slim
   # final stage that bundles iperf3 (Dockerfile.iperf); the default distroless
@@ -122,6 +133,13 @@ dockers_v2:
       # Same rc guard as the default image: an empty template on a prerelease tag
       # drops `latest-iperf`, so an rc never moves the iperf `latest` either.
       - "{{ if not .Prerelease }}latest-iperf{{ end }}"
+    # Same version/revision stamping as the default image above.
+    labels:
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+    annotations:
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
 
 homebrew_casks:
   # Same rc guard as winget below: a prerelease tag must not land in the tap, or

@@ -1061,6 +1061,13 @@ func (c *Controller) Changed() <-chan struct{} {
 // round-tripping (and thus reverting) values it doesn't own. The DB write
 // precedes the broadcast, so on a store error the in-memory values are untouched.
 func (c *Controller) mutate(ctx context.Context, fn func(v *Values) map[string]string) error {
+	return c.mutateErr(ctx, func(v *Values) (map[string]string, error) { return fn(v), nil })
+}
+
+// mutateErr is mutate for mutators that can themselves fail (Update's
+// stored-baseline read): a non-nil error from fn aborts the write with nothing
+// persisted, applied, or broadcast.
+func (c *Controller) mutateErr(ctx context.Context, fn func(v *Values) (map[string]string, error)) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	// The initial load failed, so the in-memory values are defaults, not the
@@ -1070,7 +1077,10 @@ func (c *Controller) mutate(ctx context.Context, fn func(v *Values) map[string]s
 		return ErrSettingsUnavailable
 	}
 	v := c.get()
-	kv := fn(&v)
+	kv, err := fn(&v)
+	if err != nil {
+		return err
+	}
 	// Seal the iperf3 passwords on the way to disk. Every write goes through mutate,
 	// so this is the only place that needs to know. restoreSealed first re-attaches
 	// any ciphertext this process couldn't decrypt at load, so an unrelated save can't
@@ -1242,6 +1252,81 @@ func setIf[T any](dst *T, src *T) {
 	}
 }
 
+// keys reports which persisted keys this patch explicitly submits (non-nil
+// fields), mirroring apply. Update needs the distinction: only a SUBMITTED
+// field may newly pin a value the store doesn't hold yet (a flag-backed or
+// shipped-default value the operator saved); fields merely carried along keep
+// the store a sparse overlay. TestPatchKeysCoversEveryField pins the mapping.
+func (p Patch) keys() map[string]bool {
+	ks := make(map[string]bool)
+	mark := func(set bool, key string) {
+		if set {
+			ks[key] = true
+		}
+	}
+	mark(p.Latency != nil, keyLatency)
+	mark(p.LatencyEnabled != nil, keyLatencyEnabled)
+	mark(p.DNSProbe != nil, keyDNSProbe)
+	mark(p.NetinfoEnabled != nil, keyNetinfo)
+	mark(p.Speed != nil, keySpeed)
+	mark(p.Retention != nil, keyRetention)
+	mark(p.SpeedRetention != nil, keySpeedRet)
+	mark(p.DowntimeRetention != nil, keyDowntimeRet)
+	mark(p.Timeout != nil, keyTimeout)
+	mark(p.DownAfter != nil, keyDownAfter)
+	mark(p.UpAfter != nil, keyUpAfter)
+	mark(p.SpeedServerID != nil, keySpeedServer)
+	mark(p.SpeedAutoLoc != nil, keySpeedAutoLoc)
+	mark(p.SpeedAutoLabel != nil, keySpeedAutoLabel)
+	mark(p.SpeedtestEnabled != nil, keySpeedEnabled)
+	mark(p.SpeedtestOnReconnect != nil, keySpeedOnRecon)
+	mark(p.IPv6Mode != nil, keyIPv6Mode)
+	mark(p.ExitTarget != nil, keyExitTarget)
+	mark(p.SpeedtestAdaptive != nil, keySpeedAdaptive)
+	mark(p.SpeedtestOnDegraded != nil, keySpeedOnDegraded)
+	mark(p.DegradedPingMS != nil, keyDegradedPingMS)
+	mark(p.SpeedtestSkipBusy != nil, keySpeedSkipBusy)
+	mark(p.SpeedBusyMbps != nil, keySpeedBusyMbps)
+	mark(p.SpeedEngine != nil, keySpeedEngine)
+	mark(p.IperfServer != nil, keyIperfServer)
+	mark(p.IperfServers != nil, keyIperfServers)
+	mark(p.IperfDur != nil, keyIperfDur)
+	mark(p.IperfStreams != nil, keyIperfStreams)
+	mark(p.OoklaConnections != nil, keyOoklaConnections)
+	mark(p.OoklaLoss != nil, keyOoklaLoss)
+	mark(p.SpeedBestOf != nil, keySpeedBestOf)
+	mark(p.IperfOmit != nil, keyIperfOmit)
+	mark(p.SpeedDirection != nil, keySpeedDirection)
+	mark(p.IperfDirection != nil, keyIperfDirection)
+	mark(p.IperfUDP != nil, keyIperfUDP)
+	mark(p.IperfUDPRate != nil, keyIperfUDPRate)
+	mark(p.IperfWindow != nil, keyIperfWindow)
+	mark(p.SpeedRetries != nil, keySpeedRetries)
+	mark(p.IperfRetries != nil, keyIperfRetries)
+	mark(p.IperfCongestion != nil, keyIperfCongest)
+	mark(p.IperfNoDelay != nil, keyIperfNoDelay)
+	mark(p.IperfDSCP != nil, keyIperfDSCP)
+	mark(p.IperfMSS != nil, keyIperfMSS)
+	mark(p.ThreshDownMbps != nil, keyThreshDown)
+	mark(p.ThreshUpMbps != nil, keyThreshUp)
+	mark(p.ThreshPingMS != nil, keyThreshPing)
+	mark(p.ThreshJitterMS != nil, keyThreshJitter)
+	mark(p.ThreshLossPct != nil, keyThreshLoss)
+	mark(p.ThreshConsec != nil, keyThreshConsec)
+	mark(p.ThreshBloatDownMS != nil, keyThreshBloatDown)
+	mark(p.ThreshBloatUpMS != nil, keyThreshBloatUp)
+	mark(p.AlertOnOutage != nil, keyAlertOnOutage)
+	mark(p.WebhookURL != nil, keyWebhookURL)
+	mark(p.WebhookFormat != nil, keyWebhookFormat)
+	mark(p.HeartbeatURL != nil, keyHeartbeatURL)
+	mark(p.DigestFreq != nil, keyDigestFreq)
+	mark(p.SchedLatEnabled != nil, keySchedLatEnabled)
+	mark(p.SchedLatWindows != nil, keySchedLatWindows)
+	mark(p.SchedSpeedEnabled != nil, keySchedSpeedEnabled)
+	mark(p.SchedSpeedWindows != nil, keySchedSpeedWindows)
+	return ks
+}
+
 // Update validates, clamps, persists, and applies a dashboard-form patch. Nil
 // (omitted) fields keep their current value - PATCH semantics - so a partial
 // API body can't silently reset the ~50 form settings it didn't mention.
@@ -1263,8 +1348,15 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 		}
 	}
 	var out Values
-	err := c.mutate(ctx, func(cur *Values) map[string]string {
-		old := formKeys(normalize(*cur)) // baseline, to persist only what changes
+	err := c.mutateErr(ctx, func(cur *Values) (map[string]string, error) {
+		// The diff baseline below is the STORE, not the in-memory values; read it
+		// under the writer lock so no concurrent write can slip between this read
+		// and the decision. On a read error the save fails with nothing applied.
+		stored, err := c.store.AllSettings(ctx)
+		if err != nil {
+			return nil, err
+		}
+		old := formKeys(normalize(*cur)) // the running values (for the unsubmitted-key rule)
 		v := *cur
 		p.apply(&v)
 		// Each server's iperf3 password is write-only: the form never echoes it, so a
@@ -1276,20 +1368,46 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 		nv.IperfServers = mergeIperfPasswords(nv.IperfServers, cur.IperfServers)
 		*cur = nv
 		out = *cur
-		// Persist ONLY the keys that actually changed. formKeys(out) is the full
-		// ~50-key snapshot; writing all of it froze every default a partial POST
-		// didn't mention - which shadowed CLI flags AND (since a persisted config
-		// key now reads as establishment) could make a fresh install look upgraded
-		// and skip first-run consent. A no-op POST now persists nothing. The
-		// in-memory Values above are still fully merged, so reads are unaffected.
+		// Persist ONLY what this save establishes - writing the full ~50-key
+		// snapshot froze every default a partial POST didn't mention, which
+		// shadowed CLI flags AND (since a persisted config key reads as
+		// establishment) could make a fresh install look upgraded and skip
+		// first-run consent. A SUBMITTED key's baseline is what a restart would
+		// otherwise read back: the stored value when the key is persisted, else
+		// the SHIPPED default - never the flag-overlaid in-memory value, which
+		// made an explicit save of a flag-backed value a no-op (old == new) that
+		// silently reverted once the flag was removed. It also persists when it
+		// differs from the running value, so setting a flag-backed field to the
+		// shipped default sticks too. An UNSUBMITTED key still persists only when
+		// its value actually moved (a normalize side effect), keeping the store a
+		// sparse overlay: untouched defaults and unsaved flag values stay
+		// unpersisted, so future shipped-default and flag changes flow through,
+		// and a no-op POST persists nothing.
 		newKeys := formKeys(out)
+		shipped := formKeys(normalize(shippedDefaults(c.defaults)))
+		submitted := p.keys()
 		diff := make(map[string]string, len(newKeys))
 		for k, val := range newKeys {
-			if old[k] != val {
+			if !submitted[k] {
+				if val != old[k] {
+					diff[k] = val
+				}
+				continue
+			}
+			base, isStored := stored[k]
+			if !isStored {
+				base = shipped[k]
+			} else if k == keyIperfServers {
+				// Stored sealed (ciphertext); old[k] is that same list's in-memory
+				// plaintext, so compare against it or every save would re-seal (and
+				// rewrite) an unchanged list.
+				base = old[k]
+			}
+			if val != base || val != old[k] {
 				diff[k] = val
 			}
 		}
-		return diff
+		return diff, nil
 	})
 	if err != nil {
 		return Values{}, err
@@ -1363,6 +1481,33 @@ func formKeys(v Values) map[string]string {
 		keySchedSpeedWindows: windowsJSON(v.SchedSpeedWindows),
 		keyQuickSetup:        b2s(v.QuickSetupDone),
 	}
+}
+
+// shippedDefaults returns the fresh-install (shipped) values of the form
+// fields, given the seeded defaults. The controller is seeded with the shipped
+// defaults plus any CLI flag overlays already applied (it cannot tell the two
+// apart from def alone), so the flag-seedable fields are pinned back to their
+// shipped constants here and every other field passes through unchanged - no
+// flag can alter those. Update diffs an unpersisted submitted key against THIS
+// baseline: a saved flag-backed value must persist (or it silently reverts when
+// the flag is removed), while a value matching the shipped default stays
+// unpersisted so the store remains a sparse overlay. The constants mirror
+// config.Default(); TestShippedDefaultsMatchConfig pins them so they can't
+// drift.
+func shippedDefaults(def Values) Values {
+	def.Latency = 5 * time.Second                // -interval
+	def.LatencyEnabled = true                    // -latency
+	def.Timeout = 3 * time.Second                // -timeout
+	def.DownAfter = 2                            // -down-after
+	def.UpAfter = 1                              // -up-after
+	def.SpeedtestEnabled = false                 // -speedtest
+	def.Speed = time.Hour                        // -speedtest-interval
+	def.SpeedtestOnReconnect = true              // -speedtest-on-reconnect
+	def.IPv6Mode = "auto"                        // -ipv6
+	def.Retention = 30 * 24 * time.Hour          // -retain
+	def.SpeedRetention = 365 * 24 * time.Hour    // -retain-speed
+	def.DowntimeRetention = 365 * 24 * time.Hour // -retain-downtime
+	return def
 }
 
 // SetMonitoring flips just the master on/off flag (power button).
@@ -1592,11 +1737,28 @@ func (c *Controller) EnsureQuickSetupOffer(ctx context.Context, nowUnix int64) e
 	if est {
 		return c.SetQuickSetupDone(ctx, true)
 	}
-	// Genuinely fresh (no history). A normal past offer clock is left exactly as
-	// it was (a fresh install mid-hold, or one released after 48h). Only two
-	// states act: never-offered (since==0) seeds the clock, and a future clock
-	// (since>now) is pulled back to now so the countdown is sane.
-	if since := c.QuickSetupOfferSince(ctx); since != 0 && since <= nowUnix {
+	// Genuinely fresh (no history). The offer-clock read must NOT mask a store
+	// error as 0 (as QuickSetupOfferSince does): "never seeded" and "could not
+	// read" take opposite actions here, and acting on the masked 0 would rewrite
+	// the clock to now, restarting the 48h consent countdown off one transient
+	// failure.
+	since, rerr := c.QuickSetupOfferSinceErr(ctx)
+	return c.seedOfferClock(ctx, since, rerr, nowUnix)
+}
+
+// seedOfferClock is EnsureQuickSetupOffer's fresh-install leg, taking the
+// offer-clock read RESULT so its failure contract is enforced (and testable) in
+// one place: a read error takes NO decision and makes NO write - the same
+// failure direction as the history gate, retried next boot. Otherwise a normal
+// past offer clock is left exactly as it was (a fresh install mid-hold, or one
+// released after 48h); only two states act: never-offered (since==0) seeds the
+// clock, and a future clock (since>now) is pulled back to now so the countdown
+// is sane.
+func (c *Controller) seedOfferClock(ctx context.Context, since int64, rerr error, nowUnix int64) error {
+	if rerr != nil {
+		return rerr
+	}
+	if since != 0 && since <= nowUnix {
 		return nil
 	}
 	return c.store.SetSetting(ctx, keyQuickSetupOffer, strconv.FormatInt(nowUnix, 10))
