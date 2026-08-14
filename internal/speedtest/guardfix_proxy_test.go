@@ -14,15 +14,29 @@ import (
 	ookla "github.com/showwin/speedtest-go/speedtest"
 )
 
-// clearProxyEnv scrubs every proxy variable the dial guard consults, so a
-// proxy configured in the developer's or CI's real environment cannot leak
-// into a test's verdicts. t.Setenv restores the originals on cleanup.
+// clearProxyEnv scrubs every proxy variable the dial guard and the per-request
+// proxy decision consult - plus ALL_PROXY, which nothing consults but a host
+// environment may still carry - so a proxy configured in the developer's or
+// CI's real environment cannot leak into a test's verdicts. t.Setenv restores
+// the originals on cleanup.
 func clearProxyEnv(t *testing.T) {
 	t.Helper()
 	for _, kv := range proxyEnvVars {
 		t.Setenv(kv[0], "")
 		t.Setenv(kv[1], "")
 	}
+	for _, k := range []string{"NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(k, "")
+	}
+	// REQUEST_METHOD is not a proxy variable, but it is the one net/http reads
+	// to decide it is serving CGI - where HTTP_PROXY is caller-supplied and both
+	// the routing decision and the dial guard's trust set change (see inCGI).
+	t.Setenv("REQUEST_METHOD", "")
+	// The destination guard memoizes resolutions (see resolveProxiedDest), so a
+	// verdict another test cached under its scripted resolver must not answer
+	// here - nor this test's under the next one's.
+	flushDestResolveCache()
+	t.Cleanup(flushDestResolveCache)
 }
 
 // The operator's configured proxy endpoint is trusted local config: the dial
@@ -63,11 +77,11 @@ func TestProbeDialGuardProxyEnvForms(t *testing.T) {
 		{"HTTP_PROXY", "http://192.168.1.10:8888", "192.168.1.10:8888"},
 		{"http_proxy", "http://192.168.1.10:8888", "192.168.1.10:8888"}, // lowercase form
 		{"HTTPS_PROXY", "http://10.9.8.7:3128", "10.9.8.7:3128"},
-		{"https_proxy", "10.9.8.7:3128", "10.9.8.7:3128"},            // bare host:port
-		{"ALL_PROXY", "socks5://100.64.0.9:1080", "100.64.0.9:1080"}, // CGNAT-hosted SOCKS
-		{"all_proxy", "socks5://100.64.0.9", "100.64.0.9:1080"},      // socks5 default port
-		{"HTTP_PROXY", "http://172.16.0.2", "172.16.0.2:80"},         // http default port
-		{"HTTPS_PROXY", "https://172.16.0.3", "172.16.0.3:443"},      // https default port
+		{"https_proxy", "10.9.8.7:3128", "10.9.8.7:3128"},             // bare host:port
+		{"HTTP_PROXY", "socks5://100.64.0.9:1080", "100.64.0.9:1080"}, // CGNAT-hosted SOCKS
+		{"HTTPS_PROXY", "socks5://100.64.0.9", "100.64.0.9:1080"},     // socks5 default port
+		{"HTTP_PROXY", "http://172.16.0.2", "172.16.0.2:80"},          // http default port
+		{"HTTPS_PROXY", "https://172.16.0.3", "172.16.0.3:443"},       // https default port
 	}
 	for _, c := range cases {
 		t.Run(c.key+"="+c.val, func(t *testing.T) {
@@ -80,6 +94,27 @@ func TestProbeDialGuardProxyEnvForms(t *testing.T) {
 				t.Errorf("guard refused configured proxy %s=%q dialing %s: %v", c.key, c.val, c.dial, err)
 			}
 		})
+	}
+}
+
+// ALL_PROXY must NOT feed the allowance: net/http's ProxyFromEnvironment
+// never reads it (x/net/http/httpproxy consults HTTP_PROXY, HTTPS_PROXY and
+// NO_PROXY only), so no request can ever ride that endpoint - trusting it
+// opened a dial to an internal address for zero routing benefit.
+func TestProbeDialGuardIgnoresAllProxy(t *testing.T) {
+	clearProxyEnv(t)
+	t.Setenv("ALL_PROXY", "socks5://10.11.12.13:1080")
+	if err := probeDialGuard("tcp", "10.11.12.13:1080", nil); err == nil {
+		t.Fatal("guard trusted an ALL_PROXY endpoint that no request is ever routed through")
+	}
+	t.Setenv("all_proxy", "socks5://100.64.0.9:1080")
+	if err := probeDialGuard("tcp", "100.64.0.9:1080", nil); err == nil {
+		t.Fatal("guard trusted a lowercase all_proxy endpoint that no request is ever routed through")
+	}
+	// And with ONLY ALL_PROXY set nothing is proxied, so the proxied-destination
+	// pre-check must stay inert rather than filtering the catalogue.
+	if got := len(proxyAddrs()); got != 0 {
+		t.Fatalf("proxyAddrs trusts %d ALL_PROXY endpoint(s), want 0", got)
 	}
 }
 

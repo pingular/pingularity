@@ -183,6 +183,17 @@ func (n *Notifier) url() string {
 	return strings.TrimSpace(n.URLFn())
 }
 
+// Configured reports whether a webhook URL is set, i.e. whether Send can
+// actually deliver anything. Read live, like url(), so it tracks a settings
+// change.
+//
+// Send deliberately returns nil for a blank URL (see its doc): an alert is
+// fire-and-forget and must not look like a delivery failure worth retrying. That
+// makes nil ambiguous for a caller whose next action depends on the message
+// having ARRIVED - the digest advances a once-per-period watermark on success -
+// so such a caller asks here first instead of reading the no-op as delivery.
+func (n *Notifier) Configured() bool { return n.url() != "" }
+
 // outageRetries is the bounded backoff for a transition alert. A link_up/
 // link_down POST is a one-shot event, so a transient webhook failure (5xx,
 // rate-limit, or the brief post-reconnect resolver hiccup when DNS/routing lags

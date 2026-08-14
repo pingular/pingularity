@@ -1531,6 +1531,17 @@ func TestWWWAuthenticateOnlyForNonAppClients(t *testing.T) {
 // state (a password set via Settings while the first-run offer is open).
 func TestQuickSetupRefusesAccessChangeWhenAuthActive(t *testing.T) {
 	s := newTestServer(t)
+	// Seed the offer clock FIRST, as every boot does on a fresh install. Order is
+	// load-bearing: setting a password makes the install "established", and the
+	// boot step marks an established install already-answered rather than opening
+	// an offer - so seeding afterwards produces a closed window, not an open one.
+	// This order is also the state the test names: a password set via Settings
+	// while the first-run offer is still open.
+	//
+	// Without it the window gate refuses these POSTs before they ever reach the
+	// step-up refusal this test exists to pin, and the test passes with that
+	// refusal deleted - which is exactly what it must never do.
+	seedQuickSetupOffer(t, s)
 	setPassword(t, s, "admin", "secret") // auth now active; quick_setup_done still false
 	h := s.Handler()
 
@@ -1582,7 +1593,8 @@ func TestQuickSetupRefusesAccessChangeWhenAuthActive(t *testing.T) {
 // silently flip access/update off). A complete answer turns monitoring on.
 func TestQuickSetupRejectsIncompleteAnswer(t *testing.T) {
 	post := func(t *testing.T, body string) *httptest.ResponseRecorder {
-		s := newTestServer(t) // fresh: auth inactive, quick_setup pending
+		s := newTestServer(t)     // fresh: auth inactive, quick_setup pending
+		seedQuickSetupOffer(t, s) // the boot step production always runs; without it the POST is refused before validation
 		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
 		r.Host = "127.0.0.1:9000"
 		r.Header.Set("Content-Type", "application/json")
@@ -1602,6 +1614,7 @@ func TestQuickSetupRejectsIncompleteAnswer(t *testing.T) {
 	}
 	// A complete answer succeeds and turns monitoring on.
 	s := newTestServer(t)
+	seedQuickSetupOffer(t, s) // the boot step production always runs; without it the answer is refused as a closed offer
 	if err := s.settings.SetMonitoring(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
@@ -1626,6 +1639,7 @@ func TestQuickSetupRejectsIncompleteAnswer(t *testing.T) {
 func TestQuickSetupAuthRequiresPassword(t *testing.T) {
 	post := func(t *testing.T, body string) (*httptest.ResponseRecorder, *Server) {
 		s := newTestServer(t)
+		seedQuickSetupOffer(t, s) // the boot step production always runs; without it the POST is refused before the password rules run
 		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
 		r.Host = "127.0.0.1:9000"
 		r.Header.Set("Content-Type", "application/json")
@@ -1690,6 +1704,7 @@ func TestMonitoringPowerOnAnswersOfferAtomically(t *testing.T) {
 func TestQuickSetupAuthFlagMustMatchPassword(t *testing.T) {
 	post := func(body string) *httptest.ResponseRecorder {
 		s := newTestServer(t)
+		seedQuickSetupOffer(t, s) // the boot step production always runs; without it the POST is refused before the flag/password match runs
 		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
 		r.Host = "127.0.0.1:9000"
 		r.Header.Set("Content-Type", "application/json")
@@ -1713,6 +1728,7 @@ func TestQuickSetupAuthFlagMustMatchPassword(t *testing.T) {
 // this bug.
 func TestQuickSetupRetryIdempotentAfterAuthEnabled(t *testing.T) {
 	s := newTestServer(t)
+	seedQuickSetupOffer(t, s) // the boot step production always runs; without it the FIRST answer is refused as a closed offer
 	post := func(body, remote string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("POST", "/api/quick-setup", strings.NewReader(body))
 		r.Host = "127.0.0.1:9000" // IP literal passes the rebinding guard

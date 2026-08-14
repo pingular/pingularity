@@ -679,21 +679,26 @@ func TestDowntimeByDayPauseAcrossMidnight(t *testing.T) {
 }
 
 // A corrupt or crafted duration_s (a backup import does not range-check it, and
-// normVal accepts any whole number up to ~9.2e18) must not drive the per-day
-// loop past now: without the upper clamp the loop appends one row per day of
-// the duration, hanging the request and exhausting memory. The clamp bounds it
-// to [start, now], so the call returns promptly with a handful of rows.
+// normVal accepts any whole number up to ~9.2e18) must not drive the per-day loop
+// outside the queried window: unclamped it appends one row per day of the
+// duration - eleven million of them in the first seconds here - hanging the
+// request and exhausting memory. prorate clamps every span to [since, now], so
+// the call returns promptly with a handful of rows.
 func TestDowntimeByDayClampsCraftedDuration(t *testing.T) {
 	st := open(t)
 	ctx := context.Background()
 	now := time.Now()
-	if err := st.InsertEvent(ctx, now.Add(-2*time.Minute), "down", -1, ""); err != nil {
-		t.Fatalf("insert down: %v", err)
-	}
+	// Seeded as a legacy row, like its UptimeSince sibling: InsertEvent now drops a
+	// duration this large (maxPauseDuration), so routing the fixture through it
+	// leaves duration_s NULL and the scenario unbuilt. The residue this guards
+	// against is already on disk, written by a build that had no such door.
+	//
+	// Unpaired on purpose. A preceding 'down' anchors the outage at ITS timestamp,
+	// the crafted duration never reaches the day loop, and the clamp under test is
+	// unreachable - so the shape that exercises it is the stray 'up' a corrupt
+	// import leaves behind, which the loop starts at ts-duration_s.
 	// ~31,700 years of "downtime": pre-clamp this is ~1.16e10 loop iterations.
-	if err := st.InsertEvent(ctx, now.Add(-time.Minute), "up", 1_000_000_000_000, ""); err != nil {
-		t.Fatalf("insert up: %v", err)
-	}
+	seedLegacyEvent(t, st, now.Add(-time.Minute).Unix(), "up", int64(1_000_000_000_000))
 	type res struct {
 		rows []DowntimeDay
 		err  error
@@ -708,10 +713,10 @@ func TestDowntimeByDayClampsCraftedDuration(t *testing.T) {
 		if r.err != nil {
 			t.Fatalf("DowntimeByDay: %v", r.err)
 		}
-		// The real outage spans ~2 minutes ending at now, so at most today plus a
-		// midnight-straddle: a tiny, bounded result rather than tens of billions.
+		// The queried window is 24h, so at most today plus a midnight-straddle: a
+		// tiny, bounded result rather than tens of billions.
 		if len(r.rows) > 2 {
-			t.Fatalf("got %d day rows, want <= 2 - upper bound is not clamped to now", len(r.rows))
+			t.Fatalf("got %d day rows, want <= 2 - the day loop is not clamped to the window", len(r.rows))
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("DowntimeByDay did not return within 5s - the loop is unbounded")
@@ -1048,16 +1053,22 @@ func TestImportSkipsJSONContainerValue(t *testing.T) {
 	}
 }
 
-// UptimeSince clamps computed downtime to the [since, now] window: a corrupt or
-// crafted duration_s (imports don't range-check it) must not blow the fraction
-// far negative. The SQL uses MIN(o_start + duration_s, now); this proves it.
+// UptimeSince clamps computed downtime to the [since, now] window: a corrupt
+// duration_s must not blow the fraction far negative. The SQL uses
+// MIN(o_start + duration_s, now); this proves it.
+//
+// Seeded with raw SQL because that is now the only way such a row EXISTS: every
+// door bounds the length (eventRowSane on import, repairInsaneEventDurations at
+// rest, InsertEvent on the live path). The clamp is still the thing under test -
+// it is what stands between the readers and a row that predates those doors, and
+// it must keep standing whether or not anything can add a new one.
 func TestUptimeSinceClampsCraftedDuration(t *testing.T) {
 	st := open(t)
 	now := time.Now()
 	sampleAt(t, st, now, 1000, "cf", "ipv4", true)
 	// Down 120s ago, "recovered" 60s ago but with an absurd ~31,700-year duration.
 	eventAt(t, st, now, 120, "down", -1)
-	eventAt(t, st, now, 60, "up", 1_000_000_000_000)
+	seedLegacyEvent(t, st, now.Add(-60*time.Second).Unix(), "up", int64(1_000_000_000_000))
 	up, err := ratioOf(st.UptimeSince(context.Background(), now.Add(-1000*time.Second), 0))
 	if err != nil {
 		t.Fatal(err)

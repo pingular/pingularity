@@ -9,9 +9,12 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -191,6 +194,18 @@ func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder)
 	client := ookla.New(ookla.WithDoer(doer), ookla.WithUserConfig(uc))
 	if _, ok := http.DefaultClient.Transport.(*ookla.Speedtest); ok {
 		http.DefaultClient.Transport = nil
+	}
+	// The transport New stamped carries net/http's ProxyFromEnvironment, whose
+	// environment read is cached once per process. Replace it with the
+	// fresh-reading equivalent that also vets the LOGICAL destination of every
+	// proxied request (see guardedEnvProxy): the doer follows GET redirects
+	// itself, so a ping or download 3xx re-enters the transport with a
+	// third-party URL the pre-measure check never saw - and behind a proxy the
+	// dial guard only ever sees the proxy's address. Direct requests keep their
+	// dial-time guard. An explicit UserConfig.Proxy (never set here) keeps the
+	// library's own routing.
+	if uc != nil && uc.T != nil && uc.Proxy == "" {
+		uc.T.Proxy = guardedEnvProxy
 	}
 	// WithUserConfig stamped doer.Transport = client (the library's UA-adding
 	// RoundTripper over its own http.Transport), overwriting anything set before
@@ -498,13 +513,13 @@ func probeDialGuard(_, address string, _ syscall.RawConn) error {
 	}
 	if err := blockedIP(ip); err != nil {
 		// The ONE internal endpoint a dial may legitimately reach: the
-		// operator's own forward proxy. HTTP(S)_PROXY/ALL_PROXY are trusted
-		// local configuration, and when they are set net/http routes every
-		// library request THROUGH that endpoint, so refusing its (often
-		// loopback or LAN) address broke every catalogue fetch, ranking ping
-		// and transfer behind such a proxy. Exact host:port only - the rest of
-		// the proxy's network stays refused. Consulted only on a refusal, so
-		// the public fast path never reads the environment.
+		// operator's own forward proxy. HTTP(S)_PROXY are trusted local
+		// configuration, and when they are set net/http routes every library
+		// request THROUGH that endpoint, so refusing its (often loopback or
+		// LAN) address broke every catalogue fetch, ranking ping and transfer
+		// behind such a proxy. Exact host:port only - the rest of the proxy's
+		// network stays refused. Consulted only on a refusal, so the public
+		// fast path never reads the environment.
 		if isConfiguredProxy(address) {
 			return nil
 		}
@@ -567,7 +582,7 @@ var blockedProbeNets = func() []*net.IPNet {
 
 // ---- Operator proxy handling -------------------------------------------------
 //
-// HTTP(S)_PROXY/ALL_PROXY are operator-trusted local configuration. Two sides:
+// HTTP(S)_PROXY are operator-trusted local configuration. Two sides:
 //
 //   - the dial guard must ALLOW the configured proxy endpoint (see
 //     probeDialGuard), or nothing works behind a loopback/LAN proxy;
@@ -576,25 +591,95 @@ var blockedProbeNets = func() []*net.IPNet {
 //     so the LOGICAL destination must be validated separately (see
 //     guardProxiedDestination), or a hostile catalogue entry naming an
 //     internal host tunnels straight past the dial guard.
+//
+// The trust set is exactly what net/http consults per request, no wider.
+// ALL_PROXY deliberately is NOT here: net/http's ProxyFromEnvironment never
+// reads it (x/net/http/httpproxy reads HTTP_PROXY, HTTPS_PROXY and NO_PROXY
+// only), so no request can ever ride an ALL_PROXY endpoint - allowing dials to
+// one was pure attack surface. Which requests are EXEMPT from proxying, and
+// which are refused outright under CGI, do follow the same per-request rules
+// net/http applies - scheme selection, NO_PROXY, the loopback/localhost
+// exemption (see envProxyEndpoint) and the CGI check (see cgiProxyRefusal) -
+// except read FRESH from the environment on every call, because net/http's own
+// copy is cached once per process and t.Setenv-driven tests cannot reach it.
+//
+// What follows net/http is those exemption rules, NOT the whole decision: this
+// is not a drop-in ProxyFromEnvironment, and anyone changing either side needs
+// to know it. net/http has two outcomes, proxy or direct. There are three
+// here, and the third is a refusal: a value this daemon cannot use - an
+// unsupported scheme, or one that names no host:port (see parseProxyEnvURL) -
+// fails every request that would have ridden it. httpproxy has no third
+// outcome, because it validates no scheme at all and config.init drops a parse
+// error and leaves that variable unset, sending the same request direct.
+// Failing instead is deliberate: the operator configured a proxy, and traffic
+// leaving by a route they did not choose - direct, or through an endpoint the
+// "http://" + value retry invented - is the harm this section exists to
+// prevent. Divergence details sit on parseProxyEnvURL (which values are
+// usable) and envProxyEndpoint (routing).
 
 // proxyEnvVars are the variables net/http's ProxyFromEnvironment consults,
 // uppercase preferred - the same precedence it applies.
 var proxyEnvVars = [][2]string{
 	{"HTTP_PROXY", "http_proxy"},
 	{"HTTPS_PROXY", "https_proxy"},
-	{"ALL_PROXY", "all_proxy"},
+}
+
+// getenvEither reads one proxy variable in both spellings, uppercase preferred.
+func getenvEither(upper, lower string) string {
+	if v := os.Getenv(upper); v != "" {
+		return v
+	}
+	return os.Getenv(lower)
+}
+
+// inCGI reports what x/net/http/httpproxy infers from REQUEST_METHOD: this
+// process is serving a CGI request, where "HTTP_PROXY" is not operator config
+// at all - it is the caller's Proxy request header, which the CGI convention
+// maps into the environment. net/http therefore ERRORS an http request instead
+// of honouring it (see cgiProxyRefusal), and never routes one through that
+// endpoint, so the dial guard's trust set drops it too.
+func inCGI() bool { return os.Getenv("REQUEST_METHOD") != "" }
+
+// cgiProxyRefusal is httpproxy's CGI check, in its order: it fires on the
+// http scheme alone, BEFORE the loopback and NO_PROXY exemptions, whenever
+// HTTP_PROXY parses to a usable endpoint. Matching that order matters - a
+// request net/http refuses must not be sent here just because NO_PROXY happens
+// to cover its host.
+func cgiProxyRefusal(u *url.URL) error {
+	if !inCGI() || strings.ToLower(u.Scheme) != "http" {
+		return nil
+	}
+	// A value that yields no usable endpoint carries no request anywhere, so
+	// there is no egress choice here to take away from a CGI caller. httpproxy
+	// stands down for the same reason: its CGI branch needs a non-nil parsed
+	// proxy, and config.init leaves that nil for any value parseProxy rejected.
+	//
+	// It does NOT follow that the caller always hears something instead.
+	// envProxyEndpoint applies the loopback/localhost and NO_PROXY exemptions
+	// BEFORE it parses the value, so on an exempt destination an unusable value
+	// produces no error at all and the request goes direct in silence - while a
+	// USABLE value is CGI-refused on that same destination, this check being
+	// deliberately ahead of those exemptions. Measured both ways in
+	// TestProxyUnusableValueRefusesOnlyWhatWouldHaveBeenProxied: an operator
+	// who typo'd HTTP_PROXY hears about it only on the requests that would have
+	// been proxied.
+	if p, err := parseProxyEnvURL(getenvEither("HTTP_PROXY", "http_proxy")); err != nil || p == nil {
+		return nil
+	}
+	return errors.New("refusing to use HTTP_PROXY value in CGI environment; see golang.org/s/cgihttpproxy")
 }
 
 // proxyAddrs returns the configured proxy endpoints as host:port, read fresh
-// from the environment on every call (three Getenvs - cheap, and it keeps
+// from the environment on every call (a few Getenvs - cheap, and it keeps
 // t.Setenv-driven tests honest where net/http's own once-cached copy is not).
 func proxyAddrs() []string {
 	var out []string
+	cgi := inCGI()
 	for _, kv := range proxyEnvVars {
-		v := os.Getenv(kv[0])
-		if v == "" {
-			v = os.Getenv(kv[1])
+		if cgi && kv[0] == "HTTP_PROXY" {
+			continue // no request rides it in CGI; see inCGI
 		}
+		v := getenvEither(kv[0], kv[1])
 		if v == "" {
 			continue
 		}
@@ -616,16 +701,118 @@ func proxyAddrs() []string {
 	return out
 }
 
-// proxyHostPort extracts host:port from one proxy environment value the way
-// net/http's environment parsing does: a bare "host[:port]" gets scheme http,
-// and a missing port gets the scheme's default (80/443/1080).
-func proxyHostPort(v string) string {
+// leadingScheme returns the scheme a proxy value spells out in the
+// "scheme://host" form, lowercased, or "" when the value names none.
+//
+// The "://" is the whole discriminator, and it is judged on the spelling
+// rather than on RFC 3986's scheme grammar. url.Parse reports a scheme for the
+// bare "host:port" form too ("proxy.example:3128" parses as scheme
+// "proxy.example", "ftp:3128" as scheme "ftp") and those are hosts, so the
+// colon alone proves nothing; conversely a value url.Parse refuses to read as
+// a scheme was still WRITTEN as one, and reading it as a host is the mistake
+// this exists to stop. Measured: "1http://proxy.example:21" - a scheme may not
+// start with a digit, so url.Parse takes the whole value for a path - came
+// back from the "http://" + value retry as the endpoint "1http:80". A
+// host:port value never contains "//" at all, so nothing legitimate is caught
+// here.
+func leadingScheme(v string) string {
+	i := strings.Index(v, "://")
+	if i <= 0 || strings.ContainsAny(v[:i], "/@:") {
+		return ""
+	}
+	return strings.ToLower(v[:i])
+}
+
+// parseProxyEnvURL parses one proxy environment value into the endpoint the
+// daemon may route through, or an error naming what is wrong with it. It is
+// deliberately NOT httpproxy's parseProxy (see the section comment above); the
+// two differ in two respects, both of them here.
+//
+// First: the "http://" + value retry, which is what makes the bare "host:port"
+// spelling - the form most operators write - mean http://host:port. httpproxy
+// retries whenever the first parse fails, or yields no scheme, or yields no
+// host, and that is far too wide, because url.Parse reads the SCHEME NAME of
+// the retried string as its host: the authority of
+// "http://" + "ftp://proxy.example:notaport" ends at the next "/", leaving host
+// "ftp:" - hostname "ftp", no port. Measured, every one of these came back as
+// an endpoint nobody configured, and the dial guard (whose trust set comes from
+// this same call) took each one for the operator's own proxy:
+//
+//	"ftp://proxy.example:21"       -> ftp:80   (the original report, and the
+//	                                            only one the clean-parse scheme
+//	                                            check below ever caught)
+//	"ftp://proxy.example:notaport" -> ftp:80   (first parse fails, so that
+//	                                            check never sees it)
+//	"ftp:///proxy.example"         -> ftp:80   (parses clean, but host is empty)
+//	"http://"                      -> http:80
+//	"unix:///var/run/proxy.sock"   -> unix:80
+//	"http://proxy.example:3128 "   -> http:80  (one trailing space, and the
+//	                                            configured proxy is never used)
+//
+// So a value that spells out "scheme://" is used exactly as written or
+// refused - never retried. Values with no scheme still get the retry, which is
+// what the schemeless forms need: "192.168.1.10:3128" and "[::1]:3128" do not
+// parse at all, and "user:pass@proxy.example:3128" parses with an empty host.
+// The retry additionally requires a non-empty HOSTNAME, where httpproxy takes
+// any parse at all: ":3128" otherwise comes back as an endpoint (host ":3128")
+// that proxyHostPort cannot express - measured, it yields "" - so net/http
+// would be handed a proxy with no matching entry in the dial guard's trust
+// set, and the operator would see a blocked dial rather than the real problem.
+//
+// Second: the outcome for a value this daemon cannot use. httpproxy discards
+// the parse error in config.init and connects DIRECT; an unsupported scheme it
+// does not detect at all. Here both are errors - an operator who configured a
+// proxy must not have the traffic quietly sent out by a route they did not
+// choose, and a typo'd scheme must be visible as a typo. No endpoint comes
+// back either way, so an unusable value can never enter the trust set.
+//
+// One ambiguity is left alone, because it is genuine: "mailto:ops@example.com"
+// has the same shape as "user:pass@proxy.example:3128" and is read the same
+// way, credentials plus host. Nothing is invented there - the host is written
+// in the value - and net/http reads it identically.
+//
+// An empty value means no proxy is configured and is not an error.
+func parseProxyEnvURL(v string) (*url.URL, error) {
+	if v == "" {
+		return nil, nil
+	}
 	u, err := url.Parse(v)
-	if err != nil || u.Host == "" {
-		u, err = url.Parse("http://" + v)
-		if err != nil || u.Host == "" {
-			return ""
+	// Hostname(), not Host: url.Parse fills Host with ":3128" for a value like
+	// "http://:3128", so gating on Host lets a scheme-with-no-host through as a
+	// usable endpoint. It is not usable - proxyHostPort has no host to record, so
+	// the dial guard's trust set comes out EMPTY, and an empty trust set is how
+	// guardProxiedDestination and guardedServers decide there is no proxy to
+	// police. Both then stand down for the whole run. A typo would not merely fail
+	// to route, it would silently disarm the guard, so this shape falls through to
+	// the refusal below with every other value that names a scheme it cannot use.
+	if err == nil && u.Scheme != "" && u.Hostname() != "" {
+		switch u.Scheme {
+		case "http", "https", "socks5", "socks5h":
+			return u, nil
 		}
+		return nil, fmt.Errorf("unsupported proxy scheme %q in proxy address %q: use http, https, socks5 or socks5h, or a bare host:port", u.Scheme, v)
+	}
+	// The value named a scheme and still yielded no endpoint, so there is
+	// nothing to fall back to: retrying it here is what fabricated the
+	// endpoints listed above.
+	if s := leadingScheme(v); s != "" {
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy address %q: %v (a value spelled %s:// is used as written, never read as a bare host:port)", v, err, s)
+		}
+		return nil, fmt.Errorf("invalid proxy address %q: the %q scheme names no host to connect to", v, s)
+	}
+	if retry, rerr := url.Parse("http://" + v); rerr == nil && retry.Hostname() != "" {
+		return retry, nil
+	}
+	return nil, fmt.Errorf("invalid proxy address %q: not a usable host:port", v)
+}
+
+// proxyHostPort extracts host:port from one proxy environment value, with a
+// missing port getting the scheme's default (80/443/1080).
+func proxyHostPort(v string) string {
+	u, err := parseProxyEnvURL(v)
+	if err != nil || u == nil {
+		return ""
 	}
 	host, port := u.Hostname(), u.Port()
 	if host == "" {
@@ -642,6 +829,170 @@ func proxyHostPort(v string) string {
 		}
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// noProxyExcludes reports whether NO_PROXY exempts host:port from proxying,
+// matching x/net/http/httpproxy's rules: "*" exempts everything; a CIDR or IP
+// entry matches an IP-literal host; a domain entry matches the host and its
+// subdomains ("example.com"), subdomains only when it leads with a dot or
+// "*." (".example.com" / "*.example.com"); an entry's :port, when present,
+// must match the request's.
+func noProxyExcludes(host, port string) bool {
+	nv := getenvEither("NO_PROXY", "no_proxy")
+	if nv == "" {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	ip := net.ParseIP(host)
+	for _, entry := range strings.Split(nv, ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if entry == "*" {
+			return true
+		}
+		if _, cidr, err := net.ParseCIDR(entry); err == nil {
+			if ip != nil && cidr.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		ehost, eport := entry, ""
+		if h, p, err := net.SplitHostPort(entry); err == nil {
+			ehost, eport = h, p
+		}
+		if ehost == "" || (eport != "" && eport != port) {
+			continue
+		}
+		if eip := net.ParseIP(ehost); eip != nil {
+			if ip != nil && eip.Equal(ip) {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(ehost, "*.") {
+			ehost = ehost[1:]
+		}
+		matchHost := false
+		if !strings.HasPrefix(ehost, ".") {
+			matchHost, ehost = true, "."+ehost
+		}
+		if strings.HasSuffix(host, ehost) || (matchHost && host == ehost[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+// envProxyURL is the routing decision alone, for callers that have nothing to
+// do with an unusable value: it reports the proxy a request for u would ride,
+// and nil when the request goes direct OR when the configured value is one the
+// daemon cannot use (see parseProxyEnvURL). envProxyEndpoint carries the reason
+// in that second case, and guardedEnvProxy is what puts it in front of the
+// operator instead of quietly connecting direct.
+func envProxyURL(u *url.URL) *url.URL {
+	p, err := envProxyEndpoint(u)
+	if err != nil {
+		return nil
+	}
+	return p
+}
+
+// envProxyEndpoint returns the proxy this daemon routes a request for u
+// through, nil for a direct connection, or an error for a configured value it
+// cannot use. Which requests are exempt is net/http's rule set, read fresh:
+// HTTP_PROXY for http, HTTPS_PROXY for https, nothing for other schemes, never
+// for localhost/loopback destinations, and never for a NO_PROXY-excluded host.
+// The CGI refusal, httpproxy's one other rule, sits in cgiProxyRefusal because
+// it returns an error rather than a routing decision.
+//
+// The ENDPOINT is not ProxyFromEnvironment's, and neither is the third
+// outcome, so this is not a drop-in replacement for it (see the section
+// comment above): parseProxyEnvURL refuses values httpproxy accepts - an
+// unsupported scheme, and anything that becomes a URL only by rewriting a
+// scheme the operator wrote into a hostname - and returns those as errors
+// where httpproxy discards the value and connects direct.
+//
+// One divergence inside the exemption rules themselves remains, deliberately:
+// httpproxy punycodes both sides of the NO_PROXY comparison (idnaASCII, from
+// canonicalAddr and its own init), so
+// there a Unicode entry matches a punycode host and vice versa, while here the
+// two must be written the same way. Closing it means taking on
+// golang.org/x/net/idna - a dependency this module does not otherwise have -
+// for a mixed-spelling case, and the divergence is fail-safe in both
+// directions: the request rides the proxy where net/http would send it direct,
+// and a proxied request is destination-vetted either way. Pinned by
+// TestEnvProxyNoProxyIDNAFormsMustMatch.
+//
+// The error is a value this request would have had to ride and cannot (an
+// unsupported scheme, or one that will not parse - see parseProxyEnvURL), and
+// it is reached only after every exemption above: a request the environment
+// sends direct anyway, and a request whose scheme selects the OTHER variable,
+// are unaffected by a broken one.
+func envProxyEndpoint(u *url.URL) (*url.URL, error) {
+	var v string
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "http":
+		v = getenvEither("HTTP_PROXY", "http_proxy")
+	case "https":
+		v = getenvEither("HTTPS_PROXY", "https_proxy")
+	default:
+		return nil, nil
+	}
+	if v == "" {
+		return nil, nil
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" || host == "localhost" {
+		return nil, nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil, nil
+	}
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	if noProxyExcludes(host, port) {
+		return nil, nil
+	}
+	return parseProxyEnvURL(v)
+}
+
+// guardedEnvProxy is the Proxy function on every HTTP client this file builds:
+// the probes' client and the transport the library stamps for the measurement
+// client alike (see probeClient, newOoklaClientRec). A proxied request's dial
+// only ever names the proxy, so the LOGICAL destination is vetted here, on
+// EVERY request - redirect hops included, because the client re-enters the
+// transport (and therefore this function) per hop - before anything is dialed.
+// A direct request returns (nil, nil) and keeps its dial-time guard; the
+// vetting itself stands down with the loopback relaxation exactly as the dial
+// guard does (guardProxiedDestination is inert when probeDialControl is nil).
+func guardedEnvProxy(req *http.Request) (*url.URL, error) {
+	if err := cgiProxyRefusal(req.URL); err != nil {
+		return nil, err
+	}
+	// Vet the destination BEFORE deciding how to reach it, not after. Routing
+	// first left one hole open: the dial guard has to EXEMPT the configured
+	// proxy address (a proxied dial only ever names the proxy), so a hostile
+	// catalogue entry or redirect naming the proxy's OWN host:port routed
+	// DIRECT - loopback, or NO_PROXY-excluded - skipped this check entirely,
+	// and was then waved through the dial guard by that same exemption. The
+	// daemon delivered an origin-form request, attacker-chosen path and all, to
+	// a service on the operator's machine. Judging the destination on what it
+	// IS, before how we route it, closes that without weakening the exemption
+	// the proxy hop genuinely needs. Inert unless a proxy is configured (see
+	// guardProxiedDestination), so a direct-only install is unaffected.
+	if err := guardProxiedDestination(req.Context(), req.URL.Host); err != nil {
+		return nil, err
+	}
+	return envProxyEndpoint(req.URL)
 }
 
 // isConfiguredProxy reports whether a dial address is one of the operator's
@@ -721,6 +1072,84 @@ func resolvedProxyIPs(host string) []net.IP {
 	return ips
 }
 
+// lookupDestIPs resolves a proxied request's destination. A var so the guard's
+// own tests can count and script resolutions without touching real DNS.
+var lookupDestIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// destResolveTTL bounds how long one destination's resolution is reused (see
+// resolveProxiedDest). A var only so tests can shrink it.
+var destResolveTTL = 30 * time.Second
+
+// destResolveMax caps the memo. Sized for a catalogue pass (guardedServers
+// vets every entry it fetches, the city race a pool per origin), and cleared
+// wholesale rather than evicted by age - the entries are cheap to rebuild and
+// the alternative is bookkeeping nobody reads.
+const destResolveMax = 512
+
+var (
+	destResolveMu    sync.Mutex
+	destResolveCache = map[string]destResolved{}
+)
+
+type destResolved struct {
+	ips     []net.IP
+	err     error
+	expires time.Time
+}
+
+// flushDestResolveCache empties the memo. Tests only: a scripted resolver in
+// one test must not answer for the previous one's names.
+func flushDestResolveCache() {
+	destResolveMu.Lock()
+	clear(destResolveCache)
+	destResolveMu.Unlock()
+}
+
+// resolveProxiedDest resolves a proxied request's destination host, memoized
+// for destResolveTTL.
+//
+// The VETTING stays per request - that is the security property, since each
+// redirect hop re-enters the transport with a new URL - but re-RESOLVING put a
+// resolver round-trip inline with the bytes being timed: a proxied transfer
+// issues one request per chunk (this package's own upload harness logs ~2,300
+// POSTs in ~4.5s, all to one hostname), so the guard hammered the resolver and
+// its added latency landed inside the measured throughput. The memo keeps the
+// same verdict for the same name and costs the accuracy of a name that changes
+// mid-window - already the accepted residual for proxied requests, whose
+// destination the proxy resolves separately from us anyway (see
+// docs/security-model.md).
+//
+// Both outcomes are memoized: a refusal re-resolving would hammer the resolver
+// exactly as hard as an allowance. A ctx-driven failure is NOT, because it
+// describes the run that ended rather than the host, and caching it would
+// refuse that destination for the rest of the window.
+func resolveProxiedDest(ctx context.Context, host string) ([]net.IP, error) {
+	destResolveMu.Lock()
+	e, ok := destResolveCache[host]
+	destResolveMu.Unlock()
+	if ok && time.Now().Before(e.expires) {
+		return e.ips, e.err
+	}
+	// Resolved OUTSIDE the lock: holding it would queue every proxied request
+	// in the process behind one slow lookup, which is the latency this memo
+	// exists to remove. Concurrent first-callers for the same host can
+	// duplicate that one lookup - bounded by the transfer's worker count, and
+	// every request after it hits the memo.
+	ips, err := lookupDestIPs(ctx, host)
+	if err != nil && ctx.Err() != nil {
+		return ips, err
+	}
+	destResolveMu.Lock()
+	if len(destResolveCache) >= destResolveMax {
+		clear(destResolveCache)
+	}
+	destResolveCache[host] = destResolved{ips: ips, err: err, expires: time.Now().Add(destResolveTTL)}
+	destResolveMu.Unlock()
+	return ips, err
+}
+
 // guardProxiedDestination validates the LOGICAL destination of a request that
 // will traverse the operator's proxy: internal IP-literals are refused
 // outright, hostnames are resolved here and every address checked before the
@@ -748,9 +1177,21 @@ func guardProxiedDestination(ctx context.Context, hostport string) error {
 	if ip := net.ParseIP(host); ip != nil {
 		return blockedIP(ip)
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := resolveProxiedDest(ctx, host)
 	if err != nil {
-		return fmt.Errorf("blocked proxied request to unresolvable host %q: %w", host, err)
+		// Fail closed, and say why in the terms the operator can act on. A
+		// proxied request names its destination only INSIDE the request, so the
+		// dial guard cannot see it - resolving here is the only way to know
+		// whether the proxy is about to be pointed at something internal. When
+		// the name will not resolve locally we cannot tell, and guessing "fine"
+		// is how a hostile catalogue entry reaches a LAN service.
+		//
+		// The honest cost: a proxy-only network with no local resolver (a
+		// socks5h setup where DNS is meant to happen AT the proxy) cannot vet
+		// anything, so speedtests stop rather than run unchecked. That is the
+		// intended trade, but it is invisible without saying so - the symptom is
+		// otherwise "every server refused" with no cause.
+		return fmt.Errorf("blocked proxied request to %q: its address could not be resolved locally, so the daemon cannot tell whether the proxy would be pointed at an internal service (a proxy-only network with no local DNS hits this; give the daemon a resolver, or set NO_PROXY for destinations it should reach directly): %w", host, err)
 	}
 	for _, ip := range ips {
 		if e := blockedIP(ip); e != nil {
@@ -847,11 +1288,20 @@ var probeDialControl = probeDialGuard
 // probeClient is the only client the endpoint probes use. Its dialer refuses
 // internal destinations (see probeDialGuard) on every hop, redirects included -
 // enforced at dial time, so a hostname that RESOLVES to an internal address is
-// caught too.
+// caught too. Proxied requests take the same route the transfers do.
 func probeClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
+			// Proxied exactly when net/http would proxy the request, with the
+			// logical destination vetted per hop (see guardedEnvProxy). Built
+			// bare, this transport dialed DIRECT even when the transfer client
+			// rode the operator's proxy: in a proxy-only network every fallback
+			// check and by-ID redirect probe timed out as endpointUnknown with
+			// zero proxy requests, so a migrated pinned server kept its stale
+			// URL and the proxied upload still hit the non-replayable 307 -
+			// issues #17/#18, alive behind proxies.
+			Proxy:       guardedEnvProxy,
 			DialContext: (&net.Dialer{Timeout: timeout, Control: probeDialControl}).DialContext,
 			// Every caller builds this client for a single request and drops it,
 			// so a kept-alive socket can never be reused - it would only sit in
@@ -1632,10 +2082,20 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		results = append(results, res)
 	}
 	if len(results) == 0 {
+		// Even a total failure carries its usage out: every candidate's failed
+		// transfers still moved spentDown/spentUp real bytes, and returning an
+		// empty Result here erased them - the scheduler's error path recorded
+		// 0/0 for traffic that lands on the user's bill (see recordFailedUsage).
+		// Engine too: it is the only field of a total failure that is knowable,
+		// and the usage row's engine column is otherwise empty - which the
+		// metrics path then reads as the DEFAULT engine (a guess that happens to
+		// be right here and wrong for an iperf3 failure, whose Result carries its
+		// own engine on the same path).
+		spent := Result{Engine: "ookla", DownloadBytes: spentDown, UploadBytes: spentUp}
 		if firstErr != nil {
-			return Result{}, firstErr
+			return spent, firstErr
 		}
-		return Result{}, fmt.Errorf("no speedtest servers available")
+		return spent, fmt.Errorf("no speedtest servers available")
 	}
 
 	// Say so when the round refused to believe a direction: the guard changes
@@ -2002,6 +2462,13 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 		// stand-in; the alternative is a nil deref inside NewUserConfig.
 		uc = &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent}
 	}
+	// Read the capture window off the client being replaced BEFORE the swap:
+	// SetCaptureTime lands on the MANAGER, not the UserConfig, so a rebuild
+	// that only copies the config silently reverts to the library's 15s
+	// default - a caller-configured window (the live-probe suites' 3s, the
+	// offline harness's shorter ones) advertised one duration and transferred,
+	// and billed, at another.
+	carry := managerCaptureTime(srv.Context)
 	// Each attempt gets its OWN UserConfig value. The library aliases the
 	// pointer it is handed (NewUserConfig does s.config = uc, then writes
 	// uc.T), so passing the run's shared config into every rebuild meant
@@ -2013,6 +2480,9 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 	// the library on the paths a rebuilt client uses.
 	attempt := *uc
 	client, rec := newOoklaClientRec(&attempt)
+	if carry > 0 {
+		client.SetCaptureTime(carry)
+	}
 	srv.Context = client
 	if o != nil {
 		if o.attemptT != nil {
@@ -2025,6 +2495,30 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 		o.attemptT = attempt.T // the transport New stamped for THIS attempt
 		o.upRec = rec          // diagnostics follow the client the transfer actually uses
 	}
+}
+
+// managerCaptureTime reads the transfer capture window configured on a
+// client's DataManager, or 0 when it cannot be determined. speedtest-go
+// v1.7.11's Manager interface has SetCaptureTime but no getter, and
+// freshManager must CARRY a caller-configured window onto the per-attempt
+// client it builds (see there) - reflection is the least-bad access short of
+// forking the library. A library upgrade that renames the field degrades to 0
+// (keep the library's default window, today's pre-carry behaviour), and
+// TestFreshManagerCarriesCaptureWindowState pins the read so that degradation
+// fails loudly instead of silently.
+func managerCaptureTime(c *ookla.Speedtest) time.Duration {
+	if c == nil {
+		return 0
+	}
+	dm, ok := c.Manager.(*ookla.DataManager)
+	if !ok || dm == nil {
+		return 0
+	}
+	f := reflect.ValueOf(dm).Elem().FieldByName("captureTime")
+	if !f.IsValid() || f.Kind() != reflect.Int64 {
+		return 0
+	}
+	return time.Duration(f.Int())
 }
 
 // ooklaTransfer is one direction's library transfer. The two implementations are
@@ -2087,11 +2581,18 @@ var errTransferPanicked = errors.New("speedtest transfer panicked")
 // owns both srv - the library writes DLSpeed/ULSpeed/TestDuration on its way out
 // - and srv.Context, which is not per-server state but the client that fetched
 // it, shared by every target of a best-of run. After this returns false the
-// caller must read no field of either and must not Reset that manager (Reset
-// swaps the snapshot and both directions with no lock while the workers read
-// them). Hence errTransferAbandoned: measure stops at the failed attempt rather
-// than retrying, and RunReason ends the run rather than measuring the next
-// target on the same client.
+// caller must read no unsynchronized FIELD of either and must not Reset that
+// manager (Reset swaps the snapshot and both directions with no lock while the
+// workers read them). Hence errTransferAbandoned: measure stops at the failed
+// attempt rather than retrying, and RunReason ends the run rather than measuring
+// the next target on the same client.
+//
+// The manager's data-volume counters are the exception, and measure does read
+// them: GetTotalDownload / GetTotalUpload / GetUploadBacklog are atomic loads of
+// counters the workers only ever add to, so a caller can ask what the abandoned
+// transfer had moved so far without racing it. That is not an optional nicety -
+// those bytes came off the user's metered allowance, and nothing else records
+// them once this returns false.
 //
 // The orphan is bounded and self-collecting: its capture window closes it at
 // most ooklaCaptureTime after the transfer began, and the goroutine then exits
@@ -2188,9 +2689,11 @@ func runTransfer(ctx context.Context, srv *ookla.Server, fn ooklaTransfer) (fini
 		return true, e
 	case <-ctx.Done():
 		// A transfer that finishes in the same instant the context dies can land
-		// here too (select picks at random). The run is discarded either way, so
-		// the only cost is not counting bytes that were about to be thrown out
-		// with it - and a failed attempt's bytes were never counted anyway.
+		// here too (select picks at random). The run is discarded either way, and
+		// the bytes are not: measure tallies the manager's volume counters on
+		// this branch as well as the finished one, so which way the select fell
+		// changes the reported speed - already thrown away - but not the data
+		// usage the user is billed against.
 		return false, fmt.Errorf("%w: %w", errTransferAbandoned, ctx.Err())
 	}
 }
@@ -2242,6 +2745,85 @@ var fetchServerList = func(ctx context.Context, client *ookla.Speedtest) (ookla.
 	return guardedServers(ctx, currentEndpoints(servers)), err
 }
 
+// connFamilies records which IP families one measurement's transfer
+// connections ACTUALLY used, so Result.IPFamily can be derived from a real
+// recorded connection rather than guessed from configuration. Fed by the
+// httptrace hook traceConnFamilies installs on the transfer contexts; the
+// library's workers obtain connections concurrently, hence the lock.
+type connFamilies struct {
+	mu     sync.Mutex
+	v4, v6 bool
+}
+
+// note classifies one transfer connection's remote address. A connection to
+// the operator's configured proxy is skipped on purpose: that hop's family
+// describes the local leg to the proxy, not the path that carried the
+// transfer beyond it, so recording it would claim knowledge we don't have -
+// a proxied run honestly stays unrecorded.
+func (c *connFamilies) note(remote string) {
+	if isConfiguredProxy(remote) {
+		return
+	}
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	a, err := netip.ParseAddr(host)
+	if err != nil {
+		return // not an IP literal; nothing honest to record
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// A v4-mapped literal (dual-bound listener) is IPv4 on the wire - the same
+	// rule iperfFamily applies to iperf3's start.connected block.
+	if a.Is4() || a.Is4In6() {
+		c.v4 = true
+	} else {
+		c.v6 = true
+	}
+}
+
+// family reports what the recorded connections allow us to say: "4"/"6" when
+// every transfer connection agreed, "mixed" when both families really carried
+// transfer bytes (the same vocabulary the iperf engine stores when its two
+// processes disagree), "" when no connection was recorded at all.
+func (c *connFamilies) family() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.v4 && c.v6:
+		return "mixed"
+	case c.v4:
+		return "4"
+	case c.v6:
+		return "6"
+	}
+	return ""
+}
+
+// traceConnFamilies returns ctx with a client trace that feeds every
+// connection obtained under it into rec. Applied ONLY to the transfer
+// contexts (the runTransfer calls): a wider scope would also record the
+// latency-under-load probe's endpoint, which is a different host entirely.
+func traceConnFamilies(ctx context.Context, rec *connFamilies) context.Context {
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn == nil {
+				return
+			}
+			if ra := info.Conn.RemoteAddr(); ra != nil {
+				rec.note(ra.String())
+			}
+		},
+	})
+}
+
+// ooklaLoss indirects measurePacketLoss the same way ooklaPing/ooklaDownload/
+// ooklaUpload stand in for the network: the loss probe needs a live UDP
+// protocol no offline test can serve, and what measure() records about a
+// SUCCESSFUL probe (UDPDirection) was otherwise unreachable in tests.
+var ooklaLoss = measurePacketLoss
+
 // measure runs one full measurement against an already-chosen server.
 func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retries int) (Result, error) {
 	// The target is third-party data on every path here (catalogue Host, by-ID
@@ -2266,6 +2848,12 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	idleMS := measureIdleLatency(ctx, probeAddr)
 	anyErr := func(error) bool { return true } // a failed transfer is worth retrying
 
+	// The family the transfers ACTUALLY used, from their real connections (see
+	// connFamilies). One recorder spans every attempt of both directions: the
+	// per-attempt client rebuilds (freshManager) must not lose the download's
+	// record before the upload adds its own.
+	fams := &connFamilies{}
+
 	// Each retry attempt must start from a clean DataManager: the library's
 	// Register*Handler only appends while the handler stack has room, so a retry
 	// on the same client would otherwise drive the previous attempt's cancelled
@@ -2284,16 +2872,51 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		err = withRetryPred(ctx, retries, anyErr, func() error {
 			freshManager(o, srv, o.uc) // per-attempt manager; see freshManager
 			stop := startLoadSampler(ctx, probeAddr)
-			finished, e := runTransfer(ctx, srv, ooklaDownload)
+			// traceConnFamilies scopes the family record to the transfer's own
+			// requests - the load sampler above probes a different host.
+			finished, e := runTransfer(traceConnFamilies(ctx, fams), srv, ooklaDownload)
 			loadedDown = stop() // our own sampler, always joined
+			// Tally what THIS attempt really pulled, whatever became of it. The
+			// bytes came off the user's allowance either way, and the figure is
+			// about to become unreachable: the next attempt's freshManager hands
+			// out a manager whose counter starts at zero. An ABANDONED attempt is
+			// counted here too - it used to return having counted nothing, so a
+			// user who cancelled during the download phase (the FIRST phase of
+			// every run, and so the likeliest moment to cancel) had the whole
+			// run's usage reported as 0 bytes after moving hundreds of MB, and
+			// the scheduler's zero-usage guard then dropped the row entirely.
+			downBytes += srv.Context.GetTotalDownload()
 			if !finished {
 				// srv and the shared client now belong to the orphaned transfer
-				// (see runTransfer): read nothing off them, and don't come back
-				// for another attempt - the Reset above would race its workers.
+				// (see runTransfer), and this attempt does not come back for
+				// another go - the rebuild above would race its workers.
+				//
+				// The volume counter read just above is the ONE thing that may
+				// still be read off an abandoned manager. GetTotalDownload and
+				// GetTotalUpload are atomic loads of counters the library's
+				// workers only ever add to, and srv.Context is only ever assigned
+				// from the run's own goroutine (freshManager here, and server
+				// selection before any transfer exists), never by the transfer, so
+				// the read races nothing. It reports the total as of now and
+				// misses whatever the orphan pulls after we walked away, which is
+				// the honest answer to "what had this run spent when the user
+				// cancelled it".
+				//
+				// GetUploadBacklog, which uploadSpent adds below, is not one load
+				// but two - total read volume minus total upload, clamped at zero.
+				// Both operands are atomic so it still races nothing, but a
+				// confirmation landing between them makes the sum miss that
+				// delta. Bounded, and it errs toward under-reporting usage rather
+				// than over-reporting it, which is the right direction for a
+				// figure that bills the operator.
+				//
+				// Nothing else on an abandoned manager is safe: DLSpeed/ULSpeed
+				// and TestDuration are plain fields the library writes without
+				// synchronisation on its way out, and Reset swaps the snapshot and
+				// both directions with no lock at all.
 				return e
 			}
-			downBytes += srv.Context.GetTotalDownload() // count this attempt before the next Reset zeroes it
-			if e == nil && ctx.Err() != nil {           // the lib can return nil on cancellation
+			if e == nil && ctx.Err() != nil { // the lib can return nil on cancellation
 				e = ctx.Err()
 			}
 			if e == nil { // -1 = failed transfer (see naErr)
@@ -2304,8 +2927,9 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		if err != nil {
 			// Carry the safely-tallied bytes out with the error: the traffic was
 			// really spent (and lands on the user's bill) whether or not the
-			// measurement survived. Orphaned transfers' live bytes are already
-			// excluded by the !finished guards above.
+			// measurement survived. An ABANDONED transfer's bytes are in there
+			// too - its counter is read before the guard above returns - so a
+			// cancelled run reports what it moved instead of 0.
 			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("download: %w", err)
 		}
 	}
@@ -2399,12 +3023,18 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 				rescued = true
 			}
 			stop := startLoadSampler(ctx, probeAddr)
-			finished, e := runTransfer(ctx, srv, ooklaUpload)
+			finished, e := runTransfer(traceConnFamilies(ctx, fams), srv, ooklaUpload)
 			loadedUp = stop()
-			if !finished { // abandoned: srv belongs to the orphan now (see above)
+			// Confirmed + backlog: a FAILED or ABANDONED attempt's pushed bytes
+			// aren't in GetTotalUpload alone. Counted before the branch below for
+			// the same reason as the download's tally - an abort left the user's
+			// data usage claiming 0 for traffic that really went out.
+			upBytes += uploadSpent(srv)
+			if !finished {
+				// Abandoned: srv belongs to the orphan now, and uploadSpent's
+				// atomic counters are all that may be read off it (see above).
 				return e
 			}
-			upBytes += uploadSpent(srv) // confirmed + backlog: a FAILED attempt's pushed bytes aren't in GetTotalUpload alone
 			if e == nil && ctx.Err() != nil {
 				e = ctx.Err()
 			}
@@ -2428,18 +3058,38 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			// The recorder's summary is APPENDED, not substituted: %w keeps
 			// errMeasurementNA in the chain and the "upload:" prefix stays first,
 			// so speedFailStage still classifies this exactly as before.
+			// Name the retry budget when it is what made the rescue unreachable.
+			// The single-stream rescue is gated on being a SECOND attempt, and
+			// withRetryPred runs the closure once when the budget is zero, so an
+			// install that set retries to 0 can never reach it - on an uplink slow
+			// enough to starve, that install loses every run and the diagnostic
+			// above says only that no chunk finished inside the window. Nothing
+			// pointed at the one field that fixes it, so say it here. Only when
+			// the budget really is the blocker: with retries available the rescue
+			// was tried, and blaming the setting would be wrong.
+			hint := ""
+			if retries <= 0 {
+				hint = " (no retry budget: the single-stream fallback for a starved upload only runs on a second attempt - raise Retries above 0 in Settings to allow it)"
+			}
 			if o.upRec != nil {
 				return Result{DownloadBytes: downBytes, UploadBytes: upBytes},
-					fmt.Errorf("upload: %w [%s]", err, o.upRec.summary())
+					fmt.Errorf("upload: %w [%s]%s", err, o.upRec.summary(), hint)
 			}
-			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w", err)
+			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w%s", err, hint)
 		}
 	}
 
 	// Packet loss needs its own UDP pass; it stays nil when the user turns it off.
 	var loss *float64
+	var udpDir string
 	if o.LossFn == nil || o.LossFn() {
-		loss = measurePacketLoss(ctx, srv)
+		loss = ooklaLoss(ctx, srv)
+		// The probe SENDS its datagrams (speedtest-go's PacketLossSender), so a
+		// successful one measured the upstream path - the only direction this
+		// engine can honestly claim for loss.
+		if loss != nil {
+			udpDir = "up"
+		}
 	}
 
 	return Result{
@@ -2452,6 +3102,8 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		Server:          fmt.Sprintf("%s, %s", srv.Sponsor, srv.Name),
 		ServerID:        srv.ID,
 		PacketLoss:      loss,
+		UDPDirection:    udpDir,
+		IPFamily:        fams.family(),
 		DownloadBytes:   downBytes,
 		UploadBytes:     upBytes,
 		IdleMS:          idleMS,

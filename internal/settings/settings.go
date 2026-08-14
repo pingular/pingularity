@@ -111,6 +111,23 @@ const (
 	// own keys - so they're scoped to the server they belong to.
 )
 
+// KeyInstallBornVersion is the store's immutable birth-provenance marker: the
+// app version that initialized a BRAND-NEW database, stamped exactly once by
+// the controller that watched it come into existence (ensureBornMarker, from
+// New/Reload, or a later settings write finishing a stamp a transient store
+// fault lost) and never rewritten. PRESENCE is the contract,
+// not the value: a store created before the marker existed can never gain it.
+// PRESENCE is the trustworthy direction - it proves the store was born under a
+// build that stamps it. ABSENCE proves much less than it looks: the marker
+// shipped partway through 0.62, so an early-0.62 store and a genuinely pre-0.62
+// one are indistinguishable, which is why nothing OPENS access from it and
+// main only warns - main's ambiguous-container-access warning keys on it,
+// because measurement history alone cannot tell a pre-0.62 upgrade from a
+// fresh 0.62 install that consented (skip/dismiss/power-on) and only then
+// accrued history. Exported so main can gate on raw key presence; listed in
+// installStateKeys so it never reads as operator configuration.
+const KeyInstallBornVersion = "install_born_version"
+
 // Test-parameter bounds (mirrored by the UI inputs' min/max).
 const (
 	MinIperfDur     = 1
@@ -376,6 +393,51 @@ type Controller struct {
 	// Atomic rather than wmu-guarded: Loaded is read on every request, and taking
 	// the writer lock on the hot path to answer it would serialise the server.
 	initErr atomic.Bool
+	// bornVersion is what ensureBornMarker stamps into KeyInstallBornVersion
+	// when this controller initializes a brand-new store (WithBornVersion;
+	// "unknown" when the caller didn't say). Immutable after New.
+	bornVersion string
+	// bornMarkerErr holds the reason the birth marker is NOT on disk although
+	// this controller had a stamp to take: either the write failed, or the
+	// brand-new-vs-established judgement could not be made at all (nil while
+	// nothing has failed). The stamp has one natural moment - the store is
+	// brand-new only once - so a lost write leaves the install unmarked for the
+	// rest of its life unless THIS process completes it; keeping the reason here
+	// lets main log it at boot (BornMarkerErr), or the recurring ambiguity
+	// warning it causes has no traceable cause. Cleared as soon as the stamp
+	// lands (a later Reload, or the first settings write that proves the store
+	// writable again).
+	//
+	// Atomic for the same reason as initErr: it is written under New/Reload and
+	// read by the caller without the writer lock.
+	bornMarkerErr atomic.Pointer[error]
+	// bornPending records that THIS controller WITNESSED the birth - it read a
+	// genuinely brand-new store (EstablishedInStore said not established, and no
+	// marker) - and the stamp has not landed yet. It is what lets a later attempt
+	// finish the job even once the store has become established in the meantime,
+	// and the distinction it encodes is the whole point:
+	//
+	//   - The immutability rule exists so a LATER PROCESS cannot claim a birth it
+	//     never saw. A controller that first met the database when it already had
+	//     history is exactly that process, and it must refuse forever.
+	//   - This controller saw the empty database itself. Completing its own
+	//     pending stamp seconds or minutes later is TRUTHFUL, not retroactive:
+	//     the fact being recorded (this daemon created this store) was observed,
+	//     not inferred from what is on disk now.
+	//
+	// So it is deliberately in-memory only and never persisted or inherited: a
+	// restart drops it, and the new process is back to refusing. It is armed ONLY
+	// on a definite not-established reading - never on an undetermined one, which
+	// would be the same guess the rule forbids - and cleared the moment the
+	// marker is on disk.
+	//
+	// The witness is about a DATABASE, not a file path: it says "the store I read
+	// was empty", so anything that replaces the store's contents underneath the
+	// controller voids it - see ForgetBirthWitness, which the restore path calls.
+	//
+	// Atomic: armed under New/Reload, read (and cleared) from the settings write
+	// path, which holds wmu rather than any lock New takes.
+	bornPending atomic.Bool
 	// sessionEpoch is the persisted session-revocation epoch, folded into every
 	// session-token MAC. Kept in an atomic (not Values) so it's cheap to read on
 	// every authenticated request and never flows through the export/normalize path.
@@ -405,6 +467,12 @@ type Option func(*Controller)
 // WithCrypter encrypts the stored iperf3 passwords at rest. Without it they are
 // stored as they always were (in the clear), which is what the tests use.
 func WithCrypter(cr Crypter) Option { return func(c *Controller) { c.crypter = cr } }
+
+// WithBornVersion names the app version recorded in KeyInstallBornVersion when
+// this controller initializes a brand-new store. The marker's semantics ride on
+// its presence, never this value - it exists so a bug report's settings dump
+// says which release created the database.
+func WithBornVersion(v string) Option { return func(c *Controller) { c.bornVersion = v } }
 
 // sealed/unsealed convert the iperf_servers VALUE (a JSON blob) on its way to and
 // from the store, so overlay/formKeys stay pure functions over plaintext Values and
@@ -567,6 +635,13 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 		c.initErr.Store(true)
 		return c, err
 	}
+	// Stamp birth provenance on a brand-new store BEFORE anything else can run
+	// on it - main calls New ahead of every window in which monitoring could
+	// accrue history, so a store the marker is missing from is genuinely
+	// pre-marker (pre-0.62), not merely not-yet-stamped. Must see m before the
+	// in-place edits below (the unseal writes keyIperfServers even when absent,
+	// which would read as prior configuration).
+	c.ensureBornMarker(ctx, m)
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
 	c.seedSessionEpoch(m)
@@ -826,6 +901,11 @@ func (c *Controller) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Reload is the recovery path's first successful read when New's failed (the
+	// settings-retry loop, SIGHUP): the fresh install it just recovered starts
+	// its consent hold here, so this is still before any monitoring window and
+	// the brand-new store must get its birth marker now, not never.
+	c.ensureBornMarker(ctx, m)
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
 	c.seedSessionEpoch(m)
@@ -1101,6 +1181,17 @@ func (c *Controller) mutateErr(ctx context.Context, fn func(v *Values) (map[stri
 		return err
 	}
 	c.broadcast(v)
+	// The write above just proved the store accepts writes again, which is the
+	// one thing a birth stamp lost to a transient fault was waiting for. Done
+	// here rather than on a timer: the write that would otherwise ESTABLISH the
+	// store (the operator's Quick Setup answer, an access choice, any save) is
+	// the same write that shuts the stamping window, so completing the stamp on
+	// its back means the two can never race. Last, after the broadcast, so a
+	// piece of bookkeeping can never delay the operator's setting taking effect,
+	// and its own failure cannot fail their save (it is surfaced through
+	// BornMarkerErr, which is where a caller looks for it). No-op - one atomic
+	// load - unless a stamp is pending.
+	c.completePendingBornMarker(ctx)
 	return nil
 }
 
@@ -1764,6 +1855,186 @@ func (c *Controller) seedOfferClock(ctx context.Context, since int64, rerr error
 	return c.store.SetSetting(ctx, keyQuickSetupOffer, strconv.FormatInt(nowUnix, 10))
 }
 
+// ensureBornMarker stamps a BRAND-NEW store, exactly once, with the version
+// that initialized it (KeyInstallBornVersion). m is the pristine AllSettings
+// snapshot New/Reload just read, consulted before their in-place edits so
+// nothing can masquerade as the marker or as configuration. Brand-new means
+// NOT established (EstablishedInStore: no history, no anchor, no operator
+// config) and no marker yet - an established store WITHOUT one predates the
+// marker's introduction and must never gain it retroactively, since a stamp
+// added later would claim a birth that cannot be proven. That absence is what
+// main's ambiguous-container-access WARNING keys on; it decides nothing on its
+// own, because it cannot separate a pre-0.62 store from an early-0.62 one. The marker is
+// bookkeeping, not configuration (installStateKeys), so stamping it flips
+// neither EstablishedInStore nor the fresh-install consent hold.
+//
+// The establishment check has THREE outcomes, and collapsing two of them is how
+// a lost stamp used to go unexplained:
+//
+//   - established: nothing to do, no error, silence.
+//   - brand-new: this is a birth; stamp it (and remember having seen it, see
+//     bornPending).
+//   - UNDETERMINED (the store read failed): stamp nothing - the store may well
+//     be established and guessing is exactly what the immutability rule
+//     forbids - but say so, through the same channels a failed write uses, and
+//     re-decide at the next load rather than pretending the question was
+//     answered.
+//
+// A failed WRITE is likewise never swallowed: see stampBornMarker.
+func (c *Controller) ensureBornMarker(ctx context.Context, m map[string]string) {
+	if _, ok := m[KeyInstallBornVersion]; ok {
+		// Already stamped; the marker is immutable. Clear the pending state and any
+		// recorded failure - the store is marked, whatever an earlier attempt
+		// reported (this controller's own retry, or another process entirely).
+		c.bornPending.Store(false)
+		c.bornMarkerErr.Store(nil)
+		return
+	}
+	// Skip the establishment read once this controller has already WITNESSED the
+	// birth: it saw the empty database with its own eyes, so what the store looks
+	// like now cannot unmake that observation. Establishment is only asked of a
+	// controller that does not yet know - which is every controller that did not
+	// see the store brand-new, and those must keep refusing.
+	if !c.bornPending.Load() {
+		est, err := c.EstablishedInStore(ctx)
+		if err != nil {
+			// UNDETERMINED. Take the safe direction (no stamp: an established store
+			// must never gain one), but record and print it - this is the one failure
+			// mode that used to be silent, and its symptom months later is an
+			// ambiguity warning on every boot with nothing in the log to explain it.
+			// bornPending stays UNARMED: "I could not tell" is not "I saw an empty
+			// database", and arming it on a guess is precisely the retroactive claim
+			// the marker exists to prevent. The next New/Reload asks again.
+			err = fmt.Errorf("could not tell whether this database is brand-new: %w", err)
+			c.bornMarkerErr.Store(&err)
+			c.warnBornMarker("could not determine whether this install is brand-new (%s): %v - no birth version was recorded, deliberately: a store that may already be established must never be stamped, because a marker added later claims a birth that cannot be proven. The judgement is retaken on the next settings load; if this store really was brand-new and nothing records it, a containerized upgrade will warn about unprovable access provenance on every boot; pass -access/PINGULARITY_ACCESS explicitly to settle it.", err)
+			return
+		}
+		if est {
+			return
+		}
+		// A genuinely brand-new store, seen by THIS controller. From here on it may
+		// finish the stamp whatever the store grows into, and only it may.
+		c.bornPending.Store(true)
+	}
+	c.stampBornMarker(ctx)
+}
+
+// stampBornMarker takes the pending stamp and reports the outcome. The caller
+// has established that this controller witnessed a brand-new store and that the
+// marker is not on disk.
+//
+// Two ADJACENT attempts are the fast path, not the whole story. They cover the
+// fault they were written for - a lock the busy timeout did not absorb, a
+// passing I/O error - and cost nothing. They cannot cover a fault that outlives
+// them by more than microseconds (a read-only window while a volume remounts, a
+// stalled disk), which is why the failure leaves bornPending armed: the next
+// Reload, or the first settings write that proves the store writable again,
+// completes it. See completePendingBornMarker.
+//
+// Never abort startup over any of this. Monitoring is the job, and what makes
+// that safe is that marker ABSENCE decides nothing: it only advises (main's
+// ambiguous-container-access warning, which writes nothing). The cost of a
+// stamp that is never completed is a permanent warning with no recorded cause
+// and a provenance signal missing for future upgrades - which is exactly why
+// the reason is recorded and printed instead of dropped.
+func (c *Controller) stampBornMarker(ctx context.Context) {
+	v := c.bornVersion
+	if v == "" {
+		v = "unknown"
+	}
+	err := setBornMarker(ctx, c.store, v)
+	if err != nil {
+		err = setBornMarker(ctx, c.store, v)
+	}
+	if err == nil {
+		// Stamped - possibly long after the birth, by the controller that saw it.
+		c.bornPending.Store(false)
+		c.bornMarkerErr.Store(nil)
+		return
+	}
+	c.bornMarkerErr.Store(&err)
+	c.warnBornMarker("could not record this install's birth version (%s): %v - this daemon witnessed the empty database, so it retries while it runs (the next settings reload or save can still complete the stamp); if it restarts first, the install stays permanently unmarked, because a store that is no longer brand-new must never be stamped by a process that did not see it born. Nothing about monitoring or access changes (an unmarked store never opens access), but a containerized upgrade would then warn about unprovable access provenance on every boot; pass -access/PINGULARITY_ACCESS explicitly to settle it.", err)
+}
+
+// warnBornMarker prints a birth-marker failure straight to stderr, bypassing the
+// log level: this runs during settings load, when the configured level may still
+// be "off" - and it is the operator's only load-time notice of why their install
+// may be treated as pre-marker for the rest of its life (main also logs it
+// through BornMarkerErr once the logger is up).
+func (c *Controller) warnBornMarker(format string, err error) {
+	fmt.Fprintf(os.Stderr, "pingularity: WARNING: "+format+"\n", KeyInstallBornVersion, err)
+}
+
+// completePendingBornMarker finishes a stamp this controller witnessed but could
+// not write, on the back of a settings write that just SUCCEEDED - the cheapest
+// possible proof that the store takes writes again.
+//
+// It is the answer to "what else drives the retry?". A Reload is not enough on
+// its own: when New itself succeeded (the settings load worked; only the stamp
+// failed) main arms no retry loop, so the next Reload is a SIGHUP or an import -
+// operator-driven events that may never come, while the store quietly becomes
+// established and the stamp is lost for good. A goroutine or timer would be the
+// wrong shape for a one-line bookkeeping write; the write path is already the
+// exact signal, needs no clock, and the sequence the loss actually follows -
+// "the fault clears, then consent/config land" - runs straight through it.
+//
+// Costs one atomic load per settings write in the overwhelmingly normal case.
+func (c *Controller) completePendingBornMarker(ctx context.Context) {
+	if !c.bornPending.Load() {
+		return
+	}
+	c.stampBornMarker(ctx)
+}
+
+// setBornMarker performs the birth marker's single write. It is a var ONLY so a
+// test can fail the FIRST attempt and let the retry through: the fault the retry
+// exists for is a transient one, and no real store can be made to fail once and
+// then succeed microseconds later inside the same call. The default is the plain
+// store write; the failure path itself (write refused, error surfaced, store
+// left markerless) is tested against a genuinely read-only database rather than
+// through this seam.
+var setBornMarker = func(ctx context.Context, st *store.Store, v string) error {
+	return st.SetSetting(ctx, KeyInstallBornVersion, v)
+}
+
+// BornMarkerErr reports why the store's birth marker (KeyInstallBornVersion) is
+// not on disk although this controller had a stamp to take: the write failed, or
+// the brand-new-vs-established judgement could not be made. It is nil when there
+// was nothing to stamp (an established store) or the stamp landed.
+//
+// Non-nil means the marker is missing and, if this process exits before it
+// lands, missing for good: only a controller that witnessed the store brand-new
+// may write it, and a restart is a controller that did not. While this process
+// runs the stamp is still pending - the next Reload or settings write may
+// complete it and clear this - so a caller that logs it is reporting a state
+// that can improve, not a verdict.
+//
+// Nothing depends on the marker's presence to open access or take any other
+// decision - it is provenance - so this is a warning to log, never a reason to
+// stop the daemon.
+func (c *Controller) BornMarkerErr() error {
+	if p := c.bornMarkerErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// ForgetBirthWitness drops any pending birth stamp, and the restore path MUST
+// call it before loading a backup's contents. The witness records "the database
+// I read was empty" - a fact about the rows, not about the file - so replacing
+// those rows wholesale voids it. Without this, a daemon whose own birth stamp
+// failed could finish that stamp AFTER an operator restored a pre-0.62 backup,
+// marking a genuinely old install as born under this version: a birth that was
+// never witnessed for the data now in the store, which is precisely the false
+// provenance the marker exists to prevent, and worse than no marker at all
+// because a later migration would trust it.
+//
+// Dropping it is always safe: an imported backup that carries its own marker
+// keeps it, and one that does not stays markerless - correctly ambiguous, and
+// warned about on the next container boot.
+func (c *Controller) ForgetBirthWitness() { c.bornPending.Store(false) }
+
 // installStateKeys are settings-table keys that hold INSTALL or session
 // bookkeeping, not operator configuration. A genuinely fresh install can already
 // carry some of these at first boot (the offer clock EnsureQuickSetupOffer seeds,
@@ -1772,8 +2043,13 @@ func (c *Controller) seedOfferClock(ctx context.Context, since int64, rerr error
 var installStateKeys = map[string]bool{
 	keyQuickSetup:      true, // quick_setup_done      - the answer marker itself
 	keyQuickSetupOffer: true, // quick_setup_offer_since - the first-run offer clock
-	keyAuthSessEpoch:   true, // auth_session_epoch    - logout revocation, session state
-	"first_seen_ts":    true, // the monitoring anchor - evidence, not config
+	// install_born_version - birth provenance, stamped by the daemon itself on
+	// a brand-new store. Counting it as configuration would make every fresh
+	// install read established one line after its creation, releasing the
+	// consent hold and un-freshening EstablishedInStore everywhere.
+	KeyInstallBornVersion: true,
+	keyAuthSessEpoch:      true, // auth_session_epoch    - logout revocation, session state
+	"first_seen_ts":       true, // the monitoring anchor - evidence, not config
 	// Legacy telemetry identity/state (feature removed; only on older DBs).
 	"telemetry_id": true, "telemetry_install_id": true, "telemetry_salt": true,
 	"telemetry_id_born_at": true, "telemetry_consent_version": true,

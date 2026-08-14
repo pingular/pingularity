@@ -1384,6 +1384,9 @@ func csvSafe(s string) string {
 // POST /api/speed/runs/delete  body {"ts": <unix seconds>}. ts is the run's
 // identity across the UI/API (same key as the chart<->table link and ?locate).
 // Idempotent: deleting an already-gone run reports deleted:0, not an error.
+// On a real deletion the cached aggregates are invalidated, like the outage,
+// bulk and import paths: the run's bytes feed the data pills and the /metrics
+// byte series, and the UI reloads status the instant the row disappears.
 func (s *Server) handleSpeedRunDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
@@ -1403,6 +1406,9 @@ func (s *Server) handleSpeedRunDelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.internalError(w, err)
 		return
+	}
+	if n > 0 {
+		s.invalidateAggregates()
 	}
 	s.log.Info("speedtest run deleted", "ts", in.TS, "rows", n)
 	writeJSON(w, map[string]any{"deleted": n})
@@ -1492,7 +1498,7 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// cell when it's absent.
 			csvMbps(sp.DownMbps, sp.DownBytes),
 			csvMbps(sp.UpMbps, sp.UpBytes),
-			strconv.FormatFloat(sp.PingMS, 'f', 1, 64),
+			csvPing(sp.PingMS),
 			fptr1(sp.PingBestMS),
 			fptr1(sp.JitterMS), fptr(sp.PacketLoss),
 			fptr1(sp.IdleMS), fptr1(sp.LoadedDownMS), fptr1(sp.LoadedUpMS), fptr1(sp.LoadedDownP95MS), fptr1(sp.LoadedUpP95MS), healthStr(sp.Healthy),
@@ -2452,6 +2458,42 @@ func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The offer window gates the WRITE, not just the dialog. /api/status stops
+	// advertising Quick Setup once the 48-hour window closes (quick_setup_pending),
+	// and the same expiry releases the boot monitoring hold, so an install left on
+	// the default power setting is already probing by then - but this handler used
+	// to check only the answered marker, so a browser tab left open past the
+	// deadline (or anything else that kept this URL) could still post a whole
+	// answer and overwrite the cadence, the access scope, and the login of a
+	// running install. Going through
+	// quickSetupPending - the SAME helper /api/status reads - is what stops the
+	// advertised offer and the endpoint from ever disagreeing again, including on
+	// a store read failure, which both sides see as "no offer" and close together.
+	// That direction refuses a legitimate first-run answer during a transient
+	// failure, which is the right way to fail here: the apply below would not have
+	// survived that store anyway.
+	//
+	// This is a broken contract rather than a privilege escalation. Once a login is
+	// active the check just below already refuses these payloads outright (403,
+	// with or without a session), and the local-only and DNS-rebind filters run in
+	// guard ahead of this endpoint's auth exemption, so they still bound who can
+	// reach it. The `dismiss` path above stays DELIBERATELY ungated, and should not
+	// be "fixed" to match: it writes only the server-owned answered marker and
+	// nothing else (TestQuickSetupDismissTouchesNothingElse pins that), and that
+	// marker is the very state an expired window already implies, so refusing it
+	// would protect nothing while breaking the one action a stale dialog should
+	// still be able to take - closing itself. It carries its own auth gate above.
+	//
+	// 403 matches the "already configured" refusal below - the request is
+	// well-formed and understood, this first-run endpoint just will not serve it
+	// anymore. A 409 (this file's code for "no matching speedtest run to stop")
+	// would wrongly suggest retrying once some state changes; nothing reopens the
+	// window.
+	if !s.quickSetupPending(r.Context()) {
+		http.Error(w, "Quick Setup is no longer offered; the first-run window has closed - change these under Settings", http.StatusForbidden)
+		return
+	}
+
 	// A full answer changes access/auth. Once a login is ACTIVE, that is a
 	// step-up-protected operation (see handleAccess) - this endpoint has no
 	// current-password proof, so refuse rather than let a cookie-only session
@@ -2852,10 +2894,37 @@ var importReconcileHook func()
 // restoring on the builds that predate it; only a file actually CARRYING held
 // rows demands 4.
 //
+// It went to 5 when the speed table gained columns: `failed` (the marker that
+// separates a usage-accounting row - a run that failed partway, whose bytes
+// count toward data usage though it measured nothing - from a real measurement)
+// and the descriptive pair `ip_family` / `udp_direction`. These are COLUMNS
+// inside a category older builds already carry, not new keys, so the category
+// mapping below cannot see them.
+//
+// AN OLDER BUILD DOES NOT DROP A COLUMN IT DOES NOT KNOW. It is tempting to
+// reason that it would, and to bump only for the columns whose absence would
+// change what the restored rows mean - `failed` would, the descriptive pair
+// would not. But ImportTableBatch, unchanged since the first commit and so
+// present in every shipped build, aborts the category with `unknown column
+// (backup from a newer version?)`. And the abort lands MID-RESTORE: categories
+// apply in file order and config is last, so latency has already been committed
+// when speed is refused. The user is left with a half-restored database on the
+// documented roll-back path - which is worse than either a clean refusal or a
+// silently shed column.
+//
+// So the rule is not "which columns change the meaning" but the blunter "does
+// the file carry any column those builds have never heard of". Content-dependent
+// like `pauses_quarantine`, and enforced on the bytes rather than asserted:
+// handleExport asks which of them any row actually uses, DROPS the unused ones
+// from the rows it streams, and stamps 5 only if something is left. An install
+// that has never recorded one keeps stamping 1-4 and keeps restoring on older
+// builds; one that has stamps 5, and those builds refuse it at the envelope
+// check, before a single category commits.
+//
 // minExportSchema is the oldest we still read: bumping the writer must not orphan
 // the backups already on disk.
 const (
-	exportSchema    = 4
+	exportSchema    = 5
 	minExportSchema = 1
 )
 
@@ -2864,7 +2933,11 @@ const (
 // rejects anything above 1 before reading a byte, so stamping the file's own
 // requirement rather than exportSchema is what keeps a pauses-less backup
 // restorable on the builds that predate pauses (the roll-back path).
-func exportSchemaFor(keys []string) int {
+// newSpeedColumns says the speed rows being exported still carry at least one
+// column added after schema 4, which no category key can express (see
+// exportSchema's v5 paragraph). The caller has already dropped the ones no row
+// uses, so this is about the bytes actually being written, not the table shape.
+func exportSchemaFor(keys []string, newSpeedColumns bool) int {
 	v := 1
 	for _, k := range keys {
 		switch k {
@@ -2875,6 +2948,9 @@ func exportSchemaFor(keys []string) int {
 		case "pauses": // ... and to 2 for
 			v = max(v, 2)
 		}
+	}
+	if newSpeedColumns {
+		v = max(v, 5) // ... and to 5 for the post-schema-4 speed columns, which are columns rather than keys
 	}
 	return v
 }
@@ -2928,6 +3004,36 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 		break
 	}
+	// The speed category needs the same content check, for columns rather than a
+	// key (see store.SpeedColumnsPastSchema4InUse). A column older builds do not
+	// know is not skipped by them: their import aborts the category, partway
+	// through a restore that has already committed latency. So the file must
+	// either carry none of those columns - and keep stamping the version its
+	// content actually needs - or stamp 5, where the envelope check refuses it
+	// before a single category commits.
+	//
+	// On a check error assume every one of them is in use: "an older build
+	// refuses the backup" is the safe failure, "a column is silently shed" is not.
+	newSpeedCols := map[string]bool{}
+	for _, dc := range sel {
+		if dc.table != "speed" {
+			continue
+		}
+		inUse, cerr := s.store.SpeedColumnsPastSchema4InUse(r.Context(), snap)
+		if cerr != nil {
+			s.log.Warn("export: could not tell which new speed columns are in use; stamping for all of them", "err", cerr)
+			inUse = store.AllSpeedColumnsPastSchema4InUse()
+		}
+		newSpeedCols = inUse
+		break
+	}
+	carriesNewSpeedCols := false
+	for _, inUse := range newSpeedCols {
+		if inUse {
+			carriesNewSpeedCols = true
+			break
+		}
+	}
 	// Progress-refreshed write deadline: rearm as rows flush, so a client that stops
 	// reading is reaped within one window instead of holding the cursor for minutes.
 	bump := exportDeadlineBumper(w, s.log)
@@ -2952,11 +3058,23 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	catsJSON, _ := json.Marshal(cats)
 	fmt.Fprintf(bw, `{"pingularity_export":%d,"producer_version":%q,"exported_at":%d,"categories":%s`,
-		exportSchemaFor(cats), s.version, time.Now().Unix(), catsJSON)
+		exportSchemaFor(cats, carriesNewSpeedCols), s.version, time.Now().Unix(), catsJSON)
 	for _, dc := range sel {
 		fmt.Fprintf(bw, ",%q:[", dc.key)
 		first := true
 		err := s.store.ExportTableRowsTx(r.Context(), snap, dc.table, func(m map[string]any) error {
+			// Drop the post-schema-4 columns no row uses, so the low stamp this
+			// file is about to carry is TRUE: an older build would abort the
+			// whole category on any one of them, not skip it. A column that IS
+			// in use stays, and carriesNewSpeedCols has already pushed the stamp
+			// out of that build's range - the two decisions read the same map.
+			if dc.table == "speed" {
+				for _, c := range store.SpeedColumnsPastSchema4() {
+					if !newSpeedCols[c] {
+						delete(m, c)
+					}
+				}
+			}
 			if !first {
 				bw.WriteByte(',')
 			}
@@ -3117,19 +3235,32 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	for _, dc := range dataCategories {
 		keyToCat[dc.key] = struct{ cat, table string }{dc.cat, dc.table}
 	}
-	// Retention window per table, for the about-to-be-pruned warning below
-	// (0 = keep forever = nothing to warn about).
-	retention := map[string]time.Duration{
-		"samples": s.settings.Retention(), "dns": s.settings.Retention(),
-		"speed": s.settings.SpeedRetention(), "events": s.settings.DowntimeRetention(),
-		// pauses is pruned on the downtime horizon like events, and was missing here:
-		// a restore could land pause rows already past it and say nothing, so the
-		// spans that shape uptime coverage disappeared at the next prune without the
-		// warning every other category gets.
-		"pauses": s.settings.DowntimeRetention(), "pauses_quarantine": s.settings.DowntimeRetention(),
-	}
 	result := map[string]int{}
-	prunable := map[string]bool{} // category -> imported rows predate its retention window
+	// Oldest row timestamp seen per category (unix seconds), for the
+	// about-to-be-pruned warning below. The import RECORDS timestamps and decides
+	// nothing: the window that will actually prune these rows is whatever
+	// retention is live AFTER this restore, and a backup can carry its own
+	// retention settings, which only go live at the reload further down. Comparing
+	// here - against the destination's pre-import windows - got both directions
+	// wrong, the silent one badly: a keep-forever destination importing a backup
+	// with a short retention plus older rows had nothing to compare against (window
+	// 0 = no warning ever), reported a clean restore, activated the backup's short
+	// window, and lost the restored history at the next hourly prune.
+	// Every table of a category feeds one entry (latency = samples + dns, speed =
+	// speed + speed_servers, downtime = events + pauses + pauses_quarantine), so
+	// the value is the MINIMUM across the category - that is the row the window
+	// prunes first, and it is what keeps pauses/pauses_quarantine covered by the
+	// downtime horizon they are pruned on.
+	// Key ABSENT = no timestamped row was seen at all, which is not the same as a
+	// row stamped 0 (an epoch ts is a real, very prunable timestamp) and must
+	// produce no warning: speed_servers keys its time by run_ts and contributes
+	// none, so a speed category carrying only selection reports has nothing to say.
+	// A restore replaces the rows this daemon may have watched being created, so
+	// any pending birth stamp stops describing what is in the store. Dropped
+	// BEFORE the first row lands, not after: the stamp can be completed by a
+	// settings write, and an import performs several.
+	s.settings.ForgetBirthWitness()
+	oldestTS := map[string]int64{}
 	importedConfig := false
 	// The login state BEFORE any config lands. A backup carries the login settings
 	// but never the password hash (settingsExportDeny), so applying it verbatim can
@@ -3185,10 +3316,12 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		n, old, err := s.importArray(r.Context(), dec, key, dc.table, retention[dc.table], progress)
+		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, progress)
 		result[dc.cat] += n // latency spans two tables (samples + dns); sum them
-		if old {
-			prunable[dc.cat] = true
+		if sawTS {
+			if cur, ok := oldestTS[dc.cat]; !ok || minTS < cur {
+				oldestTS[dc.cat] = minTS // oldest across every table of the category
+			}
 		}
 		if dc.cat == "config" {
 			importedConfig = true
@@ -3490,8 +3623,30 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(body)
 		return
 	}
+	// Classify the recorded timestamps HERE, from the LIVE settings - deliberately
+	// after the reload above, because a backup carries its own retention policy and
+	// the reload is what makes it the policy that prunes.
+	//
+	// This reads the live values whether or not that reload succeeded, which looks
+	// like an oversight and is not. Reload succeeded: the live windows ARE the
+	// imported ones, which is exactly what the next prune will apply. Reload
+	// failed: Reload leaves the previous values in the live cache, so the
+	// destination's own windows really do govern the hour ahead - and the
+	// reload-failure warnings above already say the stored config differs. Either
+	// way the live values are the ones that prune, so there is nothing to
+	// special-case.
+	liveWindow := map[string]time.Duration{
+		"latency":  s.settings.Retention(),
+		"speed":    s.settings.SpeedRetention(),
+		"downtime": s.settings.DowntimeRetention(),
+	}
 	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
-		if prunable[cat] {
+		window := liveWindow[cat]
+		ts, seen := oldestTS[cat]
+		if window <= 0 || !seen { // keep forever, or no timestamped rows landed
+			continue
+		}
+		if ts < time.Now().Add(-window).Unix() {
 			warnings = append(warnings, "Some imported "+cat+" rows are older than the current "+cat+
 				" retention window and will be pruned within the hour - raise retention in the Data tab if you want to keep them.")
 		}
@@ -3509,20 +3664,21 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 // importArray streams one export category's JSON array into table in bounded
 // batches (matching the store's own per-transaction bound), returning the rows
-// applied and whether any parsed row predates the retention window - a restored
-// row older than the cutoff comes back only to be pruned within the hour, which
-// reads as a broken restore unless the response says so.
-func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, window time.Duration, onProgress func()) (n int, prunable bool, err error) {
+// applied and the OLDEST row timestamp it parsed - a restored row older than the
+// retention window comes back only to be pruned within the hour, which reads as a
+// broken restore unless the response says so. The comparison itself belongs to
+// the caller and happens after the settings reload, since the backup may carry
+// the very retention policy that decides it; this only reports what it saw.
+// sawTS distinguishes "no timestamped rows at all" (speed_servers is keyed by
+// run_ts and has no ts column; an empty array has no rows) from a genuine row
+// stamped 0, which is an ancient, entirely prunable timestamp.
+func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, onProgress func()) (n int, minTS int64, sawTS bool, err error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return 0, false, fmt.Errorf("bad %s data: %w", key, err)
+		return 0, 0, false, fmt.Errorf("bad %s data: %w", key, err)
 	}
 	if tok != json.Delim('[') {
-		return 0, false, fmt.Errorf("bad %s data: expected an array", key)
-	}
-	var cutoff int64
-	if window > 0 {
-		cutoff = time.Now().Add(-window).Unix()
+		return 0, 0, false, fmt.Errorf("bad %s data: expected an array", key)
 	}
 	const batchRows = 5000 // = store.importTxRows: one handler batch per store transaction
 	batch := make([]map[string]any, 0, batchRows)
@@ -3551,35 +3707,39 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		// wire size of this element.
 		var raw json.RawMessage
 		if derr := dec.Decode(&raw); derr != nil {
-			return n, prunable, fmt.Errorf("bad %s data: %w", key, derr)
+			return n, minTS, sawTS, fmt.Errorf("bad %s data: %w", key, derr)
 		}
 		// Reject a single oversized row before it is unmarshalled and batched: no
 		// legitimate record approaches maxRowBytes, and this keeps one hostile row
 		// from bloating a batch (importReadBurst bounds the transient decode).
 		if len(raw) > maxRowBytes {
-			return n, prunable, fmt.Errorf("bad %s data: a single record exceeds the %d MiB per-record limit", key, maxRowBytes>>20)
+			return n, minTS, sawTS, fmt.Errorf("bad %s data: a single record exceeds the %d MiB per-record limit", key, maxRowBytes>>20)
 		}
 		var row map[string]any
 		if derr := json.Unmarshal(raw, &row); derr != nil {
-			return n, prunable, fmt.Errorf("bad %s data: %w", key, derr)
+			return n, minTS, sawTS, fmt.Errorf("bad %s data: %w", key, derr)
 		}
-		if cutoff > 0 {
-			if ts, ok := row["ts"].(float64); ok && int64(ts) < cutoff {
-				prunable = true
+		// Only a timestamp the store would actually keep counts: it applies this
+		// same sanity rule (finite, >= 0, in int64 range) and drops the row
+		// otherwise, so a NaN/negative/absurd ts must not become "the oldest row we
+		// imported" - and int64() of a non-finite float is not even defined.
+		if ts, ok := row["ts"].(float64); ok && !math.IsInf(ts, 0) && !math.IsNaN(ts) && ts >= 0 && ts < float64(math.MaxInt64) {
+			if v := int64(ts); !sawTS || v < minTS {
+				minTS, sawTS = v, true
 			}
 		}
 		batch = append(batch, row)
 		batchBytes += len(raw)
 		if len(batch) >= batchRows || batchBytes >= importBatchBytes {
 			if ferr := flush(); ferr != nil {
-				return n, prunable, ferr
+				return n, minTS, sawTS, ferr
 			}
 		}
 	}
 	if _, terr := dec.Token(); terr != nil { // closing ']'
-		return n, prunable, fmt.Errorf("bad %s data: %w", key, terr)
+		return n, minTS, sawTS, fmt.Errorf("bad %s data: %w", key, terr)
 	}
-	return n, prunable, flush()
+	return n, minTS, sawTS, flush()
 }
 
 // importBatchBytes flushes an import batch once its decoded rows exceed this many
@@ -4189,14 +4349,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "pingularity_uptime_since_timestamp_seconds %d\n", floor)
 	}
 
-	fmt.Fprintln(w, "# HELP pingularity_speed_data_used_bytes Cumulative measured speedtest bytes (down+up of completed runs) within retention; excludes iperf3 warm-up, the UDP loss probe, and failed/retried attempts, so it is a lower bound on wire traffic.")
+	fmt.Fprintln(w, "# HELP pingularity_speed_data_used_bytes Cumulative speedtest bytes (down+up) within retention, INCLUDING attempts that failed or were retried - they spent the data too; excludes iperf3 warm-up and the UDP loss probe, so it is a lower bound on wire traffic.")
 	fmt.Fprintln(w, "# TYPE pingularity_speed_data_used_bytes gauge")
 	fmt.Fprintf(w, "pingularity_speed_data_used_bytes %d\n", dataBytes)
 	// Per-window usage (same windows as uptime_ratio). Pruning makes the total
 	// above non-monotonic, so a metered-link operator can't derive "this month's
 	// speedtest data" from it - serve the windowed numbers the dashboard already
 	// computes.
-	fmt.Fprintln(w, "# HELP pingularity_speed_data_used_window_bytes Measured speedtest bytes (down+up of completed runs) within the window; a lower bound on wire traffic (see pingularity_speed_data_used_bytes).")
+	fmt.Fprintln(w, "# HELP pingularity_speed_data_used_window_bytes Speedtest bytes (down+up) within the window, including failed and retried attempts; a lower bound on wire traffic (see pingularity_speed_data_used_bytes).")
 	fmt.Fprintln(w, "# TYPE pingularity_speed_data_used_window_bytes gauge")
 	for _, wv := range []struct {
 		w string
@@ -4205,7 +4365,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "pingularity_speed_data_used_window_bytes{window=\"%s\"} %d\n", promLabel(wv.w), wv.v)
 	}
 	if avgDownB > 0 || avgUpB > 0 { // absent before any run, like the other speed readings - never a fake 0
-		fmt.Fprintln(w, "# HELP pingularity_speed_avg_run_bytes Average bytes per speedtest run (recent runs), by direction; a direction is absent (not 0) until it has been measured.")
+		fmt.Fprintln(w, "# HELP pingularity_speed_avg_run_bytes Average bytes per speedtest run (recent runs), by direction; a direction is absent (not 0) until it has been measured. Runs that failed partway are excluded on purpose - this is a projection of what the next run will cost, and an aborted run's partial bytes predict a bill no schedule produces (their bytes are still in pingularity_speed_data_used_bytes).")
 		fmt.Fprintln(w, "# TYPE pingularity_speed_avg_run_bytes gauge")
 		// Emit each direction only when it has data. A download-only history has a
 		// zero upload average (no upload samples); publishing avg_run_bytes{up} 0
@@ -4256,7 +4416,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		if sp.DownBytes != nil || sp.UpBytes != nil {
 			// What THIS run consumed (the retention-wide totals above can't answer
 			// that) - the number a metered-link operator alerts on per run.
-			fmt.Fprintln(w, "# HELP pingularity_speed_last_run_bytes Data the last speedtest transferred, by direction; absent when the engine did not measure it.")
+			fmt.Fprintln(w, "# HELP pingularity_speed_last_run_bytes Data the last speedtest transferred, by direction; absent when the engine did not measure it. \"Last\" means the last run that measured something: a run that failed partway is never the last run, here or on the dashboard.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_last_run_bytes gauge")
 			if sp.DownBytes != nil {
 				fmt.Fprintf(w, "pingularity_speed_last_run_bytes{direction=\"down\"} %d\n", *sp.DownBytes)
@@ -4912,6 +5072,20 @@ func csvMbps(mbps float64, bytes *int64) string {
 		return ""
 	}
 	return strconv.FormatFloat(mbps, 'f', 2, 64)
+}
+
+// csvPing renders a latency figure, blank when the run never probed one. Zero is
+// the "not probed" sentinel for ping (a successful iperf3 run that moved real
+// bytes can legitimately report 0), and the tiles, the runs table, the charts
+// and /metrics all treat it as absent - the CSV was the last surface still
+// exporting it as a literal "0.0", which reads as a perfect round trip rather
+// than as no measurement, and is worse in an export than on screen because a
+// spreadsheet will happily average it.
+func csvPing(ms float64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return strconv.FormatFloat(ms, 'f', 1, 64)
 }
 
 // healthStr renders the threshold verdict for CSV ("" when not evaluated).

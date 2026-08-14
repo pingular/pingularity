@@ -116,6 +116,14 @@ func TestDefaultSettings(t *testing.T) {
 // local_only=true under the old warn-only regime and is 403'd off its own
 // published port on upgrade, with no shell in the distroless image to repair
 // the database from.
+//
+// It is also the ONLY path that persists an access decision (pinned
+// structurally by TestOnlyExplicitInputPersistsAccess): the container
+// grandfather that used to write access_local_only=false from an inference
+// about a store's age is gone, because that inference could not tell an
+// rc.1-rc.3 container - born private - from a genuinely pre-0.62 one, and
+// opening the wrong one put an unauthenticated dashboard on the LAN. Ambiguity
+// now fails closed and only warns, which makes this override the way back in.
 func TestReconcileAccess(t *testing.T) {
 	ctx := context.Background()
 	newSet := func(t *testing.T, storedLocalOnly bool) *settings.Controller {

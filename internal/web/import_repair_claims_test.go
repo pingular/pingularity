@@ -37,10 +37,16 @@ func saysRestrictionFailed(warnings []string) bool {
 	return false
 }
 
-// A protected, previously local-only box restores a backup that turns login
-// off and opens network access; the settings store dies between the reload
-// (backup live) and the repair - the moment a disk error or an exhausted
-// reconcile budget would surface.
+// A protected, network-reachable box restores a backup that turns login off;
+// the settings store dies between the reload (backup live) and the repair - the
+// moment a disk error or an exhausted reconcile budget would surface.
+//
+// The exposure being tested is "network-reachable with the login now off", so
+// the box is set network-reachable HERE. It used to arrive at that state by
+// importing access_local_only=0, but access posture no longer rides in a backup
+// (settingsExportDeny): it belongs to the host, not the file. That is a
+// different guarantee from this one and has its own test - the repair still has
+// to tell the truth about a write that failed.
 func TestFailedLocalOnlyRepairDoesNotClaimAccessWasRestricted(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
@@ -50,13 +56,13 @@ func TestFailedLocalOnlyRepairDoesNotClaimAccessWasRestricted(t *testing.T) {
 	if err := s.settings.SetAuthEnabled(ctx, true); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
-	if err := s.settings.SetAccessLocalOnly(ctx, true); err != nil {
-		t.Fatalf("local: %v", err)
+	if err := s.settings.SetAccessLocalOnly(ctx, false); err != nil {
+		t.Fatalf("open access: %v", err)
 	}
 	importReconcileHook = func() { s.store.Close() }
 	t.Cleanup(func() { importReconcileHook = nil })
 
-	rr := importConfig(t, s, `{"key":"auth_enabled","value":"0"},{"key":"access_local_only","value":"0"}`)
+	rr := importConfig(t, s, `{"key":"auth_enabled","value":"0"}`)
 	warnings := warningsOf(t, rr)
 	if s.settings.AccessLocalOnly() {
 		t.Fatalf("fixture drift: the repair write was expected to fail, but access is local-only (HTTP %d, warnings %v)",
@@ -71,15 +77,22 @@ func TestFailedLocalOnlyRepairDoesNotClaimAccessWasRestricted(t *testing.T) {
 	}
 }
 
-// The mirror site: a box with no password restores a backup that wants login on
-// (unenforceable - the hash never rides) and network access open; the same
-// store failure hits the unenforceable-auth repair's SetAccessLocalOnly.
+// The mirror site: a network-reachable box with no password restores a backup
+// that wants login on (unenforceable - the hash never rides); the same store
+// failure hits the unenforceable-auth repair's SetAccessLocalOnly.
+//
+// As above, the box is set network-reachable here rather than by the backup:
+// that repair only runs when access is already open (web.go's !AccessLocalOnly
+// guard), and the file can no longer be what opens it.
 func TestFailedLocalOnlyRepairAfterUnenforceableAuthDoesNotClaimRestriction(t *testing.T) {
 	s := newTestServer(t)
+	if err := s.settings.SetAccessLocalOnly(context.Background(), false); err != nil {
+		t.Fatalf("open access: %v", err)
+	}
 	importReconcileHook = func() { s.store.Close() }
 	t.Cleanup(func() { importReconcileHook = nil })
 
-	rr := importConfig(t, s, `{"key":"auth_enabled","value":"1"},{"key":"access_local_only","value":"0"}`)
+	rr := importConfig(t, s, `{"key":"auth_enabled","value":"1"}`)
 	warnings := warningsOf(t, rr)
 	if s.settings.AccessLocalOnly() {
 		t.Fatalf("fixture drift: the repair write was expected to fail, but access is local-only (HTTP %d, warnings %v)",

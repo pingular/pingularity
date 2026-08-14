@@ -49,7 +49,8 @@ const DEFS = {
   parseRange: 'function parseRange', fmtRangeEcho: 'function fmtRangeEcho',
   rangeLoad: 'function rangeLoad', speedTileMbps: 'function speedTileMbps',
   mbpsText: 'function mbpsText', pingText: 'function pingText',
-  spMeasured: 'function spMeasured', spdAverages: 'function spdAverages',
+  spMeasured: 'function spMeasured', pingMeasured: 'function pingMeasured',
+  spdAverages: 'function spdAverages',
   speedtestBusy: 'function speedtestBusy',
   speedtestAbortable: 'function speedtestAbortable',
   autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
@@ -67,7 +68,8 @@ const DEFS = {
   pkcs1FlagUsable: 'function pkcs1FlagUsable', pkcs1BoxState: 'function pkcs1BoxState',
   qsUseNote: 'function qsUseNote',
   iperfPwOrphan: 'function iperfPwOrphan',
-  famLabel: 'function famLabel', udpDirLabel: 'function udpDirLabel',
+  famLabel: 'function famLabel', famTitle: 'function famTitle',
+  udpDirLabel: 'function udpDirLabel',
   udpDirTitle: 'function udpDirTitle',
   congestionContainerHint: 'function congestionContainerHint',
   loopbackHost: 'function loopbackHost',
@@ -320,11 +322,26 @@ test('downloads route through the marked fetch, not native href GETs', () => {
 // downloadVia buffers the body (it must, to route through the marked fetch), so
 // it caps the buffer and reports 'toobig' instead of letting a giant backup
 // exhaust the browser; the export button surfaces the streaming workaround.
-test('oversized downloads are capped, not silently buffered to death', () => {
-  assert.match(script, /const downloadCapBytes = /, 'a download buffer cap exists');
-  assert.match(script, /getReader\(\)/, 'downloadVia streams into a bounded buffer instead of r.blob()');
-  assert.match(script, /return 'toobig'/, 'past the cap it reports toobig rather than buffering on');
-  // The export handler tells the operator to use the DB file / CLI on toobig.
+// The download path must not hold the body in the JS heap. It used to
+// accumulate chunks into an array behind a 100 MiB cap, which fired during
+// NORMAL use: a default install at its own 30-day retention (the shipped 3
+// probe targets at 5s, DNS on) exports ~150 MiB, measured through the real
+// export handler. The backup an operator takes right before doing something
+// risky was the thing that broke, so the ceiling is now a declared-size sanity
+// check only, and the browser owns the bytes.
+test('downloads let the browser own the bytes, and do not cap the happy path', () => {
+  assert.match(script, /const downloadCapBytes = /, 'a declared-size ceiling still exists');
+  assert.doesNotMatch(script, /chunks\.push\(value\)/,
+    'the body must NOT be accumulated in the JS heap - that is what made a routine export fail');
+  assert.match(script, /const b=await r\.blob\(\)/,
+    'the response goes straight to a Blob, which the browser can spill to disk');
+  const cap = /const downloadCapBytes = ([^;]+);/.exec(script);
+  assert.ok(cap, 'the ceiling is a literal we can evaluate');
+  const bytes = Function('"use strict";return (' + cap[1] + ')')();
+  assert.ok(bytes >= 1024 * 1024 * 1024,
+    `the ceiling is ${bytes} bytes; a default install exports ~150 MiB, so anything near that refuses ordinary backups`);
+  // Still reported (and still explained) when a server DECLARES something absurd.
+  assert.match(script, /return 'toobig'/, 'a declared oversize is still refused');
   assert.match(script, /res==='toobig'/, 'the export handler checks for the oversized signal');
   assert.match(script, /too large to download in the browser/, 'and points to the streaming workaround');
 });
@@ -388,6 +405,24 @@ test('log and CSV downloads surface an oversized result instead of failing silen
   assert.match(script, /These logs are too large to download/, 'log handler messages on toobig (was silent)');
   // the no-stream fallback also refuses an over-cap declared size instead of buffering blindly
   assert.match(script, /Content-Length[\s\S]{0,80}downloadCapBytes[\s\S]{0,40}return 'toobig'/, 'blob fallback caps via Content-Length');
+});
+
+// role="button" on an <a> announces a button but only gets Enter for free -
+// Space activation is native <button> behavior that ARIA does not add, and the
+// click handlers listen for clicks only. Native buttons give Space AND Enter
+// through the browser's own click synthesis, and with no href there is no
+// native navigation left to regress the marked-fetch download paths.
+test('download controls are native buttons: Space activates, Enter still works', () => {
+  assert.match(html, /<button[^>]*id="logDownload"[^>]*type="button"/, 'log download is a native button');
+  assert.match(html, /<button[^>]*id="csvDownload"[^>]*type="button"/, 'CSV download is a native button');
+  assert.doesNotMatch(html, /<a[^>]*id="logDownload"/, 'no anchor faking a button for the log download');
+  assert.doesNotMatch(html, /<a[^>]*id="csvDownload"/, 'no anchor faking a button for the CSV download');
+  assert.doesNotMatch(html, /id="logDownload"[^>]*href=/, 'no href on the log control - nothing to navigate');
+  assert.doesNotMatch(html, /id="csvDownload"[^>]*href=/, 'no href on the CSV control - nothing to navigate');
+  // The same click handlers still drive the marked fetch, so keyboard
+  // activation (both keys) reaches downloadVia exactly like a pointer click.
+  assert.match(script, /\$\('logDownload'\)\.addEventListener\('click'/, 'log click handler intact');
+  assert.match(script, /\$\('csvDownload'\)\.addEventListener\('click'/, 'CSV click handler intact');
 });
 
 test('log download never carries a navigable api/logs href - no Basic-prompt bypass (#6)', () => {
@@ -586,6 +621,142 @@ test('heatmap: a Sunday-aligned year needs no padding at all', () => {
   const cells = driveHeatmap([], new Date(2026, 6, 27, 12, 0).getTime());
   assert.equal(cells.length, 366);
   assert.ok(cells.every(c => c.style.visibility !== 'hidden'));
+});
+
+// --- heatmap: the days a multi-day outage spans but did not start on ----------
+// The backend prorates an outage's downtime onto every local day it covered but
+// counts the outage itself only on the day it BEGAN (store.go DowntimeByDay). So
+// the middle of a Mon 23:00 -> Wed 01:00 outage is a shaded, clickable day whose
+// outages count is 0 and which holds no event of its own: the locator, which
+// matched event dates against the day, found nothing and the click silently did
+// nothing. Continuation days now resolve to the outage ENCLOSING them rather than
+// being made inert - the alternative cannot be expressed from the heatmap payload
+// anyway, since the RECOVERY day is also outages=0 and its click has always worked.
+const HM = new Function(extract('function hmDayRange') + '\n' + extract('function hmScanDay')
+  + '\nreturn { hmDayRange, hmScanDay };')();
+const jul = (d, h, mi = 0) => Math.floor(new Date(2026, 6, d, h, mi).getTime() / 1000);
+const scan = (evs, day, off = 0, st = { up: null, upTs: 0 }) => {
+  const [from, to] = HM.hmDayRange(day);
+  return HM.hmScanDay(evs, off, from, to, st);
+};
+
+test('hmDayRange: local midnight to local midnight, taken from the date parts', () => {
+  assert.deepEqual(HM.hmDayRange('2026-07-14'), [jul(14, 0), jul(15, 0)]);
+  // Month end: day+1 rolls the month over rather than adding 86400 seconds, which
+  // is also what keeps a 23h/25h DST day exactly one local day wide.
+  assert.deepEqual(HM.hmDayRange('2026-07-31'),
+    [jul(31, 0), Math.floor(new Date(2026, 7, 1).getTime() / 1000)]);
+  // From the parts, never from the string: "2026-07-14" parses as UTC, which would
+  // slide the window off the local days the backend bucketed by (heatmap?tz=...).
+  // A UTC test runner cannot tell the two apart, so the construction is pinned.
+  assert.match(extract('function hmDayRange'), /new Date\(p\[0\],p\[1\]-1,p\[2\]\)/);
+});
+
+test('heatmap locator: a day inside a multi-day outage resolves to that outage', () => {
+  // Newest-first, exactly as /api/events returns them.
+  const evs = [{ ts: jul(15, 1), type: 'up', has_duration: true, duration_s: 7200 },
+    { ts: jul(13, 23), type: 'down' }];
+  // Tuesday: prorated downtime, no event of its own -> the recovery that closed it.
+  assert.deepEqual(scan(evs, '2026-07-14'), { idx: 0, ts: jul(15, 1), done: true });
+  // The days that DO hold an event are untouched - each still pins to its own row.
+  assert.deepEqual(scan(evs, '2026-07-13'), { idx: 1, ts: jul(13, 23), done: true });
+  assert.deepEqual(scan(evs, '2026-07-15'), { idx: 0, ts: jul(15, 1), done: true });
+  // A day AFTER the outage closed encloses nothing - it must not borrow a row.
+  assert.deepEqual(scan(evs, '2026-07-16'), { idx: -1, ts: 0, done: true });
+
+  // Still running: no recovery row exists yet, so the day pins to the 'down'.
+  assert.deepEqual(scan([{ ts: jul(13, 23), type: 'down' }], '2026-07-14'),
+    { idx: 0, ts: jul(13, 23), done: true });
+
+  // A monitor restart re-detects an outage, leaving an extra 'down' inside it, and
+  // later outages sit above it. Walking newest-first, the recovery that pairs with
+  // a 'down' is the last 'up' SEEN - which is what survives both.
+  const messy = [{ ts: jul(20, 8), type: 'up' }, { ts: jul(20, 7), type: 'down' },
+    { ts: jul(16, 12), type: 'up' }, { ts: jul(15, 9), type: 'down' },
+    { ts: jul(13, 23), type: 'down' }];
+  assert.deepEqual(scan(messy, '2026-07-14'), { idx: 2, ts: jul(16, 12), done: true });
+});
+
+test('heatmap locator: the walk survives the 1000-event page boundary', () => {
+  // The recovery is on one page and the 'down' that opened the outage on the next,
+  // so pairing them at all depends on the carried state.
+  const st = { up: null, upTs: 0 };
+  const first = scan([{ ts: jul(15, 1), type: 'up' }], '2026-07-14', 0, st);
+  assert.deepEqual(first, { idx: -1, ts: 0, done: false }, 'a page that settles nothing must keep paging');
+  const second = scan([{ ts: jul(13, 23), type: 'down' }], '2026-07-14', 1000, st);
+  assert.deepEqual(second, { idx: 0, ts: jul(15, 1), done: true }, 'the recovery index is global, not page-local');
+});
+
+// The locator is only worth anything wired up: this drives the REAL click handler
+// out of index.html and checks it pages to the row AND that the row highlights.
+function driveHeatmapClick(day, events) {
+  let handler = null;
+  const fetched = [];
+  const els = { heatmap: { addEventListener: (_ev, fn) => { handler = fn; } },
+    events: { querySelector: () => null } };
+  const fget = async url => { fetched.push(url);
+    const off = +/offset=(\d+)/.exec(url)[1];
+    return { json: async () => ({ events: off ? [] : events }) }; };
+  const api = new Function('$', 'fget', 'drawHeatmap', 'setOutagesOpen', 'loadOutages',
+    'let outageSelDay=null, outageSelTs=0, outagesPage=1, outagesPerPage=10;\n'
+    + script.match(/const fmtLocalDate = [^;]*;/)[0] + '\n'
+    + extract('function hmDayRange') + '\n'
+    + extract('function hmScanDay') + '\n'
+    + extract('function evHighlighted') + '\n'
+    + extract("$('heatmap').addEventListener('click'") + ');\n'
+    + 'return { evHighlighted, state: () => ({ outageSelDay, outageSelTs, outagesPage }) };')(
+    id => els[id], fget, () => {}, () => {}, async () => {});
+  const cell = { dataset: { day } };
+  return { api, fetched, click: () => handler({ target: { closest: () => cell } }) };
+}
+
+test('heatmap click: a continuation day pages to its outage and highlights the row', async () => {
+  // 24 newer events sit above the outage, so its recovery is the 25th row - page 3
+  // at 10 per page. Nothing here is a same-day match, so only the enclosing-outage
+  // path can find it.
+  const events = [];
+  for (let i = 0; i < 12; i++) {
+    events.push({ ts: jul(20, 12) - i * 200, type: 'up', has_duration: true, duration_s: 60 });
+    events.push({ ts: jul(20, 12) - i * 200 - 100, type: 'down' });
+  }
+  const up = { ts: jul(15, 1), type: 'up', has_duration: true, duration_s: 7200 };
+  const down = { ts: jul(13, 23), type: 'down' };
+  events.push(up, down);
+
+  const { api, fetched, click } = driveHeatmapClick('2026-07-14', events);
+  await click();
+  const st = api.state();
+  assert.equal(st.outageSelDay, '2026-07-14', 'the day is still pinned');
+  assert.equal(st.outagesPage, 3,
+    'the table stayed on page 1: the click promised events and produced none');
+  assert.equal(st.outageSelTs, up.ts, 'the day resolved to no row at all');
+  assert.equal(api.evHighlighted(up), true, 'the enclosing outage must be the highlighted row');
+  assert.equal(api.evHighlighted(events[0]), false, 'an unrelated outage must not light up');
+  assert.equal(api.evHighlighted(down), false,
+    "the outage's opening 'down' is dated outside the day and is not its identity row");
+  assert.equal(fetched.length, 1, 'one page of events is enough to locate this');
+
+  // Re-clicking the same cell unpins it - and takes the mapped row with it,
+  // otherwise the highlight outlives the pin.
+  await click();
+  assert.equal(api.state().outageSelDay, null);
+  assert.equal(api.state().outageSelTs, 0);
+  assert.equal(api.evHighlighted(up), false);
+});
+
+test('heatmap: a day that only continues an earlier outage says so, and stays clickable', () => {
+  const cells = driveHeatmap(
+    [{ date: '2026-07-14', outages: 0, downtime_s: 86400, window_s: 86400, observed_s: 86400 }],
+    new Date(2026, 7, 2, 12, 0).getTime());
+  const c = cells.find(x => (x.dataset.tip || '').startsWith('2026-07-14'));
+  assert.ok(c, 'the continuation day drew no cell at all');
+  assert.ok(!/outage\(s\)/.test(c.dataset.tip),
+    'a day that was offline end to end reads "0 outage(s)": ' + c.dataset.tip);
+  assert.match(c.dataset.tip, /down, from an outage that began earlier/);
+  // Still interactive: its click now resolves to the outage that encloses it.
+  assert.equal(c.dataset.day, '2026-07-14');
+  assert.equal(c.attrs.role, 'button');
+  assert.match(c.attrs['aria-label'], /Activate to view events\./);
 });
 
 // --- single-run graph: spanOne duplicates a lone point so it draws a flat line ---
@@ -2600,6 +2771,106 @@ test('applyPendingServer does not re-fetch a pin whose health is already known',
   assert.equal(calls.length, 0, 'a known verdict must not re-issue the by-ID lookup');
 });
 
+// --- Ookla list requests: only the newest may write the page's scope ----------
+// fetchServers is the single entry point for the city search, the by-ID pin and
+// the auto refetch, and every one of them mutates autoLoc/autoLabel/pendingServer
+// and repopulates the dropdown when it lands. They overlap for real - ticking Auto
+// starts the auto refetch under a running city search - so the real functions are
+// driven here against fetches the test resolves by hand, in the order that breaks.
+const tick = () => new Promise(r => setTimeout(r, 0));
+function driveServers() {
+  const fetches = [];
+  const fetchStub = () => new Promise((resolve, reject) => {
+    fetches.push({ ok: body => resolve({ json: async () => body }), fail: () => reject(new Error('offline')) });
+  });
+  const els = {
+    serverCity: { value: '' },
+    setServer: { value: '', disabled: false },
+    serverSearchBtn: { disabled: false, innerHTML: 'Search' },
+    settingsMsg: { textContent: '' },
+  };
+  const log = { loading: [], populated: [], errs: [] };
+  const api = new Function('$', 'fetch', 'setServerLoading', 'populateServers',
+    'applyPendingServer', 'updateScopeNote', 'clearServerFieldError', 'serverFieldError', 'serverTabActive',
+    'let serversLoaded=false, serversScope="", serverTabSeen=true, pendingServer="", autoLoc="", '
+    + 'autoLabel="", autoDefaultLoc="", autoCentreLastRun=false, serverSearchInFlight=null, serverSearchFailed=false;\n'
+    // The generation counter itself is lifted from the page, so deleting it there
+    // fails this drive rather than letting the test supply its own.
+    + script.match(/let serversGen\s*=\s*0;/)[0] + '\n'
+    + script.match(/const shortPlace = [^;]*;/)[0] + '\n'
+    + extract('async function fetchServers') + '\n'
+    + extract('async function loadServers') + '\n'
+    + extract('function chooseAutoServer') + '\n'
+    + extract('async function searchServers') + '\n'
+    + 'return { fetchServers, chooseAutoServer, searchServers, '
+    + 'state: () => ({ autoLoc, autoLabel, pendingServer, searchFailed: serverSearchFailed }) };')(
+    id => els[id], fetchStub, on => log.loading.push(on), s => log.populated.push(s),
+    () => {}, () => {}, () => {}, m => log.errs.push(m), () => true);
+  return { api, els, fetches, log };
+}
+
+test('server list: a city search abandoned for Auto cannot restore city scope', async () => {
+  const { api, els, fetches, log } = driveServers();
+  els.serverCity.value = 'Paris';
+  const search = api.searchServers();
+  await tick();
+  assert.equal(fetches.length, 1, 'the search must be in flight for this race to exist');
+  api.chooseAutoServer();              // Auto ticked before the city answer lands
+  await tick();
+  assert.equal(fetches.length, 2, 'ticking Auto refetches the auto-scoped list');
+
+  // The abandoned city request answers FIRST, while the auto one is still running.
+  fetches[0].ok({ lat: 48.8, lon: 2.3, location: 'Paris, FR, Europe', servers: [{ id: 'p' }] });
+  await search; await tick();
+  assert.deepEqual(log.populated, [],
+    'the abandoned city list repopulated the dropdown under a checked Auto box');
+  assert.deepEqual(log.loading, [true, true],
+    'the abandoned request cleared the spinner the live request is still showing');
+  assert.deepEqual(log.errs, []);
+
+  fetches[1].ok({ location: 'Berlin, DE', centre: 'last_run', servers: [{ id: 'a' }] });
+  await tick();
+  const st = api.state();
+  assert.equal(st.autoLoc, '', 'a stale city response restored city scope while Auto is checked');
+  assert.equal(st.autoLabel, '');
+  assert.deepEqual(log.populated, [[{ id: 'a' }]], 'the auto list is what the dropdown ends up showing');
+  assert.deepEqual(log.loading, [true, true, false]);
+});
+
+test('server list: of two overlapping searches the newest wins, whichever answers first', async () => {
+  const { api, fetches, log } = driveServers();
+  api.fetchServers({ city: 'Paris' });
+  api.fetchServers({ city: 'Berlin' });
+  await tick();
+  assert.equal(fetches.length, 2);
+  fetches[1].ok({ lat: 52.5, lon: 13.4, location: 'Berlin, DE', servers: [{ id: 'b' }] });
+  await tick();
+  fetches[0].ok({ lat: 48.8, lon: 2.3, location: 'Paris, FR', servers: [{ id: 'p' }] });
+  await tick();
+  const st = api.state();
+  assert.equal(st.autoLoc, '52.5,13.4', 'the older search overwrote the newer one');
+  assert.equal(st.autoLabel, 'Berlin, DE');
+  assert.deepEqual(log.populated, [[{ id: 'b' }]], 'and it put the older city list back in the dropdown');
+});
+
+test('server list: an abandoned search cannot report a failure the page has moved past', async () => {
+  const { api, els, fetches, log } = driveServers();
+  els.serverCity.value = 'Nowherecity';
+  const search = api.searchServers();
+  await tick();
+  api.chooseAutoServer();
+  await tick();
+  fetches[0].fail();                   // the abandoned lookup fails, late
+  await search; await tick();
+  assert.deepEqual(log.errs, [],
+    '"city not found" was painted into the footer under a hidden search box');
+  assert.equal(api.state().searchFailed, false,
+    'the abandoned failure left the save-blocking flag set');
+  assert.equal(els.serverSearchBtn.disabled, false,
+    'the Search button must be released even when its search was abandoned');
+  assert.equal(els.serverSearchBtn.innerHTML, 'Search', 'and its label restored, not left as a spinner');
+});
+
 // --- container-awareness surfaces (I1/I5/I8/I9) ------------------------------
 // I5: family "auto" resolves invisibly - a dual-stack native host measures IPv6
 // where an IPv6-less bridge silently measures IPv4 - so a recorded family is
@@ -2608,9 +2879,35 @@ test('applyPendingServer does not re-fetch a pin whose health is already known',
 test('famLabel: names only a recorded family', () => {
   assert.equal(F.famLabel('4'), 'IPv4');
   assert.equal(F.famLabel('6'), 'IPv6');
+  // iperf runs down and up as separate processes, and a dual-stack hostname can
+  // land them on DIFFERENT families; the engine stores that as 'mixed' rather
+  // than letting one direction speak for the row, and the UI must name it.
+  assert.equal(F.famLabel('mixed'), 'IPv4+IPv6');
   assert.equal(F.famLabel(''), '');
   assert.equal(F.famLabel(undefined), '');
   assert.equal(F.famLabel('ipv6'), '', 'only the stored enum, never a lookalike');
+});
+
+// 'mixed' alone reads like a single dual-stack transfer, so it - and only it -
+// carries an explaining tooltip; the plain families need none.
+test('famTitle: explains mixed, and ONLY mixed', () => {
+  assert.match(F.famTitle('mixed', 'iperf3'), /different IP famil/i, 'the mixed tooltip says what really happened');
+  assert.equal(F.famTitle('4', 'iperf3'), '');
+  assert.equal(F.famTitle('6', 'ookla'), '');
+  assert.equal(F.famTitle('', 'ookla'), '');
+  assert.equal(F.famTitle(undefined, 'ookla'), '');
+});
+
+// The two engines earn different sentences. iperf3 runs each direction as its
+// own process, so 'mixed' really does mean the directions differed; Ookla
+// records one family set across both directions AND every retry, so claiming
+// per-direction knowledge there would be a lie the data can't support.
+test('famTitle: only iperf3 may claim the directions differed', () => {
+  assert.match(F.famTitle('mixed', 'ookla'), /across its directions and any retries/i);
+  assert.doesNotMatch(F.famTitle('mixed', 'ookla'), /Download and upload were measured over different/i,
+    'an Ookla run cannot claim per-direction families');
+  assert.match(F.famTitle('mixed', undefined), /across its directions and any retries/i,
+    'unknown engine gets the weaker, always-true wording');
 });
 
 // I9: which way the UDP loss/jitter probe sampled. Anything but the closed
@@ -2626,9 +2923,12 @@ test('udpDirLabel / udpDirTitle: down/up -> path labels, anything else -> nothin
 
 // qualityParts needs lossStr (a brace-less arrow const), so it is compiled with
 // its real dependencies rather than through the shared factory.
-const qualityParts = new Function(script.match(/const lossStr = [^;]*;/)[0] + '\n'
-  + extract('function udpDirLabel') + '\n' + extract('function qualityParts')
-  + '\nreturn qualityParts;')();
+// pingMeasured rides along for the same reason (it gates the ping readout), and
+// isNum - a brace-less arrow const - is injected exactly as the shared factory does.
+const qualityParts = new Function('isNum', script.match(/const lossStr = [^;]*;/)[0] + '\n'
+  + extract('function udpDirLabel') + '\n' + extract('function pingMeasured') + '\n'
+  + extract('function qualityParts')
+  + '\nreturn qualityParts;')(v => typeof v === 'number');
 
 test('the tooltip labels loss/jitter with the probed direction ONLY when the sample carries one', () => {
   const parts = qualityParts({ ping_ms: 4.5, jitter_ms: 0.4, packet_loss: 0.5, udp_direction: 'down' });
@@ -2640,6 +2940,55 @@ test('the tooltip labels loss/jitter with the probed direction ONLY when the sam
   assert.ok(!pingOnly.some(p => /path/.test(p)), 'a direction without loss/jitter shown would label nothing the probe measured');
 });
 
+// --- ping_ms 0 is "not probed" on EVERY surface, not just the tiles -----------
+// A successful iperf3 run with the latency probe off: real bytes both ways, a
+// real jitter/loss sample, and ping_ms 0 - the documented sentinel. The tiles,
+// the range average and /metrics already drop it; the tooltip, the runs table
+// and the quality chart rendered it as a genuine zero-millisecond reading, so
+// the same row read "-" in one place and a perfect 0.0 ms an inch away.
+const iperfNoPing = { ts: 1770000000, engine: 'iperf3',
+  down_mbps: 940.2, up_mbps: 912.7, download_bytes: 5.9e8, upload_bytes: 5.7e8,
+  ping_ms: 0, jitter_ms: 0.4, packet_loss: 0, udp_direction: 'down' };
+
+test('a run that moved bytes with no ping probe reads as unmeasured, never 0.0 ms', () => {
+  // The run is not empty - both directions really were measured, which is exactly
+  // why "the speed is real, so the ping must be too" is the wrong inference.
+  assert.equal(F.spMeasured(iperfNoPing, 'down_mbps'), true);
+  assert.equal(F.spMeasured(iperfNoPing, 'up_mbps'), true);
+
+  assert.equal(F.pingMeasured(iperfNoPing), false);
+  assert.equal(F.pingMeasured({ ping_ms: 0.4 }), true, 'a sub-millisecond LAN ping is a real reading');
+  assert.equal(F.pingMeasured({}), false, 'omitempty dropped the field entirely');
+  assert.equal(F.pingMeasured({ ping_ms: null }), false);
+
+  // Tooltip: the ping line is omitted, the rest of the Quality line is not.
+  const parts = qualityParts(iperfNoPing);
+  assert.ok(!parts.some(p => /ping/.test(p)), 'the tooltip claimed a 0.0 ms ping: ' + parts.join(' · '));
+  assert.ok(parts.some(p => /jitter/.test(p)) && parts.some(p => /loss/.test(p)),
+    'the probe DID measure jitter/loss - those must survive: ' + parts.join(' · '));
+
+  // Tiles and the range average already agreed; assert it so the three cannot drift.
+  assert.equal(F.pingText(iperfNoPing.ping_ms), '-');
+  assert.equal(F.spdAverages([iperfNoPing]).ping, null);
+  assert.equal(F.spdAverages([iperfNoPing]).down, 940.2, 'only the ping is unmeasured');
+});
+
+test('the runs table and the quality chart gate ping on the same predicate', () => {
+  // Both render from DOM/canvas machinery too heavy to drive here, so assert the
+  // shipped source consumes the predicate - the same way the family/direction
+  // helpers are pinned above.
+  const runs = extract('async function loadRuns');
+  assert.match(runs, /pingMeasured\(r\)\?num1\(r\.ping_ms\):'-'/,
+    'the runs table prints num1(0) = "0.0" for a run that never probed');
+  const q = extract('function drawQualityChart');
+  assert.match(q, /pingMeasured\(p\)\?p\.ping_ms/, 'the jitter envelope still anchors on a 0 ms ping');
+  assert.match(q, /points\.filter\(pingMeasured\)/, 'the plotted set still includes the sentinel');
+  assert.match(q, /spdLine\(x,pp,X,Y,'ping_ms'/,
+    "spdLine's own filter is isNum, which keeps 0 - it must be handed the gated set");
+  assert.match(q, /if\(pingMeasured\(p\)\) chartDot/, 'a single 0 ms run still draws a dot at the floor');
+  assert.ok(!/isNum\(p\.ping_ms\)/.test(q), 'a bare isNum ping gate is left in the chart');
+});
+
 // The helpers must actually be consumed where runs are detailed, or the labels
 // exist only in tests.
 test('the run tooltip and the runs table consume the family/direction helpers', () => {
@@ -2648,6 +2997,7 @@ test('the run tooltip and the runs table consume the family/direction helpers', 
   assert.match(tip, /qualityParts\(p\)/, 'the tooltip quality line must ride the labelled builder');
   const runs = extract('async function loadRuns');
   assert.match(runs, /famLabel\(r\.ip_family\)/, 'the runs table must name the measured family');
+  assert.match(runs, /famTitle\(r\.ip_family,\s*engOf\(r\)\)/, 'a mixed row must carry the explaining tooltip, scoped to its engine');
   assert.match(runs, /udpDirTitle\(r\)/, 'the loss/jitter cells must carry the probe-direction tooltip');
   const tiles = extract('function setSpeedTiles');
   assert.match(tiles, /udpDirLabel\(sp\.udp_direction\)/, 'the jitter/loss tiles must carry the probe-direction tooltip');
@@ -2708,6 +3058,25 @@ test('the loopback trap fires only in a BRIDGED container, skips deleted rows, a
   assert.ok(post >= 0 && trap > post, 'the loopback check must sit in the success path, not block the save');
 });
 
+// The trap itself asks only "bridged container + a loopback server in the list",
+// which is the right question for the drawer, where the bubble lives inside
+// #iperfServerRow and is hidden outright whenever the engine is Ookla. The
+// post-save TOAST has no such markup around it, so it inherited none of that
+// gating: an install running Ookla, with an iperf3 server still sitting in the
+// saved list (added while trying iperf3, or kept for later), got told on every
+// single save that its iperf3 server would refuse connections - about an engine
+// that never runs. Two surfaces, same warning, opposite answers.
+test('the post-save loopback toast is gated on iperf3 actually being the engine', () => {
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  const j = save.indexOf('const lb=');
+  assert.ok(j > 0, 'the save path must still compute the loopback trap');
+  const guard = save.slice(j, save.indexOf(';', j));
+  assert.match(guard, /setSpeedEngine/,
+    'the toast fires without consulting the engine, so an Ookla install with a leftover iperf3 server ' +
+    'is warned about iperf3 on every save; the drawer bubble is gated by its container markup and stays ' +
+    'silent, so the two surfaces disagree');
+});
+
 // M5: the trap must key on the settings payload's BRIDGED flag, never on the
 // broader containerized one - in a host-network container the containerized
 // flag is true but localhost IS the host, so keying on it warned about (and
@@ -2736,4 +3105,335 @@ test('bridged vs containerized: each hint keys on its own flag', () => {
 test('the old cannot-enforce-local-only-in-a-container bubble is gone', () => {
   assert.doesNotMatch(html, /localOnlyContainerNote/, 'dead old-access-model bubble still present');
   assert.doesNotMatch(html, /cannot be enforced in this container/i, 'old-access-model wording still present');
+});
+
+// A roving-tabindex radiogroup puts focus on the CHECKED option, and the checked
+// Quick Setup segment is filled with --accent. An --accent focus ring on it is
+// invisible, so the keyboard indicator disappeared on the one element that had
+// to show it. --on-accent is the token picked for contrast against that fill.
+test('the checked Quick Setup segment has a focus ring you can actually see', () => {
+  const base = /\.qs-seg b:focus-visible\{([^}]*)\}/.exec(html);
+  assert.ok(base, 'the segments declare a focus-visible ring');
+  const onFill = /\.qs-seg b\.on\{([^}]*)\}/.exec(html);
+  assert.ok(onFill, 'the checked segment declares its fill');
+  assert.match(onFill[1], /background:var\(--accent\)/, 'the checked segment is filled with --accent');
+
+  const checkedRing = /\.qs-seg b\.on:focus-visible\{([^}]*)\}/.exec(html);
+  assert.ok(checkedRing, 'the CHECKED segment needs its own focus-ring colour, or the ring is accent-on-accent');
+  assert.match(checkedRing[1], /outline-color:var\(--on-accent\)/,
+    'the checked segment\'s ring must use the token chosen to contrast with the accent fill');
+});
+
+// --- the marked fetch, and the three downloads that exist because of it ---
+//
+// Every request the SPA issues THROUGH THE WRAPPER carries `X-Pingularity-UI: 1`,
+// and the daemon reads it as "this caller is the dashboard, not curl". Through the
+// wrapper is the accurate scope, and the exception is deliberate: the login POST
+// goes out via `_fetch`, the raw handle captured before the wrapper is installed,
+// so it is NOT marked (index.html says so where it does it). That is harmless
+// because /api/auth/login is authExempt and neither writer of `WWW-Authenticate`
+// sits on the login path - but it means this file's tests bound the wrapper, not
+// the set of call sites. A second `_fetch` caller would be equally unmarked and
+// equally invisible here. Verified consumers, both of them
+// on the 401 path: the session guard in internal/web/auth.go, and the Quick Setup
+// dismiss branch in internal/web/web.go. Each one withholds the
+// `WWW-Authenticate: Basic` response header when the request carries the marker.
+// Unmarked, the daemon offers Basic to the browser instead, and a same-origin
+// fetch answered 401+Basic raises the browser's NATIVE credentials dialog on top
+// of the SPA's own login overlay - once per API poll, and the status poll alone
+// runs every 3 seconds. Suppressing the challenge never weakens the auth check
+// itself; curl/wget/Prometheus never send the marker and still get their Basic
+// challenge, which is why the discriminator has to be a REQUEST header.
+//
+// That last point is the whole reason the log, backup-export and speed-runs-CSV
+// downloads were converted from <a href> links to fetch: a navigation cannot send
+// a request header, so a plain link is unmarkable by construction - middle-click
+// and "save link as" would bypass the marker and draw the browser's Basic prompt
+// on an expired session.
+
+// A bare indexOf into an 8000-line file can quietly land on a second occurrence
+// and compile the wrong code, which looks exactly like a test that fails to
+// discriminate. Every anchor below is pinned to exactly one match first.
+// `what` names what the anchor holds, because two of them are not downloads at
+// all: they are the global fetch binding itself. Reporting "the download it
+// drives has gone somewhere untested" when someone breaks `.bind(window)` points
+// the reader at the wrong end of the page - that change takes the WHOLE dashboard
+// down, not one button.
+function soleAnchor(anchor, what = 'whatever it anchors is no longer under test') {
+  const n = script.split(anchor).length - 1;
+  assert.equal(n, 1,
+    `expected exactly one \`${anchor}\` in the page script, found ${n} - if it is 0 the shipped ` +
+    `code no longer has this call site, and ${what}`);
+  return anchor;
+}
+
+// downloadVia is the one definition here that `extract` cannot lift: its
+// Content-Disposition regex literal, /filename="?([^"';]+)"?/i, holds a lone
+// apostrophe inside the character class, and the brace-walker reads that as the
+// start of a string literal - from there the quote parity is inverted and it
+// walks straight past the closing brace into the next function. So this one is
+// taken as the slice between two pinned anchors instead.
+function sliceBetween(from, to) {
+  const i = script.indexOf(soleAnchor(from)), j = script.indexOf(soleAnchor(to));
+  assert.ok(i >= 0 && j > i, `\`${from}\` must still sit before \`${to}\` in the page script`);
+  return script.slice(i, j);
+}
+
+// Compile the REAL wrapper, the REAL downloadVia and the REAL click handlers of
+// all three downloads together, behind a raw fetch stub that records what the
+// network actually saw. Nothing here re-implements the marking: `_fetch` binds off
+// the injected window (so the stub stands in for the browser's own fetch), the
+// page then overwrites window.fetch with the wrapper, and the requests recorded by
+// the stub are whatever the shipped wrapper chose to send.
+function driveDownloads({ status = 200 } = {}) {
+  const seen = [];
+  const rawFetch = async (url, init) => {
+    seen.push({ url: String(url), headers: new Headers((init && init.headers) || undefined) });
+    return {
+      ok: status >= 200 && status < 300, status,
+      headers: new Headers({ 'Content-Disposition': 'attachment; filename="from-server.txt"' }),
+      blob: async () => ({ size: 12 }),
+    };
+  };
+  // downloadVia hands the buffered bytes to the browser through a throwaway blob
+  // anchor, so record every anchor it makes - that is how we can tell a blob
+  // handoff from a navigation to the API url.
+  const anchors = [];
+  const doc = {
+    body: { appendChild() {} },
+    createElement: () => { const a = { clicked: false, click() { this.clicked = true; }, remove() {} }; anchors.push(a); return a; },
+  };
+  const els = {}, handlers = {};
+  const $ = id => els[id] || (els[id] = {
+    textContent: '',
+    addEventListener: (ev, fn) => { handlers[id + ':' + ev] = fn; },
+  });
+  const out = { seen, anchors, handlers, els, flashed: [], loginShown: 0 };
+  const src =
+    soleAnchor('const _fetch=window.fetch.bind(window);',
+      'the raw pre-wrapper handle the login POST uses is gone, and the page has no unmarked escape hatch') + '\n' +
+    extract(soleAnchor('window.fetch=async(...a)=>',
+      'nothing is installing the marked wrapper, so no request carries the header')) + '\n' +
+    // In the browser that assignment IS the rebinding of the global every bare
+    // `fetch(...)` in the page resolves to. A `new Function` body has its own
+    // scope, so the two are tied together by hand here - downloadVia below still
+    // calls a bare `fetch`, exactly as it ships, and reaches the wrapper only
+    // because the wrapper is what window.fetch now holds.
+    //
+    // MODELLING LIMIT, since a harness that looks this faithful invites more
+    // trust than it has earned: these two statements are emitted in a FIXED
+    // order, not in the order index.html happens to put them. Swap them in the
+    // page - capture `_fetch` after the wrapper is installed - and the real
+    // browser recurses on the first request until the stack blows, while this
+    // harness reproduces the working order and notices nothing. The order is
+    // load-bearing and nothing here pins it.
+    'const fetch=window.fetch;\n' +
+    script.match(/const downloadCapBytes = [^;]*;/)[0] + '\n' +
+    sliceBetween('async function downloadVia(', "$('exportBtn').addEventListener('click'") + '\n' +
+    extract(soleAnchor("$('exportBtn').addEventListener('click'")) + ');\n' +
+    extract(soleAnchor("$('logDownload').addEventListener('click'")) + ');\n' +
+    extract(soleAnchor("$('csvDownload').addEventListener('click'")) + ');\n' +
+    'return window.fetch;';
+  // setTimeout is stubbed rather than borrowed: downloadVia schedules the blob
+  // revoke a minute out, and a real timer would hold the test process open for
+  // that whole minute after the assertions have finished.
+  out.markedFetch = new Function('window', '$', 'document', 'URL', 'setTimeout',
+    'getCats', 'flashStatus', 'showLogin', 'logMasked', src)(
+      { fetch: rawFetch }, $, doc,
+      { createObjectURL: () => 'blob:pingularity/stub', revokeObjectURL() {} },
+      () => {}, () => ['pings'], m => out.flashed.push(m), () => { out.loginShown++; }, true);
+  return out;
+}
+
+test('requests through the fetch wrapper are marked, or the browser stacks its own password box on top of the login overlay', async () => {
+  const d = driveDownloads();
+  await d.markedFetch('api/status');
+  assert.equal(d.seen[0].headers.get('X-Pingularity-UI'), '1',
+    'a plain GET went out unmarked - the daemon then answers a 401 with a Basic challenge and the ' +
+    'browser raises its own credentials dialog over the SPA login overlay, once per poll');
+  await d.markedFetch('api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(d.seen[1].headers.get('X-Pingularity-UI'), '1',
+    'a request that brings its own headers went out unmarked - saving settings would draw the native prompt');
+  assert.equal(d.seen[1].headers.get('Content-Type'), 'application/json',
+    "the caller's own headers must survive the marking, or every POST body is refused as the wrong type");
+  // The other half of the same bargain: the SPA suppresses the browser's prompt
+  // because it raises its own. If a 401 stopped doing that, an expired session
+  // would look like a dashboard that has simply stopped updating.
+  const expired = driveDownloads({ status: 401 });
+  await expired.markedFetch('api/status');
+  assert.equal(expired.loginShown, 1, 'a 401 must raise the SPA login overlay, since the native prompt is suppressed');
+});
+
+test('the log, backup and CSV downloads all go out marked, so an expired session gets the SPA login', async () => {
+  for (const [id, url] of [['exportBtn', 'api/export'], ['logDownload', 'api/logs'], ['csvDownload', 'api/speed/runs.csv']]) {
+    const d = driveDownloads();
+    const click = d.handlers[id + ':click'];
+    assert.ok(click, `#${id} has no click handler, so whatever downloads now is not the marked fetch`);
+    await click({ preventDefault() {} });
+    assert.equal(d.seen.length, 1,
+      `#${id} put ${d.seen.length} requests on the wire instead of 1 - if it is 0 the download became a ` +
+      'navigation, which cannot carry X-Pingularity-UI and draws the browser password box on an expired session');
+    assert.ok(d.seen[0].url.startsWith(url), `#${id} requested ${d.seen[0].url}, expected ${url}`);
+    assert.equal(d.seen[0].headers.get('X-Pingularity-UI'), '1',
+      `#${id} fetched ${url} unmarked - on an expired session the daemon offers Basic and the browser ` +
+      'raises its own credentials dialog instead of the SPA login overlay');
+    // The anchor it does build points at a blob, not at the API url: that is what
+    // makes it a handoff of already-fetched bytes rather than a fresh, unmarked
+    // GET performed by the browser's navigation machinery.
+    assert.equal(d.anchors.length, 1, `#${id} must hand the file over through exactly one throwaway anchor`);
+    assert.equal(d.anchors[0].clicked, true, `#${id} built an anchor but never clicked it, so nothing is saved`);
+    assert.ok(String(d.anchors[0].href).startsWith('blob:'),
+      `#${id} pointed its anchor at ${d.anchors[0].href} - an api url there is a second, unmarked GET`);
+    assert.equal(d.anchors[0].download, 'from-server.txt',
+      `#${id} must take the filename the server sent in Content-Disposition`);
+  }
+});
+
+// The two log/CSV controls are already pinned as href-less native buttons above.
+// The Export control is the third download and had no such pin: driving its click
+// handler proves what the button does, but not that the markup has not ALSO
+// sprouted a link beside it, so that one claim is made against the source.
+test('the backup export is a button, never a link that would download unmarked', () => {
+  assert.match(html, /<button[^>]*id="exportBtn"[^>]*type="button"/, 'export is a native button');
+  assert.doesNotMatch(html, /<a[^>]*id="exportBtn"/, 'no anchor faking the export button');
+  assert.doesNotMatch(html, /href="api\/export/, 'nothing in the page navigates to api/export - a navigation goes out unmarked');
+});
+
+// Locked-out recovery. Inside a container "the host" is the wrong machine: the
+// CLI lives in the image and the database on the volume, so a host shell either
+// has no `pingularity` at all or opens some other (empty) database, reports
+// success, and leaves the login that locked the operator out exactly where it
+// was. The README's Docker section gives the real recipe - a one-off container
+// sharing the volume, then a restart, because the running daemon caches settings
+// in memory - and both of the page's instructions have to say that instead.
+//
+// The two strings below are pulled out of the SHIPPED markup rather than typed
+// out here, so rewording either one without teaching the rewrite about it fails
+// these tests instead of quietly shipping a container branch that does nothing.
+// Pulled at MODULE scope, so a miss here throws before any test registers and the
+// whole file reports one unnamed TypeError instead of a failure that names what
+// moved. mustExtract turns that into a message, and the assertion below turns it
+// into a failing TEST rather than a dead run - a rename in the markup should cost
+// one red test, not the other 195.
+function mustExtract(re, what) {
+  const m = html.match(re);
+  if (!m) throw new Error('could not find ' + what + ' in index.html - it was renamed or restructured, so the ' +
+    'password-reset tests below are no longer reading the shipped markup');
+  return m[1];
+}
+let pageResetHint = '', pagePwTip = '', resetMarkupErr = null;
+try {
+  pageResetHint = mustExtract(/id="resetHint"[^>]*>([\s\S]*?)<\/span>\s*<\/div>/, 'the reset-hint element');
+  pagePwTip = mustExtract(/data-tip="([^"]*Forgot it\? Run pingularity reset-auth[^"]*)"/, 'the password tooltip');
+} catch (e) {
+  resetMarkupErr = e;
+}
+
+test('the password-reset markup these tests read is still present', () => {
+  assert.equal(resetMarkupErr, null, String(resetMarkupErr && resetMarkupErr.message));
+});
+
+test('the password-reset instructions send a container operator into the container, not to the host', () => {
+  const resetAuthText = new Function(extract('function resetAuthText') + '\nreturn resetAuthText;')();
+  for (const [what, s] of [['the footer hint', pageResetHint], ['the password tooltip', pagePwTip]]) {
+    assert.match(s, /pingularity reset-auth/, what + ' must still name the recovery command');
+    assert.equal(resetAuthText(s, false), s, what + ' must keep its wording word-for-word on a native host');
+    assert.equal(resetAuthText(s, undefined), s,
+      what + ': an older daemon sends no containerized flag, and a guess must not send a native operator into a container');
+    const c = resetAuthText(s, true);
+    assert.notEqual(c, s,
+      what + ' came back unchanged for a container - the rewrite no longer matches the string the page ships, so the advice is still "the host"');
+    assert.doesNotMatch(c, /on the host/, what + ' still points at the host, which in a container is the wrong machine');
+    assert.match(c, /one-off container sharing the volume/, what + " must give the README's container recipe");
+    assert.match(c, /restart/, what + ' must say to restart, or the reset lands and the running daemon keeps asking for the old password');
+  }
+});
+
+// updateResetAuthHint reads the page globals and writes to two elements, so it is
+// compiled with an injected `$` and containerized flag, and driven against fakes
+// carrying the real shipped strings.
+function resetHintHarness() {
+  const els = {
+    resetHint: { innerHTML: pageResetHint, dataset: {} },
+    pwInfo: { dataset: { tip: pagePwTip }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+  };
+  const src = extract('function resetAuthText') + '\n' + extract('function updateResetAuthHint');
+  const repaint = new Function('$',
+    'return function(iperfInContainer){ ' + src + '\nreturn updateResetAuthHint(); };')(id => els[id] || null);
+  return { els, repaint };
+}
+
+test('both password-reset instructions turn container-aware together, screen readers included', () => {
+  const native = resetHintHarness();
+  native.repaint(false);
+  assert.equal(native.els.resetHint.innerHTML, pageResetHint, 'a native host must see today’s footer hint untouched');
+  assert.equal(native.els.pwInfo.dataset.tip, pagePwTip, 'a native host must see today’s tooltip untouched');
+
+  const h = resetHintHarness();
+  h.repaint(true);
+  assert.match(h.els.resetHint.innerHTML, /one-off container sharing the volume/, 'the visible footer hint stayed host-only in a container');
+  assert.match(h.els.pwInfo.dataset.tip, /one-off container sharing the volume/, 'the password tooltip stayed host-only in a container');
+  // labelInfoBubbles copies data-tip into aria-label ONCE at startup and skips
+  // bubbles that already have one, so without rewriting the label here a screen
+  // reader would keep reading the host-only instruction no matter what the
+  // sighted tooltip says.
+  assert.match(h.els.pwInfo.attrs['aria-label'] || '', /one-off container sharing the volume/,
+    'the tooltip’s accessible name still tells a screen-reader user to run it on the host');
+
+  // applySettings runs on every settings GET and after every Save, so each of
+  // these elements is repainted over and over. Every repaint has to start from
+  // the wording stashed on the first call, never from what the last one left:
+  // the rewrite is a replace of the "on the host" clause, which the rewritten
+  // text no longer contains, so an element rewritten in place could never be
+  // painted back. Paint container, then native, and the shipped sentences must
+  // return word-for-word. (Repainting container twice proves nothing here - the
+  // replace simply finds nothing the second time, cache or no cache.)
+  h.repaint(false);
+  assert.equal(h.els.resetHint.innerHTML, pageResetHint,
+    'the footer hint would not paint back to the shipped wording - the repaint is rewriting its own output, not the page’s sentence');
+  assert.equal(h.els.pwInfo.dataset.tip, pagePwTip,
+    'the tooltip would not paint back to the shipped wording - the repaint is rewriting its own output, not the page’s sentence');
+
+  // The flag arrives with the settings payload, so the repaint has to run AFTER
+  // applySettings stores it. Above that line it paints with the previous value of
+  // the global - false until some later settings load repaints it - so the first
+  // paint a container operator gets is the host-only advice. Matching the call
+  // anywhere in the function would pass either way, hence the positions.
+  const apply = extract('function applySettings');
+  const flagAt = apply.search(/iperfInContainer\s*=\s*s\.containerized/);
+  const repaintAt = apply.search(/updateResetAuthHint\(\)/);
+  assert.ok(flagAt >= 0, 'applySettings no longer stores the containerized flag that the repaint reads');
+  assert.ok(repaintAt > flagAt,
+    'applySettings does not repaint the advice after the containerized flag lands, so it stays host-only in a container');
+  assert.match(html, /id="pwInfo"/, 'the password tooltip has no id, so the repaint cannot find it');
+});
+
+// The README's Access-tab bullet answers the same "forgot the password?" question
+// as the dashboard, and the two drifted the moment the page learned to branch on
+// the container (the README still carried the older combined sentence). The
+// fragments below are taken out of the page's own rewrite rather than typed here,
+// so a reword of the advice that leaves the README behind fails instead of
+// shipping two different answers. The container half also points readers at the
+// README's Docker section, so that section has to exist.
+test('the README gives the same locked-out recovery advice as the dashboard', () => {
+  const readmeRaw = readFileSync(join(here, '..', '..', '..', 'README.md'), 'utf8');
+  const readme = readmeRaw.replace(/\s+/g, ' '); // the bullet is hard-wrapped; compare on one line
+  const m = extract('function resetAuthText').match(/replace\('([^']+)',\s*'([^']+)'\)/);
+  assert.ok(m, 'resetAuthText no longer swaps one literal clause for another, so the wordings the README must match cannot be read out of it');
+  const [, hostClause, containerClause] = m;
+  const shared = 'to clear it and disable auth', restart = 'then restart the container';
+  assert.ok(hostClause.endsWith(shared) && containerClause.includes(shared) && containerClause.includes(restart),
+    'the page reworded the advice, so this test can no longer split it into the fragments the README must carry');
+  const where = containerClause.split(shared)[0].trim(); // "from a one-off container sharing the volume"
+  for (const frag of [hostClause, where, restart]) {
+    assert.ok(readme.includes(frag),
+      'the README no longer says "' + frag + '", so it and the dashboard now answer "forgot the password?" differently');
+  }
+  // The command itself is not in the page: it needs an entrypoint override, the
+  // pinned -db path and the operator's own volume and tag. So the advice has to
+  // say where it is, and that place has to exist.
+  assert.ok(/README/.test(containerClause) && /Docker/.test(containerClause),
+    'the container advice says to run the reset from a one-off container but no longer says where the command is, and it is not one an operator can guess');
+  assert.match(readmeRaw, /^#+ +Docker\b/m,
+    'the container advice sends the operator to the README’s Docker section for the command, and there is no such section');
 });

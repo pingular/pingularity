@@ -404,10 +404,28 @@ func (s *Server) guard(next http.Handler) http.Handler {
 	})
 }
 
-// authExempt lists what stays reachable without a session: the static UI shell
-// (so the login overlay can render), the login/logout endpoints, and GET
-// /api/access (the login-overlay flags). /metrics and every other /api/ route
-// are gated.
+// authExempt lists what stays reachable without a session: /api/auth/login and
+// /api/auth/logout, GET /api/access (the flags the login overlay renders from),
+// /api/quick-setup (which gates itself in its handler rather than here - see the
+// case below), and everything NOT under /api/ - the static UI shell, font and
+// favicon, so the login overlay can render at all. Every other /api/ route is
+// gated.
+//
+// The method predicates are asymmetric, so read the table rather than a summary
+// of it. /api/access is the ONLY entry scoped by method: GET is exempt, POST
+// falls through to the default and is gated, because it changes the password and
+// who may reach the dashboard. The other three name a path and nothing else, so
+// every method reaches their handlers; each answers POST alone and returns 405 to
+// the rest (handleLogin, handleLogout, handleQuickSetup).
+//
+// /metrics needs its explicit false: it is not under /api/, so without that case
+// the default below would exempt it along with the static assets and publish it
+// to anyone who can reach the port. Gated does not mean "admin login only" -
+// guard accepts a configured -metrics-token there as an alternative credential,
+// so a scraper need not hold the account that can change settings.
+//
+// /healthz and /readyz never reach this function at all: guard answers them
+// ahead of every check, including this one.
 func authExempt(r *http.Request) bool {
 	p := r.URL.Path
 	switch {
@@ -758,7 +776,12 @@ func hostAllowed(hostport string, extra []string) bool {
 		}
 	}
 	for _, a := range extra {
-		if a = strings.ToLower(strings.TrimSpace(a)); a != "" && host == a {
+		// Normalize a configured host exactly like the request host above,
+		// trailing dot included: "fleet.example.com." is the same name as
+		// "fleet.example.com", and a config carrying the dot used to match
+		// NEITHER spelling of the Host header - it 403'd every proxied request.
+		a = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(a), "."))
+		if a != "" && host == a {
 			return true
 		}
 	}
@@ -816,70 +839,117 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// The Settings drawer posts here on EVERY Save, before the settings
-		// POST. A request that changes no access state must succeed without a
-		// step-up (or any limiter spend) - demanding the password to save an
-		// unrelated latency tweak locked ordinary saves out of a login-protected
-		// install entirely. Empty username and password mean "keep current", so
-		// only a real difference counts as a change.
+		// POST, and ABORTS the whole save if this call fails. So a request that
+		// changes no access state must succeed without a step-up (or any limiter
+		// spend) - demanding the password to save an unrelated latency tweak
+		// locked ordinary saves out of a login-protected install entirely. That
+		// is a property of this branch, not an aspiration: see the no-change
+		// handling below, which skips a write rather than refusing one.
+		// Empty username and password mean "keep current", so only a real
+		// difference counts as a change.
 		reqUser := strings.TrimSpace(in.Username)
 		delta := in.Password != "" ||
 			(reqUser != "" && reqUser != s.settings.AuthUser()) ||
 			(in.AuthEnabled != nil && *in.AuthEnabled != s.settings.AuthEnabled()) ||
 			(in.LocalOnly != nil && *in.LocalOnly != s.settings.AccessLocalOnly())
 		if !delta {
+			// One thing still has to happen on a no-change save: PERSIST an
+			// explicitly submitted access scope. The value an operator sees can
+			// come from -access / PINGULARITY_ACCESS rather than the store, and
+			// then "Save" is not a no-op to them - it is how they make the
+			// choice stick so they can drop the env var. Without this, the
+			// documented env-var recovery silently fails to persist and the
+			// next boot without the variable is local-only again.
+			//
+			// The write moves no privilege NOW - the same value is already in
+			// effect either way - but it decides how LONG that privilege lasts,
+			// and that is not symmetric. Storing local_only=false pins an
+			// env-conditional open posture into a permanent one: the operator
+			// who later drops PINGULARITY_ACCESS expecting to fall back to
+			// local-only stays reachable from the whole network, and a session
+			// that never proved the password would have done that to them.
+			//
+			// So that one write is SKIPPED rather than refused. Refusing it was
+			// tried and is wrong here: because the drawer echoes local_only back
+			// on every Save and aborts on failure, a 403 breaks every ordinary
+			// settings save on the most common container setup there is - opened
+			// with PINGULARITY_ACCESS=network, password set, no stored row
+			// (reconcileAccess writes one only when the env DISAGREES with the
+			// live value, so the normal case never has one). Skipping costs the
+			// operator nothing they can see, and leaves the posture exactly as
+			// it was: still open, still conditional on the variable that opened
+			// it. An operator who genuinely wants it permanent still has a path,
+			// and it is the honest one - change the scope deliberately, which is
+			// a delta, and prove the password like any other access change.
+			//
+			// The closing direction writes as before: local_only=true can only
+			// take reach away, so no session can widen anything with it.
+			//
+			// Nothing special is needed for the install whose scope is ALREADY
+			// stored open - the case a network install hits on every Save. The
+			// refusal design needed an exemption for it, to avoid 403ing those
+			// saves; skipping needs none, because writing a value the store
+			// already holds and skipping it leave the store in the same state.
+			// An exemption here would be untestable by construction.
+			// ...and it is skipped only where skipping buys something. With no
+			// login configured there is no password a hijacked session could
+			// fail to prove, so withholding the write protects nobody and would
+			// only break the documented recovery for the installs least able to
+			// afford it.
+			//
+			// And an operator who OFFERS the password is not guessed at: they
+			// typed it into the Access tab, which is what asking for this write
+			// deliberately looks like, so it is verified and honoured. That is
+			// what keeps the documented flow - open the Access tab, leave
+			// Network access on, Save, drop the variable - working on a
+			// login-protected install. Without it the only way to produce a
+			// delta is to switch to local-only first, which instantly 403s the
+			// very browser doing it whenever the operator is working over the
+			// network: no route to a permanent choice at all.
+			//
+			// A WRONG password still refuses, and only then. The drawer sends
+			// this field only when someone has typed in it, so an ordinary save
+			// never reaches the check and never breaks.
+			if in.LocalOnly != nil {
+				persistScope := *in.LocalOnly || !s.settings.AuthActive()
+				if !persistScope && in.CurrentPassword != "" {
+					verified, ok := s.requireStepUp(w, r, in.CurrentPassword)
+					if !ok {
+						return // refusal already written
+					}
+					persistScope = verified
+				}
+				switch {
+				case persistScope:
+					if err := s.settings.SetAccessLocalOnly(r.Context(), *in.LocalOnly); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+				default:
+					// Say so in the log: the request succeeded and one thing in
+					// it did not happen, which is exactly the shape that is
+					// otherwise discovered months later, by the reboot that
+					// closes the port.
+					s.log.Info("access scope left unstored: it is open only because -access or PINGULARITY_ACCESS says so, "+
+						"and making that permanent is an access change - re-enter the current password in the Access tab to store it",
+						"ip", clientIP(r))
+				}
+			}
 			writeJSON(w, s.accessStatus(r))
 			return
 		}
-		// Step-up: a live session must not be able to change access-control
-		// settings (password, username, login toggle, network scope) without
-		// re-proving the CURRENT password - otherwise a hijacked or walk-up
-		// session silently takes over the account. Only enforced once auth is
-		// active; first-time setup has no current password to prove.
-		// checkPassword burns bcrypt under the process-wide bcryptSem, and the
-		// attempt spends the same per-client budget as login and Basic - a
-		// hijacked session must not get unlimited serialized password guesses
-		// out of this endpoint when the login form caps them. Runs under
-		// s.importMu (held above), serialized against a restore reconcile like
-		// the mutations.
-		// stepUpVerified records that THIS request proved the current password
-		// (bcrypt or the known-good escape valve). Trust decisions after the
-		// mutations - refreshing the known-good cache - key on this, never on
-		// the post-mutation auth state: a rename+enable from the
-		// disabled-with-hash state ends active WITHOUT any proof, and caching
-		// its arbitrary current_password would let it pass a blocked step-up
-		// later; a verified rename+disable ends inactive WITH proof, and
-		// skipping the refresh strands the escape valve on the dead name.
-		stepUpVerified := false
-		if s.settings.AuthActive() {
-			refuse := func(why string) {
-				stats.Inc("web.stepup_fail")
-				s.log.Warn("access change refused: "+why, "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
-				http.Error(w, "current password is required to change access settings", http.StatusForbidden)
-			}
-			if in.CurrentPassword == "" {
-				refuse("current password missing") // not a guess - no budget spent
-				return
-			}
-			key := s.limiterKey(r)
-			if !s.logins.reserve(key) {
-				// Budget spent: only the cached known-good credential passes,
-				// with no bcrypt work - the same escape valve login has, so an
-				// attacker sharing the bucket can't lock the operator out.
-				if !s.knownGood(s.settings.AuthUser(), in.CurrentPassword) {
-					stats.Inc("web.limiter_trips")
-					http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
-					return
-				}
-				stepUpVerified = true // matched a pair that passed bcrypt earlier
-			} else if s.checkPassword(s.settings.AuthUser(), in.CurrentPassword) {
-				s.logins.ok(key)
-				s.rememberGood(s.settings.AuthUser(), in.CurrentPassword)
-				stepUpVerified = true
-			} else {
-				s.logins.releaseFail(key)
-				refuse("current password wrong")
-				return
-			}
+		// Step-up before any access-control change (password, username, login
+		// toggle, network scope). stepUpVerified records that THIS request
+		// proved the current password (bcrypt or the known-good escape valve).
+		// Trust decisions after the mutations - refreshing the known-good cache
+		// - key on this, never on the post-mutation auth state: a rename+enable
+		// from the disabled-with-hash state ends active WITHOUT any proof, and
+		// caching its arbitrary current_password would let it pass a blocked
+		// step-up later; a verified rename+disable ends inactive WITH proof,
+		// and skipping the refresh strands the escape valve on the dead name.
+		stepUpVerified, ok := s.requireStepUp(w, r, in.CurrentPassword)
+		if !ok {
+			return // refusal already written
 		}
 		ctx := r.Context()
 		if in.Password != "" {
@@ -987,6 +1057,66 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "use GET or POST", http.StatusMethodNotAllowed)
 	}
+}
+
+// requireStepUp makes the caller re-prove the CURRENT password before an
+// access-control change lands, and reports whether the handler may proceed. A
+// live session must not be able to change access settings on the strength of a
+// cookie alone - otherwise a hijacked or walk-up session silently takes over the
+// account (sets a new password, renames it, disables login, or makes network
+// reach permanent). Only enforced once auth is active; first-time setup has no
+// current password to prove.
+//
+// ok=false means the refusal (403 or 429) is already written and the handler
+// must return without touching anything. verified reports that this request
+// actually PROVED the password, which is not the same as ok: an inactive-auth
+// install proves nothing and still proceeds.
+//
+// checkPassword burns bcrypt under the process-wide bcryptSem, and the attempt
+// spends the same per-client budget as login and Basic - a hijacked session must
+// not get unlimited serialized password guesses out of this endpoint when the
+// login form caps them. Callers hold s.importMu, so this is serialized against a
+// restore reconcile exactly like the mutations it guards.
+//
+// Every access change made THROUGH THIS ENDPOINT routes here, and a second copy
+// of this logic would be a second place for the limiter accounting or the escape
+// valve to drift. It is not a claim about the process as a whole, and reading it
+// as one would be wrong: Quick Setup changes auth and access behind a different
+// gate (a blanket refusal once auth is active), and the import/restore path
+// writes auth and access directly with no step-up at all.
+func (s *Server) requireStepUp(w http.ResponseWriter, r *http.Request, currentPassword string) (verified, ok bool) {
+	if !s.settings.AuthActive() {
+		return false, true
+	}
+	refuse := func(why string) {
+		stats.Inc("web.stepup_fail")
+		s.log.Warn("access change refused: "+why, "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
+		http.Error(w, "current password is required to change access settings", http.StatusForbidden)
+	}
+	if currentPassword == "" {
+		refuse("current password missing") // not a guess - no budget spent
+		return false, false
+	}
+	key := s.limiterKey(r)
+	if !s.logins.reserve(key) {
+		// Budget spent: only the cached known-good credential passes, with no
+		// bcrypt work - the same escape valve login has, so an attacker sharing
+		// the bucket can't lock the operator out.
+		if !s.knownGood(s.settings.AuthUser(), currentPassword) {
+			stats.Inc("web.limiter_trips")
+			http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
+			return false, false
+		}
+		return true, true // matched a pair that passed bcrypt earlier
+	}
+	if s.checkPassword(s.settings.AuthUser(), currentPassword) {
+		s.logins.ok(key)
+		s.rememberGood(s.settings.AuthUser(), currentPassword)
+		return true, true
+	}
+	s.logins.releaseFail(key)
+	refuse("current password wrong")
+	return false, false
 }
 
 // proxyLocalOnlyCaveat returns the sentence to append when access is (or is being)

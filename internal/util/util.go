@@ -13,10 +13,16 @@ import (
 )
 
 // InContainer reports whether the process is running inside a container,
-// detected once via the markers the runtimes themselves plant. Used to relax
-// the loopback-only access filter: a bridged container NATs every external request
-// to the gateway, so the filter can't tell a local user from a LAN one and would
-// otherwise lock the dashboard out entirely.
+// detected once via the markers the runtimes themselves plant.
+//
+// ADVISORY ONLY. It once relaxed the loopback-only access filter; it does not
+// any more, and nothing about access may be decided from it again. Guessing a
+// container's network layout to decide who may reach the dashboard is what put
+// an unauthenticated dashboard on the LAN, so access is now an explicit setting
+// with an explicit override and this answer has no say in it (there is a test
+// that fails if any new caller writes an access decision). What it still does:
+// pick the wording of warnings and hints, and tell the dashboard which
+// environment it is describing.
 var (
 	inContainerOnce sync.Once
 	inContainerVal  bool
@@ -66,25 +72,27 @@ func detectContainer() bool {
 // real path (an extra latency hop, a traceroute that dead-ends at the container
 // gateway, and - the largest, least obvious distortion - a substituted DNS
 // resolver, because a loopback stub is unreachable from a bridged namespace so
-// Docker swaps in its own public default). More consequentially, it gates the
-// default access filter: a bridged container can ONLY be reached over the
-// network (even from the host, via the published port), so it must NOT default
-// to loopback-only or it would 403 its own port with no way back in.
+// Docker swaps in its own public default). The iperf3 hints key on it too, to
+// explain why a host-referential setting cannot work from inside a namespace
+// that has no such interface or address.
 //
-// Because it now gates access, the detection errs SAFE: return false ("not
-// bridged", so default to loopback-only) ONLY when we can prove loopback reaches
-// us - natively, or in a container that visibly shares the host's network
-// namespace. Proof of host networking is seeing an interface that exists only in
-// the host namespace: the Docker/Podman default bridge (docker0 / podman0), a
-// user-defined bridge (br-...), a CNI bridge (cni-... / cni0), a CNI host-side
-// device (cali*/cilium*/flannel*/vxlan.calico), or the host end of any
-// container's veth pair (veth...). A bridged container sees only its own eth0, so
-// it never matches and is treated as isolated (reachable by default) whatever its
-// subnet or interface count. A misread can only leave a host-net container
-// reachable that could have been locked down (recoverable via access/auth) - it
-// can never lock a bridged container out of its own port. The old address-range
-// guess got this wrong both ways: a custom-subnet bridge was locked out, and a
-// host on a 172.16/12 LAN was wrongly opened.
+// ADVISORY ONLY, and it no longer gates access. It used to, and the shape of the
+// answer still carries that history: it reports "bridged" unless it can PROVE
+// host networking, because under the old access gate a wrong "not bridged"
+// locked a container out of its own published port and a wrong "bridged" merely
+// left one reachable. That asymmetry is gone with the gate. What remains is
+// the bias, and it is worth knowing which way it points: proof of host
+// networking is an interface that exists only in the host namespace - the
+// Docker/Podman default bridge (docker0 / podman0), a user-defined bridge
+// (br-...), a CNI bridge (cni-... / cni0), a CNI host-side device
+// (cali*/cilium*/flannel*/vxlan.calico), or the host end of a veth pair
+// (veth...). A host-network pod on a node running no local workloads may
+// present none of them, and is then described as bridged when it is not: the
+// operator is told their readings describe a container network that does not
+// exist. That is a wrong sentence, not a wrong access decision, which is why
+// this is left as it is rather than inverted - inverting it would silently drop
+// the warning for genuinely bridged containers whose interface names we do not
+// happen to recognise, and those are the ones with distorted readings.
 var (
 	bridgedOnce sync.Once
 	bridgedVal  bool

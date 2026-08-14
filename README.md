@@ -18,10 +18,13 @@ This is the [live demo](https://demo.pingularity.dev) - same dashboard, syntheti
 
 ```bash
 go build -o pingularity .   # requires Go 1.25.13+; pure Go, no cgo
-./pingularity               # probes every 5s; UI on http://localhost:9000
+./pingularity               # UI on http://localhost:9000
 ```
 
-No flags needed. The UI binds `:9000` by default, but every install starts
+No flags needed - but a fresh install measures nothing until you open the
+dashboard and answer **Quick Setup** (headless: start with `-quick-setup=skip`);
+left unanswered it starts on its own 48h after first launch. Once started it
+probes every 5s. The UI binds `:9000` by default, but every install starts
 **private**: a built-in filter answers only the machine it runs on, and other
 devices get `403` until you flip **Network access** on in the settings drawer's
 Access tab (flip it on and hit Save; the tab shows the address to use), or start
@@ -72,7 +75,12 @@ sudo zypper install ./pingularity_*.rpm
 Both start `pingularity.service` immediately (`systemctl status pingularity`),
 put the database in `/var/lib/pingularity`, and read flags from
 `/etc/default/pingularity` (`EnvironmentFile`) - edit that and
-`systemctl restart pingularity` to change them.
+`systemctl restart pingularity` to change them. Two kinds of flag won't work
+there, because that unit is sandboxed: `/var/lib/pingularity` is its only
+writable path, so a `-db` pointing anywhere else fails on a read-only
+filesystem, and `CAP_NET_RAW` is its only capability, so a `-listen` port below
+1024 can't be bound. Keep the database on the state directory and the dashboard
+on a high port, or put a reverse proxy in front.
 
 Prefer no package manager? Grab the `.tar.gz` for your arch from the
 [Releases page](https://install.pingularity.dev), extract it,
@@ -236,15 +244,45 @@ yourself. Two more flags matter:
 > let the UI choice stick.
 
 > **Upgrading a container from 0.61 or earlier?** Up to 0.61 a container
-> answered the network by default; from 0.62 every install starts private. An
-> **existing** container install keeps its network access across the upgrade:
-> on the first 0.62+ boot, an established database that never stored an access
-> choice - and no explicit `-access`/`PINGULARITY_ACCESS` - is migrated once,
-> persisting network access as its stored choice and logging one warning
-> (`upgraded a pre-0.62 container install: kept its network-reachable access`).
-> Set a password, or turn Local-only on in the Access tab, when you next visit.
-> Fresh installs are never migrated: their published port answers `403`, and
-> the `403` body itself explains the setting that refused you and how to opt in.
+> answered the network by default; from 0.62 every install starts private -
+> **upgrades included**. An existing container install is *not* kept
+> network-reachable across the upgrade: it starts local-only like everything
+> else, so its published port answers `403` until you opt in, and that `403`
+> body names the setting that refused you and both ways out (the **Access** tab
+> from the machine itself, or `-access network` / `-e
+> PINGULARITY_ACCESS=network` at start). The one-step fix is the env var: add
+> `-e PINGULARITY_ACCESS=network` and recreate the container - an explicitly
+> passed access mode is authoritative at every start, so it opens the port
+> immediately, at that start and every later one. It does not write the choice
+> into the database, though: keep the env var in your `docker run` / compose
+> file, or - to make it stick without one - open the **Access** tab while the
+> port is open, leave **Network access** on, enter your **current password**
+> and hit **Save**, which does store it (a saved value persists even when it
+> matches what the env var supplies), then drop the env var. Set a password at
+> the same time. Your volume, database and history are untouched either way.
+>
+> The current password is the point of that step, not a formality: storing
+> "network" is what makes the open port outlive the variable, so it is a real
+> access change and is priced like one. Save it without the password and the
+> setting still applies - nothing breaks, and every other setting on the page
+> saves normally - but the choice is not written down, so dropping the env var
+> returns the install to local-only. If a login is not configured yet, there is
+> no password to enter and Save stores it as before.
+>
+> Why you have to say it, rather than the daemon working it out: what it can
+> see is an established database that never stored an access choice, and more
+> than one kind of install looks exactly like that. An upgraded pre-0.62
+> container is one - its dashboard did answer the network. But so is any
+> database that simply lacks the birth marker 0.62 stamps on new installs,
+> including one whose marker could not be written when it was created. The
+> first wants opening; the rest were private all along, and guessing "open"
+> for them would put an unauthenticated dashboard on the LAN. So the ambiguity
+> fails closed. (A container carrying the marker is not ambiguous and is never
+> warned about.) The daemon does say so when it sees the
+> ambiguous shape: one warning in the log, `container install with no recorded
+> access choice: access stays LOCAL-ONLY, so a published port answers 403 until
+> you opt in`, with the same fix attached. It only explains - it never changes
+> access on its own.
 
 The **`-v pingularity-data:/var/lib/pingularity`** volume is what makes updates
 safe: the SQLite database *and* `pingularity.key` (which encrypts saved iperf3
@@ -294,9 +332,12 @@ name things only the host has, and the compose file there maps
 prints one startup line to stdout - version, listen address, access mode, and
 dashboard URL, e.g. `pingularity 0.62.0: listening on :9000, access
 local-only, dashboard at http://localhost:9000` - so a healthy container is
-distinguishable from a hung one. Warnings and errors (the upgrade migration
-above, security warnings) still surface at the default level; routine detail
-needs the log level raised in the About tab.
+distinguishable from a hung one. A genuinely fresh install prints a second line
+beside it - `first run: monitoring is on hold - nothing is being measured yet` -
+naming the dashboard URL and `-quick-setup=skip`, because that is the state
+where `docker ps` reads `(healthy)` and nothing is being recorded. Warnings and
+errors (the ambiguous-access warning above, security warnings) still surface at
+the default level; routine detail needs the log level raised in the About tab.
 
 **Health check.** Both images bake in a
 `HEALTHCHECK ["/pingularity", "healthz"]` (every 30s, 5s timeout, 10s start
@@ -357,6 +398,10 @@ the stored setting. Then set things right in the Access tab.
   your user profile and the service loses its program.
 - **Docker** - `docker pull ghcr.io/pingular/pingularity`, then `docker rm -f
   pingularity` and re-run it (the named volume carries your data across).
+  Coming from **0.61 or earlier** and reaching the dashboard from other
+  devices? Add `-e PINGULARITY_ACCESS=network` to that re-run: from 0.62 every
+  install starts private and the upgrade is not grandfathered, so without it
+  the published port answers `403` (see [Docker](#docker)).
 - **tarball** - Linux won't let you overwrite a *running* program file
   ("text file busy"), so either stop the service first, or copy alongside and
   rename over it (rename always works):
@@ -378,7 +423,7 @@ tarball, a `go build`, or a fresh binary you dropped in yourself.
 
 ```bash
 sudo cp pingularity /usr/local/bin/
-sudo pingularity install    # no flags - DB goes to /var/lib/pingularity, UI on 0.0.0.0:9000; starts the service
+sudo pingularity install    # no flags - DB goes to /var/lib/pingularity, UI on :9000 (loopback-only until you turn Network access on); starts the service
 pingularity status          # running | stopped | not installed
 ```
 
@@ -392,16 +437,34 @@ per-user data dir - `~/.config/pingularity/` on Linux (`$XDG_CONFIG_HOME`
 honoured), `~/Library/Application Support/pingularity/` on macOS - with a
 temp-dir path as the last resort when there is no home directory at all.
 Any flags you *do* pass to `install` are persisted into the service definition.
-Manage with `pingularity start | stop | restart | status | uninstall`.
+On systemd you can change them later without re-installing: the unit that
+`install` writes also reads `/etc/default/pingularity`, if you create one, so
+`PINGULARITY_OPTS="-speedtest -listen 127.0.0.1:9000"` plus
+`sudo systemctl restart pingularity` is enough (macOS and Windows have no
+equivalent - re-run `install` there). Manage with
+`pingularity start | stop | restart | status | uninstall`. On Linux and macOS a
+reload signal (`sudo systemctl reload pingularity`, or `kill -HUP <pid>`)
+re-reads settings from the database without restarting - how you pick up an
+out-of-band change like `reset-auth`, and the way back from the `503` a daemon
+serves when it couldn't load its settings at all. Windows has no reload signal;
+restart the service there.
 
 Alongside the database sit `logs.txt` (the log viewer's ring, so it survives a
-restart) and **`pingularity.key`** (0600) - the key that encrypts the one secret
+restart) and **`pingularity.key`** (0600) - the key that encrypts the secret
 that has to be kept recoverable: each saved iperf3 server's password. iperf3 needs
 it in the clear at test time (it encrypts it with the server's RSA key itself), so
 unlike your dashboard login it can't be hashed. Two things follow:
 
 - **Back up the key with the database** if you want those passwords to survive a
-  restore. Delete or lose the key and you simply re-enter them; nothing else breaks.
+  restore. Delete or lose the key and you re-enter them - the daemon mints a fresh
+  one at the next start. That also signs out every logged-in browser, because
+  session cookies are signed with a second secret derived from this same file;
+  which is the point, since it means a database travelling *without* its key can't
+  mint a valid session for whoever picks it up. Your password, settings and history
+  are untouched. (A key file that is present but not 32 bytes - a truncated copy, a
+  half-restored backup - is refused rather than used: the daemon still starts and
+  still monitors, but stores iperf3 passwords in the clear and says so on stderr
+  until you move the file aside and let it make a new one.)
 - The key lives next to the database, so this does **not** protect you from someone
   who can read the host. What it does protect is the database travelling on its own -
   a backup, a snapshot, a stray copy - which now carries ciphertext, not your password.
@@ -424,13 +487,27 @@ consequences worth knowing before you need them:
   round-trips**, however large - import puts no ceiling on the total file, only on
   a single record (8 MiB) or a single JSON element (256 MiB), which no real backup
   reaches.)
+- **A database that won't open is set aside, not repaired.** A torn file - typically
+  a hard power-off mid-write - would otherwise crash-loop the service forever, so
+  instead the daemon renames it and its `-wal`/`-shm` sidecars to
+  `pingularity.db.<UTC timestamp>.corrupt`, starts again on an empty store, and logs
+  which file it moved. Nothing is deleted, so the old data is still there to inspect
+  or hand to a recovery tool - but the dashboard comes back blank, and the
+  quarantined copy keeps taking up its space until you remove it. This is the
+  failure a periodic **Export** exists for.
 - **Restoring a backup where login was enabled?** The export carries the
   "login on" preference but never the password, so on a machine that doesn't
   already have one the restore leaves login **off**, **forces access to
   local-only** so it can't fall open to the LAN, and tells you so - set a
   new password in the Access tab, then re-enable Network access. (Restoring onto
   the same machine, where the password still exists, keeps login working untouched
-  and access unchanged.) In a container, that forced local-only can lock you out
+  and access unchanged.) Restoring onto a machine that already has its *own*
+  password works the other way round: the backup's login **name** is ignored and
+  yours is kept, and a backup that turns login **off** does not disable it. The
+  import says so in both cases - the password never travels, so a foreign name
+  paired with your hash would lock you out of the only page that can fix it.
+  In a container, the local-only forced by that FIRST case - a backup with login
+  on, restored where no password exists - can lock you out
   of a published port - `403`, including for the browser that ran the restore -
   and the import response says so; the way back in is restarting the container
   with `-e PINGULARITY_ACCESS=network`, then setting things right in the
@@ -440,7 +517,17 @@ consequences worth knowing before you need them:
   That date is the denominator behind every uptime figure, and importing it would
   have this box reporting uptime over a stretch it did not watch. Restore the
   **history** too and the date moves anyway - derived from the earliest row that
-  actually arrived, which is a claim the restored data backs up.
+  actually arrived, which is a claim the restored data backs up. A backup does
+  not carry **who can reach the dashboard** either: whether a machine answers
+  only itself or the whole network is a decision about *that* machine, so a
+  restore never opens a dashboard to the network, and closes one only in the
+  fail-closed case above - a backup with login on, restored where no password
+  exists. Set it in the Access tab on the destination.
+- **Restoring on an *older* version?** It will refuse the file rather than
+  restore half of it. A backup is stamped with the oldest version that can read
+  it, and that stamp is worked out from what the file actually contains - so a
+  backup whose runs use nothing new still restores on an older build, and one
+  that doesn't is turned away up front, before anything is written.
 
 ## Architecture
 
@@ -501,15 +588,21 @@ flowchart TB
 
 A run records download, upload, ping, **jitter**, (best-effort) **packet loss**,
 and **bufferbloat**, plus the bytes used and the connection it ran on (public IP,
-ISP, DNS resolver). An iperf3 run also records two facts that used to be
-invisible: the **address family** (IPv4 or IPv6) the transfer actually used -
-read back from the run itself, never guessed - and **which direction** its
+ISP, DNS resolver). A run also records two facts that used to be
+invisible: the **address family** the transfer actually used (IPv4, IPv6, or
+`mixed` when one run genuinely used both) - read back from the run's own
+connections, never guessed - and **which direction** its
 loss/jitter probe sampled. Not every field is present on every run: a download-only
 or upload-only run has no figures for the direction it skipped, packet loss is
-optional and not always measurable, and bufferbloat is absent when a transfer
+optional and not always measurable, family and probe direction are recorded
+only when the run really established them (the engine notes below say when
+that is), and bufferbloat is absent when a transfer
 phase was too short to sample, returned too few samples, or the latency target
 was unreachable. Missing is stored as missing rather than as a zero, so charts
-and thresholds can tell "not measured" from "measured, and it was bad".
+and thresholds can tell "not measured" from "measured, and it was bad". A run
+that failed outright isn't a measurement at all: it is kept only as a flagged
+data-usage row, which every measurement view filters out (see the data-usage
+bullet under [Metrics](#metrics-optional)).
 
 The **ping** shown is the engine's own number, a mean over ten samples, so it
 keeps matching what speedtest.net would report. A mean has no defence against an
@@ -551,7 +644,9 @@ reports round figures that say more about packet loss than about buffering.
 There are two engines, picked in the settings drawer:
 
 - **Ookla (speedtest.net)** - the default. Numbers match speedtest.net; no setup.
-  Its own knobs: parallel connections and the packet-loss probe.
+  Its own knobs: parallel connections (`0` = auto, which is one per CPU core up
+  to 8 - raise it, to at most 16, on a fast or high-latency link, or in a small
+  VM that can only see two cores) and the packet-loss probe.
 - **iperf3** - opt-in, run against your own `iperf3 -s` box (LAN, homelab, or
   VPS). It measures what Ookla can't: internal/LAN links and honest upload. Used
   only when the `iperf3` binary is installed (otherwise it falls back to Ookla) -
@@ -564,7 +659,14 @@ There are two engines, picked in the settings drawer:
   [iperf3 in a container](#iperf3-in-a-container) below.
 
 **Direction** (both / download / upload, plus iperf3's simultaneous `--bidir`) and
-**retries** apply to whichever engine is selected.
+**retries** (default `1`, at most `3`) are kept **per engine**: the Ookla and iperf3
+tabs each carry their own pair, so tuning one never disturbs the other, and
+switching engines switches which pair is in force. On Ookla, retries are also what
+let a very slow uplink finish at all: when parallel upload streams are too slow for
+any of them to complete inside the capture window, the retry falls back to a single
+stream. Set Ookla's retries to `0` and that fallback cannot run, so on a link that
+slow the upload - and with it the whole run - fails. The error says so and names the
+setting.
 
 For iperf3, the separate UDP loss/jitter pass probes the same direction you
 test: downstream normally, upstream for an upload-only run - so a one-direction
@@ -573,9 +675,11 @@ also means loss and jitter describe **one direction per run**, never both, and
 loss on an asymmetric path genuinely differs by direction - so each sample now
 records which way its probe ran. The loss and jitter readouts name the path on
 hover, the run tooltip carries it in its Quality line, and it's exported as
-`udp_direction` (`down`/`up`) in the API and CSV. Runs that never measured
-loss/jitter, Ookla runs, and rows recorded before the field carry no direction
-and are shown unlabeled rather than guessed at.
+`udp_direction` (`down`/`up`) in the API and CSV. An Ookla run records a
+direction too: its packet-loss probe sends the datagrams from the client to
+the server, so a probe that succeeded is recorded as `up`. Runs that never
+measured loss/jitter - either engine's - and rows recorded before the field
+carry no direction and are shown unlabeled rather than guessed at.
 
 ### iperf3 in a container
 
@@ -620,11 +724,20 @@ errors mean exactly what they say, and get no such note):
   you've enabled it in the daemon config), so a forced IPv6 run fails outright
   ("network unreachable"), and the error says why. The quieter half of the
   same problem is **Auto**: it doesn't fail, it silently measures IPv4 where a
-  dual-stack native install would measure IPv6. That is why every iperf3 run
-  records the family it actually measured - shown beside the server in the
-  runs table and run tooltip, exported as `ip_family` (`4`/`6`) in the API and
-  CSV, and empty (never guessed) on Ookla runs and rows recorded before the
-  field existed.
+  dual-stack native install would measure IPv6. That is why a run records the
+  family its transfers actually used - shown beside the server in the runs
+  table and run tooltip, exported as `ip_family` (`4`/`6`/`mixed`) in the API
+  and CSV. iperf3 reads it back from each direction's own connection report,
+  and `mixed` means the download and upload really landed on different
+  families (dual-stack DNS can do that) - labeled `IPv4+IPv6` in the UI
+  rather than picking a side. Ookla runs record it from the transfer's real
+  connections; a run with no recordable connection - for example one carried
+  entirely through an operator's proxy, where only the hop to the proxy is
+  visible - stays empty, never guessed, like rows recorded before the field
+  existed. An Ookla `mixed` claims less than an iperf3 one: a single recorder
+  spans both directions *and* every retry there, so it means both families
+  showed up somewhere in the run's transfers - a retried attempt landing on the
+  other family is enough, and the two directions need not have differed.
 
 Two more things a bridged container changes without any error at all:
 
@@ -694,8 +807,10 @@ cannot fire tests back to back: at most one reconnect test per
 `-speedtest-interval`, or per 15 minutes when that interval is shorter. There is
 also an optional **while degraded**
 toggle in the Speedtest settings (off by default, needs scheduled tests on) that
-fires a test when latency stays high without the link fully dropping. **Run
-now** (or `POST /api/speedtest`) always works.
+fires a test when latency stays high without the link fully dropping - above
+**Degraded above** (default `150` ms, `0` = off) for two probe rounds in a row,
+re-arming once latency recovers. **Run now** (or `POST /api/speedtest`) always
+works.
 
 Only one speedtest runs at a time, and the triggers do not queue behind each
 other. If a **scheduled** slot comes due while any other test is already
@@ -704,7 +819,10 @@ is not retried, and not run late (the counter
 `pingularity_stat_total{stat="speed.scheduled_skipped"}` records it). A slot
 held back by a **closed window** or a **busy link** behaves the opposite way:
 nothing was measured, so it keeps polling and fires as soon as the condition
-clears.
+clears. "Busy" is traffic on the busiest interface above **Busy above** (default
+`5` Mbps) - and unlike the alert thresholds, `0` is not "off" here: it makes any
+measurable traffic count as busy, so scheduled tests stop firing. Only scheduled
+runs consult it; reconnect, degraded and **Run now** go regardless.
 
 ### Choosing an Ookla server
 
@@ -737,7 +855,11 @@ The dashboard is built into the binary (no extra services, no CDN - the UI, web
 font, and favicon are all embedded) and served at the `-listen` address. The top
 bar carries the live status bubbles - per-family (IPv4/IPv6) latency, process
 runtime, 24h/7d uptime, and cumulative speedtest data used (click it for a
-breakdown by window). The latency and DNS dots are the theme accent at varying
+breakdown by window). That figure counts every byte a speedtest moved, including
+runs that failed partway or that you cancelled - they still cost you the traffic,
+so on a metered link the number has to include them. Those attempts are counted
+but never shown as measurements: they appear in no chart, table, average or CSV,
+because nothing was measured. The latency and DNS dots are the theme accent at varying
 **intensity** - full = healthy, fading as latency or DNS gets worse - so the
 bar stays calm at a glance and only the dot that needs attention dims. The
 uptime, runtime, and data bubbles use plain icons (a pulse line, a clock, and
@@ -789,7 +911,12 @@ Below that:
   bad was it" - the actual downtime, and how much of the day was observed.
 - **Recent outages** - the debounced up/down event log. Each resolved outage has a
   ✕ to delete it (removes it from the log, heatmap, and uptime stats -
-  handy after planned maintenance you don't want counted).
+  handy after planned maintenance you don't want counted). The durations here are
+  **observed** time, the same rule uptime and the heatmap use: any stretch of an
+  outage that monitoring didn't watch - paused with the power button, outside a
+  latency schedule window, or with the host asleep - is subtracted, so a row can be
+  much shorter than the wall time it spans. A restart mid-outage is different: it
+  splits the log into two rows, the first with no duration at all.
 
 ![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day shaded by how many outages it saw, above a Show recent outages button](docs/downtime-heatmap.png)
 
@@ -812,7 +939,11 @@ Below that:
 > | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on (until the first check succeeds: retried at 1m/5m/15m, then hourly) |
 >
 > The six **connection refresh** and **exit discovery** rows are the ones that
-> carry your public IP. They stop when monitoring is paused, and the
+> carry your public IP. "Connection refresh" means: once an hour on its own
+> (every 5 minutes while a lookup is failing), once after a reconnect at most
+> every 5 minutes, and once after every speedtest - so turning speedtests on
+> multiplies these too. Exit discovery rides those refreshes but re-traces at
+> most every 10 minutes. They stop when monitoring is paused, and the
 > **Connection info** toggle (Latency tab) stops them for good. Both cover the
 > automatic lookups only - the Connection panel's refresh button still fetches
 > on demand, and the panel says when it is no longer refreshing itself.
@@ -821,17 +952,49 @@ Below that:
 > local. Turn speedtests, the update check, or the DNS probe off and those rows
 > simply never fire. (Alert webhooks and the heartbeat post only to URLs you
 > configure yourself.)
+>
+> **Behind a proxy?** Ookla speedtests use `HTTP_PROXY` / `HTTPS_PROXY` /
+> `NO_PROXY` from the daemon's environment (lower-case spellings too), written as
+> `http://`, `https://`, `socks5://`, `socks5h://`, or a bare `host:port`;
+> `ALL_PROXY` is not read, because Go's HTTP client never routes a request through
+> it. A value the daemon cannot use - an unsupported scheme, or one that names no
+> host - **fails** the requests that would have ridden it, quoting the value,
+> rather than quietly connecting direct: traffic leaving by a route you did not
+> choose is the outcome worth refusing. And note a proxied run measures the path
+> through the proxy, not your direct link. Alert webhooks, the heartbeat, and the
+> update check deliberately ignore these variables and always dial direct - the two
+> that dial a URL *you* configure are vetted by the IP they actually resolve to,
+> which a proxy hop would hide, and the update check goes to one fixed HTTPS
+> address that must not be silently intercepted - so on a
+> network with no direct egress those three won't get out. iperf3 speaks its own
+> TCP protocol and is never proxied. One caveat on a proxy-only network: before
+> letting a proxied request name a speedtest server, the daemon resolves that name
+> locally to check the proxy isn't being pointed at something internal, so with no
+> local resolver every server is refused - and each refusal is logged only at debug
+> level, so the reason is invisible until you raise it. Give the daemon a resolver,
+> or list those destinations in `NO_PROXY`. Full reasoning in
+> [docs/security-model.md](docs/security-model.md).
 
 The **logo** (top-right) opens a tabbed settings drawer; a **power** toggle in
 the tab row starts/stops all monitoring. Changes apply **live** (no restart)
 and persist across restarts:
 
-- **Latency** → latency interval, probe timeout, and sensitivity (failures→down /
-  successes→up, IPv6 mode auto/on/off).
+- **Latency** → latency probing on/off, latency interval, probe timeout, and
+  sensitivity (failures→down / successes→up, IPv6 mode auto/on/off), plus the
+  **DNS resolution** probe (on by default), the **Connection info** lookups, and
+  the **Exit-path target** - the host or IP the exit traceroute heads toward
+  (blank = `1.1.1.1`; it must resolve to IPv4, see [How it works](#how-it-works)).
 - **Speedtest** → automatic runs on an interval, plus on-reconnect and
-  when-degraded triggers and a skip-when-busy option. Changing the interval shows a
-  live estimate of the daily/monthly data the tests will use (based on your recent
-  runs).
+  when-degraded triggers, a skip-when-busy option, and **Test more often while
+  failing** (off by default): while the last run is still breaching an Alerts
+  threshold, the interval drops to a quarter of what you set - never longer than 5
+  minutes, never shorter than 1 - so an hourly schedule tests every 5 minutes until
+  a run passes. It needs a threshold set in Alerts, and it costs far more data than
+  the cadence you configured - 12x the runs on that hourly default, for as long as
+  the breach lasts. Changing the interval shows a live estimate (Ookla only, and
+  only while automatic runs are on) of the daily/monthly data the *scheduled* tests
+  will use, based on your recent runs - it counts neither the extra triggers nor
+  this faster cadence.
 - **Server** → engine (**Ookla** or **iperf3**, each with its own servers and
   per-test options), server selection (with city search), test direction, and
   retries. **Best of 3 servers** (Ookla only, off by default) tests your chosen
@@ -877,28 +1040,42 @@ and persist across restarts:
 - **Data** → retention: three independent windows - **latency** samples (default
   **30** days), **speed** history (default **365** days), and **downtime**/outage
   history (the heatmap, default **365** days); `0` = keep forever - plus
-  per-kind "delete data" buttons, and **Export** / **Import** on the same tab: pick any of
+  per-kind "delete data" buttons, each clearing everything its category exports:
+  **latency** takes the DNS-resolution series with the ping samples, **speed**
+  takes the best-of selection reports with the runs, and **downtime** takes the
+  pause/unobserved spans with the outage events, so clearing downtime also resets
+  observation coverage. And **Export** / **Import** on the same tab: pick any of
   config / latency / speed / downtime, export them to a JSON file, and import one
   back - time-series data is **merged** (existing/newer local rows are kept, only
   missing rows are added) while **config is overwritten** and reloaded live.
-  Both ends stream on the wire, but the *browser* download buffers the file in
-  memory, so a very large backup (years of dense history) can outgrow the tab -
-  the dashboard stops and says so rather than hanging. For one that big, copy the
-  SQLite database file at the `-db` path (that single file *is* the complete
-  backup), or stream `/api/export` straight to disk with `curl -OJ` (add
-  `-u user:pass` when a login is set). The import warns you when it matters: restored rows older than
+  Both ends stream on the wire, but the *browser* download assembles the whole
+  file before it saves, with no progress shown while it does and no size warning
+  first - the export is sent as a stream, so its size is not known in advance to
+  warn about. A very large backup (years of dense history) can therefore sit
+  silently for a long time, and on a big enough one the tab can give up. For one
+  that big, copy the SQLite database file at the `-db` path (that single file
+  *is* the complete backup), or stream `/api/export` straight to disk with
+  `curl -OJ 'http://127.0.0.1:9000/api/export?config=1&latency=1&speed=1&downtime=1'`
+  (name at least one category or it is a `400`; add `-u user:pass` when a login is
+  set). The import warns you when it matters: restored rows older than
   your current retention windows will be pruned within the hour (raise
   retention first to keep them), and a config restore that carried "login on"
   without a password leaves login off until you set one.
 - **Alerts** → *Thresholds* (min download/upload, max ping/jitter/packet-loss, and
   max bufferbloat per direction; each run is marked healthy/unhealthy against the
-  values in effect when it ran, with a debounce so one blip doesn't page) and
+  values in effect when it ran) with a **Breaches in a row** count (1-10) that
+  debounces alerting - it defaults to **1**, which pages on every breaching run,
+  so raise it if one blip shouldn't - and
   *Notifications* (alert-on-outage, a generic **webhook** with a Test button, an
   optional **periodic summary** posted to the webhook - off / daily / weekly, a
   "how it went" report of uptime, median speeds, and outage count/downtime; it
   always goes out on its cadence and states the span it actually observed, so a
   period spent scheduled-off or paused is reported as such rather than as a
-  confident 100% - and a dead-man's-switch **heartbeat** URL).
+  confident 100%. The first one lands a full period *after* you switch it on -
+  enabling "daily" arms the clock rather than sending immediately - and with no
+  webhook URL set nothing is sent and no period is consumed, so adding a URL later
+  still delivers the window that was waiting. And a dead-man's-switch **heartbeat**
+  URL).
 - **Access** → access controls (changes here apply on **Save**).
   **Network access** decides whether other devices can reach the dashboard /
   API / `/metrics`, or only this machine - a live loopback filter, so remote
@@ -915,9 +1092,14 @@ and persist across restarts:
   login is active, changing **any** Access setting - password, username, the
   login toggle, or Network access - requires re-entering the **current
   password** (API callers send `current_password`), so a stolen or walked-up
-  browser session cannot quietly take over the account. Forgot the
-  password? Run `pingularity reset-auth` on the host to clear it (in a
-  container, from a one-off container sharing the volume - see
+  browser session cannot quietly take over the account. A login lasts **30 days**,
+  and signing out revokes **every** signed-in browser rather than just the one that
+  asked - which is also how you evict a lost laptop. Forgot the
+  password? Run `pingularity reset-auth` on the host to clear it and disable
+  auth, then `systemctl reload pingularity` (or restart the service) - a running
+  daemon caches settings in memory and would keep enforcing the old password; in a
+  container, run it from a one-off container sharing the volume,
+  then restart the container (exact command under
   [Docker](#docker)). **Local-only
   cannot block a same-host reverse proxy** (cloudflared, nginx): it delivers
   internet visitors as loopback connections, so pair any proxy with login.
@@ -939,7 +1121,10 @@ and persist across restarts:
   hands their space back to the chart. All preview live and
   apply on Save; each picker resets to the theme.
 - **About** → version, the **daily update-check** toggle, and the **log viewer**
-  (logging on/off, PII redaction, and copy/download/clear).
+  (logging on/off, PII redaction, and copy/download/clear). PII redaction is **on**
+  by default and is a display choice only: every line is kept in both forms, and
+  stdout (`journalctl`, `docker logs`) always carries the unmasked one - so use the
+  viewer's own download for anything you intend to share.
 
 **Nine built-in themes**, every one fully recolourable (backgrounds, panels,
 status colours, chart series - each picker previews live and resets to the theme):
@@ -953,7 +1138,12 @@ status colours, chart series - each picker previews live and resets to the theme
 > `failure`), and a numeric `priority` (1 low - 5 urgent). The heartbeat pings an
 > external watchdog (Healthchecks.io, Uptime Kuma push, …) every minute *while
 > monitoring is on*, so the watchdog can alert you if Pingularity or the whole
-> host goes silent - the one failure the in-band outage alert can't deliver.
+> host goes silent - the one failure the in-band outage alert can't deliver. It
+> follows the **power button** only, not whether probing is actually running: it
+> keeps pinging through a closed schedule window, with `-latency=false`, and
+> through a fresh install's first-run hold. A green watchdog therefore means "the
+> process is alive", not "the link is being measured" - pair it with
+> `pingularity_probing_active` if you need the latter.
 
 Notification recipes (set the **webhook URL** to):
 
@@ -994,17 +1184,21 @@ Flags only **seed** the initial values - almost everything is adjustable live in
 the settings drawer afterward and persists across restarts. A value you **save**
 in the UI is persisted even when it equals what a flag currently supplies, and
 wins from then on - removing the flag later keeps what you saved. Fields you
-never save keep following the flag (or the shipped default).
+never save keep following the flag (or the shipped default) - but note that
+**Save writes the whole drawer**: the settings form submits every field it holds,
+so the first save from the UI pins every one of them a flag had moved off the
+shipped default, not just the field you edited. Access, logging, the update check
+and the power toggle aren't part of that form and are unaffected.
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket) |
-| `-access` | `local` | who may open the dashboard: `local` (loopback only) or `network` (reachable from the LAN - set a login). A container that publishes a port needs `network` (or `PINGULARITY_ACCESS=network`), or the published port returns 403. Also settable in the UI |
+| `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket). Port `0` is refused: it asks the OS for a random port, which nothing can then find - not a bookmark, not a scrape target, not the container health check, which runs as its own process and cannot discover it |
+| `-access` | `local` | who may open the dashboard: `local` (loopback only) or `network` (reachable from the LAN - set a login). A container that publishes a port needs `network` (or `PINGULARITY_ACCESS=network`), or the published port returns 403. Also settable in the UI - but unlike every other flag here, an explicitly passed `-access` / `PINGULARITY_ACCESS` re-asserts itself at **every** start, overwriting a disagreeing saved choice in either direction (and logging that it did), so while it stays in your unit or compose file a change made in the UI is undone at the next restart. Drop it to let the UI choice stick |
 | `-db` | per-OS ([details](#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
 | `-interval` | `5s` | time between probe rounds, `1s`-`1h` (a value saved in the UI takes precedence) |
 | `-timeout` | `3s` | per-target dial timeout, `1s`-`30s` (a value saved in the UI takes precedence) |
 | `-down-after` / `-up-after` | `2` / `1` | consecutive rounds to confirm down / up (1-10) |
-| `-latency` | `true` | probe latency/connectivity at all (`-latency=false` = speedtest-only mode) |
+| `-latency` | `true` | probe latency/connectivity at all (`-latency=false` = speedtest-only mode: no probe rounds, so no outage detection, no outage alerts, no DNS line, and no reconnect or while-degraded speedtests - the probe round is what triggers those) |
 | `-ipv4` | `auto` | IPv4 probing: `auto` \| `on` \| `off` (`auto` = only while the host has an IPv4 address) |
 | `-ipv6` | `auto` | IPv6 probing: `auto` \| `on` \| `off` (live) |
 | `-speedtest` | `false` | run scheduled speedtests (startup + interval); opt-in. On-reconnect tests are governed separately by `-speedtest-on-reconnect`, the while-degraded trigger by its own UI toggle |
@@ -1014,16 +1208,23 @@ never save keep following the flag (or the shipped default).
 | `-allow-host` | *(none)* | extra `Host` header values the DNS-rebinding guard accepts - only needed behind a reverse proxy on a public domain |
 | `-trusted-proxy` | *(none)* | proxy IPs/CIDRs whose `X-Forwarded-For` identifies the real client, so one visitor's failed logins can't rate-limit everyone behind the proxy |
 | `-metrics-token` | *(none)* | optional read-only token a scraper presents to `/metrics` (Bearer or Basic password) instead of the admin login, so Prometheus needn't hold an account that can change settings; only consulted when Require login is on |
-| `-quick-setup` | `prompt` | headless first-run: `skip` starts monitoring immediately and never shows the browser Quick Setup dialog; `prompt` leaves it for a first visit |
+| `-quick-setup` | `prompt` | headless first-run: `skip` starts monitoring immediately and never shows the browser Quick Setup dialog; `prompt` leaves it for a first visit. Passed **explicitly**, `prompt` is authoritative: monitoring flags on the same command line then only configure values and no longer count as consent, so the dialog still gates monitoring |
 
 Out-of-range numeric flags are rejected at startup (and at `pingularity
-install`) rather than silently adjusted.
+install`) rather than silently adjusted - as are a fractional duration
+(`-interval`, `-timeout`, `-speedtest-interval` and the `-retain*` windows take
+whole seconds), a retention window over `87600h` (10 years; use `0` for forever),
+an unrecognised value for `-ipv4` / `-ipv6` / `-access` / `-quick-setup`, and a
+stray positional argument (`pingularity install run -listen :9000` fails rather
+than quietly dropping the flags).
 
 > **Headless installs:** a genuinely fresh install waits (monitoring paused) for
 > a first-run consent - either the browser **Quick Setup** dialog or an explicit
 > flag - so it never starts probing before someone has said to. Passing any
 > monitoring flag (`-speedtest`, `-speedtest-interval`, `-latency`, `-interval`)
-> counts as that consent; if you only tune other knobs (say `-timeout` or
+> counts as that consent - unless you explicitly pass `-quick-setup=prompt`
+> alongside them, which keeps the dialog in charge and makes those flags
+> configure values only. If you only tune other knobs (say `-timeout` or
 > `-ipv6`) pass `-quick-setup=skip` so the service starts monitoring at boot
 > instead of holding for the dialog.
 
@@ -1049,13 +1250,15 @@ self-describing):
 - `pingularity_up` - overall connectivity (1/0)
 - `pingularity_latency_seconds` - headline latency: lowest across the anchors that
   answered (your base internet latency); absent when nothing answered
-- `pingularity_monitoring_paused` - 1 while stopped via the power button
-  (stored gauges freeze and the live per-family/DNS series go absent while
-  paused)
+- `pingularity_monitoring_paused` - 1 while monitoring is not running: stopped via
+  the power button, or a fresh install still holding for its first-run Quick Setup
+  answer (`quick_setup_pending` in `/api/status` tells those two apart). Stored
+  gauges freeze and the live per-family/DNS series go absent while paused
 - `pingularity_probing_active` - 1 while probe rounds are actually running:
   the "can I trust the data" signal. It goes 0 for every way rounds can stop -
-  the power button, the latency toggle, a closed schedule window, or all
-  address families switched off - while `pingularity_up` and
+  the power button, the latency toggle, a closed schedule window, all
+  address families switched off, or that same first-run hold - while
+  `pingularity_up` and
   `_state_since_timestamp_seconds` hold their last values
 - `pingularity_state_since_timestamp_seconds` - when the current up/down state began
 - `pingularity_current_outage_seconds` - length of the outage in progress; absent
@@ -1138,9 +1341,18 @@ self-describing):
   last run itself consumed), and `pingularity_speed_avg_run_bytes{direction}`.
   Treat all of these as a **measured lower bound on wire usage, not a bill**:
   they count the payload the engine reports moving, so they exclude warm-up
-  traffic, the UDP loss/jitter probe, runs that failed or were abandoned partway,
-  TCP/TLS/IP overhead, and retransmits. On a metered link, budget with headroom
-  above these numbers rather than against them
+  traffic, the UDP loss/jitter probe, TCP/TLS/IP overhead, and retransmits. A
+  run that failed or was aborted partway still contributes the bytes its
+  engine had counted by then, but bytes an engine never got to count - and a
+  run cut short by daemon shutdown - are lost. On a metered link, budget with
+  headroom above these numbers rather than against them. That failed run is
+  kept as an accounting row, **flagged** as one: the totals and windows above
+  count its bytes, while every view that means "a measurement" filters it out -
+  it is not in the runs table, the charts, or `latest`, so it can't become the
+  last run, and it gets no healthy/unhealthy verdict. `avg_run_bytes` skips it
+  too, on purpose: that average projects what the *next* run will cost, and a
+  run that died partway spent a fraction of a full one, so counting it would
+  predict a bill no schedule produces
 - `pingularity_process_start_time_seconds` - process start (the Prometheus-conventional
   form; `pingularity_runtime_seconds` kept for compatibility)
 - `pingularity_goroutines` / `pingularity_memory_heap_bytes` / `_memory_sys_bytes` /
@@ -1150,6 +1362,13 @@ self-describing):
 - `pingularity_disk_free_bytes` - free space on the filesystem holding the
   database, where the platform supports it - an early disk-full warning long
   before writes start failing
+- `pingularity_update_available` - 1 when a newer release has been seen, 0 when
+  not; `pingularity_update_check_timestamp_seconds` - when the release feed was
+  last polled **successfully**. Both are absent unless the daily update check is
+  on, and the timestamp stays absent until the first poll succeeds (a `0` would
+  read as 1970-stale). So `time() - pingularity_update_check_timestamp_seconds >
+  172800` is "this box can't reach the feed" - the firewalled-install signature -
+  and a week of `pingularity_update_available == 1` is an upgrade nobody noticed
 - `pingularity_worker_up{worker}` / `pingularity_worker_restarts_total{worker}` -
   per background worker (`scheduler`, `pruner`, `netinfo`, `update-check`,
   `heartbeat`, `digest`, and `settings-retry` when a failed settings load armed
@@ -1178,7 +1397,10 @@ self-describing):
   `pingularity_dns_failures_total{reason}`, `pingularity_outages_total`,
   `pingularity_outage_duration_seconds_total`, `pingularity_speed_runs_total{trigger}`,
   `pingularity_speed_failures_total{stage}`, `pingularity_notification_deliveries_total{destination}`
-  / `_failures_total{destination}` / `_blocked_total{destination}`,
+  / `_failures_total{destination}` / `_blocked_total{destination}` /
+  `pingularity_notification_delivery_duration_seconds{destination}` (a
+  `_sum`/`_count` summary in seconds, so `rate(_sum)/rate(_count)` is "the webhook
+  got slow"),
   `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`,
   `pingularity_database_prune_duration_seconds_total`,
   `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
@@ -1222,6 +1444,12 @@ local-only filter, and auth so a bare-IP health check from an LB reaches them):
   checks, so a transient DB hiccup can't trigger a restart loop.
 - `GET /readyz` - readiness: `200 ready` once the store answers and the first status
   aggregate is warm; `503` otherwise, so an LB holds traffic until the daemon is warm.
+  It also reports `503` when the daemon could not read its settings at startup - in
+  that state it refuses every other route, `/metrics` and the dashboard included,
+  rather than serve with access control it can't apply. `/healthz` keeps answering
+  `200` throughout, so the container images' baked-in health check still reads
+  `(healthy)` there: a whole-instance `503` beside a healthy `/healthz` means "check
+  the log, then reload or restart", not "still warming up".
 
 `pingularity healthz [-addr host:port]` probes `/healthz` from the command
 line and reports by exit code (0 = answered `200`; anything else prints a
@@ -1231,12 +1459,13 @@ container images' baked-in `HEALTHCHECK` runs (see [Docker](#docker)).
 ### Scraping it
 
 **Step zero for a remote Prometheus:** flip **Network access** on first - it
-starts off on every fresh install, containers included since 0.62, and until
-then every scrape from another machine gets `403`. Use the Access tab, or
-start with `-access network` / `-e PINGULARITY_ACCESS=network`. (A Prometheus
-on the same host scraping `127.0.0.1:9000` needs nothing; neither does a
-pre-0.62 container install carried across the upgrade, which keeps its
-network access - see [Docker](#docker).)
+starts off on every install that never chose otherwise, containers included
+since 0.62, and until then every scrape from another machine gets `403`. Use
+the Access tab, or start with `-access network` / `-e
+PINGULARITY_ACCESS=network`. (A Prometheus on the same host scraping
+`127.0.0.1:9000` needs nothing. A container upgraded from 0.61 or earlier needs
+the same opt-in as any other install - it is not grandfathered into network
+access, see [Docker](#docker).)
 
 A minimal job (scrape by IP so the DNS-rebinding guard doesn't get in the way -
 see the gotchas below):
@@ -1342,6 +1571,14 @@ carries `Vary: Accept-Encoding`. The two streaming downloads, `/api/export` and
 `/api/speed/runs.csv`, are always sent uncompressed so they keep streaming at
 constant memory.
 
+Every `POST` must carry `Content-Type: application/json`, **including the ones
+with no body at all** (`/api/speedtest`, `/api/speedtest/abort`, `/api/netinfo`,
+`/api/iperf/check`, `/api/speedtest/servers`, `/api/auth/logout`), which answer
+`415` without it. It is a CSRF guard: a cross-site form cannot set that content
+type without a preflight this daemon never grants. So
+`curl -X POST -H 'Content-Type: application/json' http://127.0.0.1:9000/api/speedtest`,
+and `-d '{…}'` where a body is listed below.
+
 - `GET /api/status` - current status, uptime, per-family state, targets, latest
   speed, and live speedtest progress. Every uptime figure ships with its
   observation coverage (`uptime_coverage` per window, `uptime_custom_coverage`
@@ -1360,7 +1597,10 @@ constant memory.
   for an open end), which wins over `mins`. The bucket width follows the part of
   the window that can hold data - `[from, min(to, now))` - so an omitted or
   future `to` buckets as if the window ended now rather than coarsening the lot
-- `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log
+- `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log.
+  `limit` defaults to 10 (50 on `/api/speed/runs`) and is silently capped at 1000,
+  the same ceiling `/api/logs` uses - page with `offset` and trust the `total` in
+  the body rather than the length of the array you got back
 - `POST /api/outages/delete` - `{ts}` delete one resolved outage (`ts` = the unix
   seconds of its closing up event); removes it from the log, heatmap, and
   uptime stats. Idempotent
@@ -1381,10 +1621,10 @@ constant memory.
   takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
   omit `to` for an open end), which wins over `mins` when present
 - `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail).
-  Runs that recorded them carry `ip_family` (`4`/`6`, the family the transfer
-  actually used) and `udp_direction` (`down`/`up`, which way the loss/jitter
-  probe sampled); on runs that didn't - Ookla, and rows predating the fields -
-  the keys are omitted rather than sent empty
+  Runs that recorded them carry `ip_family` (`4`/`6`/`mixed`, the family the
+  transfer actually used) and `udp_direction` (`down`/`up`, which way the
+  loss/jitter probe sampled); on runs that didn't establish one - and rows
+  predating the fields - the keys are omitted rather than sent empty
 - `GET /api/speed/runs.csv` - all runs as CSV. The same two fields are the
   final columns, `ip_family` and `udp_direction`, appended at the end so
   consumers indexing existing columns by position keep working; blank =
@@ -1396,17 +1636,26 @@ constant memory.
   round believed, any direction it refused to believe, and the rule that made
   the winner win
 - `GET /api/speed/usage` - cumulative data used per window
-- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; by
-  default centred where auto last tested, else near you; JSON content-type like
-  the other network-side-effect endpoints)
-- `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable (POST
-  with an `application/json` content-type, like the other network-side-effect endpoints)
-- `GET /api/heatmap?days=366` - per-day downtime, plus `window_s`/`observed_s`
-  per day (how much of it was in range and how much was actually monitored)
+- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; `?id=<ookla
+  id>` resolves one server by its Ookla ID instead, `404` if there is no such
+  server; by default the list is centred where auto last tested, else near you)
+- `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable
+- `GET /api/heatmap?days=365[&tz=Europe/Berlin]` - per-day downtime, plus
+  `window_s`/`observed_s` per day (how much of it was in range and how much was
+  actually monitored). `days` defaults to 365 and is capped at 366; `tz` takes an
+  IANA zone name and decides where each day starts (default: the server's own
+  zone), so a client in another zone gets its own calendar days rather than the
+  server's
 - `GET /api/netinfo` - connection info (IP/ISP/DNS); `POST` forces a full refresh
-- `GET|POST /api/settings` - read / update live settings
+- `GET|POST /api/settings` - read / update live settings. POST is a **partial**
+  update: fields you omit keep their current value, and only the settings form is
+  reachable here - monitoring (`/api/monitoring`), access/auth (`/api/access`), the
+  update check (`/api/update`) and logging (`/api/logs`) have no field in it
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
-- `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout
+- `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The
+  session cookie lasts **30 days**, and a logout revokes **every** signed-in
+  browser rather than just the one that asked (the revocation is persisted, so it
+  survives a restart) - which is also how you evict a lost laptop
 - `POST /api/speedtest` - run a speedtest now
 - `POST /api/speedtest/abort[?run=…]` - stop a speedtest in flight. A bare POST
   stops whatever is running when it arrives; `run=` (the `speedtest_run_id` from
@@ -1415,20 +1664,29 @@ constant memory.
   started in between. `204` = stopped, `409` = nothing matching to stop (idle, or
   that run already ended), `400` = `run` was not a run id. A best-of-N run that
   has already measured a server keeps that result; an abort before the first
-  result stores nothing
+  result stores nothing. `204` means the run was released, not that the traffic
+  stopped: the Ookla engine's transfer does not observe cancellation, so it keeps
+  moving bytes until its own 15-second capture window closes. Those bytes are still
+  counted against your data usage, and a fresh run started immediately afterwards
+  waits (up to ~20s) for the abandoned one to go quiet rather than measuring
+  through it
 - `GET|POST /api/monitoring` - read / set `{enabled}` master start/stop (the power toggle)
 - `POST /api/quick-setup` - apply the first-run **Quick Setup** answer in ONE
   transaction (speedtest cadence, network access, update check, and an optional
   login) and mark it answered so the dialog never returns; `{dismiss:true}` marks
   it answered without changing anything else (once a login is active, dismissing
   requires that login too). `auth_enabled` must agree with
-  whether a `password` is sent, and it refuses (`403`) once a login is already
-  configured - change access under Settings then. Fresh installs only; the offer
-  is `quick_setup_pending` in `/api/status`
+  whether a `password` is sent. Two things refuse it with `403`: a login already
+  being configured (change access under Settings then), and the first-run window
+  having closed - the offer lasts 48h from first launch, and once it lapses this
+  endpoint stops accepting answers just as `/api/status` stops advertising it.
+  Fresh installs only; the offer is `quick_setup_pending` in `/api/status`
 - `GET|POST /api/update` - update-check status / toggle the daily release poll
 - `GET|POST /api/logs` - the About-tab log viewer: read recent lines (or
-  `?download=1` for a text file, still the complete buffer) / set log level, PII
-  redaction, or clear the buffer. A bare read returns the newest 500 lines;
+  `?download=1` for a text file, still the complete buffer - add `&masked=1` for
+  the PII-masked form, which is the one to attach to a bug report; the raw form is
+  the default here, since the redaction setting is a display choice) / set log
+  level, PII redaction, or clear the buffer. A bare read returns the newest 500 lines;
   `?limit=` asks for a different window (capped at 1000, `?limit=0` for the whole
   buffer). Responses carry `limit` (the cap applied) and `buffered` (lines held),
   so a short answer can be told from a complete one, plus `epoch`, `first_seq`,
@@ -1437,7 +1695,9 @@ constant memory.
   arrived since - `since` is ignored unless `epoch` matches, because a restart
   reseeds the buffer and re-uses the same sequence numbers for different lines
 - `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
-- `GET /api/export?…` / `POST /api/import` - export / import config + history
+- `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
+  export / import config + history. Pick at least one of those four categories (any
+  non-empty value selects one); with none at all the export is a `400`.
   (JSON; export streams a single consistent snapshot with a small manifest; import
   streams in bounded batches and is **not atomic** - a mid-file error leaves earlier
   categories applied and returns `{partial:true, committed:{…}}`. Import puts no

@@ -33,8 +33,16 @@ var checkInterval = 30 * time.Minute
 // non-nil error only on a real delivery failure - NOT for an empty URL, which
 // is a no-op. *notify.Notifier satisfies it; kept minimal so this package
 // doesn't import notify.
+//
+// Because an unconfigured destination is that silent no-op, a nil error alone
+// cannot mean "arrived", and the digest's watermark advance requires exactly
+// that. Configured answers the part Send's error cannot: whether there is
+// anywhere to deliver at all. It is part of the interface rather than an
+// optional assertion so a future Sender has to state it instead of defaulting
+// into the bug this pair exists to prevent.
 type Sender interface {
 	Send(ctx context.Context, message string, fields map[string]any) error
+	Configured() bool
 }
 
 // Manager runs the periodic-digest loop.
@@ -125,6 +133,20 @@ func (m *Manager) tick(ctx context.Context) {
 	if p <= 0 {
 		m.pendingSince = time.Time{} // disabled: drop any pending retry so re-enabling arms/caps fresh
 		return                       // leave last-sent untouched so re-enabling arms cleanly
+	}
+	// Nowhere to deliver. Send is a deliberate no-op returning nil for a blank
+	// webhook URL, and reading that as delivery advanced the watermark, cleared
+	// pending state and logged "digest sent" for a summary that never left the
+	// host - silently consuming every due period until a webhook happened to be
+	// configured, and eating the one in flight when it finally was. An
+	// undeliverable period is not a sent period: leave last-sent untouched so
+	// configuring a webhook sends the window it still names, and drop any pending
+	// retry so a long unconfigured stretch re-caps fresh instead of mailing a
+	// catch-up report (the same rule as the disabled cadence above).
+	if !m.Notify.Configured() {
+		m.pendingSince = time.Time{}
+		m.Log.Debug("digest skipped: no webhook configured")
+		return
 	}
 	now := m.clock()
 	// A backward wall-clock step (NTP correction, VM snapshot restore) can leave

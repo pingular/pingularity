@@ -21,9 +21,11 @@ import (
 var ErrBusy = errors.New("a speedtest is already in progress")
 
 // ErrAborted is returned when the user cancelled a run (via Abort) BEFORE any
-// server produced a usable result - not a measurement failure, and nothing is
-// stored. An abort AFTER a best-of-N server has succeeded keeps that (best)
-// result instead, so this only fires when the abort lands before the first one.
+// server produced a usable result - not a measurement failure, and no
+// measurement is stored (data the aborted run had already moved still lands in
+// a usage-only row; see recordFailedUsage). An abort AFTER a best-of-N server
+// has succeeded keeps that (best) result instead, so this only fires when the
+// abort lands before the first one.
 var ErrAborted = errors.New("speedtest aborted")
 
 // afterClaimHook is called by RunOnce immediately after it claims the
@@ -469,6 +471,11 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	}
 	res, err := runTester(runCtx, s.curTester(), reason)
 	if err != nil {
+		// A failed run's traffic was still spent - RunReason returns the
+		// accumulated bytes alongside the error - so record the usage before
+		// deciding how the failure is reported, or a total-failure (or
+		// user-aborted) run bills the link and "data used" shows nothing.
+		s.recordFailedUsage(ctx, res, reason)
 		// A user Abort() before any server produced a result: the parent ctx is still
 		// live but runCtx was cancelled. Not a failure, and nothing to store.
 		if ctx.Err() == nil && runCtx.Err() != nil {
@@ -569,6 +576,13 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	if err := ctx.Err(); err != nil {
 		return sp, err
 	}
+	// A retried direction, or one that failed while the other succeeded, spent
+	// bytes that never reach the row above: only the winning attempt's count
+	// lands there, because a byte count on a successful row is what says the
+	// direction ran. Bill the remainder as its own usage-only row so a metered
+	// link is told the truth about what the run cost, without inventing a second
+	// measurement. Same shape and same filtering as a failed run's row.
+	s.recordExtraUsage(ctx, res, reason, sp.TS)
 	if err := s.store.InsertSpeed(ctx, sp); err != nil {
 		// The result is not durable. Do NOT advance the breach streak, the adaptive
 		// cadence (lastUnhealthy), or fire an alert on a run that was never recorded -
@@ -659,6 +673,92 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		"loaded_up_p95_ms", fptr(res.LoadedUpP95MS))
 
 	return sp, nil
+}
+
+// recordFailedUsage persists the data a FAILED (or user-aborted) run still
+// moved, so total-failure runs keep honest data-usage accounting: the
+// SpeedDataUsage sums read the speed table, and dropping the returned byte
+// counts here recorded 0 for traffic that measurably transited the link. The
+// row is accounting, not a measurement - speeds and ping stay 0, Healthy stays
+// nil, no thresholds are evaluated, and completions is NOT advanced, so the
+// startup latch cannot mistake a failure for a served slot. Skipped on
+// shutdown (parent ctx dead: the store is about to close, same rule as the
+// success path's persist gate) and when the run moved nothing.
+//
+// Failed is what keeps that distinction READABLE. Without it the row is
+// indistinguishable from a real 0 Mbps measurement to every consumer, because
+// the codebase's "was this direction measured?" predicate is `bytes != nil` and
+// this row carries real bytes: /metrics would emit a 0 download gauge (a
+// permanent false "below threshold" alert) and stamp the last-run freshness
+// anchor, and the dashboard would draw a 0 in the chart, the history table and
+// the averages. store.SpeedSample.Failed hides it from every measurement read
+// while the usage sums still count it.
+//
+// No store.SpeedSample.UsageRunTS here, unlike recordExtraUsage. That reference
+// says "these bytes belong to the run recorded at this ts", and a wholly failed
+// run has no such row - RunOnce returns before writing one, which is why this
+// function exists. This row IS the whole record of the run, at its own
+// timestamp, so DeleteSpeed already removes it by ts like any other row; there
+// is nothing for a cascade to reach it from. Pointing it at its own ts would
+// only assert a measurement that never happened, and this codebase does not
+// write a claim it cannot back.
+func (s *Scheduler) recordFailedUsage(ctx context.Context, res Result, reason string) {
+	if ctx.Err() != nil || (res.DownloadBytes <= 0 && res.UploadBytes <= 0) {
+		return
+	}
+	sp := store.SpeedSample{
+		TS: time.Now().Unix(), Server: res.Server, ServerID: res.ServerID,
+		Trigger: reason, Engine: res.Engine, Failed: true,
+		DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
+	}
+	if err := s.store.InsertSpeed(ctx, sp); err != nil {
+		// Non-fatal: the run already failed, and the caller's error is the one
+		// that explains it - losing the usage row costs accounting, not history.
+		s.log.Error("speedtest usage store", "err", err)
+	}
+}
+
+// recordExtraUsage bills traffic a SUCCESSFUL run spent beyond what it measured:
+// a retried direction's earlier attempts, or a direction that failed while the
+// other carried the run. Those bytes cannot go on the measurement row - a byte
+// count there is the signal that a direction ran, so adding a failed attempt's
+// spend would manufacture a measurement out of traffic that measured nothing.
+// They are still real bytes on a metered link, and before this they were simply
+// dropped: two 125 MB attempts recorded 125 MB.
+//
+// Written as the same usage-only row a failed run gets: flagged, so every
+// measurement read filters it out, while the data-usage sums still count it.
+// measuredTS is the timestamp of the measurement row this spend belongs to; the
+// usage row is written one second later so the two never share a key. The speed
+// table's backup merge is keyed on ts alone, and its import keeps the FIRST row
+// it sees for a key - so two rows in the same second meant a restore silently
+// kept one and dropped the other. That lost the measurement, which is the worse
+// half: a backup that quietly discards the reading looks like it worked.
+// (`failed` cannot join the merge key instead: a key column that is NULL marks
+// the row unimportable, and NULL is deliberately how a real run records "not an
+// accounting row".)
+//
+// measuredTS is also written into the row itself, as UsageRunTS: the second it
+// SITS on is +1, but the run it BELONGS to is named outright, and that is what
+// DeleteSpeed cascades on. Deriving the owner from the position instead - "the
+// flagged row one second after the run" - deleted whatever else happened to be
+// there, and a manual run failing a second after a scheduled measurement puts
+// its own flagged row at exactly that second.
+func (s *Scheduler) recordExtraUsage(ctx context.Context, res Result, reason string, measuredTS int64) {
+	if ctx.Err() != nil || (res.ExtraDownBytes <= 0 && res.ExtraUpBytes <= 0) {
+		return
+	}
+	sp := store.SpeedSample{
+		TS: measuredTS + 1, Server: res.Server, ServerID: res.ServerID,
+		Trigger: reason, Engine: res.Engine, Failed: true,
+		UsageRunTS: &measuredTS,
+		DownBytes:  bytesPtr(res.ExtraDownBytes), UpBytes: bytesPtr(res.ExtraUpBytes),
+	}
+	if err := s.store.InsertSpeed(ctx, sp); err != nil {
+		// Non-fatal for the same reason as recordFailedUsage: the measurement
+		// itself is what matters here, and it is stored either way.
+		s.log.Error("speedtest extra usage store", "err", err)
+	}
 }
 
 // fptr renders an optional measurement for logging: rounded, or "n/a".
