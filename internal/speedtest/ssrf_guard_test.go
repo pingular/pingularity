@@ -22,16 +22,22 @@ import (
 // still let genuinely public hosts through, or every real speedtest server is
 // unreachable. IPv4-mapped IPv6 forms must normalize and be caught too.
 func TestProbeDialGuardBlocksCGNATAndReserved(t *testing.T) {
+	clearProxyEnv(t) // an ambient proxy naming one of these must not relax the guard
 	blocked := []string{
-		"100.64.0.5:8080",          // RFC 6598 CGNAT (Tailscale) - the FIX-2 gap
-		"100.127.255.254:443",      // RFC 6598 top of range
-		"[::ffff:100.64.0.5]:8080", // IPv4-mapped form of the same
-		"192.0.2.1:80",             // RFC 5737 TEST-NET-1
-		"198.18.0.1:80",            // RFC 2544 benchmarking
-		"203.0.113.9:80",           // RFC 5737 TEST-NET-3
-		"127.0.0.1:9000",           // loopback (the daemon's own UI)
-		"10.0.0.1:8080",            // RFC1918
-		"169.254.169.254:80",       // link-local cloud metadata
+		"100.64.0.5:8080",           // RFC 6598 CGNAT (Tailscale) - the FIX-2 gap
+		"100.127.255.254:443",       // RFC 6598 top of range
+		"[::ffff:100.64.0.5]:8080",  // IPv4-mapped form of the same
+		"192.0.0.8:80",              // RFC 6890 IETF protocol assignments
+		"192.0.2.1:80",              // RFC 5737 TEST-NET-1
+		"198.18.0.1:80",             // RFC 2544 benchmarking
+		"198.51.100.7:80",           // RFC 5737 TEST-NET-2
+		"[::ffff:198.51.100.7]:443", // IPv4-mapped form of the same
+		"203.0.113.9:80",            // RFC 5737 TEST-NET-3
+		"240.0.0.1:80",              // RFC 1112 class E reserved
+		"255.255.255.255:9",         // limited broadcast (top of class E)
+		"127.0.0.1:9000",            // loopback (the daemon's own UI)
+		"10.0.0.1:8080",             // RFC1918
+		"169.254.169.254:80",        // link-local cloud metadata
 	}
 	for _, a := range blocked {
 		if err := probeDialGuard("tcp", a, nil); err == nil {

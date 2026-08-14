@@ -76,6 +76,16 @@ type Config struct {
 	// replaces guessing a container's network mode from its interfaces - an
 	// operator says what they want instead. From -access or PINGULARITY_ACCESS.
 	Access string
+
+	// AccessExplicit records that Access came from explicit operator input - a
+	// -access flag actually passed on the command line, or a non-blank
+	// PINGULARITY_ACCESS - as opposed to the silent "local" default. At boot an
+	// explicit choice is authoritative over a disagreeing STORED
+	// access_local_only (main reconciles it); without this bit, stored keys win
+	// via the overlay and -e PINGULARITY_ACCESS=network could never recover a
+	// bridged container that persisted local-only. Not persisted; derived from
+	// the argv/env every start.
+	AccessExplicit bool
 }
 
 // Family names.
@@ -212,8 +222,10 @@ func ParseFlags(args []string) (Config, error) {
 	// users can set it with -e (the image can't guess its own network mode); a
 	// -access flag still overrides the env. Precedence: flag > env > default.
 	access := "local"
+	accessExplicit := false // a blank/unset env is the silent default, not a choice
 	if env := strings.TrimSpace(os.Getenv("PINGULARITY_ACCESS")); env != "" {
 		access = env
+		accessExplicit = true
 	}
 	fs.StringVar(&c.Access, "access", access, "who may open the dashboard: 'local' (loopback only; the safe default) or 'network' (reachable from the LAN - set a login). Containers that publish a port need 'network' (or PINGULARITY_ACCESS=network)")
 	if err := fs.Parse(args); err != nil {
@@ -227,12 +239,17 @@ func ParseFlags(args []string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid access mode %q: want 'local' or 'network'", c.Access)
 	}
 	// Explicit monitoring flags = headless consent (see MonitoringConsent).
+	// -access actually passed counts as explicit even when it names the default
+	// value: "-access local" is an operator choice, distinct from silence.
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "speedtest", "speedtest-interval", "latency", "interval":
 			c.MonitoringConsent = true
+		case "access":
+			accessExplicit = true
 		}
 	})
+	c.AccessExplicit = accessExplicit
 	// -quick-setup is the explicit headless-consent knob (see QuickSetupSkip).
 	switch quickSetup {
 	case "", "prompt":

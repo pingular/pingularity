@@ -306,7 +306,14 @@ func (s *Server) guard(next http.Handler) http.Handler {
 					s.log.Warn("request rejected: local-only access is on",
 						"ip", clientIP(r), "path", capForLog(r.URL.Path), "suppressed_since_last", suppressed)
 				}
-				http.Error(w, "access restricted to localhost", http.StatusForbidden)
+				// A short explanation, not a bare 403: the person reading this is
+				// usually the operator hitting their own fresh install's published
+				// port, and the body is all the interface they have. It states only
+				// the setting that refused them - nothing about auth or the install.
+				http.Error(w, "this dashboard is private (local-only access is on). "+
+					"Enable network access from the machine itself in the Access tab, "+
+					"or start with -access network / -e PINGULARITY_ACCESS=network - and set a password.",
+					http.StatusForbidden)
 				return
 			case !hostAllowed(r.Host, nil):
 				// A loopback peer whose Host needed -allow-host to pass means a
@@ -413,12 +420,14 @@ func authExempt(r *http.Request) bool {
 		// guard, which keeps a lost-response retry idempotent: a cookieless retry
 		// AFTER the answer enabled auth hits the "already done" 200 no-op instead of
 		// a guard 401. What an unauthenticated caller can reach here is bounded to
-		// two harmless outcomes - the done/no-op, and the `dismiss` marker (closes
-		// the first-run dialog, changing no access/auth/monitoring state; reachable
-		// while auth is active BY DESIGN so a dialog on an out-of-band-secured
-		// install can still be dismissed, see handleQuickSetup). A full answer that
-		// would change access/auth still 403s inside the handler once a login is
-		// active. The network/host filters (local-only, DNS-rebind) run BEFORE this
+		// one harmless outcome - the done/no-op. The `dismiss` marker is reachable
+		// without a session only while NO login is active (so a dialog on an
+		// out-of-band-secured install can still close); once auth is active the
+		// handler applies the same auth check as gated endpoints before writing it
+		// (see handleQuickSetup - the marker releases the boot monitoring hold, so
+		// an unauthenticated LAN peer must not set it). A full answer that would
+		// change access/auth still 403s inside the handler once a login is active.
+		// The network/host filters (local-only, DNS-rebind) run BEFORE this
 		// exemption, so it never widens who can reach the port.
 		return true
 	case p == "/metrics":

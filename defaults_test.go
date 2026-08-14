@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/pingular/pingularity/internal/config"
+	"github.com/pingular/pingularity/internal/settings"
+	"github.com/pingular/pingularity/internal/store"
 )
 
 // TestDefaultSettings executes the fresh-install configuration literal - which no
@@ -103,6 +106,79 @@ func TestDefaultSettings(t *testing.T) {
 	loc.Access = "local"
 	if !defaultSettings(loc).AccessLocalOnly {
 		t.Error("-access local must default AccessLocalOnly=true")
+	}
+}
+
+// reconcileAccess: an EXPLICIT -access / PINGULARITY_ACCESS must override a
+// disagreeing STORED access_local_only at boot - in either direction - and
+// persist the result; without explicit input the stored value always wins.
+// This is the recovery path for a bridged container that persisted
+// local_only=true under the old warn-only regime and is 403'd off its own
+// published port on upgrade, with no shell in the distroless image to repair
+// the database from.
+func TestReconcileAccess(t *testing.T) {
+	ctx := context.Background()
+	newSet := func(t *testing.T, storedLocalOnly bool) *settings.Controller {
+		t.Helper()
+		st, err := store.Open(":memory:")
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		t.Cleanup(func() { st.Close() })
+		set, err := settings.New(ctx, st, settings.Values{
+			Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second,
+			DownAfter: 3, UpAfter: 2,
+		})
+		if err != nil {
+			t.Fatalf("new settings: %v", err)
+		}
+		// Simulate the upgraded install: the value sits in the STORE, where the
+		// overlay makes it win over the flag-seeded default.
+		if err := set.SetAccessLocalOnly(ctx, storedLocalOnly); err != nil {
+			t.Fatalf("seed stored access_local_only: %v", err)
+		}
+		return set
+	}
+
+	cases := []struct {
+		name        string
+		stored      bool
+		cfg         config.Config
+		wantChanged bool
+		wantLocal   bool
+	}{
+		{"explicit network overrides stored local-only (the upgrade lockout)",
+			true, config.Config{Access: "network", AccessExplicit: true}, true, false},
+		{"explicit local overrides stored network",
+			false, config.Config{Access: "local", AccessExplicit: true}, true, true},
+		{"explicit and agreeing: nothing to do",
+			false, config.Config{Access: "network", AccessExplicit: true}, false, false},
+		{"silent default never overrides stored local-only",
+			true, config.Config{Access: "local", AccessExplicit: false}, false, true},
+		{"silent default leaves stored network alone too",
+			false, config.Config{Access: "local", AccessExplicit: false}, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			set := newSet(t, c.stored)
+			changed, err := reconcileAccess(ctx, c.cfg, set)
+			if err != nil {
+				t.Fatalf("reconcileAccess: %v", err)
+			}
+			if changed != c.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, c.wantChanged)
+			}
+			if got := set.AccessLocalOnly(); got != c.wantLocal {
+				t.Errorf("AccessLocalOnly = %v, want %v", got, c.wantLocal)
+			}
+			// The override must PERSIST (survive a reload), not just flip memory.
+			if err := set.Reload(ctx); err != nil {
+				t.Fatalf("reload: %v", err)
+			}
+			if got := set.AccessLocalOnly(); got != c.wantLocal {
+				t.Errorf("after reload: AccessLocalOnly = %v, want %v (override not persisted)", got, c.wantLocal)
+			}
+		})
 	}
 }
 

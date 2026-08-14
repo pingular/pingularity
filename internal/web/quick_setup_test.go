@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
@@ -95,6 +96,54 @@ func TestQuickSetupDismissTouchesNothingElse(t *testing.T) {
 	aj, _ := json.Marshal(after)
 	if string(bj) != string(aj) {
 		t.Fatalf("dismissal changed more than the marker:\n before %s\n after  %s", bj, aj)
+	}
+}
+
+// The dismiss marker is a persistent server-owned write that releases the boot
+// monitoring hold, and /api/quick-setup is authExempt (the guard never checks
+// it), so the handler must apply the auth gate itself once a login is active.
+// Three legs: unauthenticated dismiss with auth active is rejected with no
+// state change; the same dismiss with a valid session works; and with no auth
+// configured at all (an install secured out-of-band) a session-less dismiss
+// still closes the dialog.
+func TestQuickSetupDismissGatedWhenAuthActive(t *testing.T) {
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret") // auth active; quick_setup_done still false
+	h := s.Handler()
+
+	// Unauthenticated network peer (do() carries httptest's non-loopback
+	// RemoteAddr - the -access network + password-set shape): rejected, and the
+	// server-owned marker must not move.
+	w := do(t, h, "POST", "/api/quick-setup", `{"dismiss":true}`)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated dismiss with auth active: %d, want 401", w.Code)
+	}
+	if s.settings.QuickSetupDone() {
+		t.Fatal("unauthenticated dismiss set the server-owned quick_setup_done marker")
+	}
+	// CLI shape (no app header): the rejection carries the Basic challenge,
+	// mirroring the guard's discipline for gated endpoints.
+	if got := w.Header().Get("WWW-Authenticate"); got == "" {
+		t.Error("unauthenticated dismiss rejection must offer Basic to non-app clients")
+	}
+
+	// The same dismiss with a valid session works.
+	w = doSession(t, s, h, "POST", "/api/quick-setup", `{"dismiss":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authenticated dismiss with auth active: %d %s, want 200", w.Code, w.Body.String())
+	}
+	if !s.settings.QuickSetupDone() {
+		t.Fatal("authenticated dismiss did not mark Quick Setup done")
+	}
+
+	// No login configured: the pre-existing contract stands - a session-less
+	// dismiss still closes the dialog.
+	s2 := newTestServer(t)
+	if w := do(t, s2.Handler(), "POST", "/api/quick-setup", `{"dismiss":true}`); w.Code != http.StatusOK {
+		t.Fatalf("dismiss with auth inactive: %d %s, want 200", w.Code, w.Body.String())
+	}
+	if !s2.settings.QuickSetupDone() {
+		t.Fatal("auth-inactive dismiss did not mark Quick Setup done")
 	}
 }
 

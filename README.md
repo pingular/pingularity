@@ -17,7 +17,7 @@ This is the [live demo](https://demo.pingularity.dev) - same dashboard, syntheti
 ## Quick start
 
 ```bash
-go build -o pingularity .   # requires Go 1.25.12+; pure Go, no cgo
+go build -o pingularity .   # requires Go 1.25.13+; pure Go, no cgo
 ./pingularity               # probes every 5s; UI on http://localhost:9000
 ```
 
@@ -87,7 +87,7 @@ sudo pingularity install    # registers, configures, and starts the systemd serv
 Or run it as a container (see [Docker](#docker) for why the flags matter):
 
 ```bash
-docker run -d --name pingularity \
+docker run -d --name pingularity --restart unless-stopped \
   --network=host --cap-add=NET_RAW \
   -v pingularity-data:/var/lib/pingularity \
   ghcr.io/pingular/pingularity
@@ -148,13 +148,16 @@ Store and re-run.
 ### Docker
 
 ```bash
-docker run -d --name pingularity \
+docker run -d --name pingularity --restart unless-stopped \
   --network=host --cap-add=NET_RAW \
   -v pingularity-data:/var/lib/pingularity \
   ghcr.io/pingular/pingularity
 ```
 
-The image is multi-arch (amd64 + arm64). Two flags matter:
+The image is multi-arch (amd64 + arm64). `--restart unless-stopped` is there
+because a connectivity monitor that stays down after a reboot is silently
+useless - Docker brings it back with the daemon unless you stopped it
+yourself. Two more flags matter:
 
 - **`--network=host`** (load-bearing) - Pingularity measures *your host's*
   internet path. Behind Docker's default bridge network you'd instead measure
@@ -184,13 +187,38 @@ The image is multi-arch (amd64 + arm64). Two flags matter:
   (The dashboard's container notice is raised for a *bridged* container, which is
   the case it can detect; it does not detect Docker Desktop's host-networking
   mode specifically.)
-- **`--cap-add=NET_RAW`** (keep it for portability) - the **Exit** panel walks
-  a raw-socket ICMP traceroute to find where traffic leaves your ISP. Stock
-  Docker still grants `NET_RAW` by default, so plain `docker run` works without
-  the flag today - but Podman 4+, hardened Kubernetes pod specs, and
-  `--cap-drop` setups don't, and there the trace can't send its packets and the
-  Exit row shows as unavailable (everything else still works). Spelling it out
-  keeps the command correct everywhere.
+- **`--cap-add=NET_RAW`** (keep it - without it the container won't start) -
+  the **Exit** panel walks a raw-socket ICMP traceroute to find where traffic
+  leaves your ISP. The images grant that privilege through a file capability
+  stamped on the binary (`cap_net_raw+ep`), and the effective (`+e`) bit makes
+  it mandatory: when `NET_RAW` is missing from the container's capability set,
+  the kernel refuses to execute the binary at all, so the container **exits
+  immediately with "operation not permitted"** - it does not come up with a
+  degraded trace. Stock Docker still grants `NET_RAW` by default, so plain
+  `docker run` works without the flag today - but Podman 4+ dropped it from its
+  default set, and `--cap-drop=ALL` / a Kubernetes `capabilities: {drop:
+  [ALL]}` remove it too, so all of those need it added back
+  (`--cap-add=NET_RAW`; Kubernetes `add: [NET_RAW]`) for the container to
+  start. Spelling it out keeps the command correct everywhere. Two related
+  setups behave differently, and the difference is that file capability:
+  - **`--security-opt no-new-privileges`** (Kubernetes
+    `allowPrivilegeEscalation: false`) does not stop the start: it blocks a
+    file capability from raising privileges at exec even when `NET_RAW` is
+    granted, so the daemon runs *without* the capability and only the trace
+    degrades - the Exit row shows as unavailable, everything else works. The
+    unprivileged ICMP fallback that can save the trace natively is normally
+    closed in a container (a fresh network namespace's `ping_group_range`
+    admits no group), but you can open it and win the trace back without the
+    capability: `--sysctl net.ipv4.ping_group_range="65532 65532"` on a
+    bridged container (the same sysctl via `securityContext.sysctls` on
+    Kubernetes). Under `--network=host` the namespace is the host's, so
+    Docker refuses `--sysctl` there - widen the host's own
+    `ping_group_range` instead.
+  - A **native** binary without the privilege degrades gracefully, because
+    the release binaries carry no file capability - the deb/rpm unit grants
+    an ambient `CAP_NET_RAW` instead, and a tarball binary run unprivileged
+    just loses the trace. Only the container images make the capability a
+    start condition.
 
 > **Reaching the dashboard from other devices.** Every install starts
 > loopback-only, containers included - it is never guessed open from the network
@@ -198,7 +226,25 @@ The image is multi-arch (amd64 + arm64). Two flags matter:
 > `localhost:9000`, but other devices on your LAN get `403` until you opt in with
 > `-access network` (or `-e PINGULARITY_ACCESS=network`) - set a login at the same
 > time. A bridged container that publishes a port with `-p` needs the same flag,
-> or the published port returns `403`.
+> or the published port returns `403`. An explicitly passed `-access` /
+> `PINGULARITY_ACCESS` is authoritative at every start: it updates a disagreeing
+> saved setting (in either direction) and logs the change, so
+> `-e PINGULARITY_ACCESS=network` also recovers an install whose saved
+> local-only would otherwise lock its published port out. The flip side: while
+> the flag or env stays pinned in your unit/compose file, changing **Network
+> access** in the UI is overridden again at the next restart - drop the flag to
+> let the UI choice stick.
+
+> **Upgrading a container from 0.61 or earlier?** Up to 0.61 a container
+> answered the network by default; from 0.62 every install starts private. An
+> **existing** container install keeps its network access across the upgrade:
+> on the first 0.62+ boot, an established database that never stored an access
+> choice - and no explicit `-access`/`PINGULARITY_ACCESS` - is migrated once,
+> persisting network access as its stored choice and logging one warning
+> (`upgraded a pre-0.62 container install: kept its network-reachable access`).
+> Set a password, or turn Local-only on in the Access tab, when you next visit.
+> Fresh installs are never migrated: their published port answers `403`, and
+> the `403` body itself explains the setting that refused you and how to opt in.
 
 The **`-v pingularity-data:/var/lib/pingularity`** volume is what makes updates
 safe: the SQLite database *and* `pingularity.key` (which encrypts saved iperf3
@@ -210,6 +256,27 @@ not interpret `PINGULARITY_OPTS` as flags: that variable is expanded by the
 native Linux systemd units from `/etc/default/pingularity`, and the container
 images ignore it.
 
+A **named volume** is the happy path: on first use Docker copies the image's
+data directory into it - owner `65532:65532`, mode `0700`, plus a marker file
+the daemon uses to recognize its own directory - so an unprivileged container
+just works. (Some Docker engines loosen a fresh volume's root during that
+copy; at boot the daemon re-tightens exactly that directory - its own path,
+its own owner, the image's marker - back to `0700` and logs that it did.) A
+**bind mount** is whatever host directory you point at it, and the image's
+user won't own it: `chown 65532:65532` it first (and `chmod 700`), or run
+with `--user <uid>:<gid>` matching the directory's owner. Either way the data
+lands on the mount - the image's entrypoint pins
+`-db /var/lib/pingularity/pingularity.db`, so a `--user` override changes who
+writes, never where. On **Kubernetes**, mount the PVC at
+`/var/lib/pingularity` and set `securityContext: fsGroup: 65532` so the
+kubelet makes the volume writable for the pod (add `fsGroupChangePolicy:
+OnRootMismatch` to skip the re-chown on every mount). The daemon notices the
+resulting group-writable volume root at each boot and says exactly that: the
+shape is how an fsGroup pod writes at all, so it explains it and leaves it
+alone, and the database file itself stays owner-only. To make the directory
+owner-only and end the notice, chown the volume root to uid 65532 once and
+drop fsGroup.
+
 Two image variants ship to the same repo. The default
 `ghcr.io/pingular/pingularity` is a lean distroless image and deliberately ships
 **no iperf3** - its base has no package manager, so the opt-in iperf3 speedtest
@@ -217,7 +284,62 @@ engine can't run there and speedtests fall back to Ookla. If you use the iperf3
 engine, pull the `-iperf` variant instead
 (`ghcr.io/pingular/pingularity:latest-iperf`), a debian-slim image that bundles a
 working `iperf3` and is otherwise identical - same non-root uid 65532, same
-`CAP_NET_RAW` binary, same volume layout, so every flag above carries over.
+`CAP_NET_RAW` binary, same volume layout, so every flag above carries over. If
+you run it bridged rather than with `--network=host`, read
+[iperf3 in a container](#iperf3-in-a-container) first: several iperf3 settings
+name things only the host has, and the compose file there maps
+`host.docker.internal` so a host-side `iperf3 -s` stays reachable.
+
+**What `docker logs` shows.** Logging is off by default, but the daemon always
+prints one startup line to stdout - version, listen address, access mode, and
+dashboard URL, e.g. `pingularity 0.62.0: listening on :9000, access
+local-only, dashboard at http://localhost:9000` - so a healthy container is
+distinguishable from a hung one. Warnings and errors (the upgrade migration
+above, security warnings) still surface at the default level; routine detail
+needs the log level raised in the About tab.
+
+**Health check.** Both images bake in a
+`HEALTHCHECK ["/pingularity", "healthz"]` (every 30s, 5s timeout, 10s start
+period): the `healthz` subcommand fetches `http://127.0.0.1:9000/healthz`
+from inside the container and exits 0 on a `200`, so `docker ps` reports
+`(healthy)`/`(unhealthy)` with no curl or shell in the image. If you change
+`-listen`, the baked-in probe misses the daemon and the container reads
+unhealthy while it is fine: in compose, override it with the exec form -
+`healthcheck: { test: ["CMD", "/pingularity", "healthz", "-addr",
+"127.0.0.1:8080"] }` - and with plain `docker run`, pass `--no-healthcheck`
+on the default image (`--health-cmd` needs a shell, which distroless does not
+have; the `-iperf` image has one).
+
+**Read-only root filesystem.** The default image runs under
+`docker run --read-only`: everything the daemon writes - the database and its
+`-wal`/`-shm` sidecars, `pingularity.key`, and the `logs.txt` log snapshot -
+lives beside the pinned `-db` path, on the volume. The `-iperf` variant wants
+one addition, `--tmpfs /tmp`, if you use iperf3 **RSA auth**: the server's
+public key is staged as a temp file for the iperf3 child, and with nowhere to
+write it those runs fail with a clear `iperf3 auth: temp key` error (nothing
+else is affected).
+
+**Forgot the password?** `pingularity reset-auth` needs the database, and in
+a container that means the volume - run it from a one-off container sharing
+the volume (the image's entrypoint pins the `run` subcommand, so override it):
+
+```bash
+docker run --rm --entrypoint /pingularity \
+  -v pingularity-data:/var/lib/pingularity \
+  ghcr.io/pingular/pingularity:<tag> \
+  reset-auth -db /var/lib/pingularity/pingularity.db
+docker restart pingularity   # the running daemon caches settings in memory
+```
+
+Use the tag your container runs (`docker inspect pingularity --format
+'{{.Config.Image}}'`), so the one-off binary matches the database it opens.
+
+**Locked out of a published port?** A restore that forces access to
+local-only (see [the restore notes](#run-in-the-background-systemd--launchd--windows-service))
+leaves a bridged container's published port answering `403` - including to
+the browser that ran the restore. Recreate or restart the container with
+`-e PINGULARITY_ACCESS=network`: an explicit access choice at start overrides
+the stored setting. Then set things right in the Access tab.
 
 ### Updating
 
@@ -308,7 +430,11 @@ consequences worth knowing before you need them:
   local-only** so it can't fall open to the LAN, and tells you so - set a
   new password in the Access tab, then re-enable Network access. (Restoring onto
   the same machine, where the password still exists, keeps login working untouched
-  and access unchanged.)
+  and access unchanged.) In a container, that forced local-only can lock you out
+  of a published port - `403`, including for the browser that ran the restore -
+  and the import response says so; the way back in is restarting the container
+  with `-e PINGULARITY_ACCESS=network`, then setting things right in the
+  Access tab.
 - **Restoring onto a *different* machine?** A backup never carries the source's
   install date, so the destination keeps its own answer to "monitoring since".
   That date is the denominator behind every uptime figure, and importing it would
@@ -375,8 +501,11 @@ flowchart TB
 
 A run records download, upload, ping, **jitter**, (best-effort) **packet loss**,
 and **bufferbloat**, plus the bytes used and the connection it ran on (public IP,
-ISP, DNS resolver). Not every field is present on every run: a download-only or
-upload-only run has no figures for the direction it skipped, packet loss is
+ISP, DNS resolver). An iperf3 run also records two facts that used to be
+invisible: the **address family** (IPv4 or IPv6) the transfer actually used -
+read back from the run itself, never guessed - and **which direction** its
+loss/jitter probe sampled. Not every field is present on every run: a download-only
+or upload-only run has no figures for the direction it skipped, packet loss is
 optional and not always measurable, and bufferbloat is absent when a transfer
 phase was too short to sample, returned too few samples, or the latency target
 was unreachable. Missing is stored as missing rather than as a zero, so charts
@@ -429,10 +558,132 @@ There are two engines, picked in the settings drawer:
   present on a native install once you've installed iperf3, and in the container
   only in the `-iperf` image variant, not the default image.
   Its own knobs: parallel streams, duration, warm-up, TCP window, congestion
-  control, MSS, DSCP, the loss/jitter UDP pass, and optional RSA auth.
+  control, MSS, DSCP, the loss/jitter UDP pass, and - per server - IP version,
+  bind source, and optional RSA auth. In a bridged container several of those
+  knobs point at things only the host has - see
+  [iperf3 in a container](#iperf3-in-a-container) below.
 
 **Direction** (both / download / upload, plus iperf3's simultaneous `--bidir`) and
 **retries** apply to whichever engine is selected.
+
+For iperf3, the separate UDP loss/jitter pass probes the same direction you
+test: downstream normally, upstream for an upload-only run - so a one-direction
+test on an asymmetric line reports loss for the direction you asked about. That
+also means loss and jitter describe **one direction per run**, never both, and
+loss on an asymmetric path genuinely differs by direction - so each sample now
+records which way its probe ran. The loss and jitter readouts name the path on
+hover, the run tooltip carries it in its Quality line, and it's exported as
+`udp_direction` (`down`/`up`) in the API and CSV. Runs that never measured
+loss/jitter, Ookla runs, and rows recorded before the field carry no direction
+and are shown unlabeled rather than guessed at.
+
+### iperf3 in a container
+
+A bridged container (the default `docker run`/compose network) has its own
+network namespace: its own `localhost`, its own interfaces and addresses, its
+own `/etc/hosts`, and NAT between it and everything else. Several iperf3
+settings are **host-referential** - they name things that exist on the host but
+not inside that namespace. All of them fail loudly rather than mismeasure
+quietly, and when the daemon knows it runs in a container, most of the failures
+carry a container-specific explanation in the error itself (natively the same
+errors mean exactly what they say, and get no such note):
+
+- **A loopback server address** (`localhost`, `127.0.0.1`, `::1`) - inside a
+  bridged container that is the *container*, so the connection is refused by
+  the container's own (empty) loopback before it ever reaches the `iperf3 -s`
+  on the host. The settings drawer warns as soon as a saved
+  server points at loopback while the daemon runs bridged (a host-network
+  container's loopback *is* the host, so it never warns there; it never blocks
+  saving either - the operator may really mean the container), and a failed run's
+  error explains the same thing. Use `host.docker.internal` (see the compose
+  file below) or the host's LAN IP.
+- **Server names the host resolves privately** - entries in the host's
+  `/etc/hosts` and mDNS `.local` names resolve natively but not in a bridged
+  container, which has its own hosts file and no mDNS responder. The run fails
+  with iperf3's own name-resolution error (no container-specific hint for this
+  one - the daemon can't tell a host-private name from a typo). Use an IP, or
+  a name the container's DNS resolves.
+- **Bind source = a host IP** (`--bind`) - the address doesn't exist in the
+  container's namespace, so the bind fails ("cannot assign requested
+  address"), and the error says so. Bind a container address instead, or use
+  host networking.
+- **Bind source = a host interface name** (`--bind-dev`) - interface names
+  don't cross network namespaces, so it fails ("no such device"), and the
+  error says so. Separately, on kernels older than 5.7 `SO_BINDTODEVICE`
+  needs `CAP_NET_RAW`, which the `-iperf` image's `iperf3` deliberately does
+  not have (the capability is stamped on the `pingularity` binary alone - see
+  [docs/security-model.md](docs/security-model.md)) - so on those kernels
+  `--bind-dev` fails in the container even for an interface that does exist
+  inside it. Native installs are unaffected: the deb/rpm unit's *ambient*
+  `CAP_NET_RAW` carries into the iperf3 child.
+- **IP version = IPv6** - the default Docker bridge carries no IPv6 (unless
+  you've enabled it in the daemon config), so a forced IPv6 run fails outright
+  ("network unreachable"), and the error says why. The quieter half of the
+  same problem is **Auto**: it doesn't fail, it silently measures IPv4 where a
+  dual-stack native install would measure IPv6. That is why every iperf3 run
+  records the family it actually measured - shown beside the server in the
+  runs table and run tooltip, exported as `ip_family` (`4`/`6`) in the API and
+  CSV, and empty (never guessed) on Ookla runs and rows recorded before the
+  field existed.
+
+Two more things a bridged container changes without any error at all:
+
+- **MTU.** The Docker bridge defaults to an MTU of 1500 no matter what the
+  uplink uses, so over a tunnel or PPPoE uplink with a smaller effective MTU,
+  full-size packets fragment along the way. The UDP loss/jitter probe now
+  sends **1200-byte datagrams** (1200 + 8 UDP + 40 IPv6 = 1248, under the
+  1280-byte IPv6 minimum MTU), so the probe itself can't fragment on any sane
+  path - container or not - and its loss figure can't be fabricated by dropped
+  or late fragments. An oversized **MSS** setting doesn't error here either:
+  the kernel silently clamps it to what the interface takes.
+- **LAN line rate.** Bridged traffic crosses a veth pair and conntrack NAT,
+  which costs real CPU per packet - against a fast LAN server the measured TCP
+  rate can sit measurably below native line rate, most visibly at
+  multi-gigabit speeds. The number honestly describes the container's network
+  path; it just isn't the host's.
+
+And one setting empties rather than fails: the **congestion control**
+dropdown's suggestions come from
+`/proc/sys/net/ipv4/tcp_allowed_congestion_control`, which exists only in the
+host's initial network namespace - a bridged container can't see it, so the
+dropdown arrives with no suggestions, and the UI now says why instead of
+letting the empty list read as "this host supports no algorithms". An
+algorithm you type or import is still passed to iperf3 unchanged.
+
+**`--network=host` makes nearly all of this go away** on Linux Docker Engine:
+the container shares the host's namespace, so loopback is the host, host IPs
+bind, IPv6 works, multicast reaches the wire, and LAN tests measure at native
+line rate. Two caveats survive it: `.local` *name resolution* still depends on
+the image's own resolver (debian-slim has no mDNS module - prefer an IP or
+`host.docker.internal`), and on kernels older than 5.7 an interface-name bind
+still fails in the container (the capability note above). It is already the recommended way to run the container (see
+[Docker](#docker) - including why Docker Desktop can't provide it).
+
+The canonical compose file for the iperf3-enabled image lives at
+[install.pingularity.dev/compose-iperf.yaml](https://install.pingularity.dev/compose-iperf.yaml) -
+fetch it from there rather than copying a block from this README: the served
+file is pinned to the image version it was published with and carries the
+current comments, so it cannot drift from the daemon the way an inline
+snapshot here could. Three of its pieces are the ones this section is about:
+
+- It defaults to **`network_mode: host`**, for all the reasons above.
+- Its `extra_hosts: ["host.docker.internal:host-gateway"]` maps
+  `host.docker.internal` to the host's gateway address, so an `iperf3 -s`
+  running on the host is reachable from the container by that name on Linux
+  Docker Engine too (Docker Desktop resolves the name on its own).
+- If you must stay bridged (published ports, Docker Desktop without host
+  networking, an orchestrator that owns the network), it keeps the fallback
+  as a commented **pair** - `ports: ["9000:9000"]` together with
+  `environment: ["PINGULARITY_ACCESS=network"]`. Uncomment both or neither:
+  from 0.62 a published port alone answers `403`, because every install
+  starts private (see [Docker](#docker)) - and set a login when you opt in.
+
+One honest caveat either way: a test against an `iperf3 -s` on the **same
+machine** measures the container-to-host virtual path (or loopback, under
+host networking), not any real network - fine as a smoke test, useless as a
+line measurement.
+
+### Scheduling and triggers
 
 Scheduled speedtests are **off by default** - turn them on in the Speedtest
 settings (or with `-speedtest`). Once enabled, they run on startup and on a
@@ -442,7 +693,7 @@ separately: a test runs **after a reconnect** (on by default;
 cannot fire tests back to back: at most one reconnect test per
 `-speedtest-interval`, or per 15 minutes when that interval is shorter. There is
 also an optional **while degraded**
-toggle in the Speedtest settings (off by default, needs scheduled tests on)
+toggle in the Speedtest settings (off by default, needs scheduled tests on) that
 fires a test when latency stays high without the link fully dropping. **Run
 now** (or `POST /api/speedtest`) always works.
 
@@ -455,9 +706,7 @@ held back by a **closed window** or a **busy link** behaves the opposite way:
 nothing was measured, so it keeps polling and fires as soon as the condition
 clears.
 
-For iperf3, the separate UDP loss/jitter pass probes the same direction you
-test: downstream normally, upstream for an upload-only run - so a one-direction
-test on an asymmetric line reports loss for the direction you asked about.
+### Choosing an Ookla server
 
 For Ookla, choose a server (search a city) or leave **Auto - fastest near you**
 (it reads **Auto - fastest in \<city\>** once you've searched one). Auto
@@ -667,7 +916,9 @@ and persist across restarts:
   login toggle, or Network access - requires re-entering the **current
   password** (API callers send `current_password`), so a stolen or walked-up
   browser session cannot quietly take over the account. Forgot the
-  password? Run `pingularity reset-auth` on the host to clear it. **Local-only
+  password? Run `pingularity reset-auth` on the host to clear it (in a
+  container, from a one-off container sharing the volume - see
+  [Docker](#docker)). **Local-only
   cannot block a same-host reverse proxy** (cloudflared, nginx): it delivers
   internet visitors as loopback connections, so pair any proxy with login.
 - **Appearance** → nine themes - Retro (the default), Light, Dark, Amoled,
@@ -734,11 +985,16 @@ pingularity start|stop       start / stop the installed service
 pingularity restart|status   restart / show status
 pingularity uninstall [-y]   remove the service (data untouched)
 pingularity reset-auth       clear the password + disable auth (recovery)
+pingularity healthz          probe a running instance's /healthz; exit 0 = healthy
+                             (-addr host:port, default 127.0.0.1:9000)
 pingularity version          print version
 ```
 
 Flags only **seed** the initial values - almost everything is adjustable live in
-the settings drawer afterward and persists across restarts.
+the settings drawer afterward and persists across restarts. A value you **save**
+in the UI is persisted even when it equals what a flag currently supplies, and
+wins from then on - removing the flag later keeps what you saved. Fields you
+never save keep following the flag (or the shipped default).
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
@@ -967,12 +1223,20 @@ local-only filter, and auth so a bare-IP health check from an LB reaches them):
 - `GET /readyz` - readiness: `200 ready` once the store answers and the first status
   aggregate is warm; `503` otherwise, so an LB holds traffic until the daemon is warm.
 
+`pingularity healthz [-addr host:port]` probes `/healthz` from the command
+line and reports by exit code (0 = answered `200`; anything else prints a
+one-line reason). It exists for environments with no curl - it is what the
+container images' baked-in `HEALTHCHECK` runs (see [Docker](#docker)).
+
 ### Scraping it
 
-**Step zero for a remote Prometheus:** on a native install, flip **Network
-access** on in the dashboard's Access tab first - it starts off, and until then
-every scrape from another machine gets `403`. (A Prometheus on the same host
-scraping `127.0.0.1:9000`, or a Docker install, needs nothing.)
+**Step zero for a remote Prometheus:** flip **Network access** on first - it
+starts off on every fresh install, containers included since 0.62, and until
+then every scrape from another machine gets `403`. Use the Access tab, or
+start with `-access network` / `-e PINGULARITY_ACCESS=network`. (A Prometheus
+on the same host scraping `127.0.0.1:9000` needs nothing; neither does a
+pre-0.62 container install carried across the upgrade, which keeps its
+network access - see [Docker](#docker).)
 
 A minimal job (scrape by IP so the DNS-rebinding guard doesn't get in the way -
 see the gotchas below):
@@ -987,8 +1251,9 @@ scrape_configs:
 
 Three access controls can turn a scrape into a `401`/`403`:
 
-- **Network access still off?** (the native default) - remote scrapes get
-  `403`. Enable it in the Access tab, or run the scraper on the same host.
+- **Network access still off?** (the default on every fresh install) - remote
+  scrapes get `403`. Enable it in the Access tab, or run the scraper on the
+  same host.
 
 - **Login enabled?** `/metrics` then sits behind auth, and scrapes get `401`.
   Either add the admin credentials as HTTP Basic, or (better) start Pingularity with
@@ -1115,8 +1380,15 @@ constant memory.
   caller that wants one window filters on `ts` itself. Also
   takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
   omit `to` for an open end), which wins over `mins` when present
-- `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail)
-- `GET /api/speed/runs.csv` - all runs as CSV
+- `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail).
+  Runs that recorded them carry `ip_family` (`4`/`6`, the family the transfer
+  actually used) and `udp_direction` (`down`/`up`, which way the loss/jitter
+  probe sampled); on runs that didn't - Ookla, and rows predating the fields -
+  the keys are omitted rather than sent empty
+- `GET /api/speed/runs.csv` - all runs as CSV. The same two fields are the
+  final columns, `ip_family` and `udp_direction`, appended at the end so
+  consumers indexing existing columns by position keep working; blank =
+  unrecorded
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
   best-of run (`ts` = the run's unix seconds): every candidate that was ranked,
@@ -1148,7 +1420,8 @@ constant memory.
 - `POST /api/quick-setup` - apply the first-run **Quick Setup** answer in ONE
   transaction (speedtest cadence, network access, update check, and an optional
   login) and mark it answered so the dialog never returns; `{dismiss:true}` marks
-  it answered without changing anything else. `auth_enabled` must agree with
+  it answered without changing anything else (once a login is active, dismissing
+  requires that login too). `auth_enabled` must agree with
   whether a `password` is sent, and it refuses (`403`) once a login is already
   configured - change access under Settings then. Fresh installs only; the offer
   is `quick_setup_pending` in `/api/status`
@@ -1177,8 +1450,8 @@ constant memory.
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 
 > All endpoints are **unauthenticated** by default; what protects a fresh
-> native install is the **Network access** filter starting off (localhost
-> only). Once you open network access for other devices or Prometheus, every
+> install - native or container, since 0.62 - is the **Network access** filter
+> starting off (localhost only). Once you open network access for other devices or Prometheus, every
 > device on the LAN can use every endpoint - the **Access** tab's **login**
 > (cookie for browsers, HTTP Basic for API/Prometheus) is the fix if that LAN
 > isn't fully trusted. Either way, the dashboard speaks plain HTTP: for
@@ -1204,11 +1477,15 @@ constant memory.
 >
 > **Legacy Docker volumes:** the database file is always owner-only, but a named
 > volume created by an *older* image may have a group/world-readable directory
-> root (Docker's volume copy-up loosens it), and Pingularity won't silently
-> re-lock a directory it can't prove is its own - so it logs a one-line notice on
-> start instead. The data is already private; to clear the notice, tighten the
-> directory once: `docker exec <container> chmod 700 /var/lib/pingularity`. Fresh
-> volumes are recognized automatically and need nothing.
+> root (Docker's volume copy-up loosens it). A volume first created by a 0.62+
+> image is recognized as the daemon's own - its path, its owner, and a marker
+> file the image plants - and re-tightened to `0700` at boot automatically. One
+> created by an older image carries no marker, and Pingularity won't silently
+> re-lock a directory it can't prove is its own - so it logs a one-line notice
+> on start instead. The data is already private; to clear the notice, tighten
+> the directory once from any container that can reach the volume (the default
+> image has no shell to `docker exec` into):
+> `docker run --rm -v pingularity-data:/data debian:13-slim chmod 700 /data`.
 >
 > The full picture - what the trust boundary is, what privilege each install
 > channel runs with, what the defaults protect and how to deploy it safely - is in

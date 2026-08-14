@@ -990,6 +990,13 @@ func uptimePayload(u store.Uptime) (ratios, coverage map[string]float64) {
 	return ratios, coverage
 }
 
+// bridgedContainerFn answers "does this daemon run in a container WITHOUT the
+// host's network namespace?" - the state where loopback addresses reach the
+// container itself, not the machine. Both the status banner and the settings
+// payload's bridged flag read it. A var so tests can stub the answer; production
+// always reads util.BridgedContainer.
+var bridgedContainerFn = util.BridgedContainer
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if s.status == nil { // not wired (only happens in misconfiguration/tests) - degrade, don't panic
@@ -1113,7 +1120,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// which is a different network entirely, not merely a hop further away.
 	// The dashboard has to say so, because the numbers look perfectly healthy
 	// either way. Only sent when true, so the common case costs nothing.
-	if util.BridgedContainer() {
+	if bridgedContainerFn() {
 		resp["bridged_container"] = true
 	}
 	// The current access mode, so Quick Setup can default its access choice to
@@ -1464,11 +1471,14 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 	// the DB cursor open for minutes. Rearm on the header and every flushed row.
 	bump := exportDeadlineBumper(w, s.log)
 	bump()
+	// ip_family/udp_direction append at the END so consumers indexing existing
+	// columns by position keep working; blank = unrecorded (older rows, engines
+	// that don't report them), same absent-not-guessed rule as the JSON.
 	cw.Write([]string{"timestamp", "download_mbps", "upload_mbps", "ping_ms", "ping_best_ms", "jitter_ms",
 		"packet_loss_pct", "idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "healthy", "download_bytes", "upload_bytes",
 		"trigger", "engine", "server", "server_id", "isp", "isp_location",
 		"public_ipv4", "public_ipv6", "dns_server", "dns_provider", "dns_location",
-		"cf_colo", "exit_path"})
+		"cf_colo", "exit_path", "ip_family", "udp_direction"})
 	// Stream newest-first straight from a descending row iterator (no whole-history
 	// slice), flushing per row so back-pressure from a slow client bounds memory and
 	// the write deadline keeps advancing only while bytes actually move.
@@ -1494,6 +1504,9 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// non-IP values, so this is belt-and-suspenders and harmless for real IPs).
 			csvSafe(sp.PublicIPv4), csvSafe(sp.PublicIPv6), csvSafe(sp.DNSIP), csvSafe(sp.DNSProvider), csvSafe(sp.DNSLocation),
 			csvSafe(sp.CFColo), csvSafe(sp.ExitSummary),
+			// csvSafe despite the closed "4"/"6" and "down"/"up" enums: a crafted
+			// backup can implant arbitrary text in these TEXT columns.
+			csvSafe(sp.IPFamily), csvSafe(sp.UDPDirection),
 		})
 		cw.Flush()
 		bump()
@@ -2259,7 +2272,13 @@ type settingsDTO struct {
 	// Containerized reports whether the daemon runs inside a container. When iperf3 is
 	// unavailable it picks the right "how to enable" note: install the package (native)
 	// vs switch to the -iperf image variant (container, which has no package manager).
-	Containerized   bool         `json:"containerized"`
+	Containerized bool `json:"containerized"`
+	// Bridged (GET+POST) narrows Containerized: the container does NOT share the
+	// host's network namespace, so loopback addresses dial the container itself,
+	// not the machine. The UI's iperf3 localhost warning keys on THIS, not on
+	// Containerized - in a host-network container localhost IS the host and the
+	// warning would be wrong there.
+	Bridged         bool         `json:"bridged"`
 	CongestionAlgos []string     `json:"congestion_algos,omitempty"` // host's allowed TCP congestion algos (GET only, suggestions)
 	Defaults        *settingsDTO `json:"defaults,omitempty"`         // factory defaults (GET only)
 }
@@ -2407,10 +2426,24 @@ func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
 		return // 415/400 already written
 	}
 
-	// Decline: mark answered, change nothing else. No access mutation, so it is
-	// safe even with a login active - and it must be, or a dismissed dialog on
-	// an out-of-band-secured install could never close.
+	// Decline: mark answered, change nothing else. Reachable without a session
+	// only while NO login is active - an install secured out-of-band (with no
+	// daemon auth configured) must still be able to close the dialog. Once a
+	// login IS active, the marker is a persistent server-owned write like any
+	// other, and this endpoint is authExempt (the guard never checked), so it
+	// must carry the same credentials every gated endpoint needs - otherwise
+	// any unauthenticated LAN peer could permanently mark setup done and
+	// release the boot monitoring hold.
 	if in.Dismiss {
+		if s.settings.AuthActive() && !s.authed(r) {
+			// Same challenge discipline as the guard: offer Basic to CLI clients,
+			// never to the SPA (X-Pingularity-UI), which has its own login overlay.
+			if r.Header.Get("X-Pingularity-UI") == "" {
+				w.Header().Set("WWW-Authenticate", `Basic realm="pingularity"`)
+			}
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
 		if err := s.settings.ApplyQuickSetup(r.Context(), settings.QuickSetupAnswer{Dismiss: true}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -2527,6 +2560,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		out.Iperf3Available = speedtest.IperfAvailable()
 		out.Iperf3Version = speedtest.IperfVersion()
 		out.Containerized = s.InContainer
+		out.Bridged = bridgedContainerFn()
 		out.CongestionAlgos = speedtest.AvailableCongestionControl()
 		def := dtoFrom(s.settings.Defaults())
 		out.Defaults = &def
@@ -2649,6 +2683,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		out.Iperf3Available = speedtest.IperfAvailable()
 		out.Iperf3Version = speedtest.IperfVersion()
 		out.Containerized = s.InContainer
+		out.Bridged = bridgedContainerFn()                           // on save too, or applySettings would clear the loopback trap after every save
 		out.CongestionAlgos = speedtest.AvailableCongestionControl() // on save too, or the dropdown loses the host's algos
 		// Echo the server clock too (as GET does), or applySettings nulls the
 		// schedule "now" skew and the coverage marker falls back to browser time.
@@ -3407,7 +3442,20 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 					warnings = append(warnings, "This backup had login protection on, but backups never include "+
 						"the password, so login cannot be enforced. Access was set to this machine only, but "+caveat)
 				} else {
-					warnings = append(warnings, "This backup had login protection on, but backups never include the password. Login stays off AND access was restricted to this machine only - set a new password in the Access tab, then re-enable Network access.")
+					msg := "This backup had login protection on, but backups never include the password. Login stays off AND access was restricted to this machine only - set a new password in the Access tab, then re-enable Network access."
+					// In a container "this machine" is the container: a bridged
+					// container's published port now answers 403 - including to the
+					// browser that ran this restore - so "the Access tab" may be
+					// unreachable advice, and the distroless image has no shell to
+					// repair the stored setting from. Say the way back in: an
+					// explicit access choice at start overrides the stored one
+					// (reconcileAccess in main, authoritative since 0.62).
+					if s.InContainer {
+						msg += " This daemon runs in a container: if that just locked you out (pages now answer 403), " +
+							"restart the container with -e PINGULARITY_ACCESS=network - an explicit access choice at " +
+							"start overrides the stored setting - then set things right in the Access tab."
+					}
+					warnings = append(warnings, msg)
 				}
 			} else if caveat != "" {
 				warnings = append(warnings, "This backup had login protection on, but backups never include the "+

@@ -2,6 +2,7 @@ package settings
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -251,6 +252,32 @@ func TestEnsureQuickSetupOffer(t *testing.T) {
 		}
 		if since := c.QuickSetupOfferSince(ctx); since != now {
 			t.Fatalf("second boot moved the clock: %d, want %d", since, now)
+		}
+	})
+
+	t.Run("a transient offer-clock read error takes no decision", func(t *testing.T) {
+		// The store holds a mid-countdown offer clock, but its boot read fails
+		// transiently (the history reads before it succeeded, so the est gate
+		// can't catch this). The masked read (QuickSetupOfferSince) returns 0 -
+		// "never seeded" - and would rewrite the clock to now, restarting the
+		// 48h consent countdown off one failed read. The contract: a read error
+		// takes NO decision and makes NO write; seedOfferClock takes the read
+		// RESULT so the failing read can be staged (the concrete store can't
+		// fail one read while the ones just before it succeed).
+		c := open(t)
+		past := now - 1000
+		if err := c.store.SetSetting(ctx, keyQuickSetupOffer, strconv.FormatInt(past, 10)); err != nil {
+			t.Fatal(err)
+		}
+		rerr := errors.New("transient settings read failure")
+		if err := c.seedOfferClock(ctx, 0, rerr, now); !errors.Is(err, rerr) {
+			t.Fatalf("seedOfferClock = %v, want the read error surfaced", err)
+		}
+		if since := c.QuickSetupOfferSince(ctx); since != past {
+			t.Fatalf("offer clock = %d, want untouched %d (a failed read must not restart the countdown)", since, past)
+		}
+		if c.QuickSetupDone() {
+			t.Fatal("a failed read must not answer the offer")
 		}
 	})
 }

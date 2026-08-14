@@ -491,8 +491,13 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		// nil bytes = direction not measured (iperf3 best-effort partial), so it
 		// reads as "unknown", not a real 0, in the chart/table/thresholds.
 		PacketLoss: res.PacketLoss, DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
-		Trigger:         reason,
-		Engine:          res.Engine,
+		Trigger: reason,
+		Engine:  res.Engine,
+		// Empty stays empty (stored NULL-equivalent, absent in the API): a run
+		// that didn't record the family or probe direction must read as unknown,
+		// never as a guessed value.
+		IPFamily:        res.IPFamily,
+		UDPDirection:    res.UDPDirection,
 		PingBestMS:      res.PingBestMS,
 		IdleMS:          res.IdleMS,
 		LoadedDownMS:    res.LoadedDownMS,

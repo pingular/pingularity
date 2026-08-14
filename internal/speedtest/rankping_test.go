@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,5 +101,164 @@ func TestRankedServersDropsUnreachableStaleLatency(t *testing.T) {
 			ids = append(ids, fmt.Sprintf("%s(%v)", s.ID, s.Latency))
 		}
 		t.Fatalf("reachable must rank first; a failed ping's stale 1ms must not win. order=%v", ids)
+	}
+}
+
+// ---- Lazy reserves ----------------------------------------------------------
+//
+// rankedServers keeps a reserve list past the candidate cap so fallback
+// exclusions can be replenished - but the reserves must cost third-party
+// traffic ONLY when the pool actually comes up short. Pinging and probing them
+// unconditionally roughly doubled every selection pass's fan-out for nothing.
+
+// rankContacts records which server IDs the ranking phase actually contacted,
+// on either channel (the ranking ping or the fallback health probe).
+type rankContacts struct {
+	mu     sync.Mutex
+	pinged map[string]bool
+	probed map[string]bool
+}
+
+func (c *rankContacts) contacted(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pinged[id] || c.probed[id]
+}
+
+func (c *rankContacts) contactedIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	set := map[string]bool{}
+	for id := range c.pinged {
+		set[id] = true
+	}
+	for id := range c.probed {
+		set[id] = true
+	}
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// stubRankContacts swaps the ranking ping and the health oracle for recording
+// fakes: every pinged server answers (latency tracks distance, so the ranked
+// order is deterministic), and health comes from the given table (default OK).
+func stubRankContacts(t *testing.T, health map[string]endpointState) *rankContacts {
+	t.Helper()
+	rc := &rankContacts{pinged: map[string]bool{}, probed: map[string]bool{}}
+	oldPing, oldHealth := ooklaPing, fallbackHealth
+	ooklaPing = func(_ context.Context, s *ookla.Server, cb func(time.Duration)) error {
+		rc.mu.Lock()
+		rc.pinged[s.ID] = true
+		rc.mu.Unlock()
+		lat := time.Duration(s.Distance) * time.Millisecond
+		s.Latency = lat
+		cb(lat)
+		return nil
+	}
+	fallbackHealth = func(_ context.Context, s *ookla.Server) endpointState {
+		rc.mu.Lock()
+		rc.probed[s.ID] = true
+		rc.mu.Unlock()
+		if st, ok := health[s.ID]; ok {
+			return st
+		}
+		return endpointOK
+	}
+	t.Cleanup(func() { ooklaPing, fallbackHealth = oldPing, oldHealth })
+	return rc
+}
+
+// lazyFleet builds n servers with unique sponsors at 1..n km, so autoCandidates
+// takes the nearest autoPingMax as the pool (all within the distance margin)
+// and the rest become reserves, nearest-first: s00..s11 pool, s12.. reserve.
+func lazyFleet(n int) ookla.Servers {
+	out := make(ookla.Servers, 0, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("s%02d", i)
+		out = append(out, &ookla.Server{ID: id, Sponsor: "Sp" + id, Name: "N" + id,
+			Distance: float64(i + 1), URL: "http://" + id + ".example:8080/speedtest/upload.php"})
+	}
+	return out
+}
+
+// A healthy pool must generate ZERO reserve traffic: nothing was excluded, so
+// there is nothing to replenish and no reason to contact anyone past the cap.
+func TestRankedServersHealthyPoolContactsNoReserves(t *testing.T) {
+	rc := stubRankContacts(t, nil)
+	servers := lazyFleet(20)
+
+	ranked, _, dropped, allDead := rankedServers(context.Background(), servers, "")
+	if len(ranked) != autoPingMax || len(dropped) != 0 || allDead {
+		t.Fatalf("healthy pool: ranked=%d dropped=%v allDead=%v, want %d/none/false",
+			len(ranked), dropped, allDead, autoPingMax)
+	}
+	for i := autoPingMax; i < len(servers); i++ {
+		if id := fmt.Sprintf("s%02d", i); rc.contacted(id) {
+			t.Errorf("reserve %s was contacted although the pool needed no replenishing (contacted: %v)",
+				id, rc.contactedIDs())
+		}
+	}
+	for i := 0; i < autoPingMax; i++ {
+		if id := fmt.Sprintf("s%02d", i); !rc.contacted(id) {
+			t.Errorf("pool member %s was never contacted", id)
+		}
+	}
+}
+
+// N exclusions must contact only the N reserves needed to refill the pool -
+// not the whole reserve list.
+func TestRankedServersReplenishContactsOnlyNeededReserves(t *testing.T) {
+	rc := stubRankContacts(t, map[string]endpointState{
+		"s03": endpointRetired, "s07": endpointRetired,
+	})
+	servers := lazyFleet(20)
+
+	ranked, _, dropped, _ := rankedServers(context.Background(), servers, "")
+	got := fbIDs(ranked)
+	if len(got) != autoPingMax {
+		t.Fatalf("pool not replenished to size: %v", got)
+	}
+	if fbContains(got, "s03") || fbContains(got, "s07") {
+		t.Fatalf("ranked an excluded server: %v", got)
+	}
+	if !fbContains(got, "s12") || !fbContains(got, "s13") {
+		t.Fatalf("the two nearest reserves must refill the two exclusions: %v", got)
+	}
+	if len(dropped) != 2 || !fbContains(dropped, "s03") || !fbContains(dropped, "s07") {
+		t.Fatalf("dropped = %v, want the two pool exclusions", dropped)
+	}
+	for i := 14; i < len(servers); i++ {
+		if id := fmt.Sprintf("s%02d", i); rc.contacted(id) {
+			t.Errorf("2 exclusions contacted reserve %s beyond the 2 needed (contacted: %v)",
+				id, rc.contactedIDs())
+		}
+	}
+}
+
+// A dead reserve widens the next batch by exactly one - the phase keeps
+// contacting only what the shortfall still needs.
+func TestRankedServersReserveBatchesChain(t *testing.T) {
+	rc := stubRankContacts(t, map[string]endpointState{
+		"s03": endpointRetired, "s12": endpointRetired,
+	})
+	servers := lazyFleet(20)
+
+	ranked, _, _, _ := rankedServers(context.Background(), servers, "")
+	got := fbIDs(ranked)
+	if fbContains(got, "s12") || !fbContains(got, "s13") {
+		t.Fatalf("a dead reserve must be passed over for the next one: %v", got)
+	}
+	if !rc.contacted("s13") {
+		t.Fatal("the follow-up batch never ran; the pool stayed short")
+	}
+	for i := 14; i < len(servers); i++ {
+		if id := fmt.Sprintf("s%02d", i); rc.contacted(id) {
+			t.Errorf("contacted reserve %s beyond the chained shortfall (contacted: %v)",
+				id, rc.contactedIDs())
+		}
 	}
 }

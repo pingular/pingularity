@@ -67,6 +67,10 @@ const DEFS = {
   pkcs1FlagUsable: 'function pkcs1FlagUsable', pkcs1BoxState: 'function pkcs1BoxState',
   qsUseNote: 'function qsUseNote',
   iperfPwOrphan: 'function iperfPwOrphan',
+  famLabel: 'function famLabel', udpDirLabel: 'function udpDirLabel',
+  udpDirTitle: 'function udpDirTitle',
+  congestionContainerHint: 'function congestionContainerHint',
+  loopbackHost: 'function loopbackHost',
 };
 const NAMES = Object.keys(DEFS);
 const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
@@ -2496,27 +2500,67 @@ test('mapIperfServer remembers the saved-password state independently', () => {
 // fallback_ok is three-state and the third state is the common one: the daemon
 // probes concurrently under a short budget, so a cold list legitimately arrives
 // partly unverified. Only an explicit false may be labelled; undefined must look
-// exactly like a healthy row, or every slow list would read as broken.
-test('picker labels only servers proven to have no fallback', () => {
-  const rows = [
-    { id: '1', sponsor: 'Good', name: 'A', fallback_ok: true },
-    { id: '2', sponsor: 'Dead', name: 'B', fallback_ok: false },
-    { id: '3', sponsor: 'Unknown', name: 'C' },
-  ];
-  const unusable = s => s.fallback_ok === false;
-  const label = s => `${s.sponsor} - ${s.name}` + (unusable(s) ? ' - unavailable (no speedtest endpoint)' : '');
+// exactly like a healthy row - UNLESS an earlier response already proved the
+// server broken, in which case the serverHealth memory keeps the warning (F9).
+// This drives the REAL rememberServerHealth/annotateOption/populateServers
+// chain out of index.html through a sequence of /servers responses, returning
+// the dropdown rows the LAST response built.
+function driveServerPicker(responseSeq) {
+  const defs = extract('function rememberServerHealth') + '\n' + extract('function annotateOption') + '\n'
+    + extract('const serverOptionText') + '\n' + extract('function populateServers');
+  const rows = [];
+  const sel = { set innerHTML(v) { rows.length = 0; }, appendChild(o) { rows.push(o); } };
+  const doc = { createElement: () => ({ dataset: {}, textContent: '' }) };
+  const populate = new Function('$', 'document', 'serverHealth', 'autoText', 'applyPendingServer', 'updateScopeNote',
+    defs + '\nreturn populateServers;')(() => sel, doc, new Map(), () => 'Auto', () => {}, () => {});
+  for (const list of responseSeq) populate(list);
+  return rows; // rows[0] is the Auto option
+}
 
-  assert.equal(label(rows[0]), 'Good - A');
-  assert.equal(label(rows[1]), 'Dead - B - unavailable (no speedtest endpoint)');
-  assert.equal(label(rows[2]), 'Unknown - C', 'an undetermined server must not be labelled unavailable');
+const UNAVAIL = / - unavailable \(no speedtest endpoint\)$/;
+
+test('picker labels only servers proven to have no fallback', () => {
+  const rows = driveServerPicker([[
+    { id: 1, sponsor: 'Good', name: 'A', fallback_ok: true },
+    { id: 2, sponsor: 'Dead', name: 'B', fallback_ok: false },
+    { id: 3, sponsor: 'Unknown', name: 'C' },
+  ]]);
+  assert.equal(rows[1].textContent, 'Good - A');
+  assert.match(rows[2].textContent, UNAVAIL);
+  assert.equal(rows[2].dataset.unusable, '1');
+  assert.equal(rows[3].textContent, 'Unknown - C', 'an undetermined server must not be labelled unavailable');
+});
+
+// F9 regression: the daemon's annotate budget can expire (or its verdict cache
+// lapse) on a LATER fetch, returning a previously-proven-broken server with no
+// fallback_ok at all. The rebuilt row must keep the remembered warning, or the
+// user pins a server that fails every run.
+test('a proven-broken server keeps its warning when a later listing is undetermined', () => {
+  const rows = driveServerPicker([
+    [{ id: 5, sponsor: 'Dead', name: 'B', fallback_ok: false }],
+    [{ id: 5, sponsor: 'Dead', name: 'B' }],   // the verdict aged out of the response
+  ]);
+  assert.match(rows[1].textContent, UNAVAIL, 'the remembered false verdict must survive a refetch');
+  assert.equal(rows[1].dataset.unusable, '1');
+});
+
+// ...and the memory must not win the other way: a fresh verdict beats a stale one.
+test('a fresh healthy verdict clears a stale remembered warning', () => {
+  const rows = driveServerPicker([
+    [{ id: 5, sponsor: 'S', name: 'X', fallback_ok: false }],
+    [{ id: 5, sponsor: 'S', name: 'X', fallback_ok: true }],   // repaired since
+  ]);
+  assert.equal(rows[1].textContent, 'S - X');
+  assert.equal(rows[1].dataset.unusable, undefined);
 });
 
 // The guard governs automatic selection only. A labelled server stays
-// selectable, so a user who wants it can still pin it.
+// selectable, so a user who wants it can still pin it. The block spans
+// annotateOption (the single labelling path) through the end of populateServers.
 test('an unavailable server is labelled but never disabled', () => {
-  const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
-  const block = html.slice(html.indexOf('function populateServers'), html.indexOf('applyPendingServer(); updateScopeNote();'));
+  const block = html.slice(html.indexOf('function annotateOption'), html.indexOf('applyPendingServer(); updateScopeNote();'));
   assert.match(block, /unavailable \(no speedtest endpoint\)/, 'the label must be applied');
+  assert.match(block, /annotateOption\(o, s\.id\)/, 'every rebuilt row must consult the serverHealth memory');
   assert.doesNotMatch(block, /o\.disabled\s*=\s*true/, 'disabling would block an explicit pin the daemon honours');
 });
 
@@ -2554,4 +2598,142 @@ test('applyPendingServer resolves an unseen pin with POST+JSON, not a bare GET',
 test('applyPendingServer does not re-fetch a pin whose health is already known', () => {
   const calls = driveApplyPendingServer({ pendingServer: '77', seen: ['77'] });
   assert.equal(calls.length, 0, 'a known verdict must not re-issue the by-ID lookup');
+});
+
+// --- container-awareness surfaces (I1/I5/I8/I9) ------------------------------
+// I5: family "auto" resolves invisibly - a dual-stack native host measures IPv6
+// where an IPv6-less bridge silently measures IPv4 - so a recorded family is
+// named in the detailed run views, and an unrecorded one shows NOTHING (older
+// rows / engines that never captured it must not be guessed at).
+test('famLabel: names only a recorded family', () => {
+  assert.equal(F.famLabel('4'), 'IPv4');
+  assert.equal(F.famLabel('6'), 'IPv6');
+  assert.equal(F.famLabel(''), '');
+  assert.equal(F.famLabel(undefined), '');
+  assert.equal(F.famLabel('ipv6'), '', 'only the stored enum, never a lookalike');
+});
+
+// I9: which way the UDP loss/jitter probe sampled. Anything but the closed
+// down/up enum (older rows, Ookla, a crafted backup) yields no label at all.
+test('udpDirLabel / udpDirTitle: down/up -> path labels, anything else -> nothing', () => {
+  assert.equal(F.udpDirLabel('down'), 'download path');
+  assert.equal(F.udpDirLabel('up'), 'upload path');
+  assert.equal(F.udpDirLabel(''), '');
+  assert.equal(F.udpDirLabel(undefined), '');
+  assert.equal(F.udpDirTitle({ udp_direction: 'up' }), 'Loss/jitter probe: upload path');
+  assert.equal(F.udpDirTitle({}), '', 'no direction -> no tooltip attribute at all');
+});
+
+// qualityParts needs lossStr (a brace-less arrow const), so it is compiled with
+// its real dependencies rather than through the shared factory.
+const qualityParts = new Function(script.match(/const lossStr = [^;]*;/)[0] + '\n'
+  + extract('function udpDirLabel') + '\n' + extract('function qualityParts')
+  + '\nreturn qualityParts;')();
+
+test('the tooltip labels loss/jitter with the probed direction ONLY when the sample carries one', () => {
+  const parts = qualityParts({ ping_ms: 4.5, jitter_ms: 0.4, packet_loss: 0.5, udp_direction: 'down' });
+  assert.ok(parts.includes('probed on the download path'), 'a recorded direction must be spoken: ' + parts);
+  assert.ok(qualityParts({ packet_loss: 1.2, udp_direction: 'up' }).includes('probed on the upload path'));
+  const bare = qualityParts({ ping_ms: 4.5, jitter_ms: 0.4, packet_loss: 0.5 });
+  assert.ok(!bare.some(p => /path/.test(p)), 'no recorded direction -> no label (older rows stay unlabelled)');
+  const pingOnly = qualityParts({ ping_ms: 4.5, udp_direction: 'up' });
+  assert.ok(!pingOnly.some(p => /path/.test(p)), 'a direction without loss/jitter shown would label nothing the probe measured');
+});
+
+// The helpers must actually be consumed where runs are detailed, or the labels
+// exist only in tests.
+test('the run tooltip and the runs table consume the family/direction helpers', () => {
+  const tip = extract('function runTip');
+  assert.match(tip, /famLabel\(p\.ip_family\)/, 'the tooltip must name the measured family');
+  assert.match(tip, /qualityParts\(p\)/, 'the tooltip quality line must ride the labelled builder');
+  const runs = extract('async function loadRuns');
+  assert.match(runs, /famLabel\(r\.ip_family\)/, 'the runs table must name the measured family');
+  assert.match(runs, /udpDirTitle\(r\)/, 'the loss/jitter cells must carry the probe-direction tooltip');
+  const tiles = extract('function setSpeedTiles');
+  assert.match(tiles, /udpDirLabel\(sp\.udp_direction\)/, 'the jitter/loss tiles must carry the probe-direction tooltip');
+});
+
+// I8: a bridged container cannot read the host's allowed-congestion list
+// (/proc/sys/net/ipv4/tcp_allowed_congestion_control is init-netns-only), so an
+// empty suggestions list there gets an explanation. Natively an empty list is a
+// real answer, a populated list needs no hint, and an older daemon that never
+// sends the containerized flag must not hint either.
+test('congestion hint: exactly the empty-list-inside-a-container state', () => {
+  assert.equal(F.congestionContainerHint([], true), true);
+  assert.equal(F.congestionContainerHint(undefined, true), true);
+  assert.equal(F.congestionContainerHint(['cubic', 'bbr'], true), false);
+  assert.equal(F.congestionContainerHint([], false), false);
+  assert.equal(F.congestionContainerHint([], undefined), false, 'absent flag must mean no hint, not truthy-by-accident');
+});
+
+test('the congestion hint has a note element and repaints with the engine UI', () => {
+  assert.match(html, /id="congestionContainerNote"/, 'hint element missing from the markup');
+  assert.match(extract('function updateEngineUI'), /updateCongestionHint\(\)/, 'engine changes must repaint the hint');
+  assert.match(extract('function updateCongestionHint'), /congestionContainerHint\(congestionAlgosList, iperfInContainer\)/,
+    'the DOM toggle must ride the tested predicate');
+});
+
+// I1: inside a BRIDGED container 127.0.0.1/localhost is the CONTAINER itself,
+// so a loopback iperf3 target dials itself and gets "connection refused" with
+// no explanation. The host must be judged with the port split off first.
+test('loopbackHost: 127/8, ::1 and localhost in every host:port shape', () => {
+  for (const a of ['localhost', 'LOCALHOST:5201', '127.0.0.1', '127.0.0.1:5201', '127.255.0.7', '[::1]', '[::1]:5201', '::1'])
+    assert.equal(F.loopbackHost(a), true, a + ' must read as loopback');
+  for (const a of ['192.168.1.10:5201', 'host.docker.internal', 'iperf.example:5201', '[2001:db8::1]:5201', '2001:db8::1', '127.example.com', 'mylocalhost', ''])
+    assert.equal(F.loopbackHost(a), false, a + ' must NOT read as loopback');
+});
+
+// iperfLoopbackTrap reads the page globals, so it is compiled with injected ones.
+function driveLoopbackTrap(servers, bridged) {
+  return new Function('iperfServers', 'iperfBridged',
+    extract('function loopbackHost') + '\n' + extract('function iperfLoopbackTrap')
+    + '\nreturn iperfLoopbackTrap;')(servers, bridged)();
+}
+
+test('the loopback trap fires only in a BRIDGED container, skips deleted rows, and warns without blocking Save', () => {
+  const lo = { addr: '127.0.0.1:5201', label: '' };
+  assert.ok(driveLoopbackTrap([lo], true), 'loopback + bridged container = trap');
+  assert.equal(driveLoopbackTrap([lo], false), null,
+    'not bridged (native OR host-network container, where localhost IS the host) - a loopback target is legitimate');
+  assert.equal(driveLoopbackTrap([{ ...lo, _del: true }], true), null, 'a row being deleted is not a trap');
+  assert.equal(driveLoopbackTrap([{ addr: 'lan.box:5201' }], true), null);
+  assert.match(html, /id="iperfLoopbackWarn"/, 'the warn bubble markup must exist');
+  assert.match(extract('function renderIperfServers'), /updateIperfLoopbackWarn\(\)/,
+    'the live bubble must follow every list change');
+  // Save-time: the warning is spoken AFTER the successful POST - the save is
+  // never gated on it (a loopback target must still save).
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  const post = save.indexOf("fetch('api/settings'");
+  const trap = save.indexOf('iperfLoopbackTrap()');
+  assert.ok(post >= 0 && trap > post, 'the loopback check must sit in the success path, not block the save');
+});
+
+// M5: the trap must key on the settings payload's BRIDGED flag, never on the
+// broader containerized one - in a host-network container the containerized
+// flag is true but localhost IS the host, so keying on it warned about (and
+// after a save, toasted about) a configuration that works. The congestion-empty
+// hint is the opposite case and stays on containerized: the sysctl is readable
+// under host networking, so its list is populated there and the hint never
+// shows wrongly.
+test('bridged vs containerized: each hint keys on its own flag', () => {
+  const trapSrc = extract('function iperfLoopbackTrap');
+  assert.match(trapSrc, /iperfBridged/, 'the trap must read the bridged flag');
+  assert.doesNotMatch(trapSrc, /iperfInContainer/, 'the trap must not key on merely-containerized');
+  assert.match(extract('function applySettings'), /iperfBridged\s*=\s*s\.bridged === true/,
+    'applySettings must wire iperfBridged from the settings payload\'s bridged flag');
+  assert.match(extract('function updateCongestionHint'), /iperfInContainer/,
+    'the congestion hint stays keyed on containerized');
+  // The bubble and the post-save toast both name the failing setup precisely.
+  assert.match(html.match(/id="iperfLoopbackWarn"[^]*?<\/div>/)[0], /bridged container/,
+    'the warn bubble must say BRIDGED container, not just container');
+});
+
+// M4: the old access model let a bridged container bypass local-only, and the
+// Access tab carried a "Local-only cannot be enforced in this container" bubble
+// for it. Local-only is enforced for everyone now (a container opts into
+// network reach with -access network at start), so that bubble is a false
+// claim and must be gone.
+test('the old cannot-enforce-local-only-in-a-container bubble is gone', () => {
+  assert.doesNotMatch(html, /localOnlyContainerNote/, 'dead old-access-model bubble still present');
+  assert.doesNotMatch(html, /cannot be enforced in this container/i, 'old-access-model wording still present');
 });

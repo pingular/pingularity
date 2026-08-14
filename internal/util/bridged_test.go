@@ -20,9 +20,21 @@ func TestSharesHostNet(t *testing.T) {
 		{"host: a user-defined bridge", []string{"eth0", "br-9a1f2c3d", "lo"}, true},
 		{"host: a container veth pair end", []string{"eth0", "veth1a2b3c", "lo"}, true},
 		{"host: a CNI bridge", []string{"eth0", "cni-podman0", "lo"}, true},
+		// CNI host-side names: a hostNetwork k8s pod on these clusters must not
+		// read as bridged (false banner, wrong access default).
+		{"host: flannel bridge cni0", []string{"eth0", "cni0", "lo"}, true},
+		{"host: calico per-pod veth end", []string{"eth0", "cali1a2b3c4d5e6", "lo"}, true},
+		{"host: calico vxlan device", []string{"eth0", "vxlan.calico", "lo"}, true},
+		{"host: cilium devices", []string{"eth0", "cilium_host", "cilium_net", "lo"}, true},
+		{"host: flannel vxlan device", []string{"eth0", "flannel.1", "lo"}, true},
 		// Bridged / isolated: only the container's own eth0 (+ lo). NONE of these
 		// may be classified host-net, or the published port 403s with no way in.
 		{"bridged: docker default pool", []string{"eth0", "lo"}, false},
+		// tunl0 is an ipip FALLBACK device, created in every network namespace
+		// once the module loads - a bridged pod on a Calico IPIP node sees it in
+		// its own namespace. It must never count as a host tell, or exactly those
+		// pods would default loopback-only and lock themselves out.
+		{"bridged: pod on a Calico IPIP node sees tunl0", []string{"eth0", "tunl0", "lo"}, false},
 		{"bridged: custom subnet (old design locked this out)", []string{"eth0", "lo"}, false},
 		{"bridged: attached to two user networks (multi-eth)", []string{"eth0", "eth1", "lo"}, false},
 		{"host-net with only one NIC, no bridge up yet (over-expose, never lock out)", []string{"ens0", "lo"}, false},

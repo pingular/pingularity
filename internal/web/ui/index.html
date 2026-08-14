@@ -1604,6 +1604,10 @@
           <div class="iperf-list" id="iperfServerList"></div>
           <div class="iperf-list-actions"><button class="btn sm" id="iperfAddBtn" type="button">+ Add server</button></div>
           <span class="muted" id="iperfMsg" style="font-size:12px;min-height:1em"></span>
+          <!-- I1: never blocks Save - a loopback target is legitimate natively and the
+               operator may know better; the bubble only explains why it will refuse
+               connections from a bridged container. Toggled by updateIperfLoopbackWarn. -->
+          <div class="warn-bubble" id="iperfLoopbackWarn"><span class="wi">⚠&#xFE0E;</span><span><b id="iperfLoopbackName">A saved server</b> points at <b>localhost</b>, and this daemon runs in a <b>bridged container</b> - there, 127.0.0.1/localhost is the container itself, not the machine running your iperf3 server, so tests will fail with “connection refused”. Use the host's LAN IP (or <span class="mono">host.docker.internal</span> - built into Docker Desktop, and the canonical compose file maps it on Linux engines too), or run the container with host networking.</span></div>
         </div>
         <div class="srow-wide hidden iperf-editor" id="iperfEditor">
           <div class="iperf-editor-head"><span class="lbl" id="iperfEditTitle">Edit server</span>
@@ -1713,6 +1717,9 @@
 • An unavailable one fails the test and can crash old iperf3 servers.
 • Auto = system default.">i</span></span>
           <span class="ctl"><select id="setIperfCongestion"><option value="">Auto</option></select><span class="unit"></span></span></label>
+        <!-- Shown by updateCongestionHint (NOT class iperf-opt: updateEngineUI's blanket
+             iperf-opt toggle would un-hide it whenever iperf3 is selected, natively too). -->
+        <div class="info-note hidden" id="congestionContainerNote"><span class="wi">ℹ&#xFE0E;</span><span class="sub">No suggestions: this daemon runs in a container, which cannot see the host's allowed-algorithm list (it lives in the host's network namespace). A saved algorithm is still passed to iperf3 unchanged.</span></div>
         <label class="srow iperf-opt"><span class="lbl">DSCP marking
           <span class="info" tabindex="0" data-tip="DSCP value (--dscp) on test packets.
 • 0-63, or a name like ef, cs5, af11.
@@ -1977,7 +1984,6 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
         </div>
         <div class="access-urls" id="accessUrls"></div>
         <div class="warn-bubble" id="localOnlyWarn"><span class="wi">⚠&#xFE0E;</span><span>Turning off <b>Network access</b> from another device will <b>cut your own access</b> once you Save - do it from the machine running Pingularity.</span></div>
-        <div class="warn-bubble" id="localOnlyContainerNote"><span class="wi">⚠&#xFE0E;</span><span><b>Local-only cannot be enforced in this container</b> - the dashboard stays reachable from the network. Restrict it via how you publish the port (<span class="mono">-p</span>) and require a login.</span></div>
         <div class="access-foot" id="accessFoot">
           <button class="btn ghost" id="logoutBtn" type="button">Log out</button>
           <span class="muted" id="resetHint">Forgot the password? Run <span class="mono">pingularity reset-auth</span> on the host to clear it and disable auth.</span>
@@ -4120,6 +4126,11 @@ function setSpeedTiles(sp){
   $('sp_ping').textContent = pingText(sp.ping_ms);
   $('sp_jitter').textContent = msStr(sp.jitter_ms);
   $('sp_loss').textContent = lossStr(sp.packet_loss);
+  // Both figures come from the one UDP pass, which samples ONE direction (an
+  // asymmetric path loses differently each way) - name it where the sample
+  // recorded it; clear the title otherwise so an old label can't outlive its run.
+  { const qd=udpDirLabel(sp.udp_direction);
+    $('sp_jitter').title = $('sp_loss').title = qd ? 'Probed on the '+qd : ''; }
   $('sp_bloat_dn').textContent = bloatDirText(sp.idle_ms, sp.loaded_down_ms);
   $('sp_bloat_up').textContent = bloatDirText(sp.idle_ms, sp.loaded_up_ms);
 }
@@ -5311,12 +5322,10 @@ function runTip(p){
   if(showEngine(p)) srv.push(esc(engOf(p)));
   if(p.server) srv.push(esc(p.server));
   if(p.server_id) srv.push('#'+esc(p.server_id));
+  if(famLabel(p.ip_family)) srv.push(famLabel(p.ip_family)); // the family the run measured; absent on rows that never recorded one
   if(srv.length) h+='<div class="tt-srv">'+srv.join(' · ')+'</div>';
   h+='<div class="tt-sec"><span class="tt-h">Speed</span>↓ '+(spMeasured(p,'down_mbps')?num1(p.down_mbps):'-')+' · ↑ '+(spMeasured(p,'up_mbps')?num1(p.up_mbps):'-')+' Mbps</div>';
-  const ext=[];
-  if(typeof p.ping_ms==='number') ext.push(p.ping_ms.toFixed(1)+' ms ping');
-  if(typeof p.jitter_ms==='number') ext.push(p.jitter_ms.toFixed(1)+' ms jitter');
-  if(typeof p.packet_loss==='number') ext.push(lossStr(p.packet_loss)+' loss'); // same 1-decimal readout as the card and runs table
+  const ext=qualityParts(p);
   if(ext.length) h+='<div class="tt-sec"><span class="tt-h">Quality</span>'+ext.join(' · ')+'</div>';
   const {dd,ud}=bloatDelta(p.idle_ms,p.loaded_down_ms,p.loaded_up_ms);
   const line=(arrow,loaded,mx,bloat)=>{ if(!isNum(loaded)) return null;
@@ -5407,6 +5416,30 @@ const num1 = v => (typeof v==='number'? v : 0).toFixed(1);
 // (iperf3 jitter is often ~0.01 ms); a true zero still reads "0.0".
 const lossStr = v => (typeof v==='number') ? (v>0&&v<0.1 ? '<0.1%' : v.toFixed(1)+'%') : '-';
 const msStr = v => (typeof v==='number') ? (v>0&&v<0.1 ? '<0.1 ms' : v.toFixed(1)+' ms') : '-';
+// The address family a run actually measured. Family "auto" resolves invisibly
+// (a dual-stack native host lands on IPv6 where a v4-only path silently measures
+// IPv4), so the detailed run views name it. '' = unrecorded (older rows, engines
+// that don't report it) - shown as nothing, never guessed.
+function famLabel(f){ return f==='6' ? 'IPv6' : f==='4' ? 'IPv4' : ''; }
+// Which way the UDP loss/jitter probe sampled. Loss on an asymmetric path
+// differs by direction, so surfaces showing loss/jitter carry this label - but
+// ONLY when the sample recorded one ('' otherwise: older rows, Ookla).
+function udpDirLabel(d){ return d==='down' ? 'download path' : d==='up' ? 'upload path' : ''; }
+// The run tooltip's Quality readouts. The probe-direction label rides along
+// exactly when the sample carries one AND something the probe measured
+// (jitter/loss) is shown - a ping-only run must not get a direction it has no
+// probe for.
+function qualityParts(p){
+  const ext=[];
+  if(typeof p.ping_ms==='number') ext.push(p.ping_ms.toFixed(1)+' ms ping');
+  if(typeof p.jitter_ms==='number') ext.push(p.jitter_ms.toFixed(1)+' ms jitter');
+  if(typeof p.packet_loss==='number') ext.push(lossStr(p.packet_loss)+' loss'); // same 1-decimal readout as the card and runs table
+  const dir=udpDirLabel(p.udp_direction);
+  if(dir && (typeof p.jitter_ms==='number' || typeof p.packet_loss==='number')) ext.push('probed on the '+dir);
+  return ext;
+}
+// title= for a runs-table loss/jitter cell ('' = no tooltip attribute at all).
+function udpDirTitle(p){ const d=udpDirLabel(p.udp_direction); return d ? 'Loss/jitter probe: '+d : ''; }
 // Bufferbloat: latency added under load, taken as the worse of the two
 // directional increases (loaded median minus idle).
 function bloatDelta(idle,down,up){
@@ -5454,12 +5487,12 @@ async function loadRuns(){
       <td class="mono">${spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
       <td class="mono">${spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
       <td class="mono">${num1(r.ping_ms)}</td>
-      <td class="mono">${msStr(r.jitter_ms)}</td>
-      <td class="mono">${lossStr(r.packet_loss)}</td>
+      <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${msStr(r.jitter_ms)}</td>
+      <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${lossStr(r.packet_loss)}</td>
       <td class="mono">${bloatCell(r.idle_ms, r.loaded_down_ms, r.loaded_up_ms)}</td>
       <td class="mono">${bytesStr(r.download_bytes)}</td>
       <td class="mono">${bytesStr(r.upload_bytes)}</td>
-      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}</td>
+      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}${famLabel(r.ip_family)?' <span class="muted">· '+famLabel(r.ip_family)+'</span>':''}</td>
       <td class="mono">${esc(r.server_id)}</td>
       <td>${esc(r.isp)}</td>
       <td>${esc(r.isp_location)}</td>
@@ -6110,13 +6143,14 @@ const serverOptionText = s => { return `${s.sponsor} - ${s.name}`+(s.country?`, 
 // the latency race and then fail every run. false = will fail. true = verified.
 // undefined = not determined - the daemon probes concurrently under a short
 // budget, so a cold list legitimately arrives partly unverified, and those rows
-// must look NORMAL rather than suspect.
-const serverUnusable = s => s.fallback_ok === false;
+// must look NORMAL rather than suspect - unless an earlier response already
+// proved the server broken (the serverHealth memory below keeps that verdict).
 // Verdicts seen so far, id -> fallback_ok. A saved pin is often OUTSIDE the
 // nearby browse page, in which case applyPendingServer synthesizes a bare
 // 'Server <id>' row - which previously dropped the unavailable warning for
 // exactly the server the user actually runs against. Remembering what we have
-// been told lets the synthesized row keep its annotation across repopulates.
+// been told lets every rebuilt row (and the synthesized pin row) keep its
+// annotation across repopulates.
 const serverHealth = new Map();
 function rememberServerHealth(list){
   for (const s of (list||[])) if (s && s.id !== undefined && s.fallback_ok !== undefined) serverHealth.set(String(s.id), s.fallback_ok);
@@ -6133,15 +6167,17 @@ function populateServers(list){
   const auto=document.createElement('option'); auto.value=''; auto.textContent=autoText(); sel.appendChild(auto);
   for(const s of (list||[])){ const o=document.createElement('option'); o.value=s.id;
     o.textContent=serverOptionText(s);
-    if (serverUnusable(s)){
-      // Labelled, not disabled. The guard governs AUTOMATIC selection; an
-      // explicit choice is the user's, and the daemon honours a pin regardless.
-      // Disabling would also strand anyone who already pinned this server in a
-      // disabled-but-selected state, since applyPendingServer restores the pin
-      // by assigning sel.value.
-      o.textContent += ' - unavailable (no speedtest endpoint)';
-      o.dataset.unusable = '1';
-    }
+    // The one labelling path: rememberServerHealth above already folded this
+    // response's verdicts into the memory (a fresh verdict overwrites a stale
+    // one), so annotating from the memory labels fresh fallback_ok:false rows
+    // AND keeps the warning on a server proven broken earlier that this
+    // response returns undetermined (the daemon's annotate budget expired or
+    // its cache lapsed). Labelled, not disabled: the guard governs AUTOMATIC
+    // selection; an explicit choice is the user's, and the daemon honours a pin
+    // regardless. Disabling would also strand anyone who already pinned this
+    // server in a disabled-but-selected state, since applyPendingServer
+    // restores the pin by assigning sel.value.
+    annotateOption(o, s.id);
     sel.appendChild(o); }
   applyPendingServer(); updateScopeNote();
 }
@@ -6422,6 +6458,19 @@ function populateCongestion(algos, current){
     +list.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
   sel.value=current;
 }
+// I8: /proc/sys/net/ipv4/tcp_allowed_congestion_control belongs to the INIT
+// network namespace, so a bridged container's daemon reads nothing and the
+// dropdown arrives with no suggestions - which without a word of explanation
+// reads as "this host supports no algorithms". Only that exact state gets the
+// hint: natively an empty list is a real answer, and a populated list needs none.
+function congestionContainerHint(algos, containerized){
+  return containerized===true && !(Array.isArray(algos)&&algos.length>0);
+}
+let congestionAlgosList=[]; // last GET/POST's congestion_algos (for the hint; the <select> holds saved-value extras too)
+function updateCongestionHint(){
+  const note=$('congestionContainerNote'); if(!note) return;
+  note.classList.toggle('hidden', !($('setSpeedEngine').checked && congestionContainerHint(congestionAlgosList, iperfInContainer)));
+}
 function applySettings(s){
   if(s.defaults) defaultSettings=s.defaults;
   setFields(s);
@@ -6443,6 +6492,7 @@ function applySettings(s){
   iperfAvailable = s.iperf3_available !== false;
   iperfVersion = s.iperf3_version || ''; // "" when absent/unparseable; drives the version note
   iperfInContainer = s.containerized === true; // picks the "how to enable iperf3" note: package vs -iperf image
+  iperfBridged = s.bridged === true; // keys the loopback-target trap: only a BRIDGED container's localhost is the container itself
   iperfWanted = (s.speed_engine==='iperf3');
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable;
   // Direction is per-engine now and loaded by setFields (setSpeedDirection / setIperfDirection).
@@ -6450,6 +6500,7 @@ function applySettings(s){
   // downloads depend on the server's kernel), plus an Auto default. setFields above
   // couldn't select the saved value yet (options weren't built); do it here.
   populateCongestion(s.congestion_algos, s.iperf_congestion);
+  congestionAlgosList = Array.isArray(s.congestion_algos) ? s.congestion_algos : []; // BEFORE updateEngineUI, which paints the hint off it
   // Saved iperf3 server list + the active selection (loaded before updateEngineUI,
   // which renders the picker).
   iperfServers = (Array.isArray(s.iperf_servers) ? s.iperf_servers.map(mapIperfServer) : []).map(sv=>{ sv._id=nextIperfId(); return sv; });
@@ -6560,6 +6611,7 @@ function updateEngineUI(){
   if(iperf) $('speedDataEst').classList.add('hidden'); else updateSpeedEstimate();
   updateUdpRateRow();
   updateLossProbeWarn();
+  updateCongestionHint();
   updateIperfAuthRows();
   renderIperfServers();
 }
@@ -6611,6 +6663,7 @@ let iperfHealth={};                  // addr -> 'on'|'off'|'loading' (reachabili
 let iperfAvailable=true;             // is the iperf3 binary on PATH (from GET settings)? drives the "not installed" note
 let iperfVersion='';                 // detected iperf3 version string (from GET settings), "" if absent/unparseable; drives the version note
 let iperfInContainer=false;          // is the daemon containerized (from GET settings)? in Docker the missing-iperf3 fix is the -iperf image, not a package install
+let iperfBridged=false;              // is the container's network namespace ISOLATED from the host's (from GET settings)? only then does a loopback target dial the container itself - with host networking localhost IS the host
 let iperfWanted=false;               // did the user choose iperf3 as the engine (even if it's unavailable and forced to Ookla)?
 let busyDeferSupported=true;         // can the daemon's host read interface counters for skip-when-busy? (from GET settings)
 function iperfDotTitle(st){ return st==='on'?'Reachable - click to recheck' : st==='off'?'Unreachable - click to retry' : st==='loading'?'Checking…' : 'Status unknown - click to check'; }
@@ -6642,6 +6695,33 @@ function activeIperfServer(){ return iperfServers.find(s=>s._id===iperfActiveId)
 // under, with no replacement password typed: saving now would orphan (destroy)
 // the stored credential. Deleted rows don't count - deletion is explicit.
 function iperfPwOrphan(){ return iperfServers.find(s=>!s._del && s.orig_has_password && s.addr!==s.orig_addr && !s.password)||null; }
+// I1: does this iperf3 address point at loopback (127/8, ::1, localhost)? Inside
+// a BRIDGED container that is the CONTAINER, not the machine the operator means -
+// the natural "iperf3 -s on this box" config dials itself and gets "connection
+// refused" with no explanation. A host-network container shares the host's
+// loopback, so there (as natively) the config is legitimate and must not warn.
+// Host only; the port is split off first ([v6]:port brackets, else one lone
+// colon - a bare IPv6 literal has several).
+function loopbackHost(addr){
+  let h=(addr||'').trim().toLowerCase();
+  const b=/^\[([^\]]*)\](?::\d*)?$/.exec(h);
+  if(b) h=b[1];
+  else { const i=h.lastIndexOf(':'); if(i>=0 && h.indexOf(':')===i) h=h.slice(0,i); }
+  return h==='localhost' || h==='::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+// The first live (non-deleted) server whose address is loopback while the daemon
+// is in a BRIDGED container; null natively, in a host-network container, or when
+// none is. Warn-only - never a save gate.
+function iperfLoopbackTrap(){
+  if(!iperfBridged) return null;
+  return iperfServers.find(s=>!s._del && loopbackHost(s.addr))||null;
+}
+function updateIperfLoopbackWarn(){
+  const w=$('iperfLoopbackWarn'); if(!w) return;
+  const trap=iperfLoopbackTrap();
+  if(trap) $('iperfLoopbackName').textContent = trap.label||trap.addr; // textContent: the name is operator input
+  w.classList.toggle('show', !!trap);
+}
 function editingIperfServer(){ return iperfServers.find(s=>s._id===iperfEditingId)||null; }
 // Lenient client check (the backend + tester validate strictly): non-empty, not
 // flag-shaped, no embedded whitespace. Good enough for instant feedback.
@@ -6692,6 +6772,7 @@ function renderIperfServers(){
   // per-addr cache stops a re-render from re-probing.
   if($('setSpeedEngine').checked && _drawer.classList.contains('open'))
     iperfServers.forEach(s=>{ if(iperfAddrValid(s.addr) && iperfHealth[s.addr]===undefined) probeIperf(s.addr); });
+  updateIperfLoopbackWarn(); // any list change can create or clear the loopback-in-container trap
   renderIperfEditor();
 }
 // Show the editor only while a server is being edited (and iperf3 is the engine). Reload
@@ -6810,6 +6891,7 @@ $('setIperfAddr').addEventListener('change', ()=>{
   iperfAddrOK();
   delete iperfHealth[s.addr]; // drop the old address's stale reachability
   s.addr=next; $('iperfMsg').textContent='';
+  updateIperfLoopbackWarn(); // the edit is applied live, so the warning must follow it live too
   const n=$('iperfServerList').querySelector('.iperf-card[data-id="'+s._id+'"] .iperf-card-name'); if(n) n.innerHTML=iperfCardName(s);
   refreshIperfDots(); probeIperf(next); // re-check the new address (no-op when blank/invalid)
   // The saved password is keyed to the stored address (orig_addr); if we've moved off it
@@ -7212,7 +7294,12 @@ let saveInFlight=false;
       themeAtOpen=document.documentElement.dataset.theme; brightAtOpen=parseInt($('setBrightness').value)||100; fadeAtOpen=parseInt($('setFade').value)||100;
       await loadAccess();          // refresh password state / overlay / logout
       savedBody=formSnapshot();
-      msg.textContent=''; closeDrawer(); refreshStatus(); }
+      msg.textContent=''; closeDrawer(); refreshStatus();
+      // I1, judged on the SAVED list (applySettings just re-baselined it): the save
+      // went through - a loopback target is never a gate - but the drawer is closing
+      // over the warn bubble, so the trap gets said out loud where the operator is.
+      { const lb=iperfLoopbackTrap();
+        if(lb) flashStatus('Saved - but '+(lb.label||lb.addr)+' points at localhost, which inside this bridged container is the container itself, not the machine running your iperf3 server. Use the host\'s LAN IP or host.docker.internal.'); } }
     // Access was POSTed first (and applied); if the settings POST fails, say so -
     // so Discard isn't mistaken for "nothing was saved".
     else msg.textContent=(await r.text())+' (access/security settings, if changed, were already applied)';
@@ -7348,10 +7435,10 @@ async function loadAccess(){
   $('setNetAccess').checked=!a.local_only;
   accessSavedLocalOnly=!!a.local_only; // the warn bubble is for PENDING cut-offs only, not the already-saved state
   $('localOnlyWarn').classList.remove('show');
-  // local_only_active is the ENFORCED state (mirrors auth_active): in a bridged
-  // container the loopback filter is inert, so tell the operator the truth
-  // instead of letting the saved toggle claim a restriction that isn't there.
-  $('localOnlyContainerNote').classList.toggle('show', !!a.local_only && !a.local_only_active);
+  // local_only is enforced whenever on - for everyone, containers included (a
+  // container opts into network reach explicitly, -access network at start), so
+  // the old cannot-enforce-in-a-container bubble is gone; the payload's
+  // local_only_active now always mirrors local_only and is not consulted here.
   accessLanUrls=a.lan_urls||[]; accessPort=a.port||'9000';
   renderAccessUrls();
   $('setAuthEnabled').checked=!!a.auth_enabled;

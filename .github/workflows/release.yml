@@ -139,18 +139,17 @@ jobs:
 
       # GoReleaser does NOT resolve the current tag with `git describe`: it reads
       # GORELEASER_CURRENT_TAG first (pinned on the Run GoReleaser step below to
-      # the guarded ref), else the HIGHEST version tag pointing at HEAD. On a
-      # commit carrying more than one tag those two disagree, so the env pin is
-      # what actually guarantees the publish uses the exact tag the guards
-      # approved. This assert stays as a cheap belt-and-suspenders check that HEAD
-      # is on the guarded tag; `git describe` only approximates GoReleaser's
-      # resolution, so treat the env pin above as the real guarantee, not this.
-      - name: Assert HEAD tag matches the ref
+      # the guarded ref), else the HIGHEST version tag pointing at HEAD. The env
+      # pin is what guarantees the publish uses the exact tag the guards
+      # approved; this assert is the belt-and-suspenders check that the
+      # checked-out HEAD actually carries that tag. Membership, not equality: a
+      # commit may legitimately carry several tags (the rc-to-stable promote
+      # cuts the stable tag on the same SHA as the final rc), so require
+      # GITHUB_REF_NAME to be AMONG the tags pointing at HEAD.
+      - name: Assert the pushed tag points at HEAD
         run: |
-          head_tag="$(git describe --exact-match --tags HEAD)" || {
-            echo "::error::HEAD is not on an exact tag; refusing to release"; exit 1; }
-          if [ "$head_tag" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::HEAD tag '$head_tag' != ref '${GITHUB_REF_NAME}'; the release would publish a different version than was guarded"
+          if ! git tag --points-at HEAD | grep -Fxq -- "${GITHUB_REF_NAME}"; then
+            echo "::error::tag '${GITHUB_REF_NAME}' does not point at HEAD (tags at HEAD: $(git tag --points-at HEAD | paste -sd ' ' - || true)); the release would publish a different commit than was guarded"
             exit 1
           fi
 
@@ -225,13 +224,52 @@ jobs:
       # file listed in checksums.txt (the .tar.gz/.zip archives and the .deb/.rpm
       # packages), so a consumer can run `gh attestation verify <file> --repo ...`
       # and prove it was built by THIS workflow from THIS commit. Signed with the
-      # OIDC id-token above - no long-lived key at rest.
-      #
-      # NOTE: this covers the release-page downloads. The GHCR image is not attested
-      # here (that needs its pushed manifest digest + push-to-registry); dockers_v2
-      # attaches an SBOM to the image, and image provenance can be layered on later
-      # by reading the digest out of dist/artifacts.json.
+      # OIDC id-token above - no long-lived key at rest. The GHCR images get the
+      # same treatment below, keyed on their pushed manifest digests.
       - name: Attest build provenance (release artifacts)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-checksums: dist/checksums.txt
+
+      # Image provenance needs the digest of what was actually PUSHED - the
+      # multi-arch index digest is minted by the registry, so it can only be read
+      # back, never precomputed. Resolve both variants' version tags ({{.Version}}
+      # is the tag minus the leading v, so this works on prerelease and stable
+      # alike; `latest`/`latest-iperf` are the same manifests when they exist).
+      # Fail closed on anything that does not parse as a digest: publishing an
+      # image without its attestation would be silent, and silent is the failure
+      # mode this step exists to remove.
+      - name: Resolve pushed image digests
+        id: image_digests
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          resolve() { # resolve <output-name> <image-ref>
+            digest=$(docker buildx imagetools inspect "$2" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            case "$digest" in
+              sha256:*) echo "$2 -> $digest"; echo "$1=$digest" >> "$GITHUB_OUTPUT" ;;
+              *) echo "::error::could not resolve the pushed digest for $2 (got '$digest'); refusing to skip its attestation"; exit 1 ;;
+            esac
+          }
+          resolve default "ghcr.io/pingular/pingularity:${version}"
+          resolve iperf   "ghcr.io/pingular/pingularity:${version}-iperf"
+
+      # subject-name + subject-digest is the image form the attestation store
+      # keys on, so `gh attestation verify oci://ghcr.io/pingular/pingularity:<tag>
+      # --repo pingular/pingularity` works for pulls. The action takes the BARE
+      # image name - the oci:// scheme belongs only to the verify CLI's syntax,
+      # and the action rejects it as an invalid image name. push-to-registry also
+      # attaches the attestation to GHCR itself (the login above is still live),
+      # so registry-side policy tooling can find it without the GitHub API.
+      - name: Attest build provenance (default image)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/pingular/pingularity
+          subject-digest: ${{ steps.image_digests.outputs.default }}
+          push-to-registry: true
+
+      - name: Attest build provenance (iperf image)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/pingular/pingularity
+          subject-digest: ${{ steps.image_digests.outputs.iperf }}
+          push-to-registry: true

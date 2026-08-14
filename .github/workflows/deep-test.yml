@@ -233,7 +233,10 @@ jobs:
           # (BuildKit sets TARGETPLATFORM=linux/amd64 on this amd64 runner).
           mkdir -p linux/amd64
           CGO_ENABLED=0 GOARCH=amd64 go build -o linux/amd64/pingularity .
-          docker build -t ghcr.io/pingular/pingularity:0.7.0 .
+          # `deep-test` is a purely local tag (never pushed): a version number
+          # here went stale the release after it was written and made the logs
+          # claim a version this build is not.
+          docker build -t ghcr.io/pingular/pingularity:deep-test .
 
       - name: arm64 image actually runs (the release is multi-arch; only amd64 was ever executed)
         run: |
@@ -257,6 +260,37 @@ jobs:
           docker rm -f ping-a64
           [ -n "$ok" ] || { echo "arm64 image never became ready"; exit 1; }
 
+      - name: image ships /var/lib/pingularity 0700 65532:65532 (exported image, BEFORE any run)
+        run: |
+          # The old form of this assertion read the volume AFTER the daemon ran,
+          # and the daemon tightens its own container data dir at boot (store.go)
+          # - so a 0755-shipping image passed anyway. Vacuous. docker create +
+          # export reads what the layers say before any process ever runs.
+          docker create --name perm-probe ghcr.io/pingular/pingularity:deep-test
+          docker export perm-probe -o image-rootfs.tar
+          docker rm perm-probe
+          python3 - image-rootfs.tar <<'EOF' 2>&1 | tee -a docker.log
+          import sys, tarfile
+          entries = {}
+          with tarfile.open(sys.argv[1]) as tf:
+              for e in tf:
+                  entries[e.name.lstrip("./").rstrip("/")] = e
+          failed = False
+          d = entries.get("var/lib/pingularity")
+          if d is None or not d.isdir():
+              print("/var/lib/pingularity missing from the exported image"); failed = True
+          else:
+              if d.mode & 0o7777 != 0o700:
+                  print(f"/var/lib/pingularity mode {oct(d.mode & 0o7777)}, want 0700"); failed = True
+              if (d.uid, d.gid) != (65532, 65532):
+                  print(f"/var/lib/pingularity owner {d.uid}:{d.gid}, want 65532:65532"); failed = True
+          if "var/lib/pingularity/.pingularity-image-dir" not in entries:
+              print("volume-lineage marker .pingularity-image-dir missing"); failed = True
+          if not failed:
+              print("exported image: /var/lib/pingularity 0700 65532:65532 with marker - as shipped")
+          sys.exit(1 if failed else 0)
+          EOF
+
       - name: host-mode docker run (the README command)
         run: |
           # See the launchd step for why failures are counted in a file.
@@ -265,25 +299,24 @@ jobs:
           code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" || echo FAIL; }
           {
             docker run -d --name ping-host --network=host --cap-add=NET_RAW \
-              -v pingularity-data:/var/lib/pingularity ghcr.io/pingular/pingularity:0.7.0
+              -v pingularity-data:/var/lib/pingularity ghcr.io/pingular/pingularity:deep-test
             for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9000/metrics >/dev/null 2>&1 && break; sleep 2; done
             m=$(code http://127.0.0.1:9000/metrics);    echo "metrics -> $m"
             st=$(code http://127.0.0.1:9000/api/status); echo "status  -> $st"
             [ "$m" = "200" ]  || note "host-mode /metrics returned $m, want 200"
             [ "$st" = "200" ] || note "host-mode /api/status returned $st, want 200"
-            # The image must ship its data directory owner-only. At 0755 the daemon
-            # spends every start telling the operator their data directory is too
-            # open and to use a dedicated one - which is the one this image made.
-            dperm=$(docker run --rm -v pingularity-data:/d alpine stat -c '%a' /d)
+            # The SHIPPED dir mode is proven on the exported image in the step
+            # above - measuring it here, post-run, would be vacuous because the
+            # daemon tightens its own dir at boot. What IS runtime behaviour is
+            # the database the daemon just created: it must be 0600.
             fperm=$(docker run --rm -v pingularity-data:/d alpine stat -c '%a' /d/pingularity.db)
-            echo "volume perms: dir=$dperm db=$fperm"
-            [ "$dperm" = "700" ] || note "container data dir is $dperm, want 700"
+            echo "volume perms: db=$fperm"
             [ "$fperm" = "600" ] || note "container database is $fperm, want 600"
             docker logs ping-host 2>&1 | grep -q "group/world-accessible" \
               && note "the daemon warned about its own data directory on startup"
             echo "--- container logs ---"; docker logs ping-host 2>&1 | tail -20
             docker rm -f ping-host
-          } 2>&1 | tee docker.log
+          } 2>&1 | tee -a docker.log
           n=$(wc -l < "$FAILS" | tr -d ' ')
           [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the host-mode run - see docker.log"; exit 1; }
 
@@ -305,7 +338,7 @@ jobs:
             cat > compose.yaml <<'EOF'
           services:
             pingularity:
-              image: ghcr.io/pingular/pingularity:0.7.0
+              image: ghcr.io/pingular/pingularity:deep-test
               container_name: pingularity
               network_mode: host
               environment:
@@ -402,7 +435,7 @@ jobs:
             # no distroless `nonroot` for, the /data COPY that gives the volume its
             # mode - would first surface in a user's release. The amd64 binary is
             # already staged at linux/amd64/pingularity by the build step above.
-            trap 'docker rm -fv ping-iperf ping-iperf-cmd ping-iperf-env >/dev/null 2>&1 || true' EXIT
+            trap 'docker rm -fv ping-iperf ping-iperf-cmd ping-iperf-env ping-iperf-run iperf-srv >/dev/null 2>&1 || true; docker network rm iperf-net >/dev/null 2>&1 || true' EXIT
             docker build -f Dockerfile.iperf -t ping-iperf .
             uid=$(docker run --rm --entrypoint id ping-iperf -u)
             perm=$(docker run --rm --entrypoint stat ping-iperf -c '%a' /var/lib/pingularity)
@@ -450,6 +483,53 @@ jobs:
             echo "--- iperf env-leg container logs (sentinel-filtered tail) ---"
             { grep -Fv 'DEEP_SECRET_SENTINEL' <<<"$elogs" || true; } | tail -15
             docker rm -fv ping-iperf-env
+            echo "--- real iperf3 speedtest: sidecar server, engine selected via the API ---"
+            # The engine needs a server, and the image itself carries iperf3, so
+            # the sidecar runs from the SAME image (--entrypoint iperf3 -s): no
+            # third-party image, and it doubles as proof the bundled binary works
+            # in server mode. A user-defined bridge network gives the daemon
+            # container DNS for the sidecar's name.
+            docker network create iperf-net
+            docker run -d --name iperf-srv --network iperf-net --entrypoint iperf3 ping-iperf -s
+            docker run -d --name ping-iperf-run --network iperf-net -p 9114:9000 -e PINGULARITY_ACCESS=network ping-iperf
+            for i in $(seq 1 15); do curl -fsS --max-time 3 http://127.0.0.1:9114/metrics >/dev/null 2>&1 && break; sleep 2; done
+            # quick_setup_done releases the first-run consent hold; the rest
+            # selects the engine and points it at the sidecar. The defaults
+            # already run both directions plus the UDP loss/jitter pass.
+            curl -fsS -X POST -H 'Content-Type: application/json' --max-time 10 \
+              -d '{"quick_setup_done":true,"speed_engine":"iperf3","iperf_server":"iperf-srv:5201"}' \
+              http://127.0.0.1:9114/api/settings >/dev/null || note "selecting the iperf3 engine via /api/settings failed"
+            # POST /api/speedtest runs the measurement synchronously and returns
+            # the stored sample (~5s per direction + the UDP pass; 180s is slack).
+            sample=$(curl -fsS -X POST -H 'Content-Type: application/json' --max-time 180 http://127.0.0.1:9114/api/speedtest || true)
+            echo "iperf3 sample: $sample"
+            printf '%s' "$sample" > iperf-sample.json
+            python3 - iperf-sample.json <<'EOF' || note "the iperf3 run did not produce a full sample (see lines above)"
+          import json, sys
+          try:
+              with open(sys.argv[1]) as f:
+                  s = json.load(f)
+          except Exception as e:
+              print(f"sample is not JSON: {e}"); sys.exit(1)
+          bad = False
+          if s.get("engine") != "iperf3":
+              print(f"engine = {s.get('engine')!r}, want 'iperf3'"); bad = True
+          for k in ("down_mbps", "up_mbps"):
+              if not isinstance(s.get(k), (int, float)) or s.get(k) <= 0:
+                  print(f"{k} = {s.get(k)!r}, want > 0"); bad = True
+          for k in ("jitter_ms", "packet_loss"):
+              if not isinstance(s.get(k), (int, float)):
+                  print(f"{k} = {s.get(k)!r}, want a number (the UDP pass measures it)"); bad = True
+          if s.get("udp_direction") not in ("down", "up"):
+              print(f"udp_direction = {s.get('udp_direction')!r}, want down|up"); bad = True
+          sys.exit(1 if bad else 0)
+          EOF
+            # ...and the sample must have LANDED, not just been returned: the
+            # history API is what the dashboard and exports read.
+            hist=$(curl -fsS --max-time 5 'http://127.0.0.1:9114/api/speed?mins=60' || echo '[]')
+            grep -Fq '"engine":"iperf3"' <<<"$hist" || note "no iperf3 sample landed in /api/speed history"
+            docker rm -fv ping-iperf-run iperf-srv
+            docker network rm iperf-net
           } 2>&1 | tee -a docker.log
           n=$(wc -l < "$FAILS" | tr -d ' ')
           [ "$n" -eq 0 ] || { echo "::error::$n assertion(s) failed in the iperf3 image - see docker.log"; exit 1; }

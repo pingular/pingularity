@@ -101,7 +101,9 @@ CREATE TABLE IF NOT EXISTS speed (
     loaded_up_ms   REAL,              -- ... during the upload phase
     loaded_down_p95_ms REAL,          -- p95 of the samples taken during the download phase
     loaded_up_p95_ms   REAL,          -- ... during the upload phase
-    engine             TEXT           -- test backend: ookla|iperf3 (NULL on old rows = ookla)
+    engine             TEXT,          -- test backend: ookla|iperf3 (NULL on old rows = ookla)
+    ip_family          TEXT,          -- address family the transfer actually used: 4|6 (NULL = unrecorded, never guessed)
+    udp_direction      TEXT           -- which way the UDP loss/jitter probe sampled: down|up (NULL = unrecorded)
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
@@ -247,6 +249,10 @@ var containerDataDir = "/var/lib/pingularity"
 // inContainerFn is util.InContainer, a var so tests can force either answer.
 var inContainerFn = util.InContainer
 
+// ownedByThisUserFn is osperm.OwnedByThisUser, a var so tests can model a
+// directory owned by another user (root:<fsGroup> on a PVC) without root.
+var ownedByThisUserFn = osperm.OwnedByThisUser
+
 // realDirNoSymlink reports whether path is an actual directory and not a
 // symlink - the carve-out must never chmod THROUGH a link (the pre-existence
 // probe above deliberately Lstats for the same reason).
@@ -267,6 +273,34 @@ func realDirNoSymlink(path string) bool {
 func imageLineageMarker(dir string) bool {
 	fi, err := os.Lstat(filepath.Join(dir, ".pingularity-image-dir"))
 	return err == nil && fi.Mode().IsRegular()
+}
+
+// fsGroupShape reports whether a directory's mode and ownership look the way
+// the kubelet's fsGroup ownership management leaves a PVC root: writable
+// through its group bits, closed to world write, and not owned by our euid
+// (the kubelet chowns the volume root to root:<fsGroup> and grants the group
+// rwx). Mode and ownership only - proving our process is actually IN that
+// group would take platform-specific Stat_t plumbing, and this only picks a
+// log message: a miss falls back to the generic warning, never changes what
+// gets tightened or left alone.
+func fsGroupShape(perm os.FileMode, ownedByUs bool) bool {
+	return !ownedByUs && perm&0o020 != 0 && perm&0o002 == 0
+}
+
+// looseDataDirWarning picks the boot warning for a pre-existing group/world-
+// accessible data directory we refuse to re-permission. The generic advice
+// ("use a dedicated -db directory") is useless on a Kubernetes PVC - the mount
+// point is fixed by the pod spec and the looseness is the kubelet's fsGroup
+// ownership, applied again on every mount - so when the directory has exactly
+// that shape inside a container, name the fixes that exist there instead.
+// Message selection only: the never-repermission rule above is identical for
+// both messages.
+func looseDataDirWarning(dir string) string {
+	if fi, err := os.Lstat(dir); err == nil && inContainerFn() &&
+		fsGroupShape(fi.Mode().Perm(), ownedByThisUserFn(dir)) {
+		return fmt.Sprintf("pingularity: data directory %s is group-writable and owned by another user - the shape Kubernetes fsGroup ownership leaves on a PVC root, where group access is how this pod writes at all; leaving it unchanged (the database file itself is kept owner-only). If fsGroup is intentional, keep it (fsGroupChangePolicy: OnRootMismatch skips the per-mount re-chown); to make the directory owner-only and end this warning, chown it to this image's user (uid 65532) once and drop fsGroup.", dir)
+	}
+	return fmt.Sprintf("pingularity: data directory %s is group/world-accessible and was not created by pingularity; leaving its permissions unchanged (the database file itself is owner-only). Consider a dedicated -db directory.", dir)
 }
 
 // openAtClock is the full seam: the judging clock AND the wall/monotonic
@@ -314,7 +348,7 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 			// the chmod fails, fall through to the honest warning.
 			tightened := false
 			if inContainerFn() && dir == containerDataDir && realDirNoSymlink(dir) &&
-				osperm.OwnedByThisUser(dir) && imageLineageMarker(dir) {
+				ownedByThisUserFn(dir) && imageLineageMarker(dir) {
 				// Verify the chmod TOOK before claiming it: on a filesystem that
 				// accepts-but-ignores chmod the honest warning must survive, and
 				// must not be replaced by a false "tightened" every boot.
@@ -326,7 +360,7 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 				}
 			}
 			if !tightened {
-				log.Printf("pingularity: data directory %s is group/world-accessible and was not created by pingularity; leaving its permissions unchanged (the database file itself is owner-only). Consider a dedicated -db directory.", dir)
+				log.Printf("%s", looseDataDirWarning(dir))
 			}
 		}
 		// A database that predates the secured directory (a restored backup, a
@@ -483,6 +517,7 @@ func applySchema(db *sql.DB) error {
 		{"speed", "loaded_up_ms", "REAL"}, {"speed", "loaded_down_p95_ms", "REAL"},
 		{"speed", "loaded_up_p95_ms", "REAL"},
 		{"speed", "ping_best_ms", "REAL"},
+		{"speed", "ip_family", "TEXT"}, {"speed", "udp_direction", "TEXT"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -2356,6 +2391,16 @@ type SpeedSample struct {
 	// Engine is the test backend: ookla|iperf3 (empty on older rows = ookla).
 	// Lets the chart mark engine switchovers.
 	Engine string `json:"engine,omitempty"`
+	// IPFamily is the address family the transfer actually used ("4"/"6") -
+	// family "auto" resolves invisibly, so it's read back from the run itself
+	// (see speedtest.Result.IPFamily). Empty on rows recorded before it was
+	// captured and on engines that don't report it; never backfilled.
+	IPFamily string `json:"ip_family,omitempty"`
+	// UDPDirection is which way the UDP loss/jitter probe sampled ("down"/"up");
+	// empty when loss/jitter went unmeasured or the row predates the field. Loss
+	// on an asymmetric path differs by direction, so a sample without it stays
+	// ambiguous rather than being guessed at.
+	UDPDirection string `json:"udp_direction,omitempty"`
 	// Latency under load: idle baseline and per-phase loaded medians (ms), same
 	// method/target so loaded-minus-idle is bufferbloat. nil when unmeasurable or
 	// on older rows. The P95 fields are the tail of each phase's samples - not the
@@ -2374,7 +2419,7 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	packet_loss, healthy, jitter_ms, download_bytes, upload_bytes,
 	COALESCE(cf_colo,''), COALESCE(exit_summary,''), COALESCE(run_trigger,''),
 	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
-	ping_best_ms`
+	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,'')`
 
 // nzFinite returns a float column's value, or 0 when NULL or non-finite
 // (NaN/±Inf) - the safe sentinel for always-present scalars.
@@ -2410,7 +2455,8 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
-		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest)
+		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
+		&sp.IPFamily, &sp.UDPDirection)
 	sp.DownMbps, sp.UpMbps, sp.PingMS = nzFinite(down), nzFinite(up), nzFinite(ping)
 	sp.IdleMS = ptrFinite(idle)
 	sp.LoadedDownMS = ptrFinite(loadDown)
@@ -2496,13 +2542,13 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
 			packet_loss, healthy, jitter_ms, download_bytes, upload_bytes, cf_colo, exit_summary, run_trigger,
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
-			ping_best_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ping_best_ms, ip_family, udp_direction)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
-		ptrArg(sp.PingBestMS))
+		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection)
 	recordDBErr(err)
 	return err
 }
@@ -4241,7 +4287,7 @@ var exportTables = map[string]struct {
 		"public_ipv4", "public_ipv6", "isp", "isp_location", "dns_ip", "dns_provider", "dns_location",
 		"packet_loss", "healthy", "jitter_ms", "download_bytes", "upload_bytes", "cf_colo", "exit_summary", "run_trigger",
 		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
-		"ping_best_ms"},
+		"ping_best_ms", "ip_family", "udp_direction"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted

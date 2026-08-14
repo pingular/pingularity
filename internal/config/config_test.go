@@ -373,6 +373,43 @@ func TestQuickSetupFlag(t *testing.T) {
 	}
 }
 
+// AccessExplicit must be true exactly when the operator SAID something: a
+// -access flag actually passed on the command line (either value - "-access
+// local" is a choice, distinct from silence) or a non-blank PINGULARITY_ACCESS.
+// The silent "local" default is NOT explicit: at boot only explicit input may
+// override the stored access_local_only, in either direction (we never guess).
+func TestAccessExplicit(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		env  string
+		want bool
+	}{
+		{"neither flag nor env", nil, "", false},
+		{"unrelated flag only", []string{"-listen", ":9001"}, "", false},
+		{"blank env is not a choice", nil, "   ", false},
+		{"env network", nil, "network", true},
+		{"env local", nil, "local", true},
+		{"env with whitespace", nil, " network ", true},
+		{"flag network", []string{"-access", "network"}, "", true},
+		{"flag naming the default is still explicit", []string{"-access", "local"}, "", true},
+		{"flag via equals", []string{"-access=network"}, "", true},
+		{"flag and env together", []string{"-access", "local"}, "network", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PINGULARITY_ACCESS", c.env)
+			got, err := ParseFlags(c.args)
+			if err != nil {
+				t.Fatalf("ParseFlags: %v", err)
+			}
+			if got.AccessExplicit != c.want {
+				t.Errorf("AccessExplicit = %v, want %v", got.AccessExplicit, c.want)
+			}
+		})
+	}
+}
+
 // -access / PINGULARITY_ACCESS is the explicit access mode. Precedence:
 // flag > env > default(local); an invalid value from either source fails loudly.
 func TestAccessFlag(t *testing.T) {

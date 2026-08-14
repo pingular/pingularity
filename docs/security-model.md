@@ -47,7 +47,7 @@ raw-socket capability. Where each one lands:
 | **`sudo pingularity install`** (Linux self-install) | root | inherent | partial - no `User=`/`StateDirectory`, but `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, `PrivateTmp`, `ProtectKernelTunables`, `RestrictSUIDSGID`, `LockPersonality` |
 | **macOS** (`sudo pingularity install`, launchd) | root | inherent | none |
 | **Windows** (`pingularity install`, SCM) | `LocalSystem` | inherent | none |
-| **Docker** | non-root, uid 65532 (distroless `nonroot`) | `cap_net_raw+ep` file capability on the binary | container isolation |
+| **Docker** | non-root, uid 65532 (distroless `nonroot`) | `cap_net_raw+ep` file capability on the binary - the effective bit makes it mandatory: without `NET_RAW` the container fails to start rather than run degraded (details below) | container isolation |
 
 The rows in detail:
 
@@ -92,7 +92,33 @@ The rows in detail:
   capability is raised on exec even for the unprivileged process. `NET_RAW` is in
   Docker's default capability set, so the trace works with no `--cap-add`, and
   you can drop everything else (`--cap-drop=ALL --cap-add=NET_RAW`) and it still
-  runs.
+  runs. Two hardening knobs interact with that file capability differently,
+  and the difference matters. Removing `NET_RAW` itself (`--cap-drop=ALL`
+  without adding it back, Podman 4+'s default capability set, a Kubernetes
+  `drop: [ALL]`) does **not** yield a degraded trace: the capability's
+  effective bit makes it mandatory at exec, so the kernel refuses to start
+  the binary and the container exits immediately with "operation not
+  permitted". Refusing to start is the honest outcome - it is loud, and the
+  fix is the documented `--cap-add=NET_RAW`. `no-new-privileges`
+  (`--security-opt no-new-privileges`, Kubernetes
+  `allowPrivilegeEscalation: false`) is the opposite: the container starts,
+  but a file capability cannot raise privileges under it even when `NET_RAW`
+  is granted, so the daemon runs without the capability and only the trace
+  degrades - the Exit row shows unavailable, everything else works. (The
+  unprivileged ICMP fallback does not normally rescue it in a container - a
+  fresh network namespace's `ping_group_range` admits no group - but opening
+  that sysctl to gid 65532 restores the trace without any capability.) The
+  graceful degradation native installs get exists because their binaries
+  carry no file capability at all: the deb/rpm unit grants an ambient
+  `CAP_NET_RAW` instead, and an unprivileged tarball binary simply loses the
+  trace. That file capability stays on the `pingularity` binary alone: the
+  `-iperf` image's bundled `iperf3` carries none, and a file capability does not
+  survive the exec into it, so the iperf3 child runs with no privilege at all —
+  deliberate, since the engine needs none. The one visible consequence is on
+  kernels older than 5.7, where `SO_BINDTODEVICE` still demands `CAP_NET_RAW`:
+  there, an iperf3 **Bind source** naming an interface (`--bind-dev`) fails in
+  the container, while a deb/rpm install is unaffected because its *ambient*
+  `CAP_NET_RAW` does carry into the child.
 
 Independently of the account, the only path that runs another program on the
 operator's behalf is the **iperf3 client**, which is off unless you select the
@@ -117,7 +143,17 @@ in front of it:
 2. **The login.** Optional, off until you set a password. Passwords are stored
    as bcrypt hashes, and password checks are rate limited per client: five
    consecutive failures buy a 30-second block, keyed on the peer address (an
-   IPv6 /64, or the real client behind a `-trusted-proxy`). The limit covers
+   IPv6 /64, or the real client behind a `-trusted-proxy`). One container
+   caveat: in a bridged container remote clients can arrive NAT'd from the
+   container gateway's address (Docker Desktop, rootless Docker, and IPv6
+   connections proxied to an IPv4-only container all do this; rootful Linux
+   Engine's port DNAT keeps the real source), and naming that gateway in
+   `-trusted-proxy` would trust the spoofable `X-Forwarded-For` header from
+   **every** peer - any visitor could then choose its own rate-limit
+   identity. Reserve
+   `-trusted-proxy` for a real reverse proxy that overwrites the header;
+   where that NAT applies and there is no such proxy, all peers share one
+   bucket, which is the safer failure. The limit covers
    HTTP Basic on any gated route, not just the login endpoint. Separately,
    credentials that have already passed a bcrypt check are cached as a
    fingerprint keyed on the current hash, so a valid login is never locked out
@@ -138,9 +174,19 @@ Two things worth knowing about the filter:
   and gets a 403 until you opt in with `-access network` (or `-e
   PINGULARITY_ACCESS=network`) - set a login at the same time. A `--network=host`
   container sees real peer addresses, so local-only there behaves exactly as it
-  does natively. Pingularity still detects a bridged container, but only to warn
-  that container DNS may distort the reported upstream resolver; that detection
-  has no say over access.
+  does natively. Pingularity still detects a bridged container, but only to
+  inform - the dashboard's container notice and the iperf3 container hints -
+  never to decide access. An explicitly passed `-access` or `PINGULARITY_ACCESS`
+  is authoritative at every start: if it disagrees with the stored setting, the
+  daemon updates the stored value to match (in either direction) and logs the
+  change - which also makes `-e PINGULARITY_ACCESS=network` the recovery path
+  for an install whose saved local-only would otherwise 403 its own published
+  port. One upgrade exception, once: a pre-0.62 container install that never
+  stored an access choice is kept network-reachable by a one-time boot
+  migration - the fail-closed default would otherwise 403 its own published
+  port mid-upgrade, with no shell in the image to recover from. The migration
+  persists that as the stored choice, logs a warning, and never touches a
+  fresh install or a stored setting.
 - **A same-host reverse proxy passes it.** Traffic arriving through a proxy on
   the same machine looks local, because it is. The filter cannot block a remote
   visitor arriving that way, and the daemon warns once when it detects the
@@ -195,6 +241,33 @@ such as `plex:9000`, and the `.local`, `.lan`, `.home`, `.internal` and
 `.home.arpa` suffixes. Serving it on a real domain is exactly the case that
 needs `-allow-host`.
 
+## Speedtest servers are untrusted input
+
+Speedtest destinations come from third-party catalogue data, so the daemon
+treats them as hostile until proven otherwise. Every measurement connection -
+ranking pings, health probes, uploads, downloads, the packet-loss probe - is
+checked at dial time and refused if it points somewhere internal: loopback,
+RFC1918, link-local (including cloud metadata), CGNAT (RFC 6598), the
+documentation and benchmark ranges (RFC 5737 TEST-NET-1/2/3, RFC 2544), IETF
+protocol assignments (192.0.0.0/24), and class E space (240.0.0.0/4). A server
+that redirects a probe is re-checked against the same rules before the new
+address is adopted.
+
+Configuring an HTTP(S)/SOCKS proxy through the standard
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` variables changes the shape of the
+problem: the dial the guard sees is to your proxy, and the real destination is
+only named inside the request. So the proxy's exact address is trusted as your
+own configuration and exempted from the dial guard, and the daemon separately
+validates every speedtest destination before use - internal IP addresses are
+refused outright, hostnames are resolved and checked first, and hostnames that
+do not resolve are refused rather than trusted. Every discovery path passes
+the same filter, including the automatic city race, which vets both a
+catalogue entry's host and its URL. One caveat remains: the daemon's DNS
+lookup and your proxy's are two separate resolutions, so a hostile hostname
+that answers differently to each (DNS rebinding) could still direct proxied
+traffic at an address the daemon would have refused; internal IP-literal
+entries - the realistic hostile shape - have no such window.
+
 ## What needs a login and what does not
 
 When a password is set:
@@ -225,7 +298,13 @@ boundary as the data itself.
   sidecars are re-tightened on every start, so a file restored or copied in from
   elsewhere is fixed up; the directory's mode is set when Pingularity creates it,
   and an existing directory is left as it is (a warning is logged if it is
-  group- or world-readable). Keep it that way if you relocate the database with `-db`.
+  group- or world-readable). One carve-out to that leave-it rule: inside a
+  container, at exactly the image's own data path (`/var/lib/pingularity`),
+  owned by the daemon's user and carrying the marker file the image plants,
+  the directory is re-tightened to `0700` at boot - Docker's volume copy-up
+  loosens a fresh named volume's root, and that directory is Pingularity's
+  own by construction, so the never-repermission rule protects nothing there.
+  Keep it that way if you relocate the database with `-db`.
 - **Secrets** you enter, such as iperf3 passwords, are sealed with a key stored
   as `pingularity.key` beside the database. That protects a settings export or
   a database copy, not someone who already has both files and the ability to
@@ -300,5 +379,6 @@ Shortest version:
 - **On your LAN**: set a password first, then enable Network access.
 - **Reachable from the internet**: set a password, and put it behind a reverse
   proxy that terminates TLS. Do not expose `:9000` directly.
-- **In a container**: the access filter cannot help you. Publish the port
-  carefully and set a password.
+- **In a container**: local-only is enforced there too - a published port
+  returns 403 until you opt in with `-access network`. Do that deliberately,
+  and set a password at the same time.

@@ -65,6 +65,16 @@ func argvHas(args []string, flag string) bool {
 	return false
 }
 
+// argvHasPair reports whether flag appears with exactly val as its argument.
+func argvHasPair(args []string, flag, val string) bool {
+	for i, a := range args {
+		if a == flag {
+			return i+1 < len(args) && args[i+1] == val
+		}
+	}
+	return false
+}
+
 // fakeRunServer is a loopback address nothing listens on: parseIperfServer
 // accepts it, the handshake RTT probe fails fast (port 1 is privileged and
 // unbound), and the fake exec never dials it anyway.
@@ -268,14 +278,18 @@ func TestIperfRunExplicitPKCS1(t *testing.T) {
 
 // The UDP loss/jitter probe must sample the direction the run tested: --reverse
 // (downstream) for both/down runs, upstream (no --reverse) for an up-only run.
+// The measured direction is also RECORDED (Result.UDPDirection) - a loss sample
+// on an asymmetric path is ambiguous without it - and the probe's datagrams are
+// capped at 1200 bytes so they never fragment (see measureUDP).
 func TestIperfRunUDPProbeDirection(t *testing.T) {
 	cases := []struct {
 		dir     string
 		reverse bool
+		udpDir  string
 	}{
-		{"both", true},
-		{"down", true},
-		{"up", false},
+		{"both", true, "down"},
+		{"down", true, "down"},
+		{"up", false, "up"},
 	}
 	for _, c := range cases {
 		t.Run(c.dir, func(t *testing.T) {
@@ -306,8 +320,14 @@ func TestIperfRunUDPProbeDirection(t *testing.T) {
 			if got := argvHas(udpArgs, "--reverse"); got != c.reverse {
 				t.Errorf("dir=%s UDP probe --reverse=%v, want %v (argv %v)", c.dir, got, c.reverse, udpArgs)
 			}
+			if !argvHasPair(udpArgs, "--length", "1200") {
+				t.Errorf("UDP probe argv %v lacks --length 1200 (datagram cap under the 1280 IPv6 floor MTU)", udpArgs)
+			}
 			if res.PacketLoss == nil || *res.PacketLoss != 1.5 || res.JitterMS == nil || *res.JitterMS != 2.3 {
 				t.Errorf("loss/jitter = %v/%v, want 1.5/2.3", fptr(res.PacketLoss), fptr(res.JitterMS))
+			}
+			if res.UDPDirection != c.udpDir {
+				t.Errorf("UDPDirection = %q, want %q", res.UDPDirection, c.udpDir)
 			}
 		})
 	}
