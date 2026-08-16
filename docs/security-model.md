@@ -341,7 +341,7 @@ When a password is set:
 - Four things are exempt from auth: login, logout, a `GET /api/access` so the UI
   can tell you what state it is in before you have signed in, and
   `/api/quick-setup`, the first-run dialog's endpoint. The access entry is the
-  only one the exemption table scopes by method — `POST /api/access`, which
+  only one the exemption table scopes by method - `POST /api/access`, which
   changes who may reach the dashboard and what the password is, is gated like
   every other write. The other three name a path and nothing else, so every
   method reaches the handler; each handler then answers `POST` alone and returns
@@ -351,19 +351,19 @@ When a password is set:
   response was lost would otherwise be refused by the very login that answer
   had just enabled. The handler gates itself on state instead of on a session.
   Once the answer is recorded, every later call is an "already done" 200 that
-  writes nothing. Before that, a full answer — the one that would set access and
-  a password — is refused with a 403, and which 403 depends on the 48-hour
+  writes nothing. Before that, a full answer - the one that would set access and
+  a password - is refused with a 403, and which 403 depends on the 48-hour
   first-run window: while the window is open, an install already secured out of
   band answers "a login is already configured" and points at Settings > Access;
   once the window closes, the window gate refuses ahead of that check and
   answers "Quick Setup is no longer offered", on any install, secured or not.
-  Neither writes anything. The bare "dismiss" marker takes neither path — it is
+  Neither writes anything. The bare "dismiss" marker takes neither path - it is
   deliberately still accepted after the window has closed, so a stale dialog can
-  always close itself — but because it releases the boot monitoring hold, and is
+  always close itself - but because it releases the boot monitoring hold, and is
   therefore a real write, it demands the same credentials as any gated endpoint.
   With the login active, no unauthenticated call to this endpoint writes
   anything: the only success it can reach is that "already done" no-op, and
-  every other path is a refusal — 405 for a non-`POST`, 415/400 for a body it
+  every other path is a refusal - 405 for a non-`POST`, 415/400 for a body it
   cannot read, 401 for `dismiss`, 403 for a full answer. The
   DNS-rebinding check and the access filter run ahead of the exemption table in
   any case, so nothing here widens who can reach the port.
