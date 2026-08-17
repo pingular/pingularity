@@ -39,9 +39,11 @@ func rewritten(t *testing.T, path string) bool {
 
 // The daemon snapshots the ring on a one-minute ticker whether or not anything
 // was logged (main.go:462), and the default install runs with logging "off"
-// (main.go:426, main.go:506-507) - which sets the level to WARN rather than
+// (main.go:1823, the LogLevel in the defaults handed to settings.New, which is
+// the line that MAKES it true; main.go:426 and main.go:506-507 read as citations
+// for it but are comments relying on it) - which sets the level to WARN rather than
 // silencing it, so that install's ring is idle rather than empty and fills only
-// when something goes wrong (applyLogLevel, main.go:2357-2364). What the skip
+// when something goes wrong (applyLogLevel, main.go:2362-2373). What the skip
 // turns on is therefore idleness, not emptiness, so both states are covered
 // below: rewriting an unchanged snapshot every minute cost 60 file creations an
 // hour either way, each one fsyncing the file and (off Windows) its parent
@@ -187,6 +189,10 @@ func TestSaveFileRewritesWhenSnapshotIsGone(t *testing.T) {
 // be gone for good instead of for the one minute the pre-skip code took to
 // rebuild it. os.Lstat reports the link itself, whose mode never equals the
 // saved regular-file mode.
+//
+// What this asserts about the target is its BYTES, so it says nothing about the
+// skip's securing call, which changes a mode and no bytes. That ordering is
+// TestSaveFileNeverSecuresThroughASymlinkedSnapshot's, in save_skip_secure_test.go.
 func TestSaveFileRewritesASymlinkedSnapshot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("creating a symlink needs a privilege the test runner may not hold")
@@ -327,7 +333,12 @@ func TestSaveFileWritesToADifferentPath(t *testing.T) {
 // leave the file readable by other accounts for as long as the ring stays idle,
 // and on a default install idle is the normal state - logging "off" sets the
 // level to WARN, whose volume in normal operation is ~0 (applyLogLevel,
-// main.go:2357-2364).
+// main.go:2362-2373).
+//
+// This covers the path where the mode comparison FAILS and the rewrite repairs
+// the file, which is a Unix guarantee: the skip's other half, re-applying the
+// protection when the comparison passes, is TestSaveFileResecuresOnTheSkipPath in
+// save_skip_secure_test.go.
 func TestSaveFileRepairsALoosenedSnapshotMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no Unix mode to loosen: SecureFile writes a DACL there and os.Stat's mode is synthetic")
