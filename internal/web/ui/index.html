@@ -7437,7 +7437,7 @@ $('exportBtn').addEventListener('click', async ()=>{
   $('exportMsg').textContent='';
   const res=await downloadVia('api/export?'+c.map(x=>x+'=1').join('&'), 'pingularity-export.json');
   if(res==='toobig'){
-    $('exportMsg').textContent='This backup is too large to download in the browser. Copy the database file directly, or fetch it with curl - see the docs.';
+    $('exportMsg').textContent='This backup is too large to download in the browser. Fetch it with curl, or stop the service first and copy the database file with its -wal sidecar and pingularity.key - see the docs.';
   } else if(res==='fail'){
     $('exportMsg').textContent='Export failed.';
   }
@@ -7451,7 +7451,7 @@ $('logDownload').addEventListener('click', async e=>{ e.preventDefault();
 });
 $('csvDownload').addEventListener('click', async e=>{ e.preventDefault();
   const r=await downloadVia('api/speed/runs.csv', 'pingularity-speed-runs.csv');
-  if(r==='toobig') flashStatus('This CSV is too large to download in the browser - copy the database file or fetch /api/speed/runs.csv with curl.');
+  if(r==='toobig') flashStatus('This CSV is too large to download in the browser - fetch /api/speed/runs.csv with curl, or stop the service first and copy the database file with its -wal sidecar.');
   else if(r==='fail') flashStatus('CSV download failed.');
 });
 // The picker button IS the state: empty shows the prompt, a chosen file turns

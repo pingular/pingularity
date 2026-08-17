@@ -4487,3 +4487,37 @@ test('cadence clamping never reaches the wire', () => {
     'start overtakes the end, which the server reads as a reversed range and quietly answers with the ' +
     'default window - asking for January 2020 silently drew this week');
 });
+
+// Advice to copy the database file by hand must always name the stop-first
+// precondition. Pingularity runs in WAL mode unconditionally (the pragmaConn DSN
+// in internal/store/store.go), and nothing in the tree ever issues a
+// wal_checkpoint, so a copy taken while the service runs misses everything
+// still sitting in pingularity.db-wal. Measured on a young install: the main
+// file was 4 KiB against a 193 KiB sidecar, and the copy opened with "no such
+// table: settings" - not a partial backup, an empty one. A clean stop folds the
+// sidecar back in and the copy verifies.
+//
+// This is a guard against a CLASS, not the one line that prompted it. The README
+// stated the rule correctly in one place and contradicted it four hundred lines
+// later, and the dashboard carried the unsafe version twice - including in the
+// export fallback, which is shown to someone who is by definition running the
+// instance, since they just clicked Export in its dashboard.
+test('advice to copy the database by hand always says to stop the service first', () => {
+  const sources = [
+    ['README.md', readSource(here, '..', '..', '..', 'README.md')],
+    ['index.html', html],
+  ];
+  // A sentence is any run up to a full stop that does not end a code span, so
+  // "-db path." and "pingularity.key." do not split one instruction in half.
+  for (const [name, text] of sources) {
+    const flat = text.replace(/\s+/g, ' ');
+    const sentences = flat.split(/(?<!\b-db)(?<!\.[a-z]{2,4})\.\s/);
+    const offenders = sentences.filter((s) =>
+      /cop(y|ies|ying) the (SQLite )?database file/i.test(s)
+      && !/stop(ping)? the service|service (is )?stopped|stop it first/i.test(s));
+    assert.deepEqual(offenders, [],
+      `${name} tells a user to copy the database file without saying to stop the service first. `
+      + `In WAL mode that copy can be empty - the committed rows are in pingularity.db-wal until a `
+      + `clean stop folds them back in.`);
+  }
+});
