@@ -179,7 +179,7 @@ func TestSummaryRollup(t *testing.T) {
 // A digest window wider than downtime retention must clamp to what event history
 // actually covers: otherwise the pruned early days read as outage-free and the
 // same outage is diluted across the full window, overstating uptime. summary
-// threads RetentionFn into UptimeSince (audit #23).
+// threads RetentionFn into UptimeSince.
 func TestSummaryClampsToRetention(t *testing.T) {
 	m, st, _ := newManager(t)
 	ctx := context.Background()

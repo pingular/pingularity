@@ -1700,7 +1700,7 @@ func TestMonitoringPowerOnAnswersOfferAtomically(t *testing.T) {
 
 // auth_enabled is a pointer: when sent explicitly it must MATCH whether a
 // password is present. auth_enabled:false with a password is rejected rather
-// than silently activating a login the operator turned off (#10).
+// than silently activating a login the operator turned off.
 func TestQuickSetupAuthFlagMustMatchPassword(t *testing.T) {
 	post := func(body string) *httptest.ResponseRecorder {
 		s := newTestServer(t)

@@ -161,7 +161,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## github.com/showwin/speedtest-go v1.7.10
+## github.com/showwin/speedtest-go v1.7.11
 
 The MIT License (MIT)
 

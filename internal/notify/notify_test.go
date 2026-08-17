@@ -101,8 +101,8 @@ func TestClassifyDest(t *testing.T) {
 // ssrfBlocked must classify link-local AND cloud-metadata literals as blocked
 // (mirroring dialGuard), so a metadata webhook is a permanent failure that Outage
 // skips the retry backoff for, rather than a transient-looking dial error that
-// burns the full backoff holding outageMu (audit #20). RFC1918/loopback stay
-// allowed — self-hosted notifiers are normal use.
+// burns the full backoff holding outageMu. RFC1918/loopback stay allowed -
+// self-hosted notifiers are normal use.
 func TestSSRFBlockedMetadataLiterals(t *testing.T) {
 	blocked := []string{
 		"http://169.254.169.254/latest/meta-data", // link-local (AWS/GCP/Azure)

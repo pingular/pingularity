@@ -80,10 +80,10 @@ func TestBornMarkerWithoutVersionSaysUnknown(t *testing.T) {
 // An ESTABLISHED store must never gain the marker: stamping one later would
 // claim a birth that cannot be proven, and its absence is what main's
 // ambiguous-container-access warning reads (a signal that advises - it can no
-// longer open access, because absence cannot separate a pre-0.62 store from an
-// early-0.62 one that predates the marker). All
-// three establishment legs - prior configuration, measurement history, the
-// install anchor - and the Reload path too.
+// longer open access, because absence cannot separate a store carried up from
+// 0.61 or earlier from one born private under a build that predates the
+// marker). All three establishment legs - prior configuration, measurement
+// history, the install anchor - and the Reload path too.
 func TestBornMarkerNeverStampedOnEstablishedStore(t *testing.T) {
 	ctx := context.Background()
 	seed := map[string]func(t *testing.T, st *store.Store){
@@ -118,13 +118,13 @@ func TestBornMarkerNeverStampedOnEstablishedStore(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, ok := bornMarkerValue(t, st); ok {
-				t.Fatal("New stamped the birth marker on an established (pre-0.62-shaped) store")
+				t.Fatal("New stamped the birth marker on an established (pre-marker-shaped) store")
 			}
 			if err := c.Reload(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if _, ok := bornMarkerValue(t, st); ok {
-				t.Fatal("Reload stamped the birth marker on an established (pre-0.62-shaped) store")
+				t.Fatal("Reload stamped the birth marker on an established (pre-marker-shaped) store")
 			}
 		})
 	}

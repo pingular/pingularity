@@ -244,7 +244,7 @@ yourself. Two more flags matter:
 > let the UI choice stick.
 
 > **Upgrading a container from 0.61 or earlier?** Up to 0.61 a container
-> answered the network by default; from 0.62 every install starts private -
+> answered the network by default; every install now starts private -
 > **upgrades included**. An existing container install is *not* kept
 > network-reachable across the upgrade: it starts local-only like everything
 > else, so its published port answers `403` until you opt in, and that `403`
@@ -271,9 +271,9 @@ yourself. Two more flags matter:
 >
 > Why you have to say it, rather than the daemon working it out: what it can
 > see is an established database that never stored an access choice, and more
-> than one kind of install looks exactly like that. An upgraded pre-0.62
-> container is one - its dashboard did answer the network. But so is any
-> database that simply lacks the birth marker 0.62 stamps on new installs,
+> than one kind of install looks exactly like that. A container upgraded from
+> 0.61 or earlier is one - its dashboard did answer the network. But so is any
+> database that simply lacks the birth marker stamped on new installs,
 > including one whose marker could not be written when it was created. The
 > first wants opening; the rest were private all along, and guessing "open"
 > for them would put an unauthenticated dashboard on the LAN. So the ambiguity
@@ -330,7 +330,7 @@ name things only the host has, and the compose file there maps
 
 **What `docker logs` shows.** Logging is off by default, but the daemon always
 prints one startup line to stdout - version, listen address, access mode, and
-dashboard URL, e.g. `pingularity 0.62.0: listening on :9000, access
+dashboard URL, e.g. `pingularity 0.70.0: listening on :9000, access
 local-only, dashboard at http://localhost:9000` - so a healthy container is
 distinguishable from a hung one. A genuinely fresh install prints a second line
 beside it - `first run: monitoring is on hold - nothing is being measured yet` -
@@ -399,9 +399,9 @@ the stored setting. Then set things right in the Access tab.
 - **Docker** - `docker pull ghcr.io/pingular/pingularity`, then `docker rm -f
   pingularity` and re-run it (the named volume carries your data across).
   Coming from **0.61 or earlier** and reaching the dashboard from other
-  devices? Add `-e PINGULARITY_ACCESS=network` to that re-run: from 0.62 every
-  install starts private and the upgrade is not grandfathered, so without it
-  the published port answers `403` (see [Docker](#docker)).
+  devices? Add `-e PINGULARITY_ACCESS=network` to that re-run: every install
+  starts private and the upgrade is not grandfathered, so without it the
+  published port answers `403` (see [Docker](#docker)).
 - **tarball** - Linux won't let you overwrite a *running* program file
   ("text file busy"), so either stop the service first, or copy alongside and
   rename over it (rename always works):
@@ -788,9 +788,9 @@ snapshot here could. Three of its pieces are the ones this section is about:
 - If you must stay bridged (published ports, Docker Desktop without host
   networking, an orchestrator that owns the network), it keeps the fallback
   as a commented **pair** - `ports: ["9000:9000"]` together with
-  `environment: ["PINGULARITY_ACCESS=network"]`. Uncomment both or neither:
-  from 0.62 a published port alone answers `403`, because every install
-  starts private (see [Docker](#docker)) - and set a login when you opt in.
+  `environment: ["PINGULARITY_ACCESS=network"]`. Uncomment both or neither: a
+  published port alone answers `403`, because every install starts private
+  (see [Docker](#docker)) - and set a login when you opt in.
 
 One honest caveat either way: a test against an `iperf3 -s` on the **same
 machine** measures the container-to-host virtual path (or loopback, under
@@ -1460,8 +1460,8 @@ container images' baked-in `HEALTHCHECK` runs (see [Docker](#docker)).
 ### Scraping it
 
 **Step zero for a remote Prometheus:** flip **Network access** on first - it
-starts off on every install that never chose otherwise, containers included
-since 0.62, and until then every scrape from another machine gets `403`. Use
+starts off on every install that never chose otherwise, containers included,
+and until then every scrape from another machine gets `403`. Use
 the Access tab, or start with `-access network` / `-e
 PINGULARITY_ACCESS=network`. (A Prometheus on the same host scraping
 `127.0.0.1:9000` needs nothing. A container upgraded from 0.61 or earlier needs
@@ -1711,8 +1711,8 @@ and `-d '{…}'` where a body is listed below.
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 
 > All endpoints are **unauthenticated** by default; what protects a fresh
-> install - native or container, since 0.62 - is the **Network access** filter
-> starting off (localhost only). Once you open network access for other devices or Prometheus, every
+> install - native or container - is the **Network access** filter starting
+> off (localhost only). Once you open network access for other devices or Prometheus, every
 > device on the LAN can use every endpoint - the **Access** tab's **login**
 > (cookie for browsers, HTTP Basic for API/Prometheus) is the fix if that LAN
 > isn't fully trusted. Either way, the dashboard speaks plain HTTP: for
@@ -1738,7 +1738,7 @@ and `-d '{…}'` where a body is listed below.
 >
 > **Legacy Docker volumes:** the database file is always owner-only, but a named
 > volume created by an *older* image may have a group/world-readable directory
-> root (Docker's volume copy-up loosens it). A volume first created by a 0.62+
+> root (Docker's volume copy-up loosens it). A volume first created by a current
 > image is recognized as the daemon's own - its path, its owner, and a marker
 > file the image plants - and re-tightened to `0700` at boot automatically. One
 > created by an older image carries no marker, and Pingularity won't silently

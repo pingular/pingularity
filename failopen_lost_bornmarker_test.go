@@ -21,8 +21,8 @@ import (
 // the install markerless FOREVER: from that boot on the store is established,
 // no later controller witnessed anything, and an established store must never be
 // stamped (a marker added later claims a birth that cannot be proven). On disk
-// that install becomes byte-identical to a genuinely pre-0.62 one, which is the
-// shape these tests are about.
+// that install becomes byte-identical to a genuinely 0.61-or-earlier one, which
+// is the shape these tests are about.
 //
 // This is the test that matters: that shape must still fail CLOSED. Marker
 // absence advises and nothing more - warnAmbiguousContainerAccess writes
@@ -67,11 +67,11 @@ func quietStderr(t *testing.T, fn func()) {
 }
 
 // newLostMarkerContainerStore builds the store a container is left with when its
-// birth stamp was LOST to a write error: born under 0.62+ (fail-closed from the
-// first boot, so it was never network-reachable), yet carrying no marker, and
-// then established by an ordinary life of configuration and history. Every step
-// is real - the write genuinely fails, the marker is genuinely absent - so this
-// reproduces the shape rather than asserting it.
+// birth stamp was LOST to a write error: born under a build that fails closed
+// from the first boot (so it was never network-reachable), yet carrying no
+// marker, and then established by an ordinary life of configuration and
+// history. Every step is real - the write genuinely fails, the marker is
+// genuinely absent - so this reproduces the shape rather than asserting it.
 //
 // What makes the loss PERMANENT is the restart. The controller that watched the
 // database come into existence may still complete its own stamp (a later reload

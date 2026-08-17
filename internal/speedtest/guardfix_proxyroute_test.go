@@ -228,12 +228,20 @@ func TestMeasurementClientRefusesProxiedRedirectHop(t *testing.T) {
 	}
 }
 
-// envProxyURL must make the same per-request decision net/http's
+// envProxyEndpoint must make the same per-request decision net/http's
 // ProxyFromEnvironment makes - scheme selection, the loopback/localhost
 // exemption, and NO_PROXY in httpproxy's dialects - just read fresh instead of
 // once-cached. This is the decision the dial guard's trust set and both
 // per-request guards hang off, so each rule is pinned here.
-func TestEnvProxyURLSemantics(t *testing.T) {
+//
+// Every value configured below is one the daemon can use, so the refusal an
+// unusable value produces - the third outcome, the one net/http does not have -
+// must appear nowhere in this test, and the helper fails the test rather than
+// reading a refusal as "direct". Otherwise a change that started failing every
+// request would show up here as routing rules quietly going direct, which is
+// the opposite diagnosis. The refusal itself is
+// TestProxyUnusableValueRefusesOnlyWhatWouldHaveBeenProxied's subject.
+func TestEnvProxyEndpointSemantics(t *testing.T) {
 	mustURL := func(s string) *url.URL {
 		u, err := url.Parse(s)
 		if err != nil {
@@ -241,7 +249,14 @@ func TestEnvProxyURLSemantics(t *testing.T) {
 		}
 		return u
 	}
-	proxied := func(raw string) bool { return envProxyURL(mustURL(raw)) != nil }
+	endpoint := func(raw string) *url.URL {
+		p, err := envProxyEndpoint(mustURL(raw))
+		if err != nil {
+			t.Fatalf("request for %s: envProxyEndpoint refused a usable value: %v", raw, err)
+		}
+		return p
+	}
+	proxied := func(raw string) bool { return endpoint(raw) != nil }
 
 	clearProxyEnv(t)
 	if proxied("http://example.com/x") {
@@ -260,7 +275,7 @@ func TestEnvProxyURLSemantics(t *testing.T) {
 	}
 
 	t.Setenv("HTTPS_PROXY", "https://192.168.1.11:3129")
-	if got := envProxyURL(mustURL("https://example.com/x")); got == nil || got.Host != "192.168.1.11:3129" {
+	if got := endpoint("https://example.com/x"); got == nil || got.Host != "192.168.1.11:3129" {
 		t.Errorf("https request proxy = %v, want HTTPS_PROXY's endpoint", got)
 	}
 
@@ -303,7 +318,7 @@ func TestEnvProxyURLSemantics(t *testing.T) {
 	// A bare host:port value gets scheme http, like httpproxy's parse.
 	clearProxyEnv(t)
 	t.Setenv("HTTP_PROXY", "192.168.1.10:3128")
-	if got := envProxyURL(mustURL("http://example.com/x")); got == nil || got.Scheme != "http" || got.Host != "192.168.1.10:3128" {
+	if got := endpoint("http://example.com/x"); got == nil || got.Scheme != "http" || got.Host != "192.168.1.10:3128" {
 		t.Errorf("bare host:port proxy value parsed as %v, want http://192.168.1.10:3128", got)
 	}
 }

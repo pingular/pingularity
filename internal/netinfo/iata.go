@@ -1,10 +1,26 @@
 package netinfo
 
-// iataPlace is a city plus its approximate centre coordinate. The coordinate is
-// only ever used to centre a nearby-server search (Ookla sorts by distance and
-// pings the closest handful), so city-level precision is plenty.
+// iataPlace is a city plus its approximate centre coordinate.
+//
+// Nothing reads Lat or Lon. The table has exactly two consumers, both inside
+// cityFromRDNS (exit.go:470 and exit.go:493), and both take p.City and drop the
+// rest; geolocateHop then passes that city on with a hard-coded zero coordinate
+// (exit.go:257, "rDNS fallback has no coordinates"). The coordinate used to
+// centre a nearby-server search; that was ColoCoord, and the iataCity comment
+// below explains why it went away.
+//
+// They are kept rather than deleted for two reasons. The coordinate is what
+// makes a row checkable: given a bare {"sea": "Seattle"} a reviewer has to take
+// the mapping on trust, whereas a centre coordinate can be looked up and
+// compared. And removing two fields nothing reads would mean rewriting all 115
+// map literals below, plus collapsing the struct to a bare string at both call
+// sites, for no change in behaviour at all - a large, purely mechanical diff
+// over a hand-curated table, which is exactly the kind of edit that quietly
+// drops a row. So if you add a city, fill the coordinate in anyway; two decimal
+// places, as every row below uses, is the house precision.
 type iataPlace struct {
-	City     string
+	City string
+	// Carried, never read - see the note above before deleting these.
 	Lat, Lon float64
 }
 

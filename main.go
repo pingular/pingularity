@@ -380,13 +380,14 @@ func (p *program) run(ctx context.Context) {
 		p.materializeQuickSetup(ctx, set, func(msg string, e error) {
 			earlyLog = append(earlyLog, func() { p.log.Warn(msg, "err", e) })
 		})
-		// A pre-0.62 container install never STORED an access choice (the filter
-		// was defaulted off by an unpersisted seed), so 0.62's fail-closed
-		// default 403s its published port on upgrade. That install is
-		// INDISTINGUISHABLE on disk from an early-0.62 (rc.1-rc.3) container
-		// that was born private, so the daemon only SAYS so - it never opens
-		// access on the guess (see warnAmbiguousContainerAccess). The WARN rides
-		// earlyLog like the rest, so it survives the default "off" level.
+		// A container install from 0.61 or earlier never STORED an access choice
+		// (the filter was defaulted off by an unpersisted seed), so the
+		// fail-closed default 403s its published port on upgrade. That install
+		// is INDISTINGUISHABLE on disk from a container born private under a
+		// build that predates the birth marker, so the daemon only SAYS so - it
+		// never opens access on the guess (see warnAmbiguousContainerAccess).
+		// The WARN rides earlyLog like the rest, so it survives the default
+		// "off" level.
 		if werr := warnAmbiguousContainerAccess(ctx, p.cfg, p.store, set, containerized,
 			func(msg string, args ...any) {
 				earlyLog = append(earlyLog, func() { p.log.Warn(msg, args...) })
@@ -1730,20 +1731,20 @@ const accessAmbiguousWarnMsg = "container install with no recorded access choice
 // provenance cannot be established. It decides nothing and writes NOTHING - it
 // only calls warn (at most once) with the situation and the way out.
 //
-// Pre-0.62 containers defaulted the loopback-only filter OFF through an
-// unpersisted seed, so an install that never touched the Access tab stored no
-// access_local_only and its dashboard answered the network. 0.62 flipped that
-// default closed, which 403s such an install's published port on upgrade - and
-// the distroless image has no shell to repair it from. An earlier release tried
-// to spare those installs by PERSISTING access_local_only=false whenever the
-// store looked pre-0.62 (established, no birth marker, no stored access key).
-// That inference is unsound and has been removed:
+// Containers from 0.61 or earlier defaulted the loopback-only filter OFF
+// through an unpersisted seed, so an install that never touched the Access tab
+// stored no access_local_only and its dashboard answered the network. The
+// default fails closed now, which 403s such an install's published port on
+// upgrade - and the distroless image has no shell to repair it from. An earlier
+// attempt tried to spare those installs by PERSISTING access_local_only=false
+// whenever the store looked that old (established, no birth marker, no stored
+// access key). That inference is unsound and has been removed:
 //
-//   - the birth marker (settings.KeyInstallBornVersion) only exists as of
-//     0.62-rc.4, while the fail-closed default shipped in rc.1. A container
-//     first installed on rc.1/rc.2/rc.3 was therefore born PRIVATE yet carries
-//     no marker - byte-identical on disk to a genuine pre-0.62 install, as is
-//     any pre-marker database copied into a container;
+//   - the birth marker (settings.KeyInstallBornVersion) landed AFTER the
+//     fail-closed default did. A container first installed by a build from that
+//     window was therefore born PRIVATE yet carries no marker - byte-identical
+//     on disk to a genuine 0.61-or-earlier install, as is any pre-marker
+//     database copied into a container;
 //   - so the migration's evidence proved only age, not that anything was ever
 //     reachable, and on that whole population it silently persisted
 //     network-reachable access. The default listen is every interface and auth
@@ -1769,9 +1770,10 @@ const accessAmbiguousWarnMsg = "container install with no recorded access choice
 //     is indistinguishable from a stored agreement. A stored key - the
 //     operator's or quick setup's - means the choice was made, so there is
 //     nothing to explain;
-//   - no birth marker is STORED. Present means the store was initialized by
-//     0.62+ under the fail-closed default, so its missing access key means
-//     "never chose" and the install was never reachable to begin with;
+//   - no birth marker is STORED. Present means the store was initialized by a
+//     build that stamps it, and every build that stamps it already defaulted
+//     closed, so its missing access key means "never chose" and the install was
+//     never reachable to begin with;
 //   - the STORE is established (settings.EstablishedInStore - the same signal
 //     the quick-setup upgrade gate keys on), so a genuinely fresh container,
 //     which was never reachable either, is not lectured;
@@ -1801,7 +1803,7 @@ func warnAmbiguousContainerAccess(ctx context.Context, cfg config.Config, st *st
 		return err
 	}
 	warn(accessAmbiguousWarnMsg,
-		"why", "this store carries no birth marker and no stored access choice - the shape left behind BOTH by a pre-0.62 container, whose dashboard answered the network by default, and by an early-0.62 one that was born private; nothing on disk tells them apart, and guessing open would put an unauthenticated dashboard on the LAN",
+		"why", "this store carries no birth marker and no stored access choice - the shape left behind BOTH by a container upgraded from 0.61 or earlier, whose dashboard answered the network by default, and by one born private under a build too old to record its birth; nothing on disk tells them apart, and guessing open would put an unauthenticated dashboard on the LAN",
 		"fix", "if this dashboard was reachable from the network before, restart with -access network (-e PINGULARITY_ACCESS=network) - it is authoritative at every boot - and set a password at the same time; you can also turn network access on from the machine itself in the Access tab",
 		"access_local_only", true)
 	return nil

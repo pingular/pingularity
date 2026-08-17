@@ -119,13 +119,14 @@ const (
 // not the value: a store created before the marker existed can never gain it.
 // PRESENCE is the trustworthy direction - it proves the store was born under a
 // build that stamps it. ABSENCE proves much less than it looks: the marker
-// shipped partway through 0.62, so an early-0.62 store and a genuinely pre-0.62
-// one are indistinguishable, which is why nothing OPENS access from it and
-// main only warns - main's ambiguous-container-access warning keys on it,
-// because measurement history alone cannot tell a pre-0.62 upgrade from a
-// fresh 0.62 install that consented (skip/dismiss/power-on) and only then
-// accrued history. Exported so main can gate on raw key presence; listed in
-// installStateKeys so it never reads as operator configuration.
+// landed after the fail-closed access default did, so a store born private
+// under a build from that window and a store carried up from 0.61 or earlier
+// are indistinguishable, which is why nothing OPENS access from it and main
+// only warns - main's ambiguous-container-access warning keys on it, because
+// measurement history alone cannot tell such an upgrade apart from a fresh
+// install that consented (skip/dismiss/power-on) and only then accrued history.
+// Exported so main can gate on raw key presence; listed in installStateKeys so
+// it never reads as operator configuration.
 const KeyInstallBornVersion = "install_born_version"
 
 // Test-parameter bounds (mirrored by the UI inputs' min/max).
@@ -639,9 +640,9 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	// Stamp birth provenance on a brand-new store BEFORE anything else can run
 	// on it - main calls New ahead of every window in which monitoring could
 	// accrue history, so a store the marker is missing from is genuinely
-	// pre-marker (pre-0.62), not merely not-yet-stamped. Must see m before the
-	// in-place edits below (the unseal writes keyIperfServers even when absent,
-	// which would read as prior configuration).
+	// pre-marker, not merely not-yet-stamped. Must see m before the in-place
+	// edits below (the unseal writes keyIperfServers even when absent, which
+	// would read as prior configuration).
 	c.ensureBornMarker(ctx, m)
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
@@ -1602,7 +1603,19 @@ func shippedDefaults(def Values) Values {
 	return def
 }
 
-// SetMonitoring flips just the master on/off flag (power button).
+// SetMonitoring flips just the master on/off flag, and nothing else. NO
+// production code calls it: the power button (web's handleMonitoring) goes
+// through SetMonitoringAnsweringSetup below, because an explicit power-on is
+// also an answer to the first-run offer and the two writes must land together.
+// It is kept for the TESTS - this package's, web's, and the root first-run
+// wiring test - which want exactly what it is, one settings write touching ONE
+// key: the birth-marker tests use it as "any later settings write" and assert
+// no stamp rides along, the concurrent-setters and unowned-fields tests compose
+// it with the other single-key setters, the failed-init test pins its
+// ErrSettingsUnavailable, and the wiring test wants a real mutate to prove a
+// real broadcast reaches the netinfo loop. A new production caller would be a
+// bug: powering monitoring on without answering the offer leaves the first-run
+// hold blocking probes while the UI says monitoring is on.
 func (c *Controller) SetMonitoring(ctx context.Context, on bool) error {
 	return c.mutate(ctx, func(v *Values) map[string]string {
 		v.Monitoring = on
@@ -1865,9 +1878,10 @@ func (c *Controller) seedOfferClock(ctx context.Context, since int64, rerr error
 // marker's introduction and must never gain it retroactively, since a stamp
 // added later would claim a birth that cannot be proven. That absence is what
 // main's ambiguous-container-access WARNING keys on; it decides nothing on its
-// own, because it cannot separate a pre-0.62 store from an early-0.62 one. The marker is
-// bookkeeping, not configuration (installStateKeys), so stamping it flips
-// neither EstablishedInStore nor the fresh-install consent hold.
+// own, because it cannot separate a store that predates the marker from one
+// born private under a build too early to stamp it. The marker is bookkeeping,
+// not configuration (installStateKeys), so stamping it flips neither
+// EstablishedInStore nor the fresh-install consent hold.
 //
 // The establishment check has THREE outcomes, and collapsing two of them is how
 // a lost stamp used to go unexplained:
@@ -2025,7 +2039,7 @@ func (c *Controller) BornMarkerErr() error {
 // call it before loading a backup's contents. The witness records "the database
 // I read was empty" - a fact about the rows, not about the file - so replacing
 // those rows wholesale voids it. Without this, a daemon whose own birth stamp
-// failed could finish that stamp AFTER an operator restored a pre-0.62 backup,
+// failed could finish that stamp AFTER an operator restored a pre-marker backup,
 // marking a genuinely old install as born under this version: a birth that was
 // never witnessed for the data now in the store, which is precisely the false
 // provenance the marker exists to prevent, and worse than no marker at all

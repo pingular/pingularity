@@ -184,13 +184,13 @@ Two things worth knowing about the filter:
   port. There is **no upgrade exception**: a container carried over from 0.61
   or earlier - where the filter defaulted off - starts local-only too, and its
   published port answers 403 until the operator opts in. An earlier, unreleased
-  0.62 build did make one, persisting network access for any store that
-  *looked* pre-0.62 (established, no birth marker, no stored access choice).
+  build did make one, persisting network access for any store that *looked*
+  like an upgrade (established, no birth marker, no stored access choice).
   That inference was unsound: the fail-closed default landed several commits
   before the birth marker existed, so a container born private under one of
   those pre-marker builds carries no marker and is byte-identical on disk to a
-  genuine pre-0.62 install - as is any pre-marker database copied into a
-  container. On that whole population the migration silently opened an
+  genuine install from 0.61 or earlier - as is any pre-marker database copied
+  into a container. On that whole population the migration silently opened an
   unauthenticated dashboard to the LAN, so it was removed: **provenance is
   never inferred for an access decision.** Date heuristics fail the same way
   (a restored backup re-opens the hole), so the ambiguity fails closed and the

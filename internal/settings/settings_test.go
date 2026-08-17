@@ -774,7 +774,7 @@ func TestNormalizeCapsAuthUser(t *testing.T) {
 
 // An enabled schedule with no valid windows is forced off in normalize, so the
 // gate reads as "unscheduled / always allowed" instead of silently answering
-// "never" and disabling the whole feature (audit #15).
+// "never" and disabling the whole feature.
 func TestNormalizeEmptyScheduleForcesFlagOff(t *testing.T) {
 	got := normalize(Values{SchedSpeedEnabled: true, SchedLatEnabled: true})
 	if got.SchedSpeedEnabled {
@@ -799,7 +799,7 @@ func TestNormalizeEmptyScheduleForcesFlagOff(t *testing.T) {
 
 // Retention windows clamp to [0, MaxDuration]: the API pointer path skips secs(),
 // so normalize must cap a multi-century value the load path would otherwise
-// silently rewrite on reload, and floor a negative to 0 (audit #16).
+// silently rewrite on reload, and floor a negative to 0.
 func TestNormalizeClampsRetention(t *testing.T) {
 	got := normalize(Values{
 		Retention:         50 * 365 * 24 * time.Hour, // 50y, far past the 10y MaxDuration

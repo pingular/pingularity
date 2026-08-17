@@ -120,10 +120,11 @@ func TestDefaultSettings(t *testing.T) {
 // It is also the ONLY path that persists an access decision (pinned
 // structurally by TestOnlyExplicitInputPersistsAccess): the container
 // grandfather that used to write access_local_only=false from an inference
-// about a store's age is gone, because that inference could not tell an
-// rc.1-rc.3 container - born private - from a genuinely pre-0.62 one, and
-// opening the wrong one put an unauthenticated dashboard on the LAN. Ambiguity
-// now fails closed and only warns, which makes this override the way back in.
+// about a store's age is gone, because that inference could not tell a
+// container born private under a build too old to record its birth from a
+// genuinely 0.61-or-earlier one, and opening the wrong one put an
+// unauthenticated dashboard on the LAN. Ambiguity now fails closed and only
+// warns, which makes this override the way back in.
 func TestReconcileAccess(t *testing.T) {
 	ctx := context.Background()
 	newSet := func(t *testing.T, storedLocalOnly bool) *settings.Controller {

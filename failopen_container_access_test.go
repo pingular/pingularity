@@ -14,10 +14,10 @@ import (
 
 // These tests pin the fail-CLOSED contract for container access. The daemon
 // used to persist access_local_only=false for a container whose store merely
-// LOOKED pre-0.62 (established, no birth marker, no stored access key). The
-// marker only exists as of 0.62-rc.4, but the fail-closed default shipped in
-// rc.1 - so a container first installed on rc.1/rc.2/rc.3 was born PRIVATE and
-// still has no marker, leaving it byte-identical on disk to a genuine pre-0.62
+// LOOKED old (established, no birth marker, no stored access key). The birth
+// marker landed AFTER the fail-closed default did, so a container first
+// installed by a build from that window was born PRIVATE and still carries no
+// marker, leaving it byte-identical on disk to a genuine 0.61-or-earlier
 // install. Every gate passed, and the upgrade silently put an unauthenticated
 // dashboard on the LAN (default listen is every interface, auth usually off).
 //
@@ -71,9 +71,9 @@ func storedAccessKey(t *testing.T, st *store.Store) bool {
 	return ok
 }
 
-// testDefaults are 0.62's fresh-install seeds in miniature: AccessLocalOnly
-// true (fail closed) seeded as a DEFAULT, never stored - exactly what every
-// boot looks like before anyone chooses.
+// testDefaults are the daemon's fresh-install seeds in miniature:
+// AccessLocalOnly true (fail closed) seeded as a DEFAULT, never stored -
+// exactly what every boot looks like before anyone chooses.
 func testDefaults() settings.Values { return testDefaultsFor(config.Config{}) }
 
 // testDefaultsFor models how main SEEDS the controller: `def :=
@@ -103,10 +103,10 @@ func openStore(t *testing.T) *store.Store {
 // newPreMarkerContainerStore builds the ambiguous shape: operator configuration
 // and measurement history (so the store reads as ESTABLISHED), NO birth marker,
 // and NO stored access key. Every population in the header lands here - a
-// pre-0.62 upgrade, a build that predates the marker, a lost birth stamp.
-// Ordering is load-bearing: the store is established BEFORE settings.New runs,
-// so New refuses to stamp the marker (ensureBornMarker only stamps a brand-new
-// store), reproducing the on-disk shape rather than asserting it.
+// 0.61-or-earlier upgrade, a build that predates the marker, a lost birth
+// stamp. Ordering is load-bearing: the store is established BEFORE
+// settings.New runs, so New refuses to stamp the marker (ensureBornMarker only
+// stamps a brand-new store), reproducing the on-disk shape rather than asserting it.
 func newPreMarkerContainerStore(t *testing.T) (*store.Store, *settings.Controller) {
 	t.Helper()
 	return newAmbiguousContainerStore(t, config.Config{})
@@ -172,10 +172,10 @@ func establishedContainerController(t *testing.T, st *store.Store, cfg config.Co
 // persisted access_local_only=false and published the dashboard to the LAN.
 //
 // ONE test covers every install that reaches this shape, deliberately: a
-// genuine pre-0.62 upgrade, an install from a build that predates the marker,
-// and one whose birth stamp failed to write. They are the same bytes on disk,
-// which is the entire finding - no rule can open one without opening the
-// others, so the only safe answer is to open none of them. (A separate root
+// genuine 0.61-or-earlier upgrade, an install from a build that predates the
+// marker, and one whose birth stamp failed to write. They are the same bytes
+// on disk, which is the entire finding - no rule can open one without opening
+// the others, so the only safe answer is to open none of them. (A separate root
 // test covers the lost-stamp fixture end to end; a per-population copy here
 // would assert the same state twice and imply a distinction that does not
 // exist.)
@@ -283,12 +283,13 @@ func TestExplicitAccessStillDecidesTheAmbiguousContainer(t *testing.T) {
 	})
 }
 
-// A container BORN on 0.62+ carries the birth marker, so its missing access key
-// means "never chose", not "used to be reachable". It boots untouched, private,
-// and unlectured - even after consenting without an access choice (Quick Setup
-// dismissal) and accruing history, which is what makes it look established from
-// its second boot on.
-func TestContainerBornOn062StaysPrivateAndUnwarned(t *testing.T) {
+// A container born under a build that STAMPS the birth marker carries one, and
+// every build that stamps it already defaulted closed - so its missing access
+// key means "never chose", not "used to be reachable". It boots untouched,
+// private, and unlectured - even after consenting without an access choice
+// (Quick Setup dismissal) and accruing history, which is what makes it look
+// established from its second boot on.
+func TestMarkedContainerStaysPrivateAndUnwarned(t *testing.T) {
 	ctx := context.Background()
 	st := openStore(t)
 
@@ -323,7 +324,7 @@ func TestContainerBornOn062StaysPrivateAndUnwarned(t *testing.T) {
 	warns := bootAccessDecision(t, config.Config{}, st, set2, true)
 
 	if !set2.AccessLocalOnly() {
-		t.Fatal("a container born on 0.62 lost its fail-closed access")
+		t.Fatal("a container born with a birth marker lost its fail-closed access")
 	}
 	if storedAccessKey(t, st) {
 		t.Fatal("an access key was stored for an install whose operator never chose")
@@ -345,7 +346,8 @@ func TestWarnAmbiguousContainerAccessFires(t *testing.T) {
 
 	// ambiguous: established container store, no marker, no stored access key.
 	ambiguous := func(t *testing.T) (*store.Store, *settings.Controller) { return newPreMarkerContainerStore(t) }
-	// marked: born under 0.62+, established by later history.
+	// marked: born under a build that stamps the marker, established by later
+	// history.
 	marked := func(t *testing.T) (*store.Store, *settings.Controller) {
 		t.Helper()
 		st := openStore(t)
@@ -388,7 +390,7 @@ func TestWarnAmbiguousContainerAccessFires(t *testing.T) {
 		want      bool
 	}{
 		{"ambiguous container: the one shape that gets it", ambiguous, config.Config{}, true, true},
-		{"born on 0.62+ (marker present): provenance known", marked, config.Config{}, true, false},
+		{"marker present: provenance known", marked, config.Config{}, true, false},
 		{"access already chosen and stored", chosen, config.Config{}, true, false},
 		{"explicit -access network settles it", ambiguous, config.Config{Access: "network", AccessExplicit: true}, true, false},
 		{"explicit -access local settles it", ambiguous, config.Config{Access: "local", AccessExplicit: true}, true, false},

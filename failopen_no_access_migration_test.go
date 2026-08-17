@@ -17,9 +17,9 @@ import (
 // unauthenticated dashboard to the LAN silently.
 //
 // A behavioral test cannot cover this: it can only check the paths it thought
-// to build a fixture for, and the defect was precisely a path (rc.1-rc.3
-// stores) nobody had a fixture for. Reading the source catches the next such
-// writer wherever it is added.
+// to build a fixture for, and the defect was precisely a path (stores born
+// private under a build too old to record their birth) nobody had a fixture
+// for. Reading the source catches the next such writer wherever it is added.
 func TestOnlyExplicitInputPersistsAccess(t *testing.T) {
 	const setter = "SetAccessLocalOnly"
 
@@ -69,7 +69,7 @@ func TestOnlyExplicitInputPersistsAccess(t *testing.T) {
 			continue
 		}
 		if strings.Contains(strings.ToLower(fn.Name.Name), "grandfather") {
-			t.Errorf("%s exists again: the container access grandfather persisted network-reachable access on an inference that cannot distinguish an rc.1-rc.3 container (born private) from a pre-0.62 one", fn.Name.Name)
+			t.Errorf("%s exists again: the container access grandfather persisted network-reachable access on an inference that cannot distinguish a container born private under a build too old to record its birth from a 0.61-or-earlier one", fn.Name.Name)
 		}
 	}
 }

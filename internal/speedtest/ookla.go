@@ -885,20 +885,6 @@ func noProxyExcludes(host, port string) bool {
 	return false
 }
 
-// envProxyURL is the routing decision alone, for callers that have nothing to
-// do with an unusable value: it reports the proxy a request for u would ride,
-// and nil when the request goes direct OR when the configured value is one the
-// daemon cannot use (see parseProxyEnvURL). envProxyEndpoint carries the reason
-// in that second case, and guardedEnvProxy is what puts it in front of the
-// operator instead of quietly connecting direct.
-func envProxyURL(u *url.URL) *url.URL {
-	p, err := envProxyEndpoint(u)
-	if err != nil {
-		return nil
-	}
-	return p
-}
-
 // envProxyEndpoint returns the proxy this daemon routes a request for u
 // through, nil for a direct connection, or an error for a configured value it
 // cannot use. Which requests are exempt is net/http's rule set, read fresh:
@@ -3184,7 +3170,7 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 		UDPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl},
 	})
 	var loss *float64
-	// Upstream leak (speedtest-go v1.7.10): RunWithContext opens a TCP sampler conn
+	// Upstream leak (speedtest-go v1.7.11): RunWithContext opens a TCP sampler conn
 	// and a UDP sender conn internally and never Disconnect()s them - on pctx.Done()
 	// its sampler/sender loops just return, leaving both sockets for the Go runtime's
 	// netpoll finalizer to close on the next GC rather than closing them promptly.

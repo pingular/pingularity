@@ -325,7 +325,7 @@ func TestPublicIPChangeDropsCachedExit(t *testing.T) {
 
 // isInternalTraceTarget gates the configured exit target: loopback and link-local
 // are refused (they'd trace the host or the cloud-metadata endpoint), but public
-// and RFC1918 addresses are allowed — tracing a LAN gateway is legitimate (#19).
+// and RFC1918 addresses are allowed - tracing a LAN gateway is legitimate.
 func TestIsInternalTraceTarget(t *testing.T) {
 	cases := map[[4]byte]bool{
 		{127, 0, 0, 1}:       true,  // loopback
@@ -333,8 +333,8 @@ func TestIsInternalTraceTarget(t *testing.T) {
 		{169, 254, 0, 1}:     true,  // link-local
 		{8, 8, 8, 8}:         false, // public
 		{1, 1, 1, 1}:         false, // public (default target)
-		{192, 168, 1, 1}:     false, // RFC1918 LAN gateway — allowed
-		{10, 0, 0, 1}:        false, // RFC1918 — allowed
+		{192, 168, 1, 1}:     false, // RFC1918 LAN gateway - allowed
+		{10, 0, 0, 1}:        false, // RFC1918 - allowed
 	}
 	for v, want := range cases {
 		if got := isInternalTraceTarget(v); got != want {

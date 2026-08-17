@@ -248,7 +248,7 @@ func isRelease(s string) bool { return semverRE.MatchString(s) }
 
 // newer reports whether latest is strictly greater than current as a semver.
 // The numeric MAJOR.MINOR.PATCH decides it; on a tie a PRERELEASE current (e.g.
-// "0.62.0-rc.1") ranks below the same-numbered final ("0.62.0"), per SemVer
+// "1.0.0-rc.1") ranks below the same-numbered final ("1.0.0"), per SemVer
 // precedence - so an rc tester is offered the stable they were testing without
 // anyone having to inflate the version to force the badge. latest arrives
 // stripped to its numeric core (see fetch), so it never carries a prerelease;
@@ -271,8 +271,8 @@ func newer(current, latest string) bool {
 }
 
 // isPrerelease reports whether s carries a SemVer prerelease suffix - a hyphen
-// immediately after the MAJOR.MINOR.PATCH core, e.g. "0.62.0-rc.1". Build
-// metadata ("0.62.0+build") is not a prerelease, and non-semver input never is.
+// immediately after the MAJOR.MINOR.PATCH core, e.g. "1.0.0-rc.1". Build
+// metadata ("1.0.0+build") is not a prerelease, and non-semver input never is.
 func isPrerelease(s string) bool {
 	loc := semverRE.FindStringIndex(s)
 	if loc == nil {
