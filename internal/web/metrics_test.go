@@ -97,13 +97,18 @@ func TestMetricsExcludesProductAnalytics(t *testing.T) {
 	stats.Inc("web.ui_loads")
 	stats.Inc("web.exports")
 	stats.Inc("web.manual_speedtests")
+	// A near-miss on an allowlisted namespace: the operational prefix is
+	// "series." with the dot, so a product counter that merely starts with the
+	// same letters must stay out. Written as a substring test the allowlist
+	// would admit a whole family of unclassified names.
+	stats.Inc("seriesviewer.opens")
 	// Operational / security - must be kept.
 	stats.Inc("web.login_fail")
 	stats.Inc("web.limiter_trips")
 	stats.Inc("db.busy")
 
 	body := scrape(t, newMetricsServer(t))
-	for _, bad := range []string{"settings.changed", "web.ui_loads", "web.exports", "web.manual_speedtests"} {
+	for _, bad := range []string{"settings.changed", "web.ui_loads", "web.exports", "web.manual_speedtests", "seriesviewer.opens"} {
 		if strings.Contains(body, bad) {
 			t.Errorf("product-analytics counter %q leaked into /metrics", bad)
 		}

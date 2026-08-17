@@ -20,19 +20,34 @@ import (
 // /metrics target-cap disclosure, the step-up security counter (sibling of the
 // exported web.login_fail), and the import.* repair counters whose code
 // comment says "so it is visible on /metrics" - and promStat filtered every
-// one of them, with no other consumer of the registry in the process.
+// one of them, with no other consumer of the registry in the process. The
+// series.* chart-aggregate cache counters are the same shape of signal: they
+// are recorded for this endpoint alone, so an unclassified prefix loses them
+// silently - no log, no error, just a counter nobody can read.
 func TestMetricsExposesOperationalWebAndImportCounters(t *testing.T) {
 	stats.ResetForTest()
 	stats.Inc("web.metrics_targets_capped")
 	stats.Inc("web.stepup_fail")
 	stats.Inc("import.event_duration_dropped")
 	stats.Inc("import.pause_dropped")
+	stats.Inc("series.cache.hit")
+	stats.Inc("series.cache.expired")
+	stats.Inc("series.cache.new")
+	stats.Inc("series.cache.empty")
+	stats.Inc("series.bypass")
+	stats.Inc("series.query")
 	body := scrape(t, newMetricsServer(t))
 	for _, want := range []string{
 		`pingularity_stat_total{stat="web.metrics_targets_capped"} 1`,
 		`pingularity_stat_total{stat="web.stepup_fail"} 1`,
 		`pingularity_stat_total{stat="import.event_duration_dropped"} 1`,
 		`pingularity_stat_total{stat="import.pause_dropped"} 1`,
+		`pingularity_stat_total{stat="series.cache.hit"} 1`,
+		`pingularity_stat_total{stat="series.cache.expired"} 1`,
+		`pingularity_stat_total{stat="series.cache.new"} 1`,
+		`pingularity_stat_total{stat="series.cache.empty"} 1`,
+		`pingularity_stat_total{stat="series.bypass"} 1`,
+		`pingularity_stat_total{stat="series.query"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %s - the recorder exists but promStat filters it into a black hole", want)

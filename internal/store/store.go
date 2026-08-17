@@ -2364,10 +2364,39 @@ type seriesKey struct {
 	exclude   string
 }
 
+// liveTTLCap bounds how long a still-growing window (open-ended, or ending in
+// the future) may be served from cache. It is a CAP, not a floor: it clips a
+// TTL above it and raises nothing, so it engages only above bucket 480 - a span
+// wider than about 8.3 days (480s buckets x the 1500 the server aims for,
+// maxSeriesPoints web.go:1177). The 7d preset buckets to 403s (seriesBucket,
+// web.go:1193) and keeps its own natural 100.75s; 5m/1h/6h/1d bucket to
+// 1/2/14/57s and never reach the cache at all (the sub-minute return in Series
+// below).
+//
+// The cost of raising this from 30s is chart-versus-reality lag: up to
+// bucketSec/4 - 30s of extra staleness, which is 0 for every preset up to 1d,
+// +70.75s at 7d, and reaches the full +90s only past that ~8.3-day span, where
+// one bucket already averages eight minutes or more of probes.
+//
+// The old 30s was chosen "matching the status pills aggregate TTL" - a wrong
+// reason, and the reason the number was wrong. That TTL is aggTTL
+// (web.go:246), which guards aggregates() (web.go:250): uptime, data-usage and
+// speed averages, read by /api/status, /readyz and /metrics. It never calls
+// Series, whose only production caller is the lone non-test `.Series(` in the
+// tree, in handleSeries (web.go:1791), so the two caches share no data and no
+// figure was ever kept in step by giving them the same number.
+const liveTTLCap = 120 * time.Second
+
 // seriesEntry caches one computed aggregate; mu single-flights concurrent
 // viewers of the same key so only one runs the scan.
 type seriesEntry struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// scanned records that a scan has completed and stored its result in this
+	// entry, INCLUDING a result of no points. It exists because two different
+	// states both leave expires at the zero time - "nobody has filled this entry
+	// yet" and "a scan filled it with nothing" - and the outcome switch in Series
+	// has to tell them apart. Written and read only under mu.
+	scanned bool
 	expires time.Time
 	pts     []SeriesPoint
 }
@@ -2390,6 +2419,16 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 		bucketSec = 1
 	}
 	if bucketSec < 60 {
+		// Counted separately because this return is the ONLY place the sub-minute
+		// buckets are visible: they never consult the cache, so none of the
+		// hit/new/empty/expired counters below can account for them and a dashboard
+		// doing nothing but this would read as an idle, perfectly-behaved cache.
+		// Four of the five UI range presets land here: the chart's preset ladder is
+		// [[5,'5m'],[60,'1h'],[360,'6h'],[1440,'1d'],[10080,'7d']] minutes
+		// (index.html, grep that literal), which seriesBucket (web.go:1193) turns
+		// into 1/2/14/57/403s over maxSeriesPoints = 1500 (web.go:1177) - only 7d
+		// clears 60.
+		stats.Inc("series.bypass")
 		return s.seriesQuery(ctx, since, until, bucketSec, excludeTargets)
 	}
 	ex := append([]string(nil), excludeTargets...)
@@ -2420,8 +2459,8 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 		exclude:   strings.Join(ex, ","),
 	}
 	s.seriesMu.Lock()
-	e, ok := s.seriesCache[key]
-	if !ok {
+	e := s.seriesCache[key]
+	if e == nil {
 		if len(s.seriesCache) > 32 {
 			s.seriesCache = map[seriesKey]*seriesEntry{}
 		}
@@ -2431,22 +2470,87 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 	s.seriesMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// Freshness is judged - and counted - only after e.mu is held, never from the
+	// map lookup above. A caller that arrived while another was mid-seriesQuery
+	// found the entry stale (or absent), then BLOCKED on this mutex and is handed
+	// the fresh result right here without running a query of its own. Counting
+	// what the lookup saw would book a miss for every request the single-flight
+	// just absorbed, overstating query load by exactly the concurrency the lock
+	// is saving.
 	if time.Now().Before(e.expires) {
+		stats.Inc("series.cache.hit")
 		return e.pts, nil
+	}
+	// Three outcomes, because they have three different causes and only one of
+	// them is a TTL's fault. Every request that gets past the return above runs a
+	// scan, so the three have to partition the misses exactly: hit + new + empty
+	// + expired is every request that reached the cache, and new + empty +
+	// expired is every scan the cache path ran (series.query counts those plus
+	// the sub-minute bypasses).
+	//
+	// The switch reads the ENTRY's state, never whether the map lookup above
+	// found one. The lookup ran before e.mu was taken and describes the cache as
+	// it was then, not as it is here: the insert publishes a zero-value entry and
+	// drops seriesMu before anyone locks e.mu, so a second caller can find that
+	// entry in the map and still be the first through this switch. Reading the
+	// lookup made that caller book .empty for a key nobody had filled yet.
+	switch {
+	case !e.scanned:
+		// Nothing has ever been stored in this entry, so there was nothing to
+		// serve and the scan below is compulsory. Three ways to get here: no entry
+		// existed and the insert above made this one (first sight of the key, or
+		// the over-32-entry wipe dropped the old one); another caller published an
+		// entry and this caller reached e.mu before it stored anything; or every
+		// scan on this entry so far returned an error, which returns below without
+		// storing. Kept apart from expiry because a rolling window's key rotates
+		// every bucketSec on its own (the start is floored to the bucket, above):
+		// 403s at the 7d preset. That churn is compulsory and no TTL change can
+		// touch it, so a single "miss" counter would credit or blame a TTL for
+		// turnover it never controlled.
+		stats.Inc("series.cache.new")
+	case e.expires.IsZero():
+		// A scan completed on this entry and stored no points: the empty-result
+		// branch at the bottom of this function leaves the expiry at the zero time
+		// on purpose. Two other things also leave a zero expiry - the zero-value
+		// entry the insert above publishes, and a scan that errored before
+		// reaching the assignment - but neither sets scanned, so both are caught
+		// by the case above and only a real empty result reaches here.
+		// Nothing expired, so .expired here would be a metric that lies - and it
+		// would lie loudest where it does the most damage: on a fresh install
+		// every wide window is empty, so every poll after the first would report
+		// an expiry that never happened and a TTL change would look like it had
+		// made things worse. It is not .new either - the entry is not a fresh one,
+		// this is a key being re-scanned because its last scan found nothing to
+		// serve. Its own counter, because its cause is its own and its cure is
+		// too: not a short TTL and not key churn, but a window with no rows in
+		// it, which no TTL can fix and which stops on its own once samples land.
+		stats.Inc("series.cache.empty")
+	default:
+		// A populated entry whose TTL ran out - the only miss a TTL change can
+		// remove. .new is key churn and .empty is a window with no rows, and
+		// neither moves when liveTTLCap or the quarter-bucket TTL does, so a
+		// before/after TTL figure is a claim about THIS counter and the hits it
+		// turns into.
+		stats.Inc("series.cache.expired")
 	}
 	pts, err := s.seriesQuery(ctx, since, until, bucketSec, excludeTargets)
 	if err != nil {
 		return nil, err
 	}
 	e.pts = pts
+	// This entry now holds a result - even if that result is no points at all -
+	// so the next caller through the switch above reads .empty or .expired rather
+	// than .new. An errored scan returns above without getting here, leaving the
+	// entry exactly as it found it.
+	e.scanned = true
 	// The quarter-bucket TTL rests on "the aggregate only changes materially once
 	// per bucket" - true for a mature window, but on a young install a wide window
 	// is one trailing partial bucket that changes every probe round, so a long TTL
 	// would pin a near-empty first-run chart (and a missing DNS line) for up to
-	// ~87min on a 1y range. Cap the trailing (open-ended) window at 30s, matching
-	// the status pills' aggregate TTL; a fixed historical window is safe to cache
-	// for its full bucket. Never pin an empty result at all, so a fresh DB re-
-	// aggregates as soon as its first samples land.
+	// ~87min on a 1y range. Cap the trailing (open-ended) window at liveTTLCap; a
+	// fixed historical window is safe to cache for its full bucket. Never pin an
+	// empty result at all, so a fresh DB re-aggregates as soon as its first
+	// samples land.
 	ttl := time.Duration(bucketSec) * time.Second / 4
 	// A window whose end is still in the FUTURE is fixed but NOT historical: new
 	// samples keep entering it, so treat it like an open-ended window and cap the
@@ -2455,10 +2559,15 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 	// pin new samples out of the chart for up to bucketSec/4 (~88 min at 1y). Once
 	// the end passes into the past the window becomes genuinely historical and the
 	// full bucket TTL is valid again.
-	if (until.IsZero() || until.After(time.Now())) && ttl > 30*time.Second {
-		ttl = 30 * time.Second
+	if (until.IsZero() || until.After(time.Now())) && ttl > liveTTLCap {
+		ttl = liveTTLCap
 	}
 	if len(pts) == 0 {
+		// Left at the zero time, which - paired with the scanned flag set just
+		// above - is what the next poll reads to book series.cache.empty rather
+		// than a false .expired (the switch above). Assigned rather than assumed:
+		// an entry that held points before and scans empty now has to be reset to
+		// the empty state, not left pinned on its old expiry.
 		e.expires = time.Time{}
 	} else {
 		e.expires = time.Now().Add(ttl)
@@ -2468,6 +2577,18 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 
 // seriesQuery runs the actual Series aggregate (see Series for semantics).
 func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketSec int, excludeTargets []string) ([]SeriesPoint, error) {
+	// Counted here, not at the two call sites (the sub-minute bypass and the cache
+	// miss in Series above), so "a scan really ran" cannot drift from the code that
+	// runs one. An error still counts: the work was done and the DB paid for it.
+	// The duration goes into a histogram rather than a running mean because the
+	// spread is the whole story - a 5m window and a 30d window run the same code
+	// and differ by orders of magnitude (see BenchmarkSeriesQuery,
+	// series_bench_test.go), so a mean over both describes neither. Which bounds
+	// it lands in is internal/stats' business (stats.Observe picks them by metric
+	// name), not this call site's.
+	stats.Inc("series.query")
+	queryStart := time.Now()
+	defer func() { stats.Observe("series.query.seconds", time.Since(queryStart).Seconds()) }()
 	// excludeTargets drops targets from the latency MIN (the "lowest" line) only;
 	// online/outage detection below still counts every target, since connectivity
 	// is global truth, not a per-user display filter. Placeholders keep it
