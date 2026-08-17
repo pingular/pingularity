@@ -73,6 +73,9 @@ const DEFS = {
   udpDirTitle: 'function udpDirTitle',
   congestionContainerHint: 'function congestionContainerHint',
   loopbackHost: 'function loopbackHost',
+  latSpanMins: 'function latSpanMins', latPollForMins: 'function latPollForMins',
+  latPollDelay: 'function latPollDelay',
+  speedPollForMins: 'function speedPollForMins', speedPollDelay: 'function speedPollDelay',
 };
 const NAMES = Object.keys(DEFS);
 const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
@@ -82,7 +85,8 @@ const defs = NAMES.map(n => extract(DEFS[n])).join('\n');
 // `$` is injected so setSpdAvg can be driven against a fake element: the pill's
 // visible text and its accessible name are set on different lines, and whether the
 // second one is reached is exactly what is under test.
-const factory = new Function('document', 'TC', 'DAYN', 'isNum', '$', 'esc', 'AX_PAD', 'iperfServers', defs + '\nreturn {' + NAMES.join(',') + '};');
+const factory = new Function('document', 'TC', 'DAYN', 'isNum', '$', 'esc', 'AX_PAD', 'iperfServers',
+  'LAT_MAX_WIN_SEC', 'LAT_POLL_RUNGS', 'SPD_POLL_RUNGS', defs + '\nreturn {' + NAMES.join(',') + '};');
 const TC = { hm0: '#000000', down: '#ffffff' };
 const fakeCtx = { _v: '#000000', set fillStyle(x) { this._v = x; }, get fillStyle() { return this._v; } };
 const fakeDoc = { createElement: () => ({ getContext: () => fakeCtx }) };
@@ -104,12 +108,23 @@ const fakeEl = () => ({
 const AX_PAD_VAL = new Function(script.match(/const AX_GAP = [^;]*;/)[0] + '\n'
   + script.match(/const AX_PAD = [^;]*;/)[0] + '\nreturn AX_PAD;')();
 let fakeIperfServers = [];
+// The poll-cadence constants are brace-less consts the extractor cannot lift, and
+// they are the numbers under test (the 366-day bound the server applies, and the
+// rungs each ladder may return) - so they are evaluated out of the page rather
+// than restated here, where they could drift from what ships. MAX_WIN_MINS comes
+// along because LAT_MAX_WIN_SEC is now derived from it.
+const LAT_CONSTS = new Function(script.match(/const MAX_WIN_MINS = [^;]*;/)[0] + '\n'
+  + script.match(/const LAT_MAX_WIN_SEC = [^;]*;/)[0] + '\n'
+  + script.match(/const LAT_POLL_RUNGS = [^;]*;/)[0] + '\n'
+  + script.match(/const SPD_POLL_RUNGS = [^;]*;/)[0]
+  + '\nreturn { MAX_WIN_MINS, LAT_MAX_WIN_SEC, LAT_POLL_RUNGS, SPD_POLL_RUNGS };')();
 const F = factory(fakeDoc, TC, ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], v => typeof v === 'number',
   () => fakePill,
   // esc is a one-line arrow in the page, so it is injected rather than extracted;
   // the panel strings below interpolate daemon-supplied place names through it.
   s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
-  AX_PAD_VAL, fakeIperfServers);
+  AX_PAD_VAL, fakeIperfServers, LAT_CONSTS.LAT_MAX_WIN_SEC, LAT_CONSTS.LAT_POLL_RUNGS,
+  LAT_CONSTS.SPD_POLL_RUNGS);
 
 // Everything below picks single definitions out of the script and compiles those,
 // so a syntax error anywhere in the other ~6800 lines passes every test here AND
@@ -1540,6 +1555,12 @@ test('spdSyncPlan: a status poll cannot repaint a span selected after it left', 
   // sequence check alone would call this fresh and paint A over B.
   assert.equal(C.spdSyncPlan(4, 4, 'from=1&to=2', 'from=3&to=4'), 'stale');
 
+  // An empty loadedFor is the third way in, and it has to read as stale too:
+  // refreshSpeedChart empties the marker as a FORCED load begins, so this is a
+  // status poll landing between "the user deleted these runs" and the refetch
+  // returning. spdData is pre-delete, and 'loading range…' is the honest caption.
+  assert.equal(C.spdSyncPlan(4, 4, '', 'from=3&to=4'), 'stale');
+
   // The call site must translate that into syncSpeedPanel(fresh) correctly:
   // skip paints nothing, stale paints the loading state, sync paints the data.
   const painted = [];
@@ -1973,13 +1994,21 @@ test('the log poll is not gated on the logging switch', () => {
 //
 // This drives the REAL refreshNetinfo out of index.html with stubs, so it fails if
 // the shipped early-return logic changes.
-function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {} } = {}) {
+// TILE_GATE is the real .section-hidden check out of the page, injected into
+// every driver below so they answer with the shipped gate rather than a stub.
+const TILE_GATE = extract('function sectionHidden') + '\n' + extract('function tileIdle');
+// A document whose only .panel is `section`, hidden or not, for that gate.
+const gateDoc = (section, hidden) => ({
+  querySelector: sel => sel === '.panel[data-section="' + section + '"]'
+    ? { classList: { contains: c => c === 'section-hidden' && hidden } } : null,
+});
+function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {}, hidden = false, force = false } = {}) {
   const body = extract('async function refreshNetinfo');
   const panel = { innerHTML: '' };
   const warn = { innerHTML: '', classList: { add() {}, remove() {} } };
   const refreshBtn = { classList: { contains: () => false } };
   const els = { netinfo: panel, netinfoWarn: warn, netinfoRefresh: refreshBtn };
-  const scheduled = [];
+  const scheduled = [], fetched = [];
   const $ = id => els[id] || { innerHTML: '', classList: { add() {}, remove() {}, contains: () => false },
     setAttribute() {}, getAttribute() {}, hidden: false };
   // netinfoIdleReason is pulled from the same source, not restated here: the
@@ -1987,19 +2016,21 @@ function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {} } =
   const idle = script.includes('function netinfoIdleReason') ? extract('function netinfoIdleReason') : '';
   const make = new Function(
     '$', 'fget', 'syncNetinfoOffMark', 'netinfoOff', 'monitoring', 'setTimeout', 'clearTimeout',
-    'labelInfoBubbles', 'esc',
-    idle + '\nlet netinfoSeq = 0, netinfoRetry = null;\n' + body + '\nreturn refreshNetinfo;');
+    'labelInfoBubbles', 'esc', 'document',
+    TILE_GATE + '\n' + idle + '\nlet netinfoSeq = 0, netinfoRetry = null;\n' + body
+    + '\nreturn Object.assign(refreshNetinfo, { seq: () => netinfoSeq });');
   const fn = make(
     $,
-    async () => ({ json: async () => snapshot }),
+    async (url, _ms, opt) => { fetched.push((opt && opt.method) || 'GET'); return { json: async () => snapshot }; },
     () => {},
     netinfoOff, monitoring,
     (f, ms) => { scheduled.push(ms); return 1; },
     () => {},
     () => {},
     s => String(s),
+    gateDoc('connection', hidden),
   );
-  return fn().then(() => ({ html: panel.innerHTML, polls: scheduled.length }));
+  return fn(force).then(() => ({ html: panel.innerHTML, polls: scheduled.length, fetched, seq: fn.seq() }));
 }
 
 test('connection panel: nothing cached and monitoring paused -> says so, stops polling', async () => {
@@ -3797,4 +3828,651 @@ test('the README gives the same locked-out recovery advice as the dashboard', ()
     'the container advice says to run the reset from a one-off container but no longer says where the command is, and it is not one an operator can guess');
   assert.match(readmeRaw, /^#+ +Docker\b/m,
     'the container advice sends the operator to the README’s Docker section for the command, and there is no such section');
+});
+
+// --- hidden tiles do not poll ------------------------------------------------
+//
+// A tile dragged off the dashboard is display:none (.section-hidden), and every
+// refresher behind one used to keep fetching anyway: its own timer, tick() at
+// boot / on tab focus / on `online`, and the stale-recovery burst in
+// refreshStatus. The gate lives inside each refresher, which is what covers all
+// of those call sites at once.
+test('tileIdle: a hidden tile stands down, a visible one polls, a forced refresh always runs', () => {
+  const gate = hidden => new Function('document', TILE_GATE + '\nreturn tileIdle;')(gateDoc('latency', hidden));
+  assert.equal(gate(true)('latency'), true, 'a hidden tile must not poll - nothing it draws is on screen');
+  assert.equal(gate(true)('latency', true), false,
+    'a FORCED refresh must run even while hidden: force means the rows underneath changed (import, ' +
+    'delete, a window change), and skipping it leaves the tile\'s fetch-once guard pointing at data ' +
+    'that no longer exists, with nothing to make it refetch later');
+  assert.equal(gate(false)('latency'), false, 'a visible tile must poll');
+  assert.equal(gate(true)('speed'), false, 'the gate must key on its OWN panel, not on whether any panel is hidden');
+});
+
+// Each of the five refreshers is DRIVEN behind a hidden tile further down (see
+// "the gate, driven rather than grepped"), which is what an inert or a misplaced
+// gate has to fail. The one thing that cannot be tested that way is a gate that
+// must NOT be there: refreshStatus owns the top bar, the coachmark, Quick Setup,
+// the power button and the speedtest-running state, none of which live inside a
+// panel, so it deliberately polls whatever is hidden. Absence is not something an
+// inert version can fake, so a source check is the right shape here.
+test('refreshStatus is deliberately ungated', () => {
+  assert.doesNotMatch(extract('async function refreshStatus'), /tileIdle/,
+    'refreshStatus drives the top bar and the power button, which no tile can hide');
+});
+
+test('a hidden connection tile fetches nothing, and a forced refresh still lands', async () => {
+  const off = await driveNetinfo({ hidden: true });
+  assert.deepEqual(off.fetched, [], 'a hidden Connection tile still asked the daemon for a snapshot');
+  assert.equal(off.polls, 0, 'and still armed the 3s catch-up poll behind a panel nobody can see');
+  const on = await driveNetinfo({ hidden: false });
+  assert.deepEqual(on.fetched, ['GET'], 'a visible tile must still fetch - the gate has to key on hidden, not on nothing');
+  const forced = await driveNetinfo({ hidden: true, force: true });
+  assert.deepEqual(forced.fetched, ['POST'], 'the manual refresh button must work whatever the tile is doing');
+});
+
+// Restoring a tile has to REFETCH: redrawCharts paints from the latPoints /
+// spdData / hmData caches, and a tile hidden at PAGE LOAD has never filled them.
+function driveRefreshSection(id, { outages = 'block' } = {}) {
+  const calls = [];
+  new Function('refreshChart', 'refreshSpeedChart', 'refreshNetinfo', 'refreshHeatmap', 'loadOutages', '$',
+    extract('function refreshSection') + '\nreturn refreshSection;')(
+    f => calls.push(['latency', f]), f => calls.push(['speed', f]), f => calls.push(['connection', f]),
+    f => calls.push(['heatmap', f]), f => calls.push(['outages', f]),
+    () => ({ style: { display: outages } }))(id);
+  return calls;
+}
+
+test('restoring a tile refetches it, and the connection tile refetches with the cheap GET', () => {
+  assert.deepEqual(driveRefreshSection('latency'), [['latency', undefined]]);
+  assert.deepEqual(driveRefreshSection('speed'), [['speed', undefined]]);
+  assert.deepEqual(driveRefreshSection('downtime'), [['heatmap', undefined], ['outages', undefined]]);
+  assert.deepEqual(driveRefreshSection('downtime', { outages: 'none' }), [['heatmap', undefined]],
+    'a collapsed outage table must not be loaded just because its tile came back');
+  assert.deepEqual(driveRefreshSection('connection'), [['connection', undefined]],
+    'restoring the Connection tile must NOT force: refreshNetinfo(true) POSTs, which handleNetinfo ' +
+    'answers with a full re-fetch including the exit traceroute under a 25s context, and the forced ' +
+    'path skips the in-flight guard - so a few show/hides would stack concurrent 25s POSTs');
+});
+
+test('both restore paths refetch, not just redraw', () => {
+  assert.match(extract('function unhideSection'), /refreshSection\(id\)/,
+    'un-hiding only repaints from cache, so a tile hidden at page load comes back as an empty chart');
+  assert.match(extract("rb.addEventListener('click'"), /refreshSection/,
+    'Reset tiles brings hidden tiles back the same way, and they have the same empty caches');
+});
+
+// --- a failed forced refetch must not freeze the latency chart ---------------
+//
+// latLoadedFor / latLoadedLive are written only on success; the catch returns
+// without touching them. So a forced refetch that FAILS used to leave the marker
+// naming the very query that just failed, and every later unforced poll
+// short-circuits on it. A live window self-heals (live skips the guard); a
+// pinned span never does.
+// A promise a test can hold a fetch on, so a second call can be made while the
+// first is still in flight - which is how the ORDER of the gate and the sequence
+// bump becomes observable.
+const deferred = () => { let go; const p = new Promise(r => { go = r; }); return { p, go }; };
+function chartDriver({ hidden = false, live = false } = {}) {
+  const state = { fetches: 0, fail: false, r503: false, draws: 0, hold: null };
+  const api = new Function('latWindowQuery', 'fget', 'isReconcile503', 'retryAfterMs', 'chartLoadFailed',
+    'drawChart', 'syncLatPanel', 'document', 'state',
+    TILE_GATE + '\nlet chartSeq = 0, latLoadedFor = "", latLoadedLive = false, latPoints = [], latBackoffMs = 0;\n'
+    + extract('async function refreshChart')
+    + '\nreturn { refreshChart, seq: () => chartSeq, backoff: () => latBackoffMs };')(
+    () => ({ q: 'from=1000&to=2000', live }),
+    async () => {
+      state.fetches++;
+      if (state.hold) await state.hold;
+      if (state.fail) throw new Error('the server went away');
+      if (state.r503) return { ok: false, status: 503, headers: { get: () => '4' }, text: async () => 'reconciling' };
+      return { ok: true, json: async () => [{ t: 1 }] };
+    },
+    () => state.r503, () => 4000, () => {},
+    () => { state.draws++; }, () => {},
+    gateDoc('latency', hidden), state);
+  return Object.assign(api, { state });
+}
+
+test('a failed forced refetch cannot freeze a pinned latency span forever', async () => {
+  const c = chartDriver();                  // live:false - a pinned span
+  await c.refreshChart(true);               // the picker's first load
+  assert.equal(c.state.fetches, 1);
+  c.state.fail = true;
+  await c.refreshChart(true);               // e.g. "delete all latency data", and it fails
+  assert.equal(c.state.fetches, 2);
+  c.state.fail = false;
+  await c.refreshChart();                   // the next ordinary poll
+  assert.equal(c.state.fetches, 3,
+    'the forced refetch failed, so the chart is still drawing rows the user just deleted - and the ' +
+    'failure left the fetch-once marker naming this exact query, so every later poll returns before ' +
+    'requesting anything. Nothing on a pinned span ever clears it again.');
+});
+
+test('a pinned latency span that loaded cleanly is still fetched exactly once', async () => {
+  const c = chartDriver();
+  await c.refreshChart(true);
+  await c.refreshChart();
+  await c.refreshChart();
+  assert.equal(c.state.fetches, 1,
+    'the fetch-once guard is the whole reason a pinned span is cheap - invalidating the marker must ' +
+    'not turn every poll back into a request');
+});
+
+test('a hidden latency tile polls nothing, and forced loads still land', async () => {
+  const c = chartDriver({ hidden: true, live: true });
+  await c.refreshChart();
+  assert.equal(c.state.fetches, 0, 'a live window behind a hidden tile is the most expensive poll in the product');
+  await c.refreshChart(true);
+  assert.equal(c.state.fetches, 1,
+    'an import or a delete must still refresh the cache behind a hidden tile, or restoring it draws rows that are gone');
+});
+
+test('a forced refetch that hits a reconcile-503 cannot freeze a pinned latency span either', async () => {
+  const c = chartDriver();                  // live:false - a pinned span
+  await c.refreshChart(true);
+  assert.equal(c.state.fetches, 1);
+  c.state.r503 = true;
+  await c.refreshChart(true);               // the delete lands mid-reconcile
+  assert.equal(c.backoff(), 4000, 'the 503 must still park its Retry-After backoff');
+  c.state.r503 = false;
+  await c.refreshChart();
+  assert.equal(c.state.fetches, 3,
+    'the 503 return leaves the chart holding pre-delete rows, and it is not the catch - so clearing ' +
+    'the marker in the catch instead of at the start of the forced load would still freeze this span');
+});
+
+// --- the same freeze, on the speed chart ------------------------------------
+//
+// refreshSpeedChart has the identical marker: speedLoadedFor/speedLoadedLive are
+// written only on its success line, and both of its non-success exits return
+// without touching them. Reachable from the two paths that force it - an import
+// and a delete-data - both of which are exactly the case where the rows under a
+// pinned span really did change.
+function speedDriver({ hidden = false, live = false } = {}) {
+  const state = { fetches: 0, fail: false, r503: false, paints: 0, hold: null };
+  const api = new Function('speedWindowQuery', 'fget', 'isReconcile503', 'retryAfterMs', 'chartLoadFailed',
+    'drawSpeedChart', 'drawQualityChart', 'drawBloatChart', 'paintSpdAvgs', 'syncSpeedPanel', 'document', 'state',
+    TILE_GATE + '\nlet speedSeq = 0, speedLoadedFor = "", speedLoadedLive = false, spdData = [], spdSampled = false, '
+    + 'spdTotal = 0, speedBackoffMs = 0;\n'
+    + extract('async function refreshSpeedChart')
+    + '\nreturn { refreshSpeedChart, seq: () => speedSeq, backoff: () => speedBackoffMs };')(
+    () => ({ q: 'from=1000&to=2000', live }),
+    async () => {
+      state.fetches++;
+      if (state.hold) await state.hold;
+      if (state.fail) throw new Error('the server went away');
+      if (state.r503) return { ok: false, status: 503, headers: { get: () => '4' }, text: async () => 'reconciling' };
+      return { ok: true, headers: { get: k => (k === 'X-Sampled' ? 'false' : '2') }, json: async () => [{ ts: 1 }] };
+    },
+    () => state.r503, () => 4000, () => {},
+    () => { state.paints++; }, () => {}, () => {}, () => {}, () => {},
+    gateDoc('speed', hidden), state);
+  return Object.assign(api, { state });
+}
+
+test('a failed forced refetch cannot freeze a pinned speed span forever', async () => {
+  const s = speedDriver();                  // live:false - a pinned span
+  await s.refreshSpeedChart(true);
+  assert.equal(s.state.fetches, 1);
+  s.state.fail = true;
+  await s.refreshSpeedChart(true);          // "delete ALL speed data", and it fails
+  assert.equal(s.state.fetches, 2);
+  s.state.fail = false;
+  await s.refreshSpeedChart();              // the next ordinary poll
+  assert.equal(s.state.fetches, 3,
+    'the forced refetch failed, so the three speed charts and the stat tiles are still drawing runs ' +
+    'the user just deleted - and the failure left the fetch-once marker naming this exact query, so ' +
+    'every later poll returns before requesting anything. A pinned span never clears it again.');
+});
+
+test('a forced refetch that hits a reconcile-503 cannot freeze a pinned speed span either', async () => {
+  const s = speedDriver();
+  await s.refreshSpeedChart(true);
+  s.state.r503 = true;
+  await s.refreshSpeedChart(true);
+  assert.equal(s.backoff(), 4000, 'the 503 must still park its Retry-After backoff');
+  s.state.r503 = false;
+  await s.refreshSpeedChart();
+  assert.equal(s.state.fetches, 3,
+    'clearing the marker in the catch would miss this exit, which is why it is cleared as the forced load begins');
+});
+
+test('a pinned speed span that loaded cleanly is still fetched exactly once', async () => {
+  const s = speedDriver();
+  await s.refreshSpeedChart(true);
+  await s.refreshSpeedChart();
+  await s.refreshSpeedChart();
+  assert.equal(s.state.fetches, 1,
+    'the `force` test on the invalidation is what keeps this at one: clearing the marker on every ' +
+    'call would refetch an immutable span on every poll');
+});
+
+test('the forced invalidation sits above the fetch-once guard, where its condition still means something', () => {
+  // This one is order, not behaviour, and deliberately so: the two orders are
+  // behaviourally identical, and moving this line back below the guard passes
+  // every other test in this file - which is how it came to sit there. What the
+  // order decides is whether `if(force)` is load-bearing. BELOW the guard, an
+  // unforced poll of a loaded span returns before ever reaching the line, so
+  // dropping the condition would be invisible. ABOVE it, dropping the condition
+  // empties the marker on every poll and refetches an immutable span every tick,
+  // which the "fetched exactly once" tests above catch. Order is the only thing a
+  // test can hold here, so it is held as order.
+  for (const [def, invalidate, guard] of [
+    ['async function refreshChart', "if(force){ latLoadedFor=''", 'if(!force && !live && latLoadedFor===q'],
+    ['async function refreshSpeedChart', "if(force){ speedLoadedFor=''", 'if(!force && !live && speedLoadedFor===q'],
+  ]) {
+    const body = extract(def);
+    const i = body.indexOf(invalidate), j = body.indexOf(guard);
+    assert.ok(i > 0 && j > 0, def + ' has lost either the forced invalidation or the fetch-once guard');
+    assert.ok(i < j, def + ': the forced invalidation has drifted below the fetch-once guard, so its ' +
+      '`force` condition no longer decides anything and the next edit to drop it will pass every test');
+  }
+});
+
+test('a live speed window is never held back by the fetch-once marker', async () => {
+  const s = speedDriver({ live: true });
+  await s.refreshSpeedChart();
+  await s.refreshSpeedChart();
+  assert.equal(s.state.fetches, 2, 'a rolling window gains runs, so it must poll however recently it loaded');
+});
+
+// --- the gate, driven rather than grepped ------------------------------------
+//
+// These five were pinned by asserting the gate's SOURCE TEXT appeared in each
+// body, which passes two mutations that both ship a bug: an INERT gate (compute
+// the answer, ignore it), which polls behind a hidden tile exactly as before,
+// and a MISPLACED one below `const my=++seq`, which stands the poll down but
+// bumps the sequence on its way out. That second one matters because ++seq is
+// the claim "I am the newest request": a hidden tile ticking every few seconds
+// would keep taking that claim from the FORCED load an import or a delete
+// started, and the forced load then drops its own result on `my!==seq` - leaving
+// the tile's cache holding rows that no longer exist, with nothing to refetch
+// them. So the tests below measure requests, sequence and repaints.
+function heatmapDriver({ hidden = false } = {}) {
+  const state = { fetches: 0, draws: 0, hold: null, rows: [{ date: '2026-05-20', downtime_s: 0 }] };
+  const api = new Function('fget', 'drawHeatmap', 'document', 'state',
+    TILE_GATE + '\nlet heatmapSeq = 0, hmData = [];\n'
+    + extract('async function refreshHeatmap')
+    + '\nreturn { refreshHeatmap, seq: () => heatmapSeq, data: () => hmData };')(
+    async () => { state.fetches++; if (state.hold) await state.hold; return { json: async () => state.rows }; },
+    () => { state.draws++; },
+    gateDoc('downtime', hidden), state);
+  return Object.assign(api, { state });
+}
+function outagesDriver({ hidden = false, page = 1, pages = {} } = {}) {
+  const state = { fetches: [], hold: null };
+  const events = { innerHTML: '' };
+  const api = new Function('fget', '$', 'evHighlighted', 'outageDeletable', 'TRASH_SVG', 'fmtTime', 'fmtDur',
+    'updateOutagesPager', 'document', 'state',
+    TILE_GATE + '\nlet outagesSeq = 0, outagesTotal = 0, outagesPerPage = 10, outagesPage = ' + page + ';\n'
+    + extract('async function loadOutages')
+    + '\nreturn { loadOutages, seq: () => outagesSeq, page: () => outagesPage };')(
+    async url => {
+      const off = +(/offset=(\d+)/.exec(url) || [0, 0])[1];
+      state.fetches.push(off);
+      if (state.hold) await state.hold;
+      return { json: async () => ({ events: pages[off] || [], total: 1 }) };
+    },
+    () => events, () => false, () => false, '', () => 'T', () => '0s',
+    () => {},
+    gateDoc('downtime', hidden), state);
+  return Object.assign(api, { state, events });
+}
+
+test('a hidden tile issues no request and leaves its sequence where it found it', async () => {
+  const c = chartDriver({ hidden: true, live: true });
+  await c.refreshChart();
+  assert.deepEqual([c.state.fetches, c.seq()], [0, 0], 'the latency chart polled behind a hidden tile');
+  const s = speedDriver({ hidden: true, live: true });
+  await s.refreshSpeedChart();
+  assert.deepEqual([s.state.fetches, s.seq()], [0, 0], 'the speed chart polled behind a hidden tile');
+  const h = heatmapDriver({ hidden: true });
+  await h.refreshHeatmap();
+  assert.deepEqual([h.state.fetches, h.seq()], [0, 0], 'the heatmap polled behind a hidden tile');
+  const o = outagesDriver({ hidden: true });
+  await o.loadOutages();
+  assert.deepEqual([o.state.fetches.length, o.seq()], [0, 0], 'the outages table polled behind a hidden tile');
+  const n = await driveNetinfo({ hidden: true });
+  assert.deepEqual([n.fetched.length, n.seq], [0, 0], 'the connection tile polled behind a hidden panel');
+});
+
+test('a forced refresh of a hidden tile runs anyway, sequence and all', async () => {
+  const c = chartDriver({ hidden: true, live: true });
+  await c.refreshChart(true);
+  assert.deepEqual([c.state.fetches, c.seq(), c.state.draws], [1, 1, 1], 'a forced latency load must land');
+  const s = speedDriver({ hidden: true, live: true });
+  await s.refreshSpeedChart(true);
+  assert.deepEqual([s.state.fetches, s.seq(), s.state.paints], [1, 1, 1], 'a forced speed load must land');
+  const o = outagesDriver({ hidden: true, pages: { 0: [{ ts: 1, type: 'up' }] } });
+  await o.loadOutages(true);
+  assert.deepEqual([o.state.fetches.length, o.seq()], [1, 1], 'a forced outages load must land');
+  assert.match(o.events.innerHTML, /<tr/, 'and must repaint the table it just fetched');
+  const n = await driveNetinfo({ hidden: true, force: true });
+  assert.deepEqual([n.fetched, n.seq], [['POST'], 1], 'the manual refresh button must work whatever the tile is doing');
+});
+
+test('the heatmap has no forced path, so what its gate must let through is the VISIBLE tile', async () => {
+  // refreshHeatmap takes no `force`, because no caller has one to pass: the 60s
+  // timer, tick(), the stale-recovery burst, an import, a delete-all, an outage
+  // delete and refreshSection all call it bare, and it keeps no fetch-once marker
+  // for a stood-down poll to leave stale. So there is no forced-while-hidden case
+  // to drive here, unlike the four above. What is left to hold is the other
+  // direction: a gate stuck on `true` - or one that swallowed the whole fetch -
+  // stops the heatmap for good, and "a hidden tile issues no request" above passes
+  // that mutation happily.
+  const h = heatmapDriver({ hidden: false });
+  await h.refreshHeatmap();
+  assert.deepEqual([h.state.fetches, h.seq(), h.state.draws], [1, 1, 1],
+    'a visible heatmap must fetch, claim the sequence and repaint');
+  assert.equal(h.data().length, 1, 'and the fetched days must reach the cache the tile redraws from');
+});
+
+test('a tick behind a hidden tile cannot invalidate a forced load already in flight', async () => {
+  // Each of these starts a FORCED load (an import, a delete-data), holds it open,
+  // and lets the hidden tile's own timer tick once while it is in the air. The
+  // forced load has to come back and paint. It does not if the gate stands the
+  // tick down only AFTER letting it bump the sequence.
+  const c = chartDriver({ hidden: true, live: true });
+  let d = deferred();
+  c.state.hold = d.p;
+  let forced = c.refreshChart(true);
+  c.state.hold = null;
+  await c.refreshChart();
+  d.go(); await forced;
+  assert.equal(c.state.fetches, 1, 'the hidden latency tick must not have fetched');
+  assert.equal(c.state.draws, 1,
+    'the forced latency load found its sequence taken by a hidden tick and dropped its own result, so ' +
+    'the tile keeps its pre-import points and nothing ever refetches them');
+
+  const s = speedDriver({ hidden: true, live: true });
+  d = deferred();
+  s.state.hold = d.p;
+  forced = s.refreshSpeedChart(true);
+  s.state.hold = null;
+  await s.refreshSpeedChart();
+  d.go(); await forced;
+  assert.deepEqual([s.state.fetches, s.state.paints], [1, 1], 'same for the speed chart');
+
+  const o = outagesDriver({ hidden: true, pages: { 0: [{ ts: 1, type: 'up' }] } });
+  d = deferred();
+  o.state.hold = d.p;
+  forced = o.loadOutages(true);
+  o.state.hold = null;
+  await o.loadOutages();
+  d.go(); await forced;
+  assert.equal(o.state.fetches.length, 1, 'the hidden outages tick must not have fetched');
+  assert.match(o.events.innerHTML, /<tr/, 'same for the outages table');
+});
+
+test('the outages recursion carries force with it', async () => {
+  // Nothing forces loadOutages today - every call site passes nothing, and the
+  // downtime tile is deliberately not force-refreshed by an import or a delete
+  // (see tileIdle). The recursion is the one line that would silently drop a
+  // force if a caller ever passed one: an emptied last page steps back a page and
+  // calls itself, and unforced that second call is stopped by the tile's own gate
+  // - leaving the table showing the page that just emptied.
+  const o = outagesDriver({ hidden: true, page: 2, pages: { 0: [{ ts: 1, type: 'up' }], 10: [] } });
+  await o.loadOutages(true);
+  assert.deepEqual(o.state.fetches, [10, 0], 'the step back to page 1 never happened');
+  assert.equal(o.page(), 1);
+  assert.match(o.events.innerHTML, /<tr/, 'the emptied page was never replaced with the one behind it');
+});
+
+// --- latency poll cadence ----------------------------------------------------
+//
+// latPollMs used to answer a flat 6s for every range that was not a preset, so a
+// live custom range re-scanned its whole width ten times a minute however wide it
+// was. Cadence now comes from the span that will actually be SCANNED, priced
+// against the output bucket the server will aggregate it into.
+const CAD_NOW_MS = Date.UTC(2026, 4, 20, 10, 0, 0);
+const CAD_NOW = Math.floor(CAD_NOW_MS / 1000);
+const cadHour = 3600;
+const cadWin = mins => ({ kind: 'win', mins });
+const cadRange = (from, to) => ({ kind: 'range', from, to });
+
+test('poll cadence: the preset ladder', () => {
+  assert.equal(F.latPollDelay(cadWin(5), CAD_NOW_MS), 6000);
+  assert.equal(F.latPollDelay(cadWin(60), CAD_NOW_MS), 6000);
+  assert.equal(F.latPollDelay(cadWin(360), CAD_NOW_MS), 15000);
+  assert.equal(F.latPollDelay(cadWin(1440), CAD_NOW_MS), 60000,
+    'a day aggregates into 57-second output buckets, so a 15s poll re-scanned the whole day four times ' +
+    'per new bucket - three of those four repaint the same trailing point');
+  assert.equal(F.latPollDelay(cadWin(10080), CAD_NOW_MS), 60000);
+});
+
+test('poll cadence: the ladder boundaries, and nothing off the rungs', () => {
+  assert.equal(F.latPollForMins(120), 6000);
+  assert.equal(F.latPollForMins(121), 15000);
+  assert.equal(F.latPollForMins(1440), 60000);
+  assert.equal(F.latPollForMins(1441), 60000);
+  assert.equal(F.latPollForMins(400), 30000);
+  assert.equal(F.latPollForMins(774), 30000);
+  for (const m of [0, 0.5, 1, 5, 119, 200, 400, 700, 1439, 5000, 525600]) {
+    assert.ok(LAT_CONSTS.LAT_POLL_RUNGS.includes(F.latPollForMins(m)),
+      m + ' minutes polls at ' + F.latPollForMins(m) + 'ms, which is not one of the declared cadences');
+  }
+});
+
+test('a live absolute range is priced on the span it has SCANNED, not the span typed', () => {
+  // 09:00 to 23:00, read at 10:00: fourteen hours selected, one hour drawn.
+  const r = cadRange(CAD_NOW - cadHour, CAD_NOW + 13 * cadHour);
+  assert.equal(F.latSpanMins(r, CAD_NOW_MS), 60, 'nothing exists past now, so only the elapsed hour will be scanned');
+  assert.equal(F.latPollDelay(r, CAD_NOW_MS), F.latPollDelay(cadWin(60), CAD_NOW_MS),
+    'an hour of drawn data costs the same however it was selected');
+  assert.notEqual(F.latPollForMins(14 * 60), F.latPollDelay(r, CAD_NOW_MS),
+    'pricing it by the width typed would poll a one-hour chart once a minute');
+});
+
+test('a live year-wide range is no longer polled like a five-minute one', () => {
+  const year = cadRange(CAD_NOW - 365 * 24 * cadHour, 0);   // "since a year ago", still live
+  assert.equal(F.latPollDelay(year, CAD_NOW_MS), 60000,
+    'every non-preset range answered a flat 6s, so the widest and most expensive scan in the product ran ten times a minute');
+});
+
+test('open start and open end resolve the way the server resolves them', () => {
+  const capMins = LAT_CONSTS.LAT_MAX_WIN_SEC / 60;
+  assert.equal(F.latSpanMins(cadRange(0, 0), CAD_NOW_MS), capMins,
+    'from=0 is the open-start sentinel: the server floors the scan at its 366-day bound');
+  assert.equal(F.latPollDelay(cadRange(0, 0), CAD_NOW_MS), 60000);
+  assert.equal(F.latSpanMins(cadRange(CAD_NOW - 800 * 24 * cadHour, 0), CAD_NOW_MS), capMins,
+    'a start older than the bound scans the bound, not the 800 days asked for');
+  assert.equal(F.latSpanMins(cadRange(CAD_NOW - 3 * cadHour, 0), CAD_NOW_MS), 180, 'to=0 is the open end: it runs to now');
+  assert.equal(F.latPollDelay(cadRange(CAD_NOW - 3 * cadHour, 0), CAD_NOW_MS), 15000);
+});
+
+test('a range that has not started yet has a span of zero, never a negative one', () => {
+  const soon = cadRange(CAD_NOW + 24 * cadHour, CAD_NOW + 48 * cadHour);
+  assert.equal(F.latSpanMins(soon, CAD_NOW_MS), 0, 'a window wholly in the future scans nothing yet');
+  assert.equal(F.latPollDelay(soon, CAD_NOW_MS), 6000,
+    'a negative span must not become a negative or zero delay - that is a busy loop against the daemon');
+});
+
+test('a live range ending in two seconds wakes at its end, not a minute later', () => {
+  // 20 hours, not 12: with the 30s rung in place a 12-hour span arms 30s, and the
+  // point of this test is a span whose width alone arms the LONGEST delay.
+  const ending = cadRange(CAD_NOW - 20 * cadHour, CAD_NOW + 2);
+  assert.equal(F.latPollForMins(F.latSpanMins(ending, CAD_NOW_MS)), 60000, 'its width alone would arm a full minute');
+  const d = F.latPollDelay(ending, CAD_NOW_MS);
+  assert.ok(d >= 2000 && d <= 5000,
+    'the range stops being live in two seconds, and only the poll after that loads the final tail and ' +
+    'raises the Live button - arming a minute here holds both back for most of it. Got ' + d + 'ms');
+});
+
+test('a frozen span keeps the shortest tick, however wide it is', () => {
+  assert.equal(F.latPollDelay(cadRange(CAD_NOW - 365 * 24 * cadHour, CAD_NOW - 1), CAD_NOW_MS), 6000,
+    'its fetch no-ops before any request is made, so the ticks cost nothing - and the loop re-arms only ' +
+    'after that await with no cancellable handle, so a 60s delay armed here still has to expire before ' +
+    'the first poll of whatever window Live switches to');
+});
+
+// --- the bucket floor's own rung ---------------------------------------------
+//
+// The floor first overtakes the ladder at 400 minutes - a 16s bucket, one second
+// past the 15s rung - and stops biting at 1440, where the bucket has grown to
+// 57s. With no rung between 15s and 60s, that whole band armed a full minute, so
+// 400 minutes polled at 3.75x its own bucket width while 399 polled at 1x. The
+// 30s rung is what keeps the step at the floor to one rung.
+const cadBucketMs = m => Math.max(1, Math.floor(m * 60 / 1500)) * 1000;
+test('the bucket floor never costs more than one rung', () => {
+  assert.equal(F.latPollForMins(399), 15000, 'a 15s bucket is still met by the 15s rung');
+  assert.equal(F.latPollForMins(400), 30000,
+    'the bucket reaches 16s here; without a 30s rung this one extra second quadrupled the poll interval');
+  assert.equal(F.latPollForMins(775), 60000, 'a 31s bucket has to round up to the minute');
+  let worst = 0, at = 0;
+  for (let m = 400; m <= 1440; m++) {
+    const ratio = F.latPollForMins(m) / cadBucketMs(m);
+    if (ratio > worst) { worst = ratio; at = m; }
+  }
+  assert.ok(worst <= 2,
+    'across the band where the output bucket drives the cadence, the widest gap between a poll and the ' +
+    'bucket it waits for is ' + worst.toFixed(2) + ' buckets per poll at ' + at + ' minutes. Over 2 means a ' +
+    'rung is missing and the chart is lagging its own resolution by more than one step');
+});
+
+test('the extra rung spends no more than the ladder already spent', () => {
+  // Window-minutes re-scanned per second of wall clock: the cost the daemon
+  // actually pays. The 30s rung is only defensible because it stays under what
+  // the ladder has always run at just BELOW the band it covers.
+  const rate = m => m / (F.latPollForMins(m) / 1000);
+  let below = 0, band = 0;
+  for (let m = 1; m < 400; m++) below = Math.max(below, rate(m));
+  for (let m = 400; m <= 774; m++) band = Math.max(band, rate(m));
+  assert.ok(band <= below,
+    'the 400..774 band now re-scans up to ' + band.toFixed(1) + ' window-minutes per second, past the ' +
+    below.toFixed(1) + ' the ladder already runs at below 400 minutes - so this rung is costing more than ' +
+    'the thing it was justified against');
+});
+
+test('none of the presets moved when the rung was added', () => {
+  for (const [mins, ms] of [[5, 6000], [60, 6000], [360, 15000], [1440, 60000], [10080, 60000]])
+    assert.equal(F.latPollForMins(mins), ms, mins + '-minute latency preset changed cadence');
+  for (const [mins, ms] of [[1440, 30000], [10080, 60000], [43200, 60000], [525600, 60000]])
+    assert.equal(F.speedPollForMins(mins), ms, mins + '-minute speed preset changed cadence');
+});
+
+// --- speed poll cadence ------------------------------------------------------
+//
+// speedPollMs had the same shape of defect latPollMs did: a flat 30000 for every
+// range that was not a rolling window, so "since a year ago" re-scanned a year of
+// runs twice a minute while the 1y PRESET, the identical scan, ran once a minute.
+test('speed cadence: the preset ladder and its boundary', () => {
+  assert.equal(F.speedPollDelay(cadWin(1440), CAD_NOW_MS), 30000);
+  assert.equal(F.speedPollDelay(cadWin(10080), CAD_NOW_MS), 60000);
+  assert.equal(F.speedPollDelay(cadWin(43200), CAD_NOW_MS), 60000);
+  assert.equal(F.speedPollDelay(cadWin(525600), CAD_NOW_MS), 60000);
+  assert.equal(F.speedPollForMins(1440), 30000);
+  assert.equal(F.speedPollForMins(1441), 60000);
+  for (const m of [0, 0.5, 1, 5, 400, 1439, 5000, 525600]) {
+    assert.ok(LAT_CONSTS.SPD_POLL_RUNGS.includes(F.speedPollForMins(m)),
+      m + ' minutes polls at ' + F.speedPollForMins(m) + 'ms, which is not one of the declared speed cadences');
+  }
+});
+
+test('a live year-wide speed range is no longer polled like a one-day one', () => {
+  const year = cadRange(CAD_NOW - 365 * 24 * cadHour, 0);
+  assert.equal(F.speedPollDelay(year, CAD_NOW_MS), 60000,
+    'every range that was not a rolling preset answered a flat 30s, so the widest speed scan in the ' +
+    'product ran at twice the cadence of the same width picked from the dropdown');
+});
+
+test('a speed range is priced on the span it has SCANNED, not the span typed', () => {
+  // Two days typed, one day of it elapsed: it costs a day, so it pays a day's rate.
+  const r = cadRange(CAD_NOW - 24 * cadHour, CAD_NOW + 24 * cadHour);
+  assert.equal(F.latSpanMins(r, CAD_NOW_MS), 1440, 'nothing exists past now');
+  assert.equal(F.speedPollDelay(r, CAD_NOW_MS), F.speedPollDelay(cadWin(1440), CAD_NOW_MS),
+    'a day of drawn runs costs the same however it was selected');
+});
+
+test('a frozen speed span keeps the shortest tick, and one ending soon wakes at its end', () => {
+  assert.equal(F.speedPollDelay(cadRange(CAD_NOW - 365 * 24 * cadHour, CAD_NOW - 1), CAD_NOW_MS), 30000,
+    'refreshSpeedChart no-ops on a frozen span, so the tick is free - but the delay armed here still has ' +
+    'to expire before the first poll of the window Live switches to');
+  const ending = cadRange(CAD_NOW - 40 * 24 * cadHour, CAD_NOW + 2);
+  assert.equal(F.speedPollForMins(F.latSpanMins(ending, CAD_NOW_MS)), 60000, 'its width alone would arm a full minute');
+  const d = F.speedPollDelay(ending, CAD_NOW_MS);
+  assert.ok(d >= 2000 && d <= 5000,
+    'the range stops being live in two seconds and only the poll after that loads the runs at its end. ' +
+    'Got ' + d + 'ms');
+});
+
+// Both pollMs functions are driven rather than grepped: the backoff has to win
+// exactly one poll and clear itself, and the cadence has to come from the helper
+// the tests above pin, applied to the LIVE range at the CURRENT time. A source
+// check passes a version that reads the helper and returns something else.
+function drivePollMs(kind, { backoff = 0, range = { kind: 'win', mins: 1 }, now = CAD_NOW_MS } = {}) {
+  const rangeVar = kind === 'lat' ? 'latencyRange' : 'speedRange';
+  const helper = kind + 'PollDelay';
+  const seen = [];
+  const call = new Function('b', 'r', 'delay', 'nowMs',
+    'let ' + kind + 'BackoffMs = b;\nconst ' + rangeVar + ' = r;\nconst ' + helper + ' = delay;\n'
+    + 'const Date = { now: () => nowMs };\n'
+    + extract('function ' + kind + 'PollMs')
+    + '\nreturn () => ({ ms: ' + kind + 'PollMs(), left: ' + kind + 'BackoffMs });')(
+    backoff, range, (r, n) => { seen.push([r, n]); return 12345; }, now);
+  return Object.assign(call(), { seen });
+}
+
+test('both pollMs functions take their cadence from the pure helper', () => {
+  for (const kind of ['lat', 'speed']) {
+    const range = { kind: 'win', mins: 7 };
+    const r = drivePollMs(kind, { range });
+    assert.equal(r.ms, 12345, kind + 'PollMs does not return what its delay helper answered');
+    assert.deepEqual(r.seen, [[range, CAD_NOW_MS]],
+      kind + 'PollMs must price the range that is actually selected, at the current time');
+  }
+});
+
+test('a reconcile-503 backoff wins exactly one poll, then clears', () => {
+  for (const kind of ['lat', 'speed']) {
+    const r = drivePollMs(kind, { backoff: 4000 });
+    assert.equal(r.ms, 4000, kind + 'PollMs ignored the Retry-After the 503 parked');
+    assert.equal(r.left, 0, kind + 'PollMs kept the backoff, so every later poll waits Retry-After forever');
+    assert.deepEqual(r.seen, [], 'the helper must not even be consulted while a backoff is pending');
+  }
+});
+
+// --- the page copy of the server's window bound ------------------------------
+//
+// MAX_WIN_MINS (and LAT_MAX_WIN_SEC, derived from it) is a copy of maxWinMins in
+// web.go, and the comment above it describes what each handler does with it. A
+// copy nothing checks is a copy that drifts: mutating it to 30 days used to leave
+// every test green, because the cadence tests computed their expectations from
+// the page's own constant.
+const webGo = readFileSync(join(here, '..', 'web.go'), 'utf8');
+test('the 366-day bound is the server maxWinMins, not a number that happens to match', () => {
+  const m = /\bconst maxWinMins = ([0-9 *]+)/.exec(webGo);
+  assert.ok(m, 'maxWinMins is gone or renamed in web.go, so the page constant is pinned to nothing');
+  const serverMins = new Function('return ' + m[1])();
+  assert.equal(LAT_CONSTS.MAX_WIN_MINS, serverMins,
+    'the picker clamps every rolling window to MAX_WIN_MINS before sending it. Too high and the handler ' +
+    'rejects the mins and silently answers with its own default window; too low and windows the server ' +
+    'would happily answer become unpickable');
+  assert.equal(LAT_CONSTS.LAT_MAX_WIN_SEC, serverMins * 60,
+    'cadence prices the clamped span, so the clamp has to be the one parseRangeParams applies');
+});
+
+test('what the comment on MAX_WIN_MINS says about web.go is still what web.go does', () => {
+  // The clause that was wrong before this round: ?mins= is NOT clamped. Both
+  // handlers only ACCEPT a mins inside the bound and otherwise keep their own
+  // default, which is why an over-wide mins would draw the default window under
+  // the wrong label rather than a clamped one.
+  assert.equal((webGo.match(/n > 0 && n <= maxWinMins/g) || []).length, 2,
+    'handleSeries and handleSpeedHistory used to ACCEPT-or-default an out-of-range ?mins=; if that is now ' +
+    'a clamp, the comment above MAX_WIN_MINS in index.html is describing something else');
+  assert.match(webGo, /mins := 120\b/, 'the /api/series fallback the comment names');
+  assert.match(webGo, /mins := 7 \* 24 \* 60\b/, 'the /api/speed fallback the comment names');
+  assert.match(webGo, /floor, ceil := now\.Add\(-maxWinMins\*time\.Minute\), now\.Add\(maxWinMins\*time\.Minute\)/,
+    'the ?from/?to path IS clamped, each end to its own side of the band - that half of the comment');
+  // And the floored bucket width the latPollForMins comment leans on: integer
+  // division, so a window holds a handful MORE than maxSeriesPoints buckets.
+  assert.match(webGo, /bucket := int\(end\.Sub\(since\)\/time\.Second\) \/ maxSeriesPoints/,
+    'seriesBucket no longer floors the width by integer division, so "about 1500 buckets, and a handful ' +
+    'more" no longer describes it');
+});
+
+test('cadence clamping never reaches the wire', () => {
+  assert.doesNotMatch(extract('function latWindowQuery'), /LAT_MAX_WIN_SEC|latSpanMins/,
+    'the sent from/to must stay exactly as typed. Clamping them was tried here and reverted: a raised ' +
+    'start overtakes the end, which the server reads as a reversed range and quietly answers with the ' +
+    'default window - asking for January 2020 silently drew this week');
 });

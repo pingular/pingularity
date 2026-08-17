@@ -4698,17 +4698,25 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// duplicate inside a single scrape.
 	snap := stats.Lifetime()
 	writeNamedStats(w, snap)
-	writeLatencyHistograms(w, snap)
+	writeHistograms(w, snap)
 	writeStatMetrics(w, snap)
 }
 
-// writeLatencyHistograms emits the probe/DNS RTT distributions as Prometheus
-// histograms (cumulative _bucket + _sum + _count), so a rule can compute p95/p99
-// and see spikes that fall between scrapes - which the last-value latency gauge loses.
-func writeLatencyHistograms(w io.Writer, snap stats.Snap) {
+// writeHistograms emits the recorded distributions as Prometheus histograms
+// (cumulative _bucket + _sum + _count), so a rule can compute p95/p99 and see
+// spikes that fall between scrapes - which a last-value gauge loses.
+//
+// This table is the only reader of snap.Histos, and stats.Lifetime is read
+// nowhere else in the process (web.go:4699 is its only non-test call): a
+// histogram missing from the table is recorded forever and never exposed at
+// all, with nothing to say so.
+// Each entry's bucket bounds come from the recording side (internal/stats,
+// LatencyBucketsSeconds or the histoBuckets override), not from here.
+func writeHistograms(w io.Writer, snap stats.Snap) {
 	for _, h := range []struct{ key, name, help string }{
 		{"probe.latency", "pingularity_probe_latency_seconds", "Anchor round-trip latency distribution (seconds), per successful target probe."},
 		{"dns.latency", "pingularity_dns_latency_seconds", "DNS resolve-time distribution (seconds), per successful DNS probe."},
+		{"series.query.seconds", "pingularity_series_query_seconds", "Chart series aggregate duration (seconds), per executed query."},
 	} {
 		hist, ok := snap.Histos[h.key]
 		if !ok || hist.Count == 0 {
@@ -4751,6 +4759,16 @@ func writeNamedStats(w io.Writer, snap stats.Snap) {
 		{"db.prune_ms_sum", "pingularity_database_prune_duration_seconds_total", "Cumulative database prune time (seconds).", 0.001},
 		{"web.login_fail", "pingularity_login_failures_total", "Failed dashboard login attempts.", 1},
 		{"web.limiter_trips", "pingularity_rate_limit_trips_total", "Login rate-limiter trips.", 1},
+		// Chart-aggregate cache accounting. Fixed keys, no labels: the window,
+		// bucket width and target list a request carries are unbounded, and a
+		// label per bucket width alone would multiply these series by every
+		// range the dashboards offer.
+		{"series.cache.hit", "pingularity_series_cache_hits_total", "Chart series served from a live cache entry, running no query.", 1},
+		{"series.cache.expired", "pingularity_series_cache_expired_total", "Chart series requests whose cache entry existed but had expired.", 1},
+		{"series.cache.new", "pingularity_series_cache_new_total", "Chart series requests with no stored scan for the window (first sight, evicted, a scan that errored, or an entry another caller is still filling).", 1},
+		{"series.cache.empty", "pingularity_series_cache_empty_total", "Chart series requests re-scanned because the window's last scan found no rows, which is deliberately not cached.", 1},
+		{"series.bypass", "pingularity_series_bypass_total", "Chart series requests that never consulted the cache (sub-minute buckets).", 1},
+		{"series.query", "pingularity_series_queries_total", "Chart series aggregates actually executed.", 1},
 	} {
 		if v, ok := acc[m.key]; ok {
 			fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %g\n", m.name, m.help, m.name, m.name, v*m.scale)
@@ -4951,6 +4969,19 @@ func promStat(name string) bool {
 		strings.HasPrefix(name, "netinfo."),
 		strings.HasPrefix(name, "notify."),
 		strings.HasPrefix(name, "worker."), // background-worker up/restarts
+		// Chart-aggregate cache outcomes (series.cache.*, series.bypass,
+		// series.query). promStat gates writeStatMetrics alone: every key the
+		// table in writeNamedStats names ALSO has a hand-written row there, and
+		// that writer builds its accumulator straight from the snapshot and
+		// never calls promStat, so dropping this prefix would cost those keys
+		// only their pingularity_stat_total{stat="series…"} samples - the
+		// pingularity_series_*_total families would keep being emitted. It is a
+		// NEW series.* key that hangs on this line: with no row in
+		// writeNamedStats its only exporter is writeStatMetrics, and
+		// stats.Lifetime is read nowhere else in the process (handleMetrics
+		// makes the sole non-test call), so an unclassified name would be
+		// recorded into a black hole - no log, no error, just absent.
+		strings.HasPrefix(name, "series."),
 		strings.HasPrefix(name, "db."):
 		return true
 	case strings.HasPrefix(name, "import."):

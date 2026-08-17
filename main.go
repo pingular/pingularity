@@ -1059,6 +1059,20 @@ func seedKnownCounters() {
 		"import.event_duration_dropped", "import.pause_dropped",
 		// The summary count for run durations (its float sum is seeded below).
 		"speed.duration_n",
+		// Chart-aggregate cache accounting for /api/series. Every Store.Series
+		// call books exactly one of the outcomes below - a cache hit, one of the
+		// cache misses, or a sub-minute bypass that never consults the cache -
+		// and every outcome but the hit runs a scan, which books series.query
+		// (recorded in Store.Series and seriesQuery, internal/store/store.go;
+		// exported as the pingularity_series_* families by writeNamedStats,
+		// internal/web/web.go). So a scrape reads queries = outcomes - hits: the
+		// families are read against each other, hits against queries, and one
+		// member appearing at 1 while the rest sit at 0 skews a ratio rather
+		// than only delaying its own first step. Every state the store
+		// records belongs here for that reason; add the next one to this list
+		// and to the named-family table in writeNamedStats together.
+		"series.cache.hit", "series.cache.expired", "series.cache.new",
+		"series.cache.empty", "series.bypass", "series.query",
 	}
 	// Float sums behind exported duration families: absent-until-first-event
 	// means the family itself is missing from scrapes, hiding the first

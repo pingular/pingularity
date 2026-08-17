@@ -2382,7 +2382,15 @@ document.getElementById('logClear').innerHTML = TRASH_SVG; // same delete icon a
 const lsGet = k => { try { return localStorage.getItem(k); } catch(e){ return null; } };
 const lsSet = (k,v) => { try { localStorage.setItem(k,v); } catch(e){} };
 // --- Chart windows (preset + custom) --------------------------------------
-// The server-side ?mins= cap on /api/series and /api/speed.
+// maxWinMins from web.go, in minutes: the widest window either read endpoint
+// will answer. The two query forms reach that bound by different routes, and
+// only one of them is a clamp. ?from/?to IS clamped, each end on its own, to the
+// band 366 days either side of now (parseRangeParams). An out-of-band ?mins= is
+// not clamped at all: handleSeries and handleSpeedHistory only ACCEPT a mins in
+// 1..maxWinMins and otherwise keep their own default - 120 minutes for
+// /api/series, 7 days for /api/speed - so sending a wider one would quietly draw
+// two hours under a label reading five years. That is why commit() clamps every
+// rolling pick to this before it can be sent.
 const MAX_WIN_MINS = 366*24*60;
 // Live retention windows (minutes; 0 = keep forever), updated from
 // /api/settings - chart windows are capped here since data beyond retention
@@ -3119,6 +3127,50 @@ function restoreDrawerPlace(){
 $('palReset').addEventListener('click', ()=>{ for(const k of ['bg','bg2','panel','panel2','line','line2','fg','muted','up','down','warn','accent2','hm0']) palettePrefs[k]=''; applyPalette(); syncPaletteControls(); }); // UI-colours keys only; the Top bar section has its own reset (barReset)
 $('barReset').addEventListener('click', ()=>{ for(const k of ['dotLat','dotDns','dotUp','pwrOn','pwrOff','logoPing','logoUl']) palettePrefs[k]=''; applyPalette(); syncPaletteControls(); });
 syncPaletteControls();
+/* ---- hidden tiles ---- */
+// A tile dragged off the dashboard carries .section-hidden and is display:none -
+// see the .section-hidden rule in this file's CSS. hideSection adds the class
+// when a drag ends in a remove zone (endDrag below); applyHidden replays the
+// saved set over every panel at boot and when an undo puts a hidden set back.
+// Nothing a hidden tile draws is on screen, but every one of its refreshers kept
+// polling: the periodic timers, the boot/tab-focus/online calls in tick(), and
+// the stale-recovery burst in refreshStatus. For the two charts and the heatmap
+// that is a full server-side re-scan per poll for a panel nobody can see; the
+// Connection tile is cheaper - handleNetinfo answers the plain GET from the
+// cached snapshot with no lookup - but it still costs a request and a full
+// innerHTML rebuild a minute. Reading the class off the panel HERE, rather
+// than plumbing a flag out of the drag-and-drop closure below, is what covers
+// every one of those call sites with a single check inside each refresher.
+function sectionHidden(name){
+  const p=document.querySelector('.panel[data-section="'+name+'"]');
+  return !!p && p.classList.contains('section-hidden');
+}
+// True when a poll should stand down. FORCED refreshes always run, hidden or
+// not: force means the rows underneath changed (import, delete, a window
+// change), and the fetch-once guards in refreshChart/refreshSpeedChart key on
+// the query string - skipping a forced load of a pinned span would leave those
+// guards pointing at data that no longer exists, with nothing to make them
+// refetch it later.
+// Only those two charts are force-refreshed by an import or a delete. Both
+// paths call refreshHeatmap() and loadOutages() bare, so a hidden Downtime tile
+// does NOT reload on either - and does not need to, because neither of those
+// two keeps a fetch-once marker: un-hiding the tile puts them back through
+// refreshSection (the outages table too, if it is open) and they fetch there.
+function tileIdle(name, force){ return !force && sectionHidden(name); }
+// Restoring a tile has to REFETCH, not just repaint. redrawCharts draws from the
+// latPoints/spdData/hmData caches, so a tile that was hidden at PAGE LOAD - and
+// therefore never fetched anything - would come back as an empty chart.
+// Connection deliberately takes the plain GET: refreshNetinfo(true) POSTs, which
+// handleNetinfo (web.go) answers with a full re-fetch including the exit
+// traceroute, under a 25s context - and the forced path also skips the in-flight
+// spinner guard, so show/hide repeated a few times would stack concurrent 25s
+// POSTs on the daemon.
+function refreshSection(id){
+  if(id==='latency') refreshChart();
+  else if(id==='speed') refreshSpeedChart();
+  else if(id==='connection') refreshNetinfo();
+  else if(id==='downtime'){ refreshHeatmap(); if($('outagesSection').style.display!=='none') loadOutages(); }
+}
 // Drag-to-rearrange dashboard sections (persisted in localStorage). Drag starts
 // only from the grip handle so charts/buttons keep working.
 (function(){
@@ -3135,7 +3187,10 @@ syncPaletteControls();
   function hideSection(p){ const id=p.dataset.section; if(!id) return; const h=getHidden();
     if(!h.includes(id)){ h.push(id); lsSet('hiddenSections', JSON.stringify(h)); } p.classList.add('section-hidden');
     showUndoToast('Tile hidden', ()=>unhideSection(id)); }
-  function unhideSection(id){ lsSet('hiddenSections', JSON.stringify(getHidden().filter(x=>x!==id))); applyHidden(); redrawCharts(); } // a chart canvas was 0-sized while hidden - repaint at its restored size
+  // redrawCharts repaints at the restored size (the canvas was 0-sized while
+  // hidden); refreshSection is what fills the cache it paints from, since this
+  // tile has not been polling while it was away.
+  function unhideSection(id){ lsSet('hiddenSections', JSON.stringify(getHidden().filter(x=>x!==id))); applyHidden(); redrawCharts(); refreshSection(id); }
   // Destructive layout changes that are easy to trigger by accident (edge-drag
   // hide, Reset tiles) offer a brief Undo with their own restore action.
   function showUndoToast(message, onUndo){ const tb=document.getElementById('undoToast'); if(!tb) return;
@@ -3193,6 +3248,10 @@ syncPaletteControls();
     const prevOrder=lsGet('sectionOrder')||'', prevHidden=lsGet('hiddenSections')||'[]';
     lsSet('sectionOrder',''); lsSet('hiddenSections','[]');
     panels().forEach(p=>p.classList.remove('section-hidden')); applyOrder(defaultOrder); redrawCharts();
+    // Same reason as unhideSection: whatever this button just brought back has an
+    // empty cache behind it. Only the tiles that were actually hidden need it -
+    // the visible ones have been polling all along.
+    try{ (JSON.parse(prevHidden)||[]).forEach(id=>refreshSection(id)); }catch(_){}
     showUndoToast('Tiles reset', ()=>{ lsSet('sectionOrder', prevOrder); lsSet('hiddenSections', prevHidden);
       applyHidden(); loadOrder(); redrawCharts(); }); });
 })();
@@ -4757,7 +4816,31 @@ function latWindowQuery(){
   return {q:'from='+(r.from||1)+(r.to?'&to='+r.to:'')+ex, live:!rangeEnded(r.to)};
 }
 async function refreshChart(force){
+  if(tileIdle('latency', force)) return; // nothing on screen to update
   const {q, live}=latWindowQuery();
+  // Invalidate the marker as the forced load BEGINS, not only when it succeeds.
+  // The success line at the bottom is the only one that RECORDS a load, and both
+  // of the ways this can end without data - the catch, and the reconcile-503
+  // return inside the try - leave the marker untouched. So a forced refetch of
+  // the query already loaded used to fail and leave the marker still naming it,
+  // and the guard below then short-circuits every later unforced poll. A live
+  // window self-heals (live skips that guard); a pinned span never does.
+  // Concretely: delete all latency data with a span pinned, have that one fetch
+  // fail, and the deleted rows stay drawn for the rest of the session.
+  // Clearing BEFORE the guard is what makes the `force` test load-bearing:
+  // clearing unconditionally here would empty latLoadedFor on every poll and
+  // turn the fetch-once guard off altogether, so a pinned span would refetch its
+  // whole immutable window every tick.
+  // TRADE-OFF: an ordinary poll landing while a forced refetch of a pinned span
+  // is still in flight now sees the cleared marker and issues its own request for
+  // the same query, where before it short-circuited. That is one extra GET per
+  // poll that lands inside the forced fetch's own flight - normally none or one,
+  // since the fetch is short - and the sequence guard keeps only the newest
+  // result, so nothing worse than the duplicate request can come of it. Clearing
+  // in the catch instead would avoid even that, but it would only cover the
+  // catch: a forced load that takes the 503 return would still leave a pinned
+  // span frozen on rows that are gone.
+  if(force){ latLoadedFor=''; latLoadedLive=false; }
   if(!force && !live && latLoadedFor===q && !latLoadedLive) return;
   const my=++chartSeq; let d;
   try{
@@ -5281,7 +5364,10 @@ let speedLoadedLive=false; // and whether that load was of a still-live window
 //   loadedFor !== wantQ  spdData belongs to a different query. Never paint it as
 //                   this range's numbers - say so and let the fetch finish. This
 //                   is the case a sequence check alone misses: a fetch that
-//                   FAILED leaves seq settled but spdData still stale.
+//                   FAILED leaves seq settled but spdData still stale. An empty
+//                   loadedFor lands here too: refreshSpeedChart clears it as a
+//                   forced load begins, and 'stale' is the right answer there -
+//                   force means the rows under spdData just changed.
 // Mirrors the statusSeq/chartSeq/speedSeq guards used by the fetchers themselves.
 function spdSyncPlan(seq, curSeq, loadedFor, wantQ){
   if(seq!==curSeq) return 'skip';
@@ -5308,12 +5394,29 @@ function speedWindowQuery(){
   const from=r.from||1, to=r.to||0;
   return {q:'from='+from+(to?'&to='+to:''), live:!rangeEnded(to)};
 }
-// The refetch guard lives HERE rather than in the poll loop, because six other
-// paths call this directly (tab focus, stale recovery, a manual run, settings
-// save, import, delete). A pinned span is immutable, so it loads once; force is
+// The refetch guard lives HERE rather than in the poll loop, because the loop is
+// far from the only caller: tick() (boot, a login, tab focus, `online`), the stale-recovery
+// burst in refreshStatus, the window picker's onChange, un-hiding the tile
+// (refreshSection), a manual run, an import, a delete-all and a single-run delete
+// all call this directly. A pinned span is immutable, so it loads once; force is
 // for the cases where the selection or the underlying rows really did change.
 async function refreshSpeedChart(force){
+  if(tileIdle('speed', force)) return; // nothing on screen to update
   const {q, live}=speedWindowQuery();
+  // Invalidate the marker as the forced load BEGINS - the same rule, and the
+  // same reasons, as refreshChart above (read that comment for the trade-off).
+  // The success line below is the only one that records a load, so a forced
+  // refetch of the query already loaded that fails - or that takes the
+  // reconcile-503 return - used to leave the marker naming it, and every later
+  // unforced poll of a pinned span returns on the guard beneath. The paths that
+  // force this chart without also changing the query are an import, a delete-all
+  // and deleting a single run - each of them a case where the rows under a pinned
+  // span really did change - plus the manual RUN handler, which forces in the
+  // branch where the chart is NOT frozen (a frozen one takes backToLive, which
+  // commits a rolling window and so asks for a different query).
+  // The `force` test is load-bearing here too: clearing unconditionally would
+  // turn the fetch-once guard off and refetch an immutable span every tick.
+  if(force){ speedLoadedFor=''; speedLoadedLive=false; }
   if(!force && !live && speedLoadedFor===q && !speedLoadedLive) return;
   const my=++speedSeq; let d;
   let sampled=false, total=0;
@@ -5863,12 +5966,13 @@ function outageDeletable(e){ return !!e && e.type==='up'; }
 // nothing and the click looked broken (see hmScanDay).
 function evHighlighted(e){ return !!outageSelDay &&
   (fmtLocalDate(new Date(e.ts*1000))===outageSelDay || (!!outageSelTs && e.ts===outageSelTs)); }
-async function loadOutages(){
+async function loadOutages(force){
+  if(tileIdle('downtime', force)) return; // this table lives in the downtime tile
   const my=++outagesSeq;
   let data; try{ data=await (await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`)).json(); }catch(e){ return; }
   if(my!==outagesSeq) return;
   const ev=data.events||[]; outagesTotal=data.total||0;
-  if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(); } // page emptied
+  if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(force); } // page emptied
   $('events').innerHTML = ev.length ? ev.map(e=>`
     <tr${evHighlighted(e)?' class="ev-hl"':''}><td class="act">${outageDeletable(e)?`<button class="run-del" type="button" data-ts="${e.ts}"${e.has_duration?` data-dur="${e.duration_s}"`:''} title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
         <td>${fmtTime(e.ts)}</td>
@@ -5929,7 +6033,14 @@ function hmShade(w){ if(w<=0) return TC.hm0; const a=_rgb(TC.hm0), b=_rgb(TC.dow
   const m=a.map((c,i)=>Math.round(c+(b[i]-c)*w)); return `rgb(${m[0]},${m[1]},${m[2]})`; }
 let heatmapSeq=0; // only the newest in-flight heatmap poll rebuilds the grid (see refreshStatus)
 let hmData=[]; // last-fetched heatmap days, cached so a Downtime colour change recolours without refetching
+// No `force` parameter, because nothing forces this one: every call site - the
+// 60s timer, tick(), the stale-recovery burst, an import, a delete-all, an outage
+// delete and refreshSection - calls it bare. It also keeps no fetch-once marker,
+// so a hidden tile that stood a poll down leaves nothing stale behind: the fetch
+// below runs in full whenever the tile is on screen, and refreshSection re-runs it
+// when the tile comes back (see tileIdle).
 async function refreshHeatmap() {
+  if(tileIdle('downtime')) return; // nothing on screen to update
   const my=++heatmapSeq;
   // Pass the browser's zone so the backend buckets outage days in local time.
   const tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'';
@@ -6257,6 +6368,7 @@ async function refreshNetinfo(force) {
   // background polls stand down while it spins, and its richer result renders
   // even if an in-flight poll laps it. The forced POST gets a 26s client cap
   // (just above the server's 25s) so a dead link can't hang the spinner forever.
+  if(tileIdle('connection', force)) return; // nothing on screen to update
   if(!force && $('netinfoRefresh').classList.contains('spinning')) return;
   const my=++netinfoSeq;
   let n; try{ n=await (await (force?fget('api/netinfo',26000,{method:'POST',headers:{'Content-Type':'application/json'}}):fget('api/netinfo'))).json(); }
@@ -8231,22 +8343,128 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) tick();
 // this; those are caught by the stale-recovery hook in refreshStatus.)
 window.addEventListener('online', ()=>tick());
 setInterval(vis(refreshStatus), 3000);
-// Chart refresh cadence scales with the selected window - wide ranges barely
-// change second-to-second and re-aggregating them often is expensive server-side.
-// While a span is pinned the fetch itself no-ops (the guard in refreshChart /
-// refreshSpeedChart returns before any request), so keep ticking at the SHORTEST
-// cadence rather than the slowest: whatever delay is in flight when Live is
-// pressed has to be waited out before polling resumes, and a minute of that
-// reads as a frozen chart.
+// Chart refresh cadence scales with the window being drawn - wide ranges barely
+// change second-to-second and re-aggregating them is expensive server-side.
+// Cadence prices the span the server will actually SCAN. For an absolute range
+// that is the typed one clamped into the band 366 days either side of now, which
+// is what parseRangeParams does to each end - see MAX_WIN_MINS above for what
+// each query form gets, since only one of the two is clamped. This is that same
+// bound in seconds; both are pinned against maxWinMins in web.go by test, so
+// neither copy can drift from the server or from the other.
+const LAT_MAX_WIN_SEC = 366*24*60*60;
+// The cadences the latency chart polls at. The chosen delay is always one whole
+// rung rather than a raw computed width, so the cadence stays one of a handful
+// of values, and the widest rung doubles as the ceiling. The 30s rung is there
+// to keep the step at the bucket floor to 2x - see latPollForMins.
+const LAT_POLL_RUNGS = [6000, 15000, 30000, 60000];
+// latSpanMins: how wide the drawn window will actually be, in minutes, at nowMs.
+// Both charts price their cadence with it: /api/series and /api/speed read an
+// absolute window through the same parseRangeParams, so the same clamp applies.
+// A rolling window is its own width. An absolute range is NOT its typed width:
+// 09:00 to 23:00 read at 10:00 draws one elapsed hour, not fourteen, because
+// nothing exists past now - and paying a 14-hour window's price for it is the
+// wrong way round. from=0 is the open-start sentinel and to=0 the open-end one
+// (see latWindowQuery); both resolve here the same way the server resolves them.
+// This is for CADENCE ONLY. What goes on the wire stays exactly as typed - see
+// the clamping warning above speedWindowQuery, where clamping the sent values
+// made "January 2020" silently draw this week.
+function latSpanMins(r, nowMs){
+  const now=Math.floor(nowMs/1000);
+  const lo=now-LAT_MAX_WIN_SEC, hi=now+LAT_MAX_WIN_SEC;
+  if(r.kind==='win') return r.mins;
+  const start=Math.min(Math.max(r.from||lo, lo), hi);
+  const end=Math.min(r.to||now, now);
+  return Math.max(0, end-start)/60; // a window wholly in the future scans nothing yet
+}
+// latPollForMins: the width ladder, with the chart's own resolution as a floor
+// under it. The server aggregates a window into ABOUT maxSeriesPoints output
+// buckets, each floor(span/1500) seconds wide and never under a second
+// (seriesBucket in web.go). Floored, so a window holds a handful MORE than 1500
+// of them - seriesBucket's own doc says so - which is a rounding error for
+// choosing a cadence and not a bound to lean on. That bucket is the smallest step
+// this chart can gain, so polling faster than it advances re-scans the entire
+// window to repaint the same trailing point. The floor is the whole of the 1-day
+// change: a day aggregates to 57-second buckets, so its old 15s poll recomputed
+// a full day of rows four times per new bucket; one poll per bucket puts it on
+// the same footing the 6h window has always had.
+// The floor only overtakes the ladder from 400 minutes up - that is where the
+// bucket reaches 16s, one second past the 15s rung - and stops biting at 1440,
+// where the bucket has grown to 57s. With no rung between 15s and 60s that whole
+// band armed 60s, so a 6h40m window polled at 3.75x its own bucket width (four
+// new points landing at once, trailing point up to a minute old) while 399
+// minutes polled at 15s, one poll per bucket. Hence the 30s rung: 400..774
+// minutes now polls at 30s, and the worst ratio anywhere in the floor-driven
+// band falls from 3.75 to 1.94 buckets per poll. It buys that with work the
+// ladder already spends elsewhere - 774 minutes every 30s is 25.8 window-minutes
+// scanned per wall second, under the 26.6 the ladder has always run at 399
+// minutes every 15s. No preset moves: 5m/1h stay 6s, 6h stays 15s, 1d/7d/30d/1y
+// stay 60s. The band itself holds no preset at all - only a typed width or an
+// absolute range lands in it.
+// TRADE-OFF: the trailing end of a chart wider than 12h54m can lag a probe by up
+// to 60s, and one from 6h40m to 12h54m by up to 30s, where every window used to
+// be 15s or better. The status header keeps its own faster cadence, so "is the
+// link up right now" is unaffected.
+function latPollForMins(mins){
+  const ladder = mins<=120 ? 6000 : mins<=1440 ? 15000 : 60000;
+  const bucketMs = Math.max(1, Math.floor(mins*60/1500))*1000;
+  const need = Math.max(ladder, bucketMs);
+  return LAT_POLL_RUNGS.find(ms=>ms>=need) || LAT_POLL_RUNGS[LAT_POLL_RUNGS.length-1];
+}
+// latPollDelay: the next delay for range r at nowMs. Pure, so it can be pinned
+// by test rather than only by watching a chart.
+function latPollDelay(r, nowMs){
+  // A pinned span whose end has passed keeps the SHORTEST tick even though it
+  // can never gain a row, and costs almost nothing for it: once it has loaded,
+  // refreshChart's fetch-once guard returns before any request is made. Pressing
+  // Live repaints at once (the
+  // picker's commit calls onChange, which calls refreshChart(true)), but the loop
+  // re-arms only after its await and keeps no cancellable handle - so the delay
+  // armed while the span was pinned still has to expire before the first POLL of
+  // the new live window. Armed at 60s, a 5-minute window would sit a full minute
+  // without advancing immediately after the user asked for live data.
+  if(r.kind!=='win' && r.to && r.to*1000<=nowMs) return LAT_POLL_RUNGS[0];
+  const ms=latPollForMins(latSpanMins(r, nowMs));
+  // A live range ending in the FUTURE stops being live at that instant, and only
+  // the poll AFTER it loads the final tail and raises the Live button (both come
+  // off refreshChart's success path). Cadence following the span is what creates
+  // this: a wide range could now arm 60s a second before its end and hold both
+  // back for most of a minute, where the old flat 6s could not. Wake just past
+  // the end instead.
+  return r.kind!=='win' && r.to ? Math.min(ms, r.to*1000-nowMs+1000) : ms;
+}
 // A pending reconcile-503 backoff (see isReconcile503) wins for one poll, then clears.
 function latPollMs(){ if(latBackoffMs){ const b=latBackoffMs; latBackoffMs=0; return b; }
-  const r=latencyRange;
-  if(r.kind!=='win') return 6000;
-  return r.mins<=120?6000 : r.mins<=1440?15000 : 60000; }
+  return latPollDelay(latencyRange, Date.now()); }
+// The speed chart's own rungs: the latency ladder's top two. Neither is faster
+// than 30s, where LAT_POLL_RUNGS starts at 6s, because runs land minutes to hours
+// apart, not seconds. There is no bucket floor under them because there are no
+// time buckets to wait for - /api/speed thins by RUN COUNT
+// (SpeedHistoryBudget against maxSeriesPoints), so a window either returns every
+// run in it or a thinned sample of them, and either way a new run is the only
+// thing a poll can gain.
+const SPD_POLL_RUNGS = [30000, 60000];
+function speedPollForMins(mins){ return mins<=1440 ? SPD_POLL_RUNGS[0] : SPD_POLL_RUNGS[1]; }
+// speedPollDelay: the next delay for range r at nowMs, same shape as
+// latPollDelay and for the same reasons - read that one first. It shares
+// latSpanMins, so an absolute range is priced on the part of it that has
+// actually happened. Before this, every range that was not a rolling preset
+// answered a flat 30s however wide it was, so "since a year ago" re-scanned a
+// year of runs twice a minute: the same defect latPollMs had.
+function speedPollDelay(r, nowMs){
+  // Frozen span: the shortest tick, so the first poll after Live is pressed is
+  // not held behind a delay armed while the chart could not gain a row. Once the
+  // span has loaded these ticks cost nothing - refreshSpeedChart's own
+  // fetch-once guard turns each one back before it reaches the wire.
+  if(r.kind!=='win' && r.to && r.to*1000<=nowMs) return SPD_POLL_RUNGS[0];
+  const ms=speedPollForMins(latSpanMins(r, nowMs));
+  // A range ending in the FUTURE is live until that instant, and only the poll
+  // after it loads the final runs in it. Cadence following the span is what makes
+  // that worth handling: a wide range can now arm 60s a second before its end,
+  // where the old flat 30s could not. Wake just past the end instead.
+  return r.kind!=='win' && r.to ? Math.min(ms, r.to*1000-nowMs+1000) : ms;
+}
 function speedPollMs(){ if(speedBackoffMs){ const b=speedBackoffMs; speedBackoffMs=0; return b; }
-  const r=speedRange;
-  if(r.kind!=='win') return 30000;
-  return r.mins<=1440?30000:60000; }
+  return speedPollDelay(speedRange, Date.now()); }
 // Await the poll before scheduling the next so a reconcile-503 backoff it parks is
 // in place when latPollMs/speedPollMs pick the next delay.
 (function loopChart(){ setTimeout(async ()=>{ await vis(refreshChart)(); loopChart(); }, latPollMs()); })();

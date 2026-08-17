@@ -30,6 +30,29 @@ var (
 // and catch spikes that fall between scrapes, which a single last-value gauge loses.
 var LatencyBucketsSeconds = []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
 
+// AggregationBucketsSeconds are the cumulative upper bounds (seconds) for
+// histograms that time in-process work instead of a network round-trip.
+// LatencyBucketsSeconds stops at 5s because past that a probe has effectively
+// timed out; for a chart aggregate 5s is not the tail but the ordinary case -
+// re-aggregating the raw samples table is "seconds of work at months of
+// retention" (the Series doc comment, internal/store). Cited by symbol, not by
+// line: this reference has broken twice already as store.go shifted. With the latency
+// bounds every such observation lands in +Inf, so Count and Sum move and no
+// bucket does: no p95, and a wide window degrading from 6s to 30s is invisible.
+// These keep resolving out to a minute.
+var AggregationBucketsSeconds = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
+
+// histoBuckets registers bounds other than LatencyBucketsSeconds for a named
+// histogram. It is a compile-time table, like the metric names themselves (see
+// the package doc), rather than a Register call made from some package's
+// startup path: Observe fixes a histogram's bounds when it creates the
+// histogram on first use (below), so a call-site registration would be a race
+// between startup and the first observation, and a package whose tests never
+// run that startup path would bucket the same metric differently.
+var histoBuckets = map[string][]float64{
+	"series.query.seconds": AggregationBucketsSeconds, // chart-aggregate duration
+}
+
 // Histogram is a fixed-bucket cumulative histogram. Counts[i] is the number of
 // observations <= Bounds[i]; Count is the total (the implicit +Inf bucket).
 type Histogram struct {
@@ -147,7 +170,8 @@ func Seed(names ...string) {
 	mu.Unlock()
 }
 
-// Observe records v (seconds) into the named latency histogram (LatencyBucketsSeconds).
+// Observe records v (seconds) into the named histogram, bucketed by
+// LatencyBucketsSeconds unless histoBuckets registers other bounds for the name.
 func Observe(name string, v float64) {
 	if !validName(name) {
 		return
@@ -155,7 +179,11 @@ func Observe(name string, v float64) {
 	mu.Lock()
 	h := histos[name]
 	if h == nil {
-		h = &Histogram{Bounds: LatencyBucketsSeconds, Counts: make([]uint64, len(LatencyBucketsSeconds))}
+		b := histoBuckets[name]
+		if b == nil {
+			b = LatencyBucketsSeconds
+		}
+		h = &Histogram{Bounds: b, Counts: make([]uint64, len(b))}
 		histos[name] = h
 	}
 	for i, b := range h.Bounds {
