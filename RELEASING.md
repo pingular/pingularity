@@ -172,9 +172,9 @@ The tag publishes artifacts; the GitHub release's notes are where behavior
 changes for *running installs* get called out, above the generated changelog.
 Checklist for what earns a note: a changed default, a changed upgrade path, a
 one-time migration, anything an operator would otherwise discover as a
-surprise. The 0.62 access change is the standing example - its notes must say,
-in this order, because the first bullet is what a skimming operator has to
-leave with:
+surprise. The private-by-default access change is the standing example - its
+notes must say, in this order, because the first bullet is what a skimming
+operator has to leave with:
 
 - **Upgrading a container from 0.61 or earlier? It is NOT grandfathered.** A
   container that answered the LAN before the upgrade stops answering it after,
@@ -183,11 +183,11 @@ leave with:
   over - but the dashboard goes dark until that opt-in. Write it as the
   headline, not a footnote: this is the single most important upgrade note in
   the release. The why, in one clause if the notes have room: the daemon cannot
-  tell an upgraded pre-0.62 store from one born private under an earlier,
-  unreleased 0.62 build (before the birth marker existed) that simply ran for a
-  while - neither stored an access choice - and guessing open would put an
-  unauthenticated dashboard on the LAN, so it fails closed and logs one WARN
-  naming the state and the fix;
+  tell a store upgraded from 0.61 or earlier from one born private under an
+  earlier, unreleased build (from before the birth marker existed) that simply
+  ran for a while - neither stored an access choice - and guessing open would
+  put an unauthenticated dashboard on the LAN, so it fails closed and logs one
+  WARN naming the state and the fix;
 - **every install starts private, containers included** - no exception for
   fresh ones either: a published port answers 403 until the operator opts in
   with `-access network` / `-e PINGULARITY_ACCESS=network`, or turns Network
@@ -241,11 +241,11 @@ The announce deploy is also when
 `install.pingularity.dev/compose-iperf.yaml` (served by the same Worker)
 must move: it is pinned to the image version it was published with, so bump
 its `image:` tag to the release, and when the release changes what the
-compose has to say, change the file in the same deploy - for 0.62, the
-commented `ports: ["9000:9000"]` fallback gains a commented
-`environment: ["PINGULARITY_ACCESS=network"]` partner plus
-uncomment-both-or-neither guidance, per the README's "iperf3 in a container"
-section. The README sends readers to the served file instead of an inline
+compose has to say, change the file in the same deploy - for the
+private-by-default access change, the commented `ports: ["9000:9000"]`
+fallback gains a commented `environment: ["PINGULARITY_ACCESS=network"]`
+partner plus uncomment-both-or-neither guidance, per the README's
+"iperf3 in a container" section. The README sends readers to the served file instead of an inline
 snapshot precisely because this step keeps it matching the released daemon;
 skipping it is the drift the README promises cannot happen.
 

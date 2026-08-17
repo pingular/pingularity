@@ -28,3 +28,39 @@ deploy.sh
 # commits them as embedded repositories.
 .claude/
 /compose.yaml
+
+# Credential shapes. Unlike the scratch-artifact block above, this one is not a
+# scar: no file matching these patterns is tracked, and nothing in the tree
+# generates or writes key material - there is no key generation, no x509 and no
+# PEM encoding in any .go file here. It is purely preventative. It earns its
+# place because `git add -A` sweeps every one of these paths in today, and a
+# secret pushed to a public repo is the one accident a follow-up commit cannot
+# undo - the credential has to be rotated instead. Cheap to carry, irreversible
+# to omit.
+.env
+.env.*
+.envrc
+.netrc
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Local build and profiling artifacts. Preventative too: nothing in the tree
+# produces them today - CI runs plain `go test ./... -count=1 -race`
+# (.github/workflows/ci.yml:58) and `node --test internal/web/ui/*.test.mjs`
+# (.github/workflows/ci.yml:61), with no coverage or profiling flag on any `go
+# test` line in .github/ and no npm/yarn/pnpm step anywhere in it. These are just
+# the default output names a local `go test -c`, `-coverprofile` or `-cpuprofile`
+# run leaves behind, listed so an afternoon of profiling cannot ride along in
+# someone's commit. node_modules/ is the same bet on a future `npx`: there is no
+# package.json today.
+coverage.out
+*.test
+*.prof
+node_modules/

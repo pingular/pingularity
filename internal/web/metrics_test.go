@@ -368,7 +368,7 @@ func TestMetricsSpeedByteGauges(t *testing.T) {
 	}
 }
 
-// #7 unmeasured-is-absent: the per-run speed_download_mbps/upload_mbps/ping_ms
+// Unmeasured-is-absent: the per-run speed_download_mbps/upload_mbps/ping_ms
 // gauges must appear ONLY when that quantity was measured (download/upload gated
 // on their *_bytes evidence, ping on a non-zero reading). A direction the engine
 // skipped must NOT emit a 0.0 gauge, which would fire a permanent false
@@ -459,7 +459,7 @@ func TestMetricsLabelEscaping(t *testing.T) {
 // Target names ride in from the samples table, which an import can back-fill
 // with arbitrarily many, arbitrarily long crafted names. The metrics endpoint
 // must cap the distinct per-target series and truncate long labels so a hostile
-// backup can't explode the operator's Prometheus (audit #8).
+// backup can't explode the operator's Prometheus.
 func TestMetricsCapsTargetCardinality(t *testing.T) {
 	stats.ResetForTest()
 	ctx := context.Background()

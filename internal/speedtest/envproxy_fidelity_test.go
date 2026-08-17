@@ -107,7 +107,14 @@ func TestEnvProxyNoProxyIDNAFormsMustMatch(t *testing.T) {
 	)
 	proxied := func(entry, host string) bool {
 		t.Setenv("NO_PROXY", entry)
-		return envProxyURL(mustParseURL(t, "http://"+host+"/x")) != nil
+		p, err := envProxyEndpoint(mustParseURL(t, "http://"+host+"/x"))
+		if err != nil {
+			// The configured value below is usable, so the third outcome cannot
+			// arise here: reading a refusal as "direct" would let a change that
+			// broke every request pass as NO_PROXY matching.
+			t.Fatalf("NO_PROXY=%q host %s: envProxyEndpoint refused a usable value: %v", entry, host, err)
+		}
+		return p != nil
 	}
 	clearProxyEnv(t)
 	t.Setenv("HTTP_PROXY", "http://192.168.1.10:3128")
@@ -122,9 +129,9 @@ func TestEnvProxyNoProxyIDNAFormsMustMatch(t *testing.T) {
 	// Mixed forms: net/http would send these DIRECT; we proxy them. Documented
 	// divergence, and fail-safe in both directions.
 	if !proxied(punycodeHost, unicodeHost) {
-		t.Error("unexpected: mixed-form matching now works; update the divergence note in envProxyURL")
+		t.Error("unexpected: mixed-form matching now works; update the divergence note in envProxyEndpoint")
 	}
 	if !proxied(unicodeHost, punycodeHost) {
-		t.Error("unexpected: mixed-form matching now works; update the divergence note in envProxyURL")
+		t.Error("unexpected: mixed-form matching now works; update the divergence note in envProxyEndpoint")
 	}
 }

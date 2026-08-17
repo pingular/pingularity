@@ -12,7 +12,7 @@ import (
 // short-circuit to true when its schedule is disabled, deny when enabled with a
 // window that doesn't cover now, and the two features must gate independently. An
 // enabled schedule with NO windows is normalized off (Update runs normalize), so
-// it reads as unscheduled = allowed rather than a silent "never" (audit #15).
+// it reads as unscheduled = allowed rather than a silent "never".
 func TestSpeedAndLatencyAllowed(t *testing.T) {
 	mk := func(sched Values) *Controller {
 		t.Helper()

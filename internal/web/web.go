@@ -72,12 +72,13 @@ type LiveStatus struct {
 // StatusFunc reports the monitor's current debounced state.
 type StatusFunc func() LiveStatus
 
-// SpeedTrigger runs a speedtest on demand and reports whether one is in
-// progress. It is satisfied by speedtest.Scheduler and may be nil when
-// speedtests are disabled.
+// SpeedTrigger runs a speedtest on demand and reports the run in progress, if
+// there is one. "Is one running" needs no method of its own: RunID answers 0
+// when nothing is running, and speedRunStatus derives both facts from that
+// single read precisely so they cannot disagree. It is satisfied by
+// speedtest.Scheduler and may be nil when speedtests are disabled.
 type SpeedTrigger interface {
 	RunOnce(ctx context.Context, reason string) (store.SpeedSample, error)
-	Running() bool
 	RunID() uint64
 	Abort(id uint64) bool
 	CurrentServer() string
@@ -3632,7 +3633,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 					// unreachable advice, and the distroless image has no shell to
 					// repair the stored setting from. Say the way back in: an
 					// explicit access choice at start overrides the stored one
-					// (reconcileAccess in main, authoritative since 0.62).
+					// (reconcileAccess in main, authoritative at every boot).
 					if s.InContainer {
 						msg += " This daemon runs in a container: if that just locked you out (pages now answer 403), " +
 							"restart the container with -e PINGULARITY_ACCESS=network - an explicit access choice at " +

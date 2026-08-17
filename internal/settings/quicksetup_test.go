@@ -123,7 +123,7 @@ func TestEnsureQuickSetupOffer(t *testing.T) {
 	})
 
 	t.Run("a past-young offer clock on an ESTABLISHED install is answered, not re-held", func(t *testing.T) {
-		// #6: a fresh install expired at 48h and ran (gained samples); a small
+		// A fresh install expired at 48h and ran (gained samples); a small
 		// backward clock step made the offer clock young again (<48h, still past).
 		// History must win: mark answered, never re-hold a running install.
 		c := open(t)

@@ -13,7 +13,7 @@ import (
 // read was empty, let me finish recording that". A RESTORE replaces the rows
 // that claim is about, so the import path must void it - otherwise the very
 // next settings write the import performs completes the stamp, and a restored
-// pre-0.62 backup ends up marked as born under this version.
+// pre-marker backup ends up marked as born under this version.
 //
 // That is worse than the missing marker it replaces: an absent marker reads as
 // "unknown" and fails closed (the container ambiguity warning fires), while a
@@ -55,9 +55,9 @@ func TestImportVoidsAPendingBirthStamp(t *testing.T) {
 		t.Fatal("precondition: the store must be unmarked at this point")
 	}
 
-	// Restore a MARKERLESS backup - what a pre-0.62 export looks like. Its config
-	// rows are settings writes, which is exactly what would otherwise complete
-	// the pending stamp.
+	// Restore a MARKERLESS backup - what an export from a pre-marker install
+	// looks like. Its config rows are settings writes, which is exactly what
+	// would otherwise complete the pending stamp.
 	s := newTestServerWith(t, st, set)
 	backup := `{"pingularity_export":1,"config":[{"key":"retention_s","value":"3600"}]}`
 	if rr := importBackup(t, s, "config=1", backup); rr.Code != 200 {
@@ -69,6 +69,6 @@ func TestImportVoidsAPendingBirthStamp(t *testing.T) {
 		t.Fatalf("AllSettings: %v", err)
 	}
 	if v, ok := all[settings.KeyInstallBornVersion]; ok {
-		t.Fatalf("the restored install was stamped %q: this daemon witnessed the birth of rows the restore has replaced, so the marker claims a birth nobody saw for the data now in the store - and a pre-0.62 restore would stop being reported as ambiguous", v)
+		t.Fatalf("the restored install was stamped %q: this daemon witnessed the birth of rows the restore has replaced, so the marker claims a birth nobody saw for the data now in the store - and a pre-marker restore would stop being reported as ambiguous", v)
 	}
 }

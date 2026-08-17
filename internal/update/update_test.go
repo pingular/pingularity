@@ -95,14 +95,17 @@ func TestNewerAndIsRelease(t *testing.T) {
 		{"0.7.0", "", false},
 		// A prerelease current ranks below the same-numbered final, so an rc tester
 		// is offered the stable they were testing (latest arrives stripped to its
-		// core, so it is treated as final).
-		{"0.62.0-rc.1", "0.62.0", true},       // promoted: rc -> its own stable IS an upgrade
-		{"0.62.0-rc.2", "0.62.0", true},       // any rc of that version
-		{"v0.62.0-rc1", "0.62.0", true},       // v-prefix + hyphenless rc style
-		{"0.62.0", "0.62.0", false},           // a stable never nags toward its own number
-		{"0.62.0-rc.1", "0.62.0-rc.1", false}, // identical rc: not an upgrade
-		{"0.63.0-rc.1", "0.62.0", false},      // newer rc core is NOT downgraded to older stable
-		{"0.62.0-rc.1", "0.63.0", true},       // a real newer stable still wins outright
+		// core, so it is treated as final). The numbers below are the SemVer
+		// spec's own illustrative ones, deliberately: this package reads THIS
+		// product's release feed, so a case written around a plausible tag reads
+		// as a statement about what will ship rather than about ordering.
+		{"1.0.0-rc.1", "1.0.0", true},       // promoted: rc -> its own stable IS an upgrade
+		{"1.0.0-rc.2", "1.0.0", true},       // any rc of that version
+		{"v1.0.0-rc1", "1.0.0", true},       // v-prefix + hyphenless rc style
+		{"1.0.0", "1.0.0", false},           // a stable never nags toward its own number
+		{"1.0.0-rc.1", "1.0.0-rc.1", false}, // identical rc: not an upgrade
+		{"1.1.0-rc.1", "1.0.0", false},      // newer rc core is NOT downgraded to older stable
+		{"1.0.0-rc.1", "1.1.0", true},       // a real newer stable still wins outright
 	} {
 		if got := newer(c.cur, c.lat); got != c.want {
 			t.Errorf("newer(%q,%q)=%v want %v", c.cur, c.lat, got, c.want)

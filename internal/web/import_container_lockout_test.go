@@ -13,7 +13,7 @@ import (
 // the restore - and the distroless image has no shell to repair the stored
 // setting from. So when the daemon is containerized the warning must also
 // state the way back in: restart with -e PINGULARITY_ACCESS=network, which is
-// authoritative over the stored setting at boot (reconcileAccess, since 0.62).
+// authoritative over the stored setting at every boot (reconcileAccess).
 // Natively the Access-tab advice works as written, and a container recovery
 // hint there would be a guess about how the daemon runs - so it must not
 // appear.

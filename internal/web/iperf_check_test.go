@@ -12,7 +12,7 @@ import (
 // The iperf-check endpoint dials arbitrary hosts (LAN iperf3 servers are a
 // legitimate target, so it is not SSRF-blocked). Its response time must not leak
 // reachable/refused (fast) vs filtered (slow timeout) as a host-probing oracle:
-// every outcome must take at least the uniform budget (audit #10).
+// every outcome must take at least the uniform budget.
 func TestIperfCheckUniformTiming(t *testing.T) {
 	old := iperfCheckBudget
 	iperfCheckBudget = 150 * time.Millisecond
@@ -54,9 +54,9 @@ func TestIperfCheckUniformTiming(t *testing.T) {
 
 	floor := iperfCheckBudget - 40*time.Millisecond // scheduling slack
 	if okDur < floor {
-		t.Errorf("reachable response in %v, below the %v floor — timing leaks reachability", okDur, iperfCheckBudget)
+		t.Errorf("reachable response in %v, below the %v floor - timing leaks reachability", okDur, iperfCheckBudget)
 	}
 	if badDur < floor {
-		t.Errorf("unreachable response in %v, below the %v floor — timing leaks reachability", badDur, iperfCheckBudget)
+		t.Errorf("unreachable response in %v, below the %v floor - timing leaks reachability", badDur, iperfCheckBudget)
 	}
 }

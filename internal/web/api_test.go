@@ -966,7 +966,7 @@ func TestIperfServersToDTOWithholdsPassword(t *testing.T) {
 	}
 }
 
-// #17 log-clear-clears-disk contract: the /api/logs clear branch must run
+// The log-clear-clears-disk contract: the /api/logs clear branch must run
 // OnLogClear (main wires it to drop the on-disk logs.txt snapshot) after
 // emptying the in-memory ring, and a nil OnLogClear must be a harmless no-op.
 func TestLogsClearRunsOnLogClear(t *testing.T) {
