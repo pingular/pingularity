@@ -10,9 +10,20 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// Read a repo file with its line endings normalised to LF. Git checks these out
+// with CRLF on Windows (no .gitattributes did that until one was added beside
+// this file), and dozens of assertions here match multi-line source with a bare
+// "\n" - so on a Windows runner they silently found nothing and reported the
+// code had moved. That is how CI failed on windows-latest at a6f5778 while every
+// other platform passed. These tests are about what the source SAYS, never about
+// how its lines end, so normalising at the door is the fix rather than teaching
+// each pattern to spell "\r?\n".
+function readSource(...parts) {
+	return readFileSync(join(...parts), 'utf8').replace(/\r\n/g, '\n');
+}
 // The whole page, for the few assertions that are about markup or CSS rather than
 // about the script; `script` is what everything else works from.
-const html = readFileSync(join(here, 'index.html'), 'utf8');
+const html = readSource(here, 'index.html');
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // Extract a `function NAME` / `const NAME =` definition with balanced braces,
@@ -3808,7 +3819,7 @@ test('both password-reset instructions turn container-aware together, screen rea
 // shipping two different answers. The container half also points readers at the
 // README's Docker section, so that section has to exist.
 test('the README gives the same locked-out recovery advice as the dashboard', () => {
-  const readmeRaw = readFileSync(join(here, '..', '..', '..', 'README.md'), 'utf8');
+  const readmeRaw = readSource(here, '..', '..', '..', 'README.md');
   const readme = readmeRaw.replace(/\s+/g, ' '); // the bullet is hard-wrapped; compare on one line
   const m = extract('function resetAuthText').match(/replace\('([^']+)',\s*'([^']+)'\)/);
   assert.ok(m, 'resetAuthText no longer swaps one literal clause for another, so the wordings the README must match cannot be read out of it');
@@ -4438,7 +4449,7 @@ test('a reconcile-503 backoff wins exactly one poll, then clears', () => {
 // copy nothing checks is a copy that drifts: mutating it to 30 days used to leave
 // every test green, because the cadence tests computed their expectations from
 // the page's own constant.
-const webGo = readFileSync(join(here, '..', 'web.go'), 'utf8');
+const webGo = readSource(here, '..', 'web.go');
 test('the 366-day bound is the server maxWinMins, not a number that happens to match', () => {
   const m = /\bconst maxWinMins = ([0-9 *]+)/.exec(webGo);
   assert.ok(m, 'maxWinMins is gone or renamed in web.go, so the page constant is pinned to nothing');
