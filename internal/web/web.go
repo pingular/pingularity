@@ -177,9 +177,19 @@ type Server struct {
 	// a no-op (tests, headless). Set by main before Serve.
 	OnLogClear func()
 
-	// importSem caps concurrent /api/import runs so a flood of slow-body uploads
-	// can't tie up unbounded goroutines/FDs. Lazily built (importGate) so a
-	// struct-literal Server still gates.
+	// importSem admits one /api/import run at a time (maxConcurrentImports) and
+	// refuses the rest, so a flood of slow-body uploads can't tie up unbounded
+	// goroutines/FDs and, more importantly, so two restores can't fight over
+	// SQLite's single writer, where whichever one loses the wait lands
+	// half-finished (see maxConcurrentImports). Note this is NOT what
+	// importMu above covers: an import takes importMu only after its rows are
+	// already committed, for the settings reconcile, and only when the backup
+	// carried the config category (the importedConfig branch in handleImport).
+	// The two other holders, handleAccess and handleQuickSetup, take it to keep
+	// the access and first-run answers from interleaving with that reconcile;
+	// neither one restores rows. So importMu was never held across the row writes
+	// where the contention happens. Lazily built (importGate) so a struct-literal
+	// Server still gates.
 	importSemOnce sync.Once
 	importSem     chan struct{}
 
@@ -3104,11 +3114,43 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	bw.WriteByte('}')
 }
 
-// maxConcurrentImports caps how many /api/import runs execute at once; a slow or
-// stalled body ties up a goroutine and connection, so an unbounded fan-out is a
-// cheap resource-exhaustion lever. A handful is plenty (imports are rare, heavy,
-// and mutate shared settings).
-const maxConcurrentImports = 4
+// maxConcurrentImports caps how many /api/import runs execute at once. It is 1:
+// a restore must not run beside another restore.
+//
+// It was 4, and the extra slots could not make two restores write at once:
+// SQLite has a single writer (store.Open's pool comment), so importers serialize
+// on it whatever this constant allows. So there is no throughput for a second
+// slot to unlock: it only chooses whether the second restore waits outside the
+// gate or races inside it.
+//
+// Racing has a losing side. An import applies its rows in bounded batches, one
+// store transaction apiece (batchRows in handleImport = store.importTxRows), and
+// importTxRows exists precisely because a restore that held the writer for a whole
+// file would push other writers past their 5s busy_timeout (store's pragmaConn
+// sets it) - importTxRows' own comment says exactly that of the live monitor's
+// inserts, and a second restore's batches queue for the same writer on the same
+// timeout. A batch that waits it out fails with SQLITE_BUSY, and because a restore
+// is deliberately incremental rather than atomic (see the partial branch in
+// handleImport), that failure does not leave the destination untouched: the caller
+// gets HTTP 500 {"partial":true} naming the rows that did land - a half-finished
+// restore of an intact backup.
+//
+// No failure rate is quoted here on purpose, and no distribution either. Which
+// batch has to wait, and whether it waits out the full five seconds, is decided
+// by SQLite's busy handler against timing this code does not control, so a figure
+// copied from one sitting would only tell the next reader their build is fine
+// when it is not.
+//
+// The slots also cost outright: each admitted importer decodes into a batch of
+// its own (bounded by importBatchBytes), so peak memory tracks the slot count
+// instead of staying at one batch, and four importers can hold all four of the
+// store's pooled connections (store.Open caps a file-backed pool at 4).
+//
+// One at a time is also what the UI has always assumed - it sends ONE request
+// covering every selected category and disables the button until it answers - so
+// the callers this now refuses are a second tab, a second operator, or a retry
+// after a proxy hangup.
+const maxConcurrentImports = 1
 
 // importGate returns the (lazily built) import concurrency semaphore.
 func (s *Server) importGate() chan struct{} {
@@ -3158,8 +3200,16 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
-	// Bound concurrency: refuse rather than queue when the gate is full, so a
-	// burst of slow uploads can't pile up goroutines/FDs waiting behind each other.
+	// One restore at a time (maxConcurrentImports), and REFUSE rather than queue
+	// when the slot is taken. Queueing would fix the partial restores too, but it
+	// parks this request's goroutine, connection and FD for the whole of the
+	// running restore with nothing to bound the wait: a blocking send on the gate
+	// returns when the running restore returns it, whenever that is, and no server
+	// timeout cuts a handler blocked before it starts reading the body.
+	// That is the pile-up this gate exists to prevent. Refusing also answers the
+	// likelier question honestly - a second concurrent restore is nearly always a
+	// double-click, a second tab or a retry, and silently running a second
+	// whole-database restore after the first is worse than declining it.
 	gate := s.importGate()
 	select {
 	case gate <- struct{}{}:

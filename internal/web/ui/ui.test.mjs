@@ -2547,15 +2547,94 @@ test('the orphaned-password warning survives Done and blocks Save', () => {
     'save must refuse an orphaning payload before it is built');
 });
 
-// Quick Setup's cost line is arithmetic shown to a stranger deciding whether
-// to consent to data spend - the numbers are pinned, not trusted. 1 Gbit
-// reference: 1.8 GB down + 1.275 GB up per run.
-test('Quick Setup cost note: pinned numbers per cadence', () => {
+// Quick Setup's cost line is arithmetic shown to a stranger deciding whether to
+// consent to data spend - the numbers are pinned, not trusted, and pinned as a
+// CEILING. A speedtest-go transfer runs a fixed 15s per direction (the library's
+// DataManager captureTime, which production never shortens) unless the rate
+// converges early, and the earliest that can happen is 10.05s, so on the 1 Gbit
+// reference line one ATTEMPT at one direction tops out at 15s x 125 MB/s =
+// 1.875 GB.
+//
+// An attempt is not a run. speedDefaultRetries is 1 (speedtest.go, "2 attempts
+// per direction"), the retry re-runs the whole window rather than resuming, and
+// both attempts are billed on purpose: ookla.go rebuilds the transfer per
+// attempt and sums the bytes into the run's usage, and the iperf engine's
+// TestIperfRunFailureSumsRetryBytes pins a retried direction at 2 x 125 MB to
+// keep that property. So the figure below is a per-attempt ceiling, and it
+// is only honest while the note also says the retry can double it: that
+// disclosure is asserted here next to the number so neither can be edited away
+// alone.
+//
+// The old copy priced the window mid-range (1.8 GB down, 1.275 GB up) and so
+// promised 30.6 GB up per day for the hourly cadence where the per-attempt
+// ceiling is 45.0 GB - 47% more data than the dialog asked consent for, on a
+// link that may be metered. The rule enforced here is one-directional: the
+// figure may over-state, never under-state.
+test('Quick Setup cost note: never under-states the data spend', () => {
   const { qsUseNote } = F;
-  assert.match(qsUseNote(0), /43\.2\u00a0GB down \+ 30\.6\u00a0GB up per day/);
-  assert.match(qsUseNote(1), /7\.2\u00a0GB down \+ 5\.1\u00a0GB up per day/);
-  assert.equal(qsUseNote(2), 'No scheduled tests, only a run after an outage or when you click Run.');
+  const CEILING_GB = 1.875; // 15s cap x 125 MB/s: one attempt at one direction
+  const stated = s => {
+    const m = s.match(/([\d.]+)\u00a0GB down \+ ([\d.]+)\u00a0GB up per day/);
+    assert.ok(m, 'the note must quote a down and an up figure: ' + s);
+    return [Number(m[1]), Number(m[2])];
+  };
+  // Runs per day per branch: 24 hourly, 4 six-hourly, and 24 for "Manually" too -
+  // that branch runs nothing on a schedule, but the on-reconnect trigger it
+  // cannot switch off is spaced by reconnectSpeedGap = max(15 min, the
+  // configured interval) (main.go), and Quick Setup leaves that interval alone
+  // under "Manually" (ApplyQuickSetup writes keySpeed only when tests are
+  // enabled), so on a DEFAULT install it is the shipped 1h. A shorter
+  // -speedtest-interval means more of these runs, which is why the copy hedges
+  // with "an hour by default"; the ceiling checked here is the default one.
+  for (const [sel, runs] of [[0, 24], [1, 4], [2, 24]]) {
+    const [down, up] = stated(qsUseNote(sel));
+    const ceil = runs * CEILING_GB;
+    assert.ok(down >= ceil, `sel=${sel} promises ${down} GB down, under the ${ceil} GB ceiling`);
+    assert.ok(up >= ceil, `sel=${sel} promises ${up} GB up, under the ${ceil} GB ceiling`);
+  }
+  // The exact figures, so a re-derivation has to come through this test.
+  assert.match(qsUseNote(0), /up to <b>45\.0\u00a0GB down \+ 45\.0\u00a0GB up per day<\/b>/);
+  assert.match(qsUseNote(1), /up to <b>7\.5\u00a0GB down \+ 7\.5\u00a0GB up per day<\/b>/);
+  // "roughly" reads as a two-sided estimate; a ceiling is one-sided.
+  assert.doesNotMatch(qsUseNote(0), /roughly/, 'a ceiling is quoted as "up to", not "roughly"');
   assert.doesNotMatch(qsUseNote(0), /month/, 'the monthly total was deliberately dropped');
+  // The retry is the difference between a per-attempt figure and a cap, so no
+  // branch may quote the figure without it - and naming it has to mean asserting
+  // it HAPPENS. A bare /retr(y|ies)/ pin passes just as happily on copy that says
+  // the opposite ("A failed test NEVER retries"), so each branch's affirmative
+  // phrasing is pinned and a negated one is rejected outright.
+  const retryClaim = {0: /\bretries once\b/, 1: /\bretries once\b/, 2: /\bfails? and retr(y|ies)\b/};
+  for (const sel of [0, 1, 2]) {
+    assert.match(qsUseNote(sel), retryClaim[sel],
+      `sel=${sel} quotes a per-attempt figure without saying a failed test retries`);
+    assert.doesNotMatch(qsUseNote(sel), /\b(never|not|no|without)\b(\s+\w+){0,2}\s+retr/i,
+      `sel=${sel} denies the retry that its per-attempt figure depends on`);
+  }
+});
+
+// SpeedtestOnReconnect defaults ON, and main.go's reconnect dispatch consults it
+// without ever consulting SpeedtestEnabled - so no choice on this screen turns it
+// off. Under "Manually" Quick Setup leaves the interval alone (ApplyQuickSetup
+// writes keySpeed, "speed_interval_s", only when tests are enabled;
+// speed_seconds is the request field the screen POSTs), so on a default install
+// it is still the shipped 1h and reconnectSpeedGap = max(15 min, that interval)
+// lets a flapping line run 24 full tests a day: exactly the branch whose old
+// copy implied the data cost was near zero. Every branch has to disclose it.
+test('Quick Setup discloses the after-outage tests this screen cannot switch off', () => {
+  const { qsUseNote } = F;
+  for (const sel of [0, 1, 2]) {
+    assert.match(qsUseNote(sel), /outage/, `sel=${sel} must mention the after-outage run`);
+    assert.match(qsUseNote(sel), /on by default/, `sel=${sel} must say that trigger is on by default`);
+  }
+  assert.match(qsUseNote(2), /not switched off here/, '"Manually" must say it does not disable the trigger');
+  // Both scheduled cadences get one extra run per interval at worst - the whole
+  // figure again - and the default single retry can double each of those, so the
+  // worst case they must quote is four times the headline, not two.
+  assert.match(qsUseNote(0), /four times that/);
+  assert.match(qsUseNote(1), /four times that/);
+  // "Manually" has no schedule: its headline is already the reconnect runs, so
+  // the retry alone is what doubles it.
+  assert.match(qsUseNote(2), /twice that/);
 });
 
 // The gate is strict equality: an older daemon or the demo shim simply lacks

@@ -285,6 +285,14 @@ func TestConcurrent(t *testing.T) {
 // shutdown save, and both use the same fixed path+".tmp" scratch file. Without
 // the save mutex their O_TRUNC opens and renames interleave into a torn snapshot;
 // with it every load sees the complete ring (#21).
+//
+// Each goroutine appends its own line before saving. SaveFile skips the rewrite
+// when the ring has not changed since it last wrote this file, so against a
+// static ring only the FIRST of these 160 calls would reach the tmp+rename path
+// the test exists to race, and the other 159 would return at the skip:
+// instrumenting the loop to stat the snapshot after every call saw exactly one
+// (inode, mtime) file identity for the whole test that way, against many with
+// the append.
 func TestSaveFileConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "logs.txt")
@@ -297,12 +305,17 @@ func TestSaveFileConcurrent(t *testing.T) {
 		var wg sync.WaitGroup
 		for g := 0; g < 8; g++ {
 			wg.Add(1)
-			go func() {
+			go func(g int) {
 				defer wg.Done()
+				// The ring is already at its entry cap, so this evicts one line and
+				// adds one: every snapshot is still exactly N entries, whenever it
+				// is taken.
+				line := fmt.Sprintf("round-%02d-g-%d", round, g)
+				r.Append(line, line)
 				if err := r.SaveFile(path); err != nil {
 					t.Errorf("SaveFile: %v", err)
 				}
-			}()
+			}(g)
 		}
 		wg.Wait()
 		got := New(N)

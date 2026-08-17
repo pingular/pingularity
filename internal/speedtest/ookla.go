@@ -2568,14 +2568,19 @@ var errTransferPanicked = errors.New("speedtest transfer panicked")
 // finishes or ctx is done, whichever comes first; finished says which.
 //
 // It exists because speedtest-go's transfers do not observe cancellation. Its
-// worker goroutines - one per CPU - loop until the DataManager's running flag is
-// cleared, and only the transfer's own time.AfterFunc(captureTime) clears it
-// (speedtest/data_manager.go, TestDirection.Start). Cancelling ctx merely makes
-// every chunk request fail instantly, so the rest of the ooklaCaptureTime window
-// becomes a hot spin. Waiting for the call to return therefore held the caller
-// for up to that whole window after an abort: the UI spinner kept turning, the
-// scheduler's single-flight flag stayed set so every new run got ErrBusy, and
-// the shutdown drain gave up with "background workers did not stop in time".
+// worker goroutines loop until the DataManager's running flag is cleared, and
+// only the transfer's own time.AfterFunc(captureTime) clears it
+// (speedtest/data_manager.go, TestDirection.Start). runTransfer wraps BOTH
+// directions, and they do not run the same number of workers: with no connection
+// count configured the download leg runs one per logical CPU (runtime.NumCPU)
+// while the upload leg is capped at uploadDefaultWorkerCap, and a configured
+// count applies to both legs - the same split starvationCeiling derives from.
+// Cancelling ctx merely makes every chunk request fail instantly, so the rest
+// of the ooklaCaptureTime window becomes a hot spin. Waiting for the call to
+// return therefore held the caller for up to that whole window after an abort:
+// the UI spinner kept turning, the scheduler's single-flight flag stayed set so
+// every new run got ErrBusy, and the shutdown drain gave up with "background
+// workers did not stop in time".
 //
 // Ownership: when finished is false the transfer goroutine is STILL RUNNING and
 // owns both srv - the library writes DLSpeed/ULSpeed/TestDuration on its way out

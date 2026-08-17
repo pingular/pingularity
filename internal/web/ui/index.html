@@ -1687,7 +1687,7 @@
           <span class="info" tabindex="0" data-tip="Parallel Ookla connections.
 • More connections fill a fast or high-latency link better.
 • Too few under-reads.
-• 0 = auto (one per CPU core).">i</span></span>
+• 0 = auto: one per logical CPU for downloads, at most 8 for uploads.">i</span></span>
           <span class="ctl"><input type="number" id="setOoklaConnections" min="0" max="16" step="1"><span class="unit"></span></span></label>
         <label class="srow iperf-opt"><span class="lbl">Window size
           <span class="info" tabindex="0" data-tip="TCP window / socket-buffer size (-w).
@@ -3423,14 +3423,69 @@ function showCoach(){
 // the answer; ONLY the primary button applies anything. Declining a previewed
 // theme reverts it: "keep the defaults" must include the pixels.
 let qsSchedSel=0, qsShown=false;
-// Cost of each cadence on a 1 Gbit reference line (Ookla ~14.4s down + ~10.2s
-// up per test = 1.8 GB down + 1.275 GB up per run). Pure so the numbers are
-// pinned by test rather than trusted in prose.
+// Cost of each cadence on a 1 Gbit reference line. The headline number is the
+// ceiling for ONE attempt per direction; every multiplier that is on by default
+// is named in the copy rather than folded into the number.
+//
+// A speedtest-go transfer runs a FIXED 15s per direction (the library's
+// DataManager captureTime, mirrored as ooklaCaptureTime in
+// internal/speedtest/ookla.go; nothing in production shortens it) unless the
+// rate converges early, and the earliest that can happen is 10.05s - Welford
+// needs 201 of the library's 50ms samples, 2x its 5s window plus one. So one
+// ATTEMPT at one direction moves AT MOST 1.875 GB here. 1.256 GB is only the
+// floor for an attempt that reaches one of those two exits; an attempt that
+// errors or is abandoned partway moves less, sometimes far less. ookla.go
+// tallies an ABANDONED attempt's bytes precisely because a user who cancels
+// mid-download stops "after moving hundreds of MB", and its starvation comment
+// prices a stalled upload at min(NumCPU, 8) workers x one ~1 MB chunk, none of
+// them confirming inside the window. So only the top of the range is safe to
+// quote - which is the only end this copy quotes.
+//
+// An attempt is not a whole run. speedDefaultRetries is 1
+// (internal/speedtest/speedtest.go, "2 attempts per direction"), and a retry
+// does not resume: internal/speedtest/ookla.go rebuilds the transfer per
+// attempt and adds every attempt's bytes into the run's reported usage, on the
+// stated grounds that "the running total spans every attempt ... That total is
+// the run's real data usage". internal/speedtest's own test for the other
+// engine, TestIperfRunFailureSumsRetryBytes, pins one retried direction at
+// 2 x 125 MB. So a failed direction spends the figure below twice, which is why
+// the copy says the retry out loud instead of quoting one attempt as a cap.
+//
+// The old copy priced the window at ~14.4s down and ~10.2s up (1.8 GB and
+// 1.275 GB) - mid-window guesses. They told an hourly install it would spend
+// 30.6 GB up per day when a link whose rate never settles spends 45.0 GB per
+// attempt, 47% more. This is consent copy for gigabytes on a possibly metered
+// line, so it must never come in under what the install actually uses: both
+// directions are priced at the 15s cap and the wording is "up to", not
+// "roughly".
+//
+// The last sentence discloses the on-reconnect trigger, which none of these
+// choices turns off: it defaults ON (config.Default, settings.shippedDefaults)
+// and its dispatch in main.go checks SpeedtestOnReconnect but never
+// SpeedtestEnabled, so it survives even "Manually". reconnectSpeedGap spaces it
+// at max(15 min, the scheduled interval), so at both offered cadences it can add
+// one more run per interval - doubling the figure above - and under "Manually"
+// Quick Setup leaves the interval alone (ApplyQuickSetup writes keySpeed,
+// "speed_interval_s", only when tests are enabled; speed_seconds is the field
+// this screen POSTs, web.go's quick-setup request), so on a default install it
+// is still the shipped 1h, i.e. up to 24 runs a day on a line that keeps
+// flapping. Doubled once more by the retry, that is the "four times that" the
+// scheduled branches quote. Pure so the numbers are pinned by test rather than
+// trusted in prose.
 function qsUseNote(sel){
-  if(sel===2) return 'No scheduled tests, only a run after an outage or when you click Run.';
+  // 15s x 125 MB/s = 1.875 GB: one ATTEMPT at one direction on the reference
+  // line. A direction that fails runs a second full window (see above).
+  const gb = runs => (runs*1.875).toFixed(1);
+  if(sel===2) return 'No scheduled tests, only a run after an outage or when you click Run. '+
+    'Those after-outage runs are not switched off here - Settings has its own toggle for them, on by default - '+
+    'and repeat at most once per test interval, an hour by default: on a 1\u00a0Gbit line an unstable '+
+    'connection can still use up to <b>'+gb(24)+'\u00a0GB down + '+gb(24)+'\u00a0GB up per day</b>, '+
+    'or twice that if tests fail and retry.';
   const n = sel===0?24:4;
-  return 'On a 1\u00a0Gbit line at this pace, speed tests use roughly <b>'+(n*1.8).toFixed(1)+
-    '\u00a0GB down + '+(n*1.275).toFixed(1)+'\u00a0GB up per day</b>.';
+  return 'On a 1\u00a0Gbit line at this pace, speed tests use up to <b>'+gb(n)+
+    '\u00a0GB down + '+gb(n)+'\u00a0GB up per day</b>. A failed test retries once, and a run after an '+
+    'outage is extra - Settings has its own toggle for it, on by default - and repeats at most once '+
+    'per interval, so an unstable connection can use up to four times that.';
 }
 let _qsInerted=[];
 function qsClose(){
