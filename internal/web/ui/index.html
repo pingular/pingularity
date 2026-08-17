@@ -3423,6 +3423,15 @@ function showCoach(){
 // the answer; ONLY the primary button applies anything. Declining a previewed
 // theme reverts it: "keep the defaults" must include the pixels.
 let qsSchedSel=0, qsShown=false;
+// The install's CONFIGURED speed interval, in seconds, captured from /api/status
+// on every poll - including the one that raises this dialog (web.go's status map
+// carries speed_interval_s next to quick_setup_pending, so any build that can show
+// Quick Setup also states the interval). It is what the "Manually" branch prices
+// against: that branch writes no interval of its own, so the after-outage trigger
+// keeps running at whatever the daemon is already set to. 3600 is the shipped
+// default (config.Default) and is only the fallback for a payload that omits the
+// field.
+let qsSpeedIntervalS=3600;
 // Cost of each cadence on a 1 Gbit reference line. The headline number is the
 // ceiling for ONE attempt per direction; every multiplier that is on by default
 // is named in the copy rather than folded into the number.
@@ -3462,30 +3471,78 @@ let qsSchedSel=0, qsShown=false;
 // The last sentence discloses the on-reconnect trigger, which none of these
 // choices turns off: it defaults ON (config.Default, settings.shippedDefaults)
 // and its dispatch in main.go checks SpeedtestOnReconnect but never
-// SpeedtestEnabled, so it survives even "Manually". reconnectSpeedGap spaces it
-// at max(15 min, the scheduled interval), so at both offered cadences it can add
-// one more run per interval - doubling the figure above - and under "Manually"
-// Quick Setup leaves the interval alone (ApplyQuickSetup writes keySpeed,
-// "speed_interval_s", only when tests are enabled; speed_seconds is the field
-// this screen POSTs, web.go's quick-setup request), so on a default install it
-// is still the shipped 1h, i.e. up to 24 runs a day on a line that keeps
-// flapping. Doubled once more by the retry, that is the "four times that" the
-// scheduled branches quote. Pure so the numbers are pinned by test rather than
-// trusted in prose.
-function qsUseNote(sel){
+// SpeedtestEnabled, so it survives even "Manually". reconnectSpeedGap (main.go)
+// spaces it at max(minReconnectSpeedGap, SpeedInterval), and minReconnectSpeedGap
+// is 15 minutes, so the run count follows that gap rather than anything this
+// screen switches on.
+//
+// The two scheduled branches APPLY their own interval (qsSave posts speed_seconds
+// 3600 / 21600), so their gap is that same interval: one extra reconnect run per
+// interval, doubling the headline, doubled once more by the retry - the "four
+// times that" they quote. "Manually" applies no interval at all
+// (settings.ApplyQuickSetup writes keySpeed only when tests are enabled), so it
+// inherits whatever the daemon already has, and at any interval below 15 minutes
+// the floor takes over: 96 runs a day, 180.0 GB per direction. Hardcoding 24
+// there quoted the 1h default as if it were a ceiling and understated a 1m or 5m
+// install fourfold, on the one screen whose job is consent for data on a metered
+// link. Hence intervalS: the figure is derived from the interval the install is
+// actually running.
+//
+// Pure (intervalS in, string out) so the numbers are pinned by test rather than
+// trusted in prose; the caller passes qsSpeedIntervalS.
+function qsUseNote(sel, intervalS){
   // 15s x 125 MB/s = 1.875 GB: one ATTEMPT at one direction on the reference
   // line. A direction that fails runs a second full window (see above).
-  const gb = runs => (runs*1.875).toFixed(1);
-  if(sel===2) return 'No scheduled tests, only a run after an outage or when you click Run. '+
-    'Those after-outage runs are not switched off here - Settings has its own toggle for them, on by default - '+
-    'and repeat at most once per test interval, an hour by default: on a 1\u00a0Gbit line an unstable '+
-    'connection can still use up to <b>'+gb(24)+'\u00a0GB down + '+gb(24)+'\u00a0GB up per day</b>, '+
-    'or twice that if tests fail and retry.';
+  //
+  // Rounded UP to the printed decimal, not to the nearest one. runs*1.875 lands
+  // on a fraction toFixed(1) has to break a tie in whenever runs is 3, 7, 11...
+  // (every runs%4===3): 3 runs is 5.625 GB and toFixed printed "5.6", 25 MB under
+  // what the install can spend, and likewise at 13.125, 20.625 and so on up the
+  // range - 24 of the 96 reachable run counts. Small in absolute terms, but the
+  // direction is the whole point of this copy, and 3 runs is an ordinary 8-hour
+  // interval rather than a corner. Ceil first, then toFixed, so the printed
+  // figure is never below runs*1.875. Every figure the tests pin is unmoved by
+  // this (96 -> 180.0, 58 -> 108.8, 24 -> 45.0, 5 -> 9.4, 4 -> 7.5, 1 -> 1.9);
+  // it only lifts the ties, e.g. 3 -> 5.7. Pinned by the qsUseNote cost test.
+  const gb = runs => (Math.ceil(runs*1.875*10)/10).toFixed(1);
+  // reconnectGate's spacing is a plain time.Time field on an in-process struct
+  // (main.go), and its zero value is documented there as an OPEN gate, so a
+  // restarted daemon suppresses nothing and the next reconnect runs at once. No
+  // per-day figure on this screen survives a crash loop, so none of them may be
+  // quoted without saying what they assume.
+  const upright = ' These daily figures assume the daemon keeps running: that spacing is held in memory, so a restart lets the next run start immediately.';
+  if(sel===2){
+    // max(15 min, the configured interval) = reconnectSpeedGap. settings clamps
+    // Speed to 1m..24h, so the gap is 15 min..24h and runs is 96..1.
+    const gapS = Math.max(900, intervalS>0 ? intervalS : 3600);
+    // ceil, not floor: reconnectGate.allow (main.go) refuses a run only while
+    // now-last is under the gap, so the gap is a minimum SPACING, not a per-day
+    // quota. The runs sit at t, t+gap, t+2gap, ... and every one that starts
+    // before the day is out is a run that day, so a day holds one at the start
+    // plus one per whole gap after it - floor(86400/gap)+1 whenever the gap does
+    // not divide 86400 exactly. floor dropped that first run: it quoted 106.9 GB
+    // per direction for a 25-minute install where 108.8 is reachable. The miss is
+    // always exactly one run, which is a bigger share of the answer the wider the
+    // gap - at 5 hours it is a fifth of the day (7.5 GB quoted, 9.4 reachable).
+    // Understating the spend is the one direction this copy may never round in.
+    const runs = Math.ceil(86400/gapS);
+    // Whole hours read as hours; anything else as minutes, floored - the gap is
+    // at least 900s, so this never says less than "15 minutes", and rounding the
+    // spacing DOWN can only over-state how often a test runs. The GB figure is
+    // computed from gapS itself, not from this wording.
+    const every = gapS%3600===0 ? (gapS===3600 ? 'hour' : (gapS/3600)+' hours')
+                                : Math.floor(gapS/60)+' minutes';
+    return 'No scheduled tests, only a run after an outage or when you click Run. '+
+      'Those after-outage runs are not switched off here - Settings has its own toggle for them, on by default - '+
+      'and repeat at most once every '+every+' on this install: on a 1\u00a0Gbit line an unstable '+
+      'connection can still use up to <b>'+gb(runs)+'\u00a0GB down + '+gb(runs)+'\u00a0GB up per day</b>, '+
+      'or twice that if tests fail and retry.'+upright;
+  }
   const n = sel===0?24:4;
   return 'On a 1\u00a0Gbit line at this pace, speed tests use up to <b>'+gb(n)+
     '\u00a0GB down + '+gb(n)+'\u00a0GB up per day</b>. A failed test retries once, and a run after an '+
     'outage is extra - Settings has its own toggle for it, on by default - and repeats at most once '+
-    'per interval, so an unstable connection can use up to four times that.';
+    'per interval, so an unstable connection can use up to four times that.'+upright;
 }
 let _qsInerted=[];
 function qsClose(){
@@ -3559,7 +3616,7 @@ function showQuickSetup(){
   segChoose.qsAcc(qsBootLocalOnly ? 0 : 1, false);
   const cur=document.documentElement.dataset.theme||'retro';
   document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.classList.toggle('on', b.dataset.sw===cur));
-  $('qsUse').innerHTML=qsUseNote(qsSchedSel);
+  $('qsUse').innerHTML=qsUseNote(qsSchedSel, qsSpeedIntervalS);
   $('qsDim').hidden=false; $('qsDlg').hidden=false;
   // Inert the rest of the page so Tab can't escape the dialog into the dashboard
   // behind the dim (only touch what isn't already inert, and restore exactly that
@@ -3606,7 +3663,7 @@ function wireSeg(groupId, select){
     });
   });
 }
-wireSeg('qsSched', i=>{ qsSchedSel=i; $('qsUse').innerHTML=qsUseNote(i); });
+wireSeg('qsSched', i=>{ qsSchedSel=i; $('qsUse').innerHTML=qsUseNote(i, qsSpeedIntervalS); });
 wireSeg('qsAcc', i=>{
   $('qsPw').style.display=(i===1?'flex':'none');
   $('qsAccNote').textContent = i===1
@@ -3642,6 +3699,25 @@ document.addEventListener('keydown', e=>{
   if(!$('qsDlg').hidden){ qsDecline(); return; } // Quick Setup: Esc = dismiss, keep the defaults
   if(!$('dataPop').hidden){ const p=$('families').querySelector('.stat-data'); hideDataPop(); if(p) p.focus(); return; }
   if(!$('uptimePop').hidden){ const p=$('families').querySelector('.stat-up'); hideUptimePop(); if(p) p.focus(); return; }
+  // A heatmap tooltip raised by FOCUS has no pointer to move away: short of
+  // tabbing off the cell or the grid repainting under it, nothing a keyboard user
+  // does takes it down, so without this it sits there for as long as the cell
+  // holds focus. Dismiss it without moving focus - the cell keeps it, so Tab
+  // carries on from the same place. Conditioned on focus
+  // actually being in the grid, not merely on the tooltip being up: a pointer
+  // resting over the heatmap while the settings drawer is open would otherwise
+  // eat the Escape that was meant to close the drawer.
+  //
+  // Focusing a cell raises its tooltip, so this does take the first Escape off
+  // an open drawer - and the two do overlap, because the drawer
+  // never inerts the page behind it the way Quick Setup does (_qsInerted) and has
+  // no Tab trap of its own, so the grid is reachable from it. Two presses is the
+  // right answer: the tooltip is the innermost thing showing, focus does not move,
+  // and the second press reaches the drawer exactly as the first would have.
+  // Letting the drawer win instead would leave a focus-raised tooltip with no
+  // keyboard dismissal at all for as long as the drawer is open.
+  if(!$('hmTip').hidden && document.activeElement && document.activeElement.closest
+     && document.activeElement.closest('#heatmap')){ $('hmTip').hidden=true; return; }
   if(_drawer.classList.contains('open')) requestCloseDrawer();
 });
 
@@ -3964,6 +4040,14 @@ async function refreshStatus() {
   // it). STRICT === true - an older daemon and the demo shim simply lack the
   // field, and absent must mean never.
   if(s.first_seen) coachInstallId=String(s.first_seen);
+  // Quick Setup's "Manually" branch prices itself off this: the after-outage
+  // trigger it cannot switch off is spaced at max(15 min, this interval)
+  // (reconnectSpeedGap, main.go), so a 1m or 5m install runs four times as many
+  // of those as the shipped 1h does. Read on every poll rather than once at
+  // startup, so an interval changed elsewhere while the dialog is still waiting
+  // for an answer is picked up. Guarded on a positive number so a payload without
+  // the field keeps the shipped default rather than pricing the dialog at zero.
+  if(typeof s.speed_interval_s==='number' && s.speed_interval_s>0) qsSpeedIntervalS=s.speed_interval_s;
   if(s.quick_setup_pending===true){ qsBootLocalOnly = s.access_local_only!==false; showQuickSetup(); }
   else if(s.first_seen) showCoach();
   $('ver').textContent = s.version || '';
@@ -5857,7 +5941,20 @@ async function refreshHeatmap() {
 // Theme-tab colour change (Downtime) recolours instantly with no network call.
 function drawHeatmap(){
   const map={}; for(const d of hmData) map[d.date]=d;
-  const el=$('heatmap'); if(!el) return; el.innerHTML='';
+  const el=$('heatmap'); if(!el) return;
+  // The rebuild below throws away every cell, including whichever one the tooltip
+  // is describing - and, on the keyboard path, the one that holds focus. Both ways
+  // in are live while that happens: the 60s poll repaints under a still hand, and
+  // clicking an outage cell calls this synchronously from the click handler.
+  // Nothing else can be counted on to take the tooltip down afterwards: mouseleave
+  // waits for the pointer to leave the grid, focusout waits for focus to leave a
+  // cell that is being deleted rather than blurred, and the Escape branch fires
+  // only while activeElement is still inside #heatmap. Left up, it states the old
+  // day over a grid that has moved on. Drop it here, where the cause is; the
+  // mouseover delegate re-raises it the moment the pointer enters a cell again,
+  // and a focus-raised one comes back on the next focusin.
+  $('hmTip').hidden=true;
+  el.innerHTML='';
   const today=new Date(); today.setHours(0,0,0,0);
   const start=new Date(today); start.setDate(start.getDate()-365); start.setDate(start.getDate()-start.getDay());
   // refreshHeatmap asks for days=366 - the cap web.go enforces - so no day
@@ -5910,10 +6007,25 @@ function drawHeatmap(){
       // labelled only when it had something wrong with it, so hovering most of
       // the grid did nothing at all - which reads as broken rather than calm -
       // and a screen reader heard only the bad days, with no way to place the
-      // other three hundred in time. "No outages" is the answer to the question
-      // the hover is asking, and the date alone is worth having: nothing else on
-      // a 366-square grid says which day you are pointing at.
-      if(!parts.length) parts.push('no outages');
+      // other three hundred in time. The answer to the question the hover is
+      // asking is worth having, and so is the date alone: nothing else on a
+      // 366-square grid says which day you are pointing at.
+      //
+      // "recorded", because a date with no row in the response is not evidence
+      // of a quiet day. Store.Clear("downtime") (internal/store/store.go) drops
+      // the events and pauses tables outright while first_seen_ts survives in
+      // `settings` (monitoringSince reads it back), so after the operator uses
+      // "Delete downtime" every deleted day is inside the monitored window with
+      // nothing left to describe it; outage retention prunes old events the same
+      // way (the whole-outage DELETE FROM events in Store.Prune, not UptimeSince's
+      // clamp - the clamp only keeps the uptime denominator off the pruned span).
+      // DowntimeByDay emits no row for
+      // those days, exactly as it emits none for a genuinely clean one, so the
+      // UI cannot tell the two apart and must not claim the difference. What it
+      // can vouch for is the response in front of it, which records no outages
+      // for this date. Not "no recorded outages", which reads as a claim about
+      // the outages rather than about the records.
+      if(!parts.length) parts.push('no outages recorded');
       const what = parts.join(' · ');
       cell.dataset.tip = `${key}: ${what}`;
       if(hasEv){
@@ -5959,6 +6071,33 @@ function drawHeatmap(){
   hm.addEventListener('touchstart', e=>{ const c=e.target.closest('.cell'), t=e.touches[0];
     if(!c || !c.dataset.tip || !t){ tip.hidden=true; return; }
     tip.textContent=c.dataset.tip; tip.hidden=false; place({clientX:t.clientX, clientY:t.clientY}); }, {passive:true});
+  // Keyboard: focusing a cell shows the same tooltip, anchored to the cell instead
+  // of to a cursor that keyboard navigation never moves. drawHeatmap above makes
+  // the outage days focusable (tabIndex + role=button) and they answer Enter and
+  // Space, but this block listened for mouse and touch only, so tabbing onto one
+  // showed nothing: the markup was already inconsistent with itself. It matters
+  // most on a day that was both offline and only partly watched, where the label
+  // carries the "monitored X of Y" clause - an observation gap the fill
+  // deliberately does NOT encode (see the observation comment in drawHeatmap).
+  // drawHeatmap builds the cell's aria-label out of that same string, so a screen
+  // reader announced it on focus all along; what had no route to it was the
+  // SIGHTED keyboard user, who was left with the fill and nothing else.
+  //
+  // A day that is ONLY unobserved stays unreachable by keyboard: it takes no
+  // tabindex, and giving it one is not a small change, because DowntimeByDay mints
+  // an unobserved row for every day before the monitoring anchor - a fresh install
+  // would put a year of cells in the tab order. Reaching those needs a navigation
+  // model that survives this grid rebuilding itself by innerHTML every 60 seconds,
+  // which is a separate job.
+  //
+  // focusin, not focus: focus does not bubble, so a delegate on the container
+  // never hears it - and delegation is what lets these handlers survive that
+  // rebuild.
+  hm.addEventListener('focusin', e=>{ const c=e.target.closest && e.target.closest('.cell');
+    if(!c || !c.dataset.tip){ tip.hidden=true; return; }
+    const r=c.getBoundingClientRect();
+    tip.textContent=c.dataset.tip; tip.hidden=false; place({clientX:r.left, clientY:r.bottom}); });
+  hm.addEventListener('focusout', ()=>{ tip.hidden=true; });
 })();
 
 // setSpeedtestRunning toggles the Speed panel's running indicator (button label

@@ -360,7 +360,20 @@ func (s Summary) Message() string {
 		speed = fmt.Sprintf("median ↓ %s Mbps · ↑ %s Mbps · %s ms ping (%d test%s)",
 			fmtMed(s.MedDownMbps, "%.1f"), fmtMed(s.MedUpMbps, "%.1f"), fmtMed(s.MedPingMS, "%.0f"), s.Runs, plural(s.Runs))
 	}
-	outages := "no outages"
+	// "recorded", because zero is not evidence of a quiet period. s.Outages counts
+	// what ResolvedOutagesSince can find in `events`, and that table is empty both
+	// for a period nothing went wrong in and for one whose rows were deleted:
+	// store.Clear("downtime") drops `events` and `pauses` together while the install
+	// anchor in `settings` survives (monitoringSince reads it back), so afterwards
+	// the deleted span sits inside the monitored window with nothing left in it to
+	// describe - no pause rows, so nothing for observedLine to disclose either. The
+	// digest cannot tell the two apart and so reports its records rather than the
+	// state of the world; the heatmap tooltip says "no outages recorded" for a date
+	// with no row for the same reason. Retention is NOT that case: Summarize clamps
+	// the outage window to the retention floor and hands UptimeSince the same
+	// retention, so time whose events are gone is left out of the figures rather
+	// than read as quiet.
+	outages := "no outages recorded"
 	if s.Outages > 0 {
 		outages = fmt.Sprintf("%d outage%s · %s down", s.Outages, plural(s.Outages), util.HumanDur(s.DowntimeS))
 	}

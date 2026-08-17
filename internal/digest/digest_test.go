@@ -508,10 +508,19 @@ func TestPartiallyObservedWindowDiscloses(t *testing.T) {
 	}
 }
 
-// A window observed end to end must read exactly as it always did: no disclosure
-// line, no wording change. The sub-second difference between the digest's
-// nanosecond window and UptimeSince's whole-second one must not append a
-// disclosure to every healthy 24/7 digest (that is what discloseFloor is for).
+// A window observed end to end gains no disclosure line: the sub-second
+// difference between the digest's nanosecond window and UptimeSince's
+// whole-second one must not append a disclosure to every healthy 24/7 digest
+// (that is what discloseFloor is for).
+//
+// The exact-string assertion below also pins "no outages recorded" over a bare
+// "no outages". Zero counted outages means only that ResolvedOutagesSince found
+// nothing in `events`, which is equally what a store.Clear("downtime") leaves
+// behind - and that clear takes the pause rows with it, so an emptied span reads
+// as fully monitored and draws the same silent disclosure the first assertion
+// here pins for a genuinely clean one. The count cannot carry a claim that the
+// period was clean, so the sentence must not make one (Message says why; the
+// heatmap tooltip words a date with no row the same way).
 func TestFullyObservedWindowSaysNothingExtra(t *testing.T) {
 	m, st, _ := newManager(t)
 	ctx := context.Background()
@@ -528,7 +537,7 @@ func TestFullyObservedWindowSaysNothingExtra(t *testing.T) {
 	if got := s.observedLine(); got != "" {
 		t.Errorf("a fully observed window must disclose nothing, got %q", got)
 	}
-	if want := "📊 Pingularity summary · last 1d\nUptime 100.00% · no outages\nno speedtests"; s.Message() != want {
+	if want := "📊 Pingularity summary · last 1d\nUptime 100.00% · no outages recorded\nno speedtests"; s.Message() != want {
 		t.Errorf("message =\n%s\nwant\n%s", s.Message(), want)
 	}
 }
