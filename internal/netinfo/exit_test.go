@@ -2,6 +2,7 @@ package netinfo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -396,5 +397,66 @@ func TestRefreshDropsStaleExitOnIPChangeWhenRetraceFails(t *testing.T) {
 	m.Refresh(context.Background())
 	if got := m.Get().Exit; got == nil {
 		t.Error("IP change with successful retrace must publish the new network's exit, got nil")
+	}
+}
+
+// The two fallback causes must stay distinguishable on the wire, because they
+// need opposite responses from an operator and the bool alone cannot say which.
+//
+// "unresolved" is a name to retry or fix. "internal" resolved perfectly well and
+// was refused on purpose - loopback and link-local would trace this machine or
+// the cloud-metadata endpoint rather than an exit path. The dashboard used to
+// print "your exit-path target didn't resolve" for both, which sent the second
+// operator hunting a DNS fault that did not exist.
+//
+// The reason is asserted as the literal string the JSON carries: the dashboard
+// switches on those exact values (target_fallback_why in index.html), so renaming
+// one here without the other silently drops the UI back to its vaguest wording.
+//
+// SCOPE, so nobody reads more into this than it proves: it pins the wire contract
+// - which strings exist, and that the flag and the reason never disagree. It does
+// NOT pin which branch of cachedExit assigns which reason. resolveIPv4 is a plain
+// function and the surrounding path runs a real traceroute, so covering that would
+// mean opening a seam in production code, and a two-line switch does not earn one.
+// Swapping the two literals at the assignment would pass this test.
+func TestExitTargetFallbackNamesItsReason(t *testing.T) {
+	// The bool and the reason are one fact recorded twice, so they must never
+	// disagree: a reason without the flag hides the fallback from the UI's
+	// existing check, and a flag without a reason is the ambiguity this closes.
+	for _, c := range []struct {
+		name string
+		why  string
+		flag bool
+	}{
+		{"target resolved and was used", "", false},
+		{"no IPv4 address for the name", "unresolved", true},
+		{"resolved to loopback or link-local", "internal", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ex := &ExitInfo{TargetFallback: c.why != "", TargetFallbackWhy: c.why}
+			if ex.TargetFallback != c.flag {
+				t.Fatalf("TargetFallback = %v, want %v", ex.TargetFallback, c.flag)
+			}
+			b, err := json.Marshal(ex)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			w, present := got["target_fallback_why"]
+			if c.why == "" {
+				if present {
+					t.Errorf("target_fallback_why = %v on a run that used its target, want the "+
+						"field omitted so a reader cannot read a reason into a normal trace", w)
+				}
+				return
+			}
+			if !present || w != c.why {
+				t.Errorf("target_fallback_why = %v (present=%v), want %q - the dashboard switches "+
+					"on this exact string", w, present, c.why)
+			}
+		})
 	}
 }
