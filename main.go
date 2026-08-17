@@ -2494,8 +2494,9 @@ Run flags (all optional - defaults work with no flags):
                             separate: see -speedtest-on-reconnect)
   -speedtest-interval dur   Time between scheduled speedtests (default 1h; 1m-24h)
   -speedtest-on-reconnect=false  Don't run a speedtest after a reconnect
-                            (on by default, independent of -speedtest; rate-limited
-                            to one per -speedtest-interval, or per 15m if shorter)
+                            (on by default, independent of -speedtest; at most one
+                            per -speedtest-interval, or per 15m when that interval
+                            is shorter)
   -latency=false            Disable latency probing (speedtest-only mode)
   -retain dur               Prune latency samples older than this
                             (default 720h = 30 days; 0 = forever)

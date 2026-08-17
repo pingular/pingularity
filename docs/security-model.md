@@ -138,7 +138,10 @@ in front of it:
 
 1. **The access filter, on by default everywhere.** A fresh install starts
    local-only - native or in a container - and every request from a non-loopback
-   peer is refused with a 403. LAN access is something you turn on deliberately:
+   peer is refused with a 403 - bar `/healthz` and `/readyz`, which answer ahead
+   of this filter so an off-box load balancer can probe the port, and which
+   carry an ok/not-ready verdict and nothing else (see "What needs a login and
+   what does not"). LAN access is something you turn on deliberately:
    `-access network`, `-e PINGULARITY_ACCESS=network`, or the Access tab.
 2. **The login.** Optional, off until you set a password. Passwords are stored
    as bcrypt hashes, and password checks are rate limited per client: five
@@ -249,7 +252,8 @@ real client rather than on the proxy.
 ## DNS-rebinding protection
 
 Always on, no configuration. A request whose `Host` header is a public domain
-is refused with a 403. This stops a malicious web page from using a visitor's
+is refused with a 403 - again except `/healthz` and `/readyz`, which answer
+ahead of this check too. This stops a malicious web page from using a visitor's
 browser as a proxy into a dashboard on their own network, which is otherwise a
 real attack against any local service.
 

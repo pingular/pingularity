@@ -344,12 +344,15 @@ the default level; routine detail needs the log level raised in the About tab.
 period): the `healthz` subcommand fetches `http://127.0.0.1:9000/healthz`
 from inside the container and exits 0 on a `200`, so `docker ps` reports
 `(healthy)`/`(unhealthy)` with no curl or shell in the image. If you change
-`-listen`, the baked-in probe misses the daemon and the container reads
-unhealthy while it is fine: in compose, override it with the exec form -
+`-listen`'s **port**, or bind it to an address that excludes `127.0.0.1`, the
+baked-in probe misses the daemon and the container reads unhealthy while it is
+fine: in compose, override it with the exec form -
 `healthcheck: { test: ["CMD", "/pingularity", "healthz", "-addr",
 "127.0.0.1:8080"] }` - and with plain `docker run`, pass `--no-healthcheck`
 on the default image (`--health-cmd` needs a shell, which distroless does not
-have; the `-iperf` image has one).
+have; the `-iperf` image has one). A bind that keeps port 9000 and still answers
+on loopback - `:9000`, `0.0.0.0:9000`, `127.0.0.1:9000` - needs no override at
+all.
 
 **Read-only root filesystem.** The default image runs under
 `docker run --read-only`: everything the daemon writes - the database and its
@@ -440,9 +443,13 @@ Any flags you *do* pass to `install` are persisted into the service definition.
 On systemd you can change them later without re-installing: the unit that
 `install` writes also reads `/etc/default/pingularity`, if you create one, so
 `PINGULARITY_OPTS="-speedtest -listen 127.0.0.1:9000"` plus
-`sudo systemctl restart pingularity` is enough (macOS and Windows have no
-equivalent - re-run `install` there). Manage with
-`pingularity start | stop | restart | status | uninstall`. On Linux and macOS a
+`sudo systemctl restart pingularity` is enough. macOS and Windows have no
+equivalent, and re-running `install` is not one: over a service that already
+exists it fails with an "already exists" error and leaves the flags it was
+installed with exactly as they were - on macOS, on Windows, and on a systemd
+unit this CLI installed alike. Wherever `/etc/default` isn't an option, then,
+changing a flag means `uninstall` first, then `install` with the new set. Manage
+with `pingularity start | stop | restart | status | uninstall`. On Linux and macOS a
 reload signal (`sudo systemctl reload pingularity`, or `kill -HUP <pid>`)
 re-reads settings from the database without restarting - how you pick up an
 out-of-band change like `reset-auth`, and the way back from the `503` a daemon
@@ -534,8 +541,9 @@ consequences worth knowing before you need them:
 One static binary runs a handful of independent goroutine loops that share a
 SQLite store and a live settings controller. Nothing else is required - the UI,
 web font, and favicon are embedded; outbound calls are the probes themselves,
-optional enrichment (geo/ISP/exit), speedtests, and the update check - the
-full inventory is the outbound-calls table below.
+optional enrichment (geo/ISP/exit), speedtests (Ookla, or the iperf3 server you
+point it at), the update check, and the alert webhook and heartbeat if you
+configure them - the full inventory is the outbound-calls table below.
 
 ```mermaid
 flowchart TB
@@ -613,8 +621,11 @@ same samples - no extra probes - and everything that *decides* on latency uses
 that floor instead: which server wins a best-of round, which server the very
 first run picks, and whether your ping threshold breached. A pothole shouldn't
 pick your server or page you, but a genuinely distant link has a high floor too
-and still breaches. iperf3 reports no per-sample values, so it is judged on its
-mean exactly as before.
+and still breaches. iperf3 exposes no per-sample values of its own, so a run
+measures the latency itself: five bare TCP handshakes to the server before the
+transfer, reported as their **median** (if none of them land, iperf3's own
+`min_rtt`, and failing that the idle baseline). There is no separate fastest
+figure on those runs, so that median is both what is shown and what decides.
 
 ![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, and a save-as-image button](docs/speed-panel.png)
 
@@ -856,11 +867,23 @@ The dashboard is built into the binary (no extra services, no CDN - the UI, web
 font, and favicon are all embedded) and served at the `-listen` address. The top
 bar carries the live status bubbles - per-family (IPv4/IPv6) latency, process
 runtime, 24h/7d uptime, and cumulative speedtest data used (click it for a
-breakdown by window). That figure counts every byte a speedtest moved, including
-runs that failed partway or that you cancelled - they still cost you the traffic,
-so on a metered link the number has to include them. Those attempts are counted
-but never shown as measurements: they appear in no chart, table, average or CSV,
-because nothing was measured. The latency and DNS dots are the theme accent at varying
+breakdown by window). That figure is the transfer payload each run recorded,
+including the runs that failed partway or that you cancelled - they still cost
+you the traffic, so on a metered link the number has to include them. What it is
+not is a wire total: protocol framing, retransmits, the warm-up seconds an engine
+throws away, and the UDP loss probe all move bytes that nothing counts, which
+makes this a measured lower bound rather than a bill (the exclusions are listed
+in full under [Metrics](#metrics-optional)). On a default install - the Ookla
+engine, with its five-second packet-loss probe - the uncounted part is overhead
+plus that one short probe, so the figure runs a few percent light and no more.
+It only becomes worth budgeting around on an install deliberately pointed at
+iperf3, where every direction discards a warm-up second before the count starts
+and the UDP pass moves megabytes of its own - or gigabytes, if you raise that
+probe's rate cap by hand (the daemon warns about the uncounted usage only from
+1 Gbps up, so a smaller raise is silent). Those
+attempts are counted but never shown as measurements: they appear in no chart,
+table, average or CSV, because nothing was measured.
+The latency and DNS dots are the theme accent at varying
 **intensity** - full = healthy, fading as latency or DNS gets worse - so the
 bar stays calm at a glance and only the dot that needs attention dims. The
 uptime, runtime, and data bubbles use plain icons (a pulse line, a clock, and
@@ -886,9 +909,16 @@ Below that:
   box takes plain language (`jul 1 to jul 8`, `2026-07-01 to 2026-07-08`,
   `since jul 1`, `yesterday`, `2026`, `9am to 5pm`, `3d ago to now`) and echoes
   back the span it read. An end date includes that whole day, and a bare
-  four-digit year means that year. The charts fit whatever data the span
-  actually holds, so picking a wide range with only a little data in it zooms to
-  the data rather than drawing empty margins; a span with no runs says so.
+  four-digit year means that year. A typed range reaches back at most 366 days
+  from today: an older start is quietly raised to that floor, so a span lying
+  entirely further back comes up empty, and the chart can say only that there is
+  nothing in the range, not why. Nothing out of the box gets there - latency
+  samples are kept 30 days by default, speed runs and outages a year - so it
+  takes raising a retention window past a year (or to `0`, keep forever) and then
+  accumulating that much history, or restoring a backup that already holds it.
+  The charts fit whatever data the span actually holds, so picking a wide range
+  with only a little data in it zooms to the data rather than drawing empty
+  margins; a span with no runs in reach says so.
   While a fixed range is pinned the stat cards follow it rather than the newest
   run, and a **Live** button returns to the rolling window, and an expandable **all-runs** table
   (paginated, with **CSV export** and a per-run health badge).
@@ -896,12 +926,18 @@ Below that:
   separate **DNS-resolution** line. Each round resolves a random throwaway name
   through the host's own *system* resolver (the random label dodges caches, so it
   times the real lookup path your apps use; an NXDOMAIN answer is healthy - the
-  resolver replied). That line **gaps wherever a lookup failed** (timeout /
-  SERVFAIL / no resolver), so a DNS gap with the latency line intact means
-  "online, but DNS was struggling." Selectable window (5m / 1h / 6h / 1d / 7d,
-  a **custom** duration, or a typed **date range** exactly like the Speed panel;
-  rolling windows are capped at the relevant retention), with red bands marking
-  **rounds that failed their checks**. Those come from the latency samples
+  resolver replied). A round skips its lookup while the previous one is still in
+  flight, so a hung resolver cannot pile lookups up behind it; a lookup gives up
+  after 3s, so in practice that needs a probe interval shorter than that. The DNS
+  line **gaps wherever a bucket held no successful lookup** (timeout / SERVFAIL / no
+  resolver), so a DNS gap with the latency line intact means "online, but DNS was
+  struggling." On the wider windows one plotted point averages many lookups, and
+  that average counts the successful ones only - a failure neither plots nor
+  shifts the value, so a bucket gaps only when none of its lookups succeeded.
+  Narrow the window to see them one by one. Selectable window (5m / 1h / 6h / 1d
+  / 7d, a **custom** duration, or a typed **date range** exactly like the Speed
+  panel; rolling windows are capped at the relevant retention), with red bands
+  marking **rounds that failed their checks**. Those come from the latency samples
   themselves, not from the debounced outage log below - so a blip too short to
   become an outage event still shows a band, and deleting an outage does not
   erase the bands underneath it. Hover either chart to read the exact point.
@@ -909,9 +945,13 @@ Below that:
   **how many outages that day**, not how long they lasted: one 23-hour outage and
   one 1-second blip are both a single event and shade identically, while three
   blips shade darker than either. Hover a cell for the figure that answers "how
-  bad was it" - the actual downtime, and how much of the day was observed.
+  bad was it" - the actual downtime, and how much of the day was observed. A day
+  that was watched end to end with nothing to report leaves no record of its own
+  behind, so its cell carries no figures and says "no outages recorded" instead -
+  a claim about what is on file rather than about the day, because a day whose
+  outage history you deleted looks exactly the same from here.
 - **Recent outages** - the debounced up/down event log. Each resolved outage has a
-  ✕ to delete it (removes it from the log, heatmap, and uptime stats -
+  trash button to delete it (removes it from the log, heatmap, and uptime stats -
   handy after planned maintenance you don't want counted). The durations here are
   **observed** time, the same rule uptime and the heatmap use: any stretch of an
   outage that monitoring didn't watch - paused with the power button, outside a
@@ -921,26 +961,37 @@ Below that:
 
 ![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day shaded by how many outages it saw, above a Show recent outages button](docs/downtime-heatmap.png)
 
-> **Who does Pingularity talk to?** Only keyless public infrastructure - no API
-> token, no signup, and nothing is ever *pushed* anywhere. The complete list of
-> outbound calls, so you can audit or firewall them:
+> **Who does Pingularity talk to?** Every service it picks for you is keyless
+> public infrastructure - no API token, no signup - and nothing is ever *pushed*
+> anywhere you did not configure yourself. The complete list of outbound calls,
+> so you can audit or firewall them:
 >
 > | Service | What it receives | When |
 > |---|---|---|
 > | anchors (`1.1.1.1`, `8.8.8.8`, `9.9.9.9` + v6) | a TCP handshake, no payload | every probe round |
-> | your own DNS resolver | one random throwaway lookup | every probe round (DNS line) |
+> | your own DNS resolver | one random throwaway lookup; and, for a LAN resolver only, one CHAOS `version.bind` query to name its software | every probe round (DNS line); the `version.bind` query on the refresh that first labels the resolver set, again if that set changes, and again on any refresh while a resolver in the set is still labelled by a bare address that is not private, link-local or loopback (its naming lookup came back empty), because that retry relabels the whole set |
 > | **ipify** | a "what's my IP" request | connection refresh |
-> | **Team Cymru** (DNS) | IPs from the traceroute path, to name their ASN | exit discovery |
-> | **RIPE IPmap** | router IPs from the traceroute, for geolocation | exit discovery |
+> | **whoami.akamai.net** (DNS) | a fixed lookup whose answer is your *resolver's* egress address, not yours | connection refresh |
+> | every router on the way to the **exit target** (`1.1.1.1` unless you change it) | one ICMP echo per hop, carrying nothing about you | exit discovery |
+> | **Team Cymru** (DNS) | your public IPv4/IPv6, your resolver's egress address, the resolver addresses your host is configured with, and every traceroute hop in public address space - to name the network each one belongs to; hops that are private, carrier-NAT (`100.64/10`), link-local or loopback are skipped | connection refresh + exit discovery |
+> | **RIPE IPmap** | the two boundary router IPs the traceroute settles on, and your resolver's egress address, for geolocation | connection refresh + exit discovery |
 > | **ipwho.is**, then **geojs.io** | your public IP, for the ISP/geo line | connection refresh |
 > | **Cloudflare** (`/cdn-cgi/trace`) | a plain fetch, to learn the serving PoP | connection refresh |
 > | reverse DNS | router/host IPs, for names | connection refresh |
 > | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup | when a speedtest runs, and when the Server settings tab is opened or a city is searched |
+> | your own **iperf3 server** (opt-in) | the test traffic itself - the TCP transfers, plus a short UDP pass for loss and jitter; or, for the status light in the settings drawer, one bare TCP handshake and nothing else | when an iperf3 speedtest runs, and when the drawer checks a saved server's status light - once per address while the drawer is open with iperf3 selected, plus whenever you click a server's dot or change its address |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
 > | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on (until the first check succeeds: retried at 1m/5m/15m, then hourly) |
+> | your **alert webhook** (opt-in) | the alert text and its fields, to the URL you set | on an outage, a speed-threshold breach, a digest, or the Send test button |
+> | your **heartbeat URL** (opt-in) | a bare `GET`, no body | every minute while monitoring is live |
 >
-> The six **connection refresh** and **exit discovery** rows are the ones that
-> carry your public IP. "Connection refresh" means: once an hour on its own
+> The **connection refresh** and **exit discovery** rows are the ones that carry
+> your public IP, the `whoami.akamai.net` line excepted - that lookup's whole
+> point is that it carries nothing of yours, since your own resolver asks it for
+> you and the answer describes the resolver. Rows marked (DNS) are questions
+> handed to that resolver rather than connections the daemon makes itself, so
+> what the service at the far end sees is your resolver arriving with an address
+> in the query. "Connection refresh" means: once an hour on its own
 > (every 5 minutes while a lookup is failing), once after a reconnect at most
 > every 5 minutes, and once after every speedtest - so turning speedtests on
 > multiplies these too. Exit discovery rides those refreshes but re-traces at
@@ -951,8 +1002,12 @@ Below that:
 >
 > Everything else - dashboard, charts, history, alerts evaluation - is fully
 > local. Turn speedtests, the update check, or the DNS probe off and those rows
-> simply never fire. (Alert webhooks and the heartbeat post only to URLs you
-> configure yourself.)
+> stop firing on their own, bar two halves that answer to a different switch.
+> The Ookla server list and the iperf3 status light are the settings drawer
+> reaching out, so they follow the drawer rather than the speedtest toggle; the
+> `version.bind` query rides the connection refresh, so it follows **Connection
+> info** rather than the DNS probe. (Alert webhooks and the heartbeat post only
+> to URLs you configure yourself.)
 >
 > **Behind a proxy?** Ookla speedtests use `HTTP_PROXY` / `HTTPS_PROXY` /
 > `NO_PROXY` from the daemon's environment (lower-case spellings too), written as
@@ -972,8 +1027,15 @@ Below that:
 > letting a proxied request name a speedtest server, the daemon resolves that name
 > locally to check the proxy isn't being pointed at something internal, so with no
 > local resolver every server is refused - and each refusal is logged only at debug
-> level, so the reason is invisible until you raise it. Give the daemon a resolver,
-> or list those destinations in `NO_PROXY`. Full reasoning in
+> level, so the reason is invisible until you raise it. The fix is to give the
+> daemon a working local resolver. `NO_PROXY` is not one: the name is resolved
+> before the routing decision is made, so listing a destination there does not
+> skip the check that just failed - and a direct connection would need that same
+> lookup anyway. Clearing `HTTP_PROXY`/`HTTPS_PROXY` altogether does stand the
+> check down, since it is inert when no proxy is configured, but that only helps
+> if the daemon has direct egress. Where DNS genuinely lives only at the proxy (a
+> `socks5h` setup), there is no way round it and Ookla speedtests stop rather than
+> run unvetted. Full reasoning in
 > [docs/security-model.md](docs/security-model.md).
 
 The **logo** (top-right) opens a tabbed settings drawer; a **power** toggle in
@@ -994,8 +1056,9 @@ and persist across restarts:
   the cadence you configured - 12x the runs on that hourly default, for as long as
   the breach lasts. Changing the interval shows a live estimate (Ookla only, and
   only while automatic runs are on) of the daily/monthly data the *scheduled* tests
-  will use, based on your recent runs - it counts neither the extra triggers nor
-  this faster cadence.
+  will use, based on what your recent runs recorded - so it is a measured lower
+  bound like the data-used figure itself - and it counts neither the extra
+  triggers nor this faster cadence.
 - **Server** → engine (**Ookla** or **iperf3**, each with its own servers and
   per-test options), server selection (with city search), test direction, and
   retries. **Best of 3 servers** (Ookla only, off by default) tests your chosen
@@ -1077,8 +1140,11 @@ and persist across restarts:
   period spent scheduled-off or paused is reported as such rather than as a
   confident 100%. The first one lands a full period *after* you switch it on -
   enabling "daily" arms the clock rather than sending immediately - and with no
-  webhook URL set nothing is sent and no period is consumed, so adding a URL later
-  still delivers the window that was waiting. And a dead-man's-switch **heartbeat**
+  webhook URL set nothing is sent and no period is consumed, so a webhook you
+  remove and put back still gets the window that was waiting for it. An install
+  that has never had a webhook has no such window to hand over: adding the URL
+  arms the clock exactly like switching the summary on does, and the first report
+  lands a full day or week after that. And a dead-man's-switch **heartbeat**
   URL).
 - **Access** → access controls (changes here apply on **Save**).
   **Network access** decides whether other devices can reach the dashboard /
@@ -1135,8 +1201,10 @@ status colours, chart series - each picker previews live and resets to the theme
 
 ![Six of Pingularity's built-in themes side by side: Retro, Dark, Light, Cyber, Solarized, and Amoled](docs/themes.png)
 
-> **Notifications** post JSON to one webhook URL, shaped per host so the common
-> targets just work. Discord → `{content}`, Slack → `{text}`; every other
+> **Notifications** post to one webhook URL, shaped per host so the common
+> targets just work - JSON everywhere except ntfy. Discord → `{content}`,
+> Slack → `{text}`, ntfy → the alert text as a plain-text body with
+> `X-Title` / `X-Priority` / `X-Tags` headers (see the recipes below); every other
 > receiver gets a rich body carrying the alert text under `text`/`content`/
 > `message`/`body` plus a `title`, a `type` (`info`/`success`/`warning`/
 > `failure`), and a numeric `priority` (1 low - 5 urgent). The heartbeat pings an
@@ -1207,7 +1275,7 @@ and the power toggle aren't part of that form and are unaffected.
 | `-ipv6` | `auto` | IPv6 probing: `auto` \| `on` \| `off` (live) |
 | `-speedtest` | `false` | run scheduled speedtests (startup + interval); opt-in. On-reconnect tests are governed separately by `-speedtest-on-reconnect`, the while-degraded trigger by its own UI toggle |
 | `-speedtest-interval` | `1h` | time between scheduled speedtests, `1m`-`24h` |
-| `-speedtest-on-reconnect` | `true` | speedtest after a reconnect (at most one per `-speedtest-interval`, or per 15m if that is shorter) |
+| `-speedtest-on-reconnect` | `true` | speedtest after a reconnect (at most one per `-speedtest-interval`, and never more often than once per 15m) |
 | `-retain` / `-retain-speed` / `-retain-downtime` | `720h` (30 days) / `8760h` (1 year) / `8760h` | prune windows in Go duration units (`0` = keep forever) |
 | `-allow-host` | *(none)* | extra `Host` header values the DNS-rebinding guard accepts - only needed behind a reverse proxy on a public domain |
 | `-trusted-proxy` | *(none)* | proxy IPs/CIDRs whose `X-Forwarded-For` identifies the real client, so one visitor's failed logins can't rate-limit everyone behind the proxy |
@@ -1242,8 +1310,11 @@ than quietly dropping the flags).
 A Prometheus endpoint is exposed at `GET /metrics` if you already run a
 Prometheus/Grafana stack and want to scrape Pingularity - but nothing external is
 required; the built-in dashboard is fully standalone. `/metrics` is a passive
-**pull** endpoint - Pingularity never pushes metrics or any telemetry anywhere;
-the data only leaves the box if you scrape it.
+**pull** endpoint - nothing scrapes it for you, and it hands data out only in
+answer to a scrape. It is not the whole story of what leaves the box, though:
+measurements *are* pushed on the paths you configure yourself - alerts and the
+periodic digest carry figures to your alert webhook, and the heartbeat pings its
+URL (see the outbound-calls table above).
 
 `GET /metrics` exposes (every gauge has a `# HELP` line in the output, so it's
 self-describing):
@@ -1281,10 +1352,16 @@ self-describing):
   `pingularity_probe_last_round_timestamp_seconds` - per-target and overall probe
   freshness. `target_up` deliberately holds its last value while paused, so a
   timestamp that stops advancing is how you tell a frozen reading from a live one
-- `pingularity_probe_latency_seconds` / `pingularity_dns_latency_seconds` -
-  **histograms** (`_bucket{le}` + `_sum` + `_count`) of anchor RTT and DNS
-  resolve-time, so `histogram_quantile()` gives real p95/p99 and catches spikes that
-  fall between scrapes - which the last-value latency gauges lose
+- `pingularity_probe_latency_seconds` / `pingularity_dns_latency_seconds` /
+  `pingularity_series_query_seconds` - **histograms** (`_bucket{le}` + `_sum` +
+  `_count`) of anchor RTT, DNS resolve-time, and how long a chart aggregate took,
+  so `histogram_quantile()` gives real p95/p99 and catches spikes that fall
+  between scrapes - which the last-value latency gauges lose. Each appears
+  once it has recorded something, so the chart-query one is absent until a
+  dashboard or an `/api/series` call has run a query. Its buckets are deliberately
+  wider than the two latency ones - out to a minute rather than five seconds -
+  because a re-scan of the samples table on slow hardware runs well past where
+  latency stops being interesting
 - `pingularity_dns_up` / `pingularity_dns_resolve_seconds` - the DNS-resolution
   probe (the chart's second line): whether a cache-busted lookup succeeded and how
   long it took, via the host's own resolver. Present only while the probe is
@@ -1324,11 +1401,13 @@ self-describing):
   `pingularity_speed_ping_seconds` / `pingularity_speed_packet_loss_ratio` (0..1) -
   use whichever your dashboards expect, but don't mix the two unit systems in one
   expression
-- `pingularity_speed_ping_best_ms` - the **fastest** of the ping samples
-  `_ping_ms` averages. The engine reports a mean over ten samples, so one stalled
-  handshake moves it several-fold; this is the floor beneath it. Alert on this
-  one to mean "the link really is far", and watch the **gap** between the two to
-  spot a lossy path. Absent on iperf3 runs, which report no per-sample values
+- `pingularity_speed_ping_best_ms` - on **Ookla** runs, the **fastest** of the
+  ping samples `_ping_ms` averages. There the engine reports a mean over ten
+  samples, so one stalled handshake moves it several-fold; this is the floor
+  beneath it. Alert on this one to mean "the link really is far", and watch the
+  **gap** between the two to spot a lossy path. Absent on iperf3 runs, which do
+  sample the server themselves - up to five bare TCP handshakes - but report the
+  **median** of those as `_ping_ms` and record no floor beside it
 - `pingularity_speed_healthy` - 1/0, did the last run pass your configured
   thresholds (lets alerting reuse the in-app verdict instead of re-encoding it);
   **absent** when no thresholds are configured *or* when the run couldn't measure
@@ -1409,7 +1488,18 @@ self-describing):
   `pingularity_database_prune_duration_seconds_total`,
   `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
   `pingularity_probe_blips_total`, `pingularity_login_failures_total`,
-  `pingularity_rate_limit_trips_total`
+  `pingularity_rate_limit_trips_total`, and the chart-aggregate cache accounting:
+  `pingularity_series_cache_hits_total`, `pingularity_series_cache_expired_total`,
+  `pingularity_series_cache_new_total`, `pingularity_series_cache_empty_total`,
+  `pingularity_series_bypass_total` and `pingularity_series_queries_total`. Every
+  chart request books exactly one cache outcome - hit, expired, new, empty or
+  bypass - and every one of them but the hit goes on to run an aggregate, so
+  `queries = new + empty + expired + bypass` is an identity you can check on the
+  wire. A bypass is a sub-minute bucket, which skips the cache entirely. None of
+  the six carries a window or bucket-width label, on purpose: one series each,
+  rather than one per range the dashboard offers. They were readable all along as
+  `pingularity_stat_total{stat="series.…"}` - the named families just make them
+  findable
 - `pingularity_stat_total{stat}` / `pingularity_stat{stat}` - the internal
   **operational** registry, keyed by a `stat` label. These are two families: the
   **counters** `pingularity_stat_total{stat}` (monotonic totals + float sums;
@@ -1511,8 +1601,12 @@ Three access controls can turn a scrape into a `401`/`403`:
 Starter queries and alerts against the operational series:
 
 ```promql
-# Link down right now (alert if true for 2m)
-min_over_time(pingularity_up[2m]) == 0
+# Link down right now. Put for: 2m on the alert rule rather than widening the
+# query: min_over_time(pingularity_up[2m]) == 0 only says "some sample in the last
+# 2m was down", so one missed round pages as a two-minute outage. The
+# probing_active conjunct keeps a deliberate pause quiet - pingularity_up holds its
+# last value whenever rounds stop, so a bare == 0 would page forever.
+pingularity_up == 0 and pingularity_probing_active == 1
 
 # Outage count / downtime seconds over a day - robust even when an outage is
 # shorter than the scrape interval (counts confirmed transitions, not samples)
@@ -1537,11 +1631,25 @@ histogram_quantile(0.95, rate(pingularity_probe_latency_seconds_bucket[5m]))
 pingularity_worker_up == 0
 pingularity_metrics_data_valid == 0
 
-# Speedtests have stopped landing (wedged scheduler / always failing)
-time() - pingularity_speed_last_run_timestamp_seconds > 7200   # 2x the default 1h interval; raise if yours is longer
+# Speedtests have stopped landing (wedged scheduler, or every run failing). Not a
+# plain time() subtraction: the last-run series appears only once a run has
+# SUCCEEDED, so an install whose every speedtest fails has no series to go stale -
+# and a bare subtraction keeps firing once scheduled tests are deliberately turned
+# off. Gating on next_run (present only while the schedule is on) and treating an
+# absent last run as a stale one covers both. Raise 7200 (2x the default 1h
+# interval) above the longest gap a Speedtest schedule window leaves - a nightly
+# window means ~22h of honestly stale last_run - and expect this to be true on a
+# new install until the first run lands.
+pingularity_speed_next_run_timestamp_seconds
+  unless on(instance, job) (pingularity_speed_last_run_timestamp_seconds > time() - 7200)
 
-# The next scheduled speedtest is overdue (only present when scheduled tests are on)
-time() > pingularity_speed_next_run_timestamp_seconds + 600
+# How overdue the next scheduled speedtest is (present only while scheduled tests
+# are on). Read this one, don't alert on it: a next_run in the past is normal while
+# a closed window or a busy link is holding the run back, because that deferral
+# deliberately leaves the schedule anchor where it is. Nothing on /metrics tells a
+# deferral apart from a wedge, so alert with the query above and use this one to
+# answer "why hasn't it run" (the log says "speedtest deferred" too).
+time() - pingularity_speed_next_run_timestamp_seconds
 
 # Download below 100 Mbit/s on the last speedtest
 pingularity_speed_download_mbps < 100
@@ -1553,8 +1661,11 @@ pingularity_dns_up == 0 and pingularity_up == 1
 pingularity_speed_healthy == 0
 pingularity_current_outage_seconds > 300
 
-# Speedtests failing by stage, per hour (server_fetch / ping / download / …)
-sum(rate(pingularity_speed_failures_total[1h])) * 3600
+# Speedtests failing by stage, per hour (server_fetch / ping / download / …).
+# sum by (stage), not a bare sum: this is a labelled family with one series per
+# stage, and summing without the label collapses all nine into a single number that
+# answers the opposite of the question.
+sum by (stage) (rate(pingularity_speed_failures_total[1h])) * 3600
 
 # Webhook deliveries failing or SSRF-blocked - series exist at 0 from startup,
 # so the first event is a visible 0->1 step for rate()/increase()
@@ -1598,7 +1709,11 @@ and `-d '{…}'` where a body is listed below.
 - `GET /api/series?mins=…[&exclude=…]` - latency / online time series (server-side
   bucketed); `exclude` drops targets from the lowest-latency line. Also takes an
   absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`; omit `to`
-  for an open end), which wins over `mins`. The bucket width follows the part of
+  for an open end), which wins over `mins`. Either form reaches at most 366 days
+  back: a `from` older than that is silently raised to the floor, and a `mins`
+  beyond it is ignored in favour of the endpoint's default window - so a window
+  lying entirely further back than a year returns nothing even where retention
+  kept the rows. The bucket width follows the part of
   the window that can hold data - `[from, min(to, now))` - so an omitted or
   future `to` buckets as if the window ended now rather than coarsening the lot
 - `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log.
@@ -1623,7 +1738,9 @@ and `-d '{…}'` where a body is listed below.
   `/api/speed/runs.csv` - both cover the whole history rather than a window, so a
   caller that wants one window filters on `ts` itself. Also
   takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
-  omit `to` for an open end), which wins over `mins` when present
+  omit `to` for an open end), which wins over `mins` when present - with the same
+  366-day reach as `/api/series`, so a window entirely older than that comes back
+  empty however long retention keeps the runs
 - `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail).
   Runs that recorded them carry `ip_family` (`4`/`6`/`mixed`, the family the
   transfer actually used) and `udp_direction` (`down`/`up`, which way the
@@ -1644,12 +1761,17 @@ and `-d '{…}'` where a body is listed below.
   id>` resolves one server by its Ookla ID instead, `404` if there is no such
   server; by default the list is centred where auto last tested, else near you)
 - `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable
-- `GET /api/heatmap?days=365[&tz=Europe/Berlin]` - per-day downtime, plus
-  `window_s`/`observed_s` per day (how much of it was in range and how much was
-  actually monitored). `days` defaults to 365 and is capped at 366; `tz` takes an
-  IANA zone name and decides where each day starts (default: the server's own
-  zone), so a client in another zone gets its own calendar days rather than the
-  server's
+- `GET /api/heatmap?days=365[&tz=Europe/Berlin]` - daily downtime, plus
+  `window_s`/`observed_s` on every day it returns (how much of it was in range
+  and how much was actually monitored). The response is **sparse**: a day earns a
+  row only if it had an outage or was not watched end to end, so a year of clean
+  monitoring comes back as a handful of rows rather than 366. An absent date
+  therefore means "nothing on record", not "watched all day and clean" - history
+  you deleted, or that retention pruned, is missing in exactly the same way, so a
+  client must not read observation coverage out of a gap. `days` defaults to 365
+  and is capped at 366; `tz` takes an IANA zone name and decides where each day
+  starts (default: the server's own zone), so a client in another zone gets its
+  own calendar days rather than the server's
 - `GET /api/netinfo` - connection info (IP/ISP/DNS); `POST` forces a full refresh
 - `GET|POST /api/settings` - read / update live settings. POST is a **partial**
   update: fields you omit keep their current value, and only the settings form is
@@ -1680,11 +1802,14 @@ and `-d '{…}'` where a body is listed below.
   login) and mark it answered so the dialog never returns; `{dismiss:true}` marks
   it answered without changing anything else (once a login is active, dismissing
   requires that login too). `auth_enabled` must agree with
-  whether a `password` is sent. Two things refuse it with `403`: a login already
-  being configured (change access under Settings then), and the first-run window
-  having closed - the offer lasts 48h from first launch, and once it lapses this
-  endpoint stops accepting answers just as `/api/status` stops advertising it.
-  Fresh installs only; the offer is `quick_setup_pending` in `/api/status`
+  whether a `password` is sent. Two things refuse a full answer with `403`: a
+  login already being configured (change access under Settings then), and the
+  first-run window having closed - the offer lasts 48h from first launch, and
+  once it lapses this endpoint stops accepting full answers just as `/api/status`
+  stops advertising it. `{dismiss:true}` keeps working past that point, because
+  all it writes is the answered marker a lapsed window already implies, and a
+  dialog left open on a stale tab should always be able to close itself. Fresh
+  installs only; the offer is `quick_setup_pending` in `/api/status`
 - `GET|POST /api/update` - update-check status / toggle the daily release poll
 - `GET|POST /api/logs` - the About-tab log viewer: read recent lines (or
   `?download=1` for a text file, still the complete buffer - add `&masked=1` for
@@ -1862,19 +1987,25 @@ flowchart TB
   colo --> panel
 ```
 
-**Every request passes the access guard** before any handler runs: the
-DNS-rebinding `Host` check first, then the loopback filter (judged on the real
-TCP peer, never the spoofable `X-Forwarded-For`), then authentication - so a
-`403` on a public hostname is the rebinding guard talking, not the filter.
+**Every request passes the access guard** before any handler runs, with two
+deliberate exceptions: the [`/healthz` and `/readyz` probes](#health-endpoints)
+are answered ahead of it, so a load balancer hitting a bare IP with no
+credentials still gets its verdict (they carry no data to protect). Everything
+else meets the DNS-rebinding `Host` check first, then the loopback filter
+(judged on the real TCP peer, never the spoofable `X-Forwarded-For`), then
+authentication - so a `403` on a public hostname is the rebinding guard talking,
+not the filter.
 
 ```mermaid
 flowchart TB
-  req["request"] --> rb{"Host header a<br/>public domain<br/>not in -allow-host?"}
+  req["request"] --> hz{"/healthz<br/>or /readyz?"}
+  hz -->|yes| handler["handler runs"]
+  hz -->|no| rb{"Host header a<br/>public domain<br/>not in -allow-host?"}
   rb -->|yes| d403h["403 (rebinding guard)"]
   rb -->|no| lo{"network access off<br/>AND peer not loopback?"}
   lo -->|yes| d403["403"]
   lo -->|no| au{"login required<br/>AND path gated<br/>AND not authenticated?"}
-  au -->|no| handler["handler runs"]
+  au -->|no| handler
   au -->|yes| d401["401 (+ log failed attempt)"]
   handler --> resp["response"]
 ```

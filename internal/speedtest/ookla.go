@@ -1177,7 +1177,7 @@ func guardProxiedDestination(ctx context.Context, hostport string) error {
 		// anything, so speedtests stop rather than run unchecked. That is the
 		// intended trade, but it is invisible without saying so - the symptom is
 		// otherwise "every server refused" with no cause.
-		return fmt.Errorf("blocked proxied request to %q: its address could not be resolved locally, so the daemon cannot tell whether the proxy would be pointed at an internal service (a proxy-only network with no local DNS hits this; give the daemon a resolver, or set NO_PROXY for destinations it should reach directly): %w", host, err)
+		return fmt.Errorf("blocked proxied request to %q: its address could not be resolved locally, so the daemon cannot tell whether the proxy would be pointed at an internal service (a proxy-only network with no local DNS hits this; give the daemon a working local resolver - NO_PROXY cannot help, because the name is resolved before the routing decision is made): %w", host, err)
 	}
 	for _, ip := range ips {
 		if e := blockedIP(ip); e != nil {
@@ -3849,15 +3849,20 @@ func msIfPositive(d time.Duration) *float64 {
 }
 
 // decisionPingMS is the latency figure this run's CHOICES are made on: the
-// fastest sample when the engine gave us one, else the reported mean.
+// fastest sample when the engine gave us one, else the run's reported PingMS.
 //
 // The split is deliberate. PingMS is the engine's own number and stays that way
-// so what we display keeps matching what speedtest.net would say - but it is a
-// mean over ten samples with no outlier resistance, and one stalled handshake
-// moves it several-fold. Anything that DECIDES on latency (which server wins,
-// whether the ping threshold breached) asks "how fast is this link", and one
-// pothole is not the answer to that. iperf3 reports no per-sample values, so it
-// falls back to the mean and behaves exactly as it did before.
+// so what we display keeps matching what speedtest.net would say - but on an
+// Ookla run it is a mean over ten samples with no outlier resistance, and one
+// stalled handshake moves it several-fold. Anything that DECIDES on latency
+// (which server wins, whether the ping threshold breached) asks "how fast is
+// this link", and one pothole is not the answer to that. iperf3 reports no
+// per-sample values, so such a run carries no PingBestMS and falls through to
+// PingMS - which on an iperf3 run is not a mean at all but the MEDIAN of up to
+// five bare TCP handshakes timed before the transfer (measureServerRTT in
+// iperf.go), or, when none of them land, iperf3's own min_rtt and then the idle
+// baseline. That median is already outlier-resistant, so there the decision and
+// the display are the same figure by construction rather than by fallback.
 func decisionPingMS(r Result) float64 {
 	if r.PingBestMS != nil && validMS(*r.PingBestMS) {
 		return *r.PingBestMS
