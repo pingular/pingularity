@@ -38,14 +38,27 @@ var (
 // four wire queries instead of two, since network "ip" asks A and AAAA for each.
 // Go walks that name list in order and stops at the first name that comes back
 // with addresses (the `len(addrs) > 0` break closing goLookupIPCNAMEOrder's loop,
-// same file) - so the walk continues past a name that draws NXDOMAIN, which is
-// what the random label is meant to draw and what ResolveTime counts as healthy
-// below. The doomed second lookup therefore falls inside the window ResolveTime
-// times. (A resolver that hijacks NXDOMAIN into an address answer, as ResolveTime
-// notes, ends the walk on the first name instead.) The second lookup also hands
-// the random probe label, search domain appended, to the recursive resolver the
-// host is configured to use. Whether that name travels any further depends on the
-// search domain being a delegated zone, which this code cannot know.
+// same file) - so the walk continues past a name that resolves to nothing, which
+// is what the random label is meant to draw and what ResolveTime counts as
+// healthy below. (Against the shipped base that answer is NODATA rather than
+// NXDOMAIN - cloudflare.com replies NOERROR with an SOA and no records for a name
+// it does not have - but Go reports both as IsNotFound, so ResolveTime treats
+// them alike.) The doomed second lookup therefore falls inside the window
+// ResolveTime times. The second lookup also hands the random probe label, search
+// domain appended, to the recursive resolver the host is configured to use.
+// Whether that name travels any further depends on the search domain being a
+// delegated zone, which this code cannot know.
+//
+// Rooting does NOT simply make the reading smaller, and the release note must not
+// say so. It removes the doomed lookup on a host whose search domain has no
+// answer for the name, which reads lower. But a search list is consulted FIRST
+// for a name with fewer dots than ndots (5 in a default Kubernetes pod, where
+// this name's two dots qualify), so a search domain that answers wildcards used
+// to return addresses for a DIFFERENT name, fast, and end the walk there - and
+// that fast wrong answer is what got timed. Rooting skips that shortcut and times
+// the name actually asked for, which reads higher. Which way a given host moves
+// depends on its resolver configuration, so readings either side of the change
+// are not comparable.
 //
 // TestResolveTimeLooksUpARootedName pins the dot on the name ResolveTime hands
 // the resolver, on any host; TestResolveTimeAsksOneNamePerProbe pins the wire

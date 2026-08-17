@@ -936,8 +936,17 @@ Below that:
 - **Latency** over time - the lowest round-trip across your anchors, plus a
   separate **DNS-resolution** line. Each round resolves a random throwaway name
   through the host's own *system* resolver (the random label dodges caches, so it
-  times the real lookup path your apps use; an NXDOMAIN answer is healthy - the
-  resolver replied). A round skips its lookup while the previous one is still in
+  times the real lookup path your apps use; "no such name" is a healthy answer -
+  the resolver replied, which is what is being timed). The name is **fully
+  qualified**, so it is looked up exactly as written rather than being tried
+  against your search domains first. That matters if you are comparing against
+  readings from **0.61 or earlier**, which looked it up unqualified: on a host
+  with a search domain those readings timed an extra doomed lookup and read
+  high, while on one whose search domain answers wildcards they timed a fast
+  local hit for a different name and read low. Either way the two are not
+  comparable, and the change can move the number in either direction - re-baseline
+  any DNS alert thresholds rather than assuming which way it went.
+  A round skips its lookup while the previous one is still in
   flight, so a hung resolver cannot pile lookups up behind it; a lookup gives up
   after 3s, so in practice that needs a probe interval shorter than that. The DNS
   line **gaps wherever a bucket held no successful lookup** (timeout / SERVFAIL / no
