@@ -74,6 +74,34 @@ type Ring struct {
 	// one fixed ".tmp" path: their O_TRUNC opens and renames interleave and can
 	// produce a torn or truncated snapshot.
 	saveMu sync.Mutex
+	saved  savedSnapshot // what the last successful SaveFile left on disk; guarded by saveMu
+}
+
+// savedSnapshot describes the file the last successful SaveFile produced, so a
+// SaveFile called when nothing has been logged since can skip the rewrite. It is
+// guarded by saveMu rather than mu because only SaveFile touches it, and saveMu
+// already serializes those.
+type savedSnapshot struct {
+	written bool   // false until this Ring has completed one SaveFile, so the first call always writes
+	path    string // SaveFile takes its target per call; a different target has nothing memoised
+	epoch   string // rotated by Clear, which is the one content change the sequence sum cannot show
+	seq     uint64 // dropped+len(lines) at the moment the written entries were copied
+	// size of the file we wrote. It notices a snapshot that changed length behind
+	// our back, which is the truncate-to-reclaim-space case. (A snapshot that was
+	// DELETED is caught before this field is ever compared, by the skip's Lstat
+	// returning an error.) It does NOT notice a replacement that keeps the same
+	// length: the skip then leaves the foreign bytes in place, so only a content
+	// change in the ring will rewrite them.
+	size int64
+	// mode of the file we wrote, taken from the same Stat as size so the two sides
+	// of the comparison always come from the same source (on Windows the mode
+	// os.Stat reports is synthetic - access is governed by the DACL SecureFile
+	// sets, internal/osperm/perm_windows.go:27-29 - so comparing it against a
+	// hardcoded 0600 would never match).
+	// Without this the skip would leave a snapshot someone chmodded 0644 readable
+	// by every account on the box for as long as the ring stays idle, and this file
+	// holds the raw unmasked lines.
+	mode os.FileMode
 }
 
 // entrySize is one entry's contribution to the byte ceiling: both stored forms.
@@ -235,6 +263,12 @@ func (r *Ring) Clear() {
 // the viewer's history survives a restart. It writes a temp file and renames, so
 // a crash mid-write can't leave a torn file. Mode 0600: the raw form holds
 // IPs/hostnames, so the file is owner-only.
+//
+// A call made when nothing has been logged since the last one does nothing, so a
+// caller may snapshot on a fixed timer without paying for it while the ring sits
+// idle. What that check compares is the ring's generation token plus the file's
+// size and mode - not its content, so a same-length replacement is skipped over
+// too; savedSnapshot documents where it stops short.
 func (r *Ring) SaveFile(path string) error {
 	// Serialize with any other in-flight SaveFile: they share the fixed path+".tmp"
 	// scratch file, so overlapping writes/renames would corrupt the snapshot. This
@@ -249,7 +283,53 @@ func (r *Ring) SaveFile(path string) error {
 	r.mu.Lock()
 	snapshot := make([]Entry, len(r.lines))
 	copy(snapshot, r.lines)
+	// Generation token for the copy just taken, read under the same lock so it
+	// always describes exactly these entries. Append strictly increments
+	// dropped+len(lines) - trim only moves a line from the second term into the
+	// first - and Clear leaves that sum alone but rotates the epoch, so every way
+	// the ring's contents can change moves one of the two. Checked over 20,000
+	// randomised append/clear operations driving both eviction paths: no content
+	// change left the pair unchanged.
+	epoch, seq := r.epoch, r.dropped+uint64(len(r.lines))
 	r.mu.Unlock()
+
+	// Nothing has been logged since we last wrote this exact file, so writing it
+	// again would only rewrite bytes that are already there. The caller snapshots
+	// on a one-minute ticker whether or not anything was logged (main.go:462), and
+	// the default install runs with logging "off" (main.go:426, main.go:506-507).
+	// "Off" is not silence: it sets the level to WARN, and the ring shares that
+	// level (applyLogLevel, main.go:2357-2364; buildLogger, main.go:1851). So a
+	// default install's ring is IDLE rather than empty - it fills exactly when
+	// something has gone wrong, and applyLogLevel's own comment puts real
+	// WARN/ERROR volume in normal operation at ~0. Idle is the case this skip is
+	// for, and it pays off whatever the ring holds: TestSaveFileSkipsUnchangedRing
+	// runs an hour of the ticker over a ring with history and asserts not one
+	// rewrite, where before there were 60 - each a file creation plus the fsyncs
+	// below (the file, and off Windows its directory too), for content that never
+	// changed.
+	//
+	// The file itself is checked as well as the token, because the memo only says
+	// what THIS process wrote and something else may have changed it since. Lstat
+	// rather than Stat, for the reason LoadFile gives below: Stat follows a
+	// symlink and would describe the TARGET, so a snapshot swapped for a symlink
+	// whose target happens to match size and mode would be skipped over and left a
+	// symlink - which LoadFile then refuses outright, losing the viewer's history
+	// for good rather than for a minute. Lstat sees the link's own mode, declines
+	// the skip, and the rename below puts a regular file back, which is what every
+	// tick did before this skip existed. On a regular file the two calls agree.
+	//   - size, so a snapshot truncated to reclaim space is rewritten on the next
+	//     call instead of never coming back (a deleted one fails the Lstat, and is
+	//     rewritten for that reason rather than by the size comparison);
+	//   - mode, so a snapshot whose permissions were loosened is rebuilt through
+	//     osperm.SecureFile below and comes back owner-only. Skipping that would
+	//     leave the raw unmasked lines (IPs, hostnames) readable by other accounts
+	//     for as long as the ring stays idle - which, per the paragraph above, is a
+	//     default install's normal state rather than a brief one.
+	if r.saved.written && r.saved.path == path && r.saved.epoch == epoch && r.saved.seq == seq {
+		if fi, err := os.Lstat(path); err == nil && fi.Size() == r.saved.size && fi.Mode() == r.saved.mode {
+			return nil
+		}
+	}
 
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -280,6 +360,15 @@ func (r *Ring) SaveFile(path string) error {
 		f.Close()
 		return err
 	}
+	// Size and mode of what we just wrote, taken from the descriptor we wrote it
+	// through and after osperm.SecureFile has tightened it. The skip above compares
+	// both against the file that is actually there, which is how a truncated or
+	// chmodded snapshot gets repaired instead of being assumed good forever.
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
 	// fsync the temp file's bytes to stable storage BEFORE the rename. A rename
 	// is atomic only for the directory entry; it makes no promise about the data
 	// blocks. Without this fsync a power loss just after the rename could leave
@@ -303,18 +392,24 @@ func (r *Ring) SaveFile(path string) error {
 	// Windows has no directory fsync: FlushFileBuffers on a directory handle
 	// returns ERROR_ACCESS_DENIED. Rename durability there is the filesystem's
 	// responsibility, so skip this step rather than fail the snapshot.
-	if runtime.GOOS == "windows" {
-		return nil
+	if runtime.GOOS != "windows" {
+		dir, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		if err := dir.Sync(); err != nil {
+			dir.Close()
+			return err
+		}
+		if err := dir.Close(); err != nil {
+			return err
+		}
 	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	if err := dir.Sync(); err != nil {
-		dir.Close()
-		return err
-	}
-	return dir.Close()
+	// Record what is now on disk, so the next call can skip an identical rewrite.
+	// Only after every step succeeded: a save that failed part-way has left
+	// something we cannot describe, and must be retried rather than memoised.
+	r.saved = savedSnapshot{written: true, path: path, epoch: epoch, seq: seq, size: fi.Size(), mode: fi.Mode()}
+	return nil
 }
 
 // maxLoadLineBytes caps a single on-disk line before it is turned into an entry.

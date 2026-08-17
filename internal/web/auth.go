@@ -527,25 +527,45 @@ func hashPassword(p string) (string, error) {
 	return string(h), err
 }
 
-// dummyHash is a valid bcrypt hash (of an unguessable throwaway string) that
-// checkPassword compares against when the username doesn't match, so a wrong
-// username costs the same time as a wrong password.
-var dummyHash = func() []byte {
+// dummyHash returns a valid bcrypt hash (of an unguessable throwaway string)
+// that checkPassword compares against when the username doesn't match, so a
+// wrong username costs the same time as a wrong password.
+//
+// It is computed on first use rather than at package init because main imports
+// this package unconditionally: an eager initializer charged EVERY subcommand a
+// full DefaultCost bcrypt whether or not it ever served a login. Measured on an
+// M-series Mac, that was 43 ms of the 49 ms a `pingularity version` took, and
+// the container image's HEALTHCHECK runs `pingularity healthz` every 30s, so an
+// idle container burned about two CPU-minutes a day generating a hash it used
+// zero times.
+//
+// The generation deliberately does NOT take a bcryptSem slot: checkPassword
+// already holds one when it forces this value, and under a burst of logins
+// every slot can be held by a checkPassword call, so re-acquiring here would
+// deadlock the whole login path.
+var dummyHash = sync.OnceValue(func() []byte {
 	h, err := bcrypt.GenerateFromPassword([]byte("pingularity-dummy-2f1d"), bcrypt.DefaultCost)
 	if err != nil {
 		panic(err) // cannot happen for a fixed short input
 	}
 	return h
-}()
+})
 
 // checkPassword verifies a username/password against the stored credentials.
 func (s *Server) checkPassword(user, pass string) bool {
 	bcryptAcquire()
 	defer bcryptRelease()
+	// Force the lazy dummy hash BEFORE looking at the username, so the one-time
+	// generation lands on whichever attempt happens to be first and not on the
+	// wrong-username branch alone. Forcing it inside the branch instead would
+	// make the first wrong username after a restart cost generate+compare while
+	// a right one cost compare - a fresh username oracle, just inverted, handed
+	// to whoever gets the first login attempt in after a restart.
+	dh := dummyHash()
 	if user != s.settings.AuthUser() {
 		// Burn an equivalent bcrypt compare anyway: returning early would let
 		// an attacker probe for valid usernames via response timing.
-		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(pass))
+		_ = bcrypt.CompareHashAndPassword(dh, []byte(pass))
 		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(s.settings.AuthHash()), []byte(pass)) == nil

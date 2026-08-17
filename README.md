@@ -644,9 +644,10 @@ reports round figures that say more about packet loss than about buffering.
 There are two engines, picked in the settings drawer:
 
 - **Ookla (speedtest.net)** - the default. Numbers match speedtest.net; no setup.
-  Its own knobs: parallel connections (`0` = auto, which is one per CPU core up
-  to 8 - raise it, to at most 16, on a fast or high-latency link, or in a small
-  VM that can only see two cores) and the packet-loss probe.
+  Its own knobs: parallel connections (`0` = auto, which is one per logical CPU
+  for downloads and at most 8 for uploads; a value you set instead applies to
+  both directions, up to 16 - worth raising on a fast or high-latency link, or in
+  a small VM that can only see two cores) and the packet-loss probe.
 - **iperf3** - opt-in, run against your own `iperf3 -s` box (LAN, homelab, or
   VPS). It measures what Ookla can't: internal/LAN links and honest upload. Used
   only when the `iperf3` binary is installed (otherwise it falls back to Ookla) -
