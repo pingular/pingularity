@@ -1054,8 +1054,11 @@ and persist across restarts:
   first - the export is sent as a stream, so its size is not known in advance to
   warn about. A very large backup (years of dense history) can therefore sit
   silently for a long time, and on a big enough one the tab can give up. For one
-  that big, copy the SQLite database file at the `-db` path (that single file
-  *is* the complete backup), or stream `/api/export` straight to disk with
+  that big, stop the service and copy the SQLite database file at the `-db` path
+  together with `pingularity.key` beside it (a copy taken while it runs misses
+  the `pingularity.db-wal` sidecar, which on a young install is *everything*,
+  and without the key the saved iperf3 passwords and signed-in sessions do not
+  survive the restore), or stream `/api/export` straight to disk with
   `curl -OJ 'http://127.0.0.1:9000/api/export?config=1&latency=1&speed=1&downtime=1'`
   (name at least one category or it is a `400`; add `-u user:pass` when a login is
   set). The import warns you when it matters: restored rows older than
