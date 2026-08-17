@@ -305,8 +305,12 @@ func stubResolver(t *testing.T, addr string) {
 	t.Cleanup(func() { net.DefaultResolver = old })
 }
 
-// The cache-busting random label never exists, so NXDOMAIN is the healthy
-// answer: the resolver responded and the resolution path works.
+// The cache-busting random label resolves to nothing, and that is the healthy
+// answer: the resolver responded, which is what is being timed. The stub returns
+// NXDOMAIN because it is the simpler RCODE to hand-build; the shipped base
+// actually answers NODATA (NOERROR, no records, an SOA in authority). Go reports
+// both as DNSError.IsNotFound, so ResolveTime cannot tell them apart and does not
+// need to - see its own comment.
 func TestResolveTimeNXDOMAINIsHealthy(t *testing.T) {
 	addr, _ := dnsStub(t, 3, true) // RCODE 3 = NXDOMAIN
 	stubResolver(t, addr)
@@ -494,5 +498,46 @@ func TestResolveTimeTimeoutIsUnhealthy(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("lookup took %v; the shrunk %v timeout was not honored", elapsed, dnsProbeTimeout)
+	}
+}
+
+// The rooted name must be immune to a search domain that ANSWERS, which is the
+// case that makes the rooting change raise a reading rather than lower it.
+//
+// A resolver consults its search list first for a name with fewer dots than
+// ndots (5 in a default Kubernetes pod; this probe's name has two), so before
+// rooting, a search domain serving wildcards returned addresses for a DIFFERENT
+// name - fast, because it is local - and Go's walk stops at the first name that
+// yields addresses. That fast wrong answer was what got timed. Rooting skips the
+// search list entirely, so the timing describes the name actually asked for.
+//
+// This pins the property that survives any resolver configuration: exactly one
+// name reaches the wire, and it is the one ResolveTime asked for. A stub that
+// answers EVERY query with an address stands in for the wildcard search domain -
+// if a search suffix were ever tried, it would be answered here and counted.
+func TestResolveTimeIgnoresAnAnsweringSearchDomain(t *testing.T) {
+	addr, queries := dnsStub(t, 0, true) // RCODE 0 with an answer: a wildcard-style yes
+	stubResolver(t, addr)
+	sent := captureLookupNames(t)
+
+	if _, ok, err := ResolveTime(context.Background()); !ok || err != nil {
+		t.Fatalf("probe: ok=%v err=%v, want a healthy answer", ok, err)
+	}
+
+	names := sent()
+	if len(names) != 1 {
+		t.Fatalf("ResolveTime made %d lookups %q, want exactly 1", len(names), names)
+	}
+	if !strings.HasSuffix(names[0], ".") {
+		t.Fatalf("ResolveTime looked up %q unrooted: a search domain that answers would be "+
+			"tried first and its fast reply timed in place of the real one", names[0])
+	}
+	want := "." + dnsProbeDomain + "."
+	for _, q := range queries() {
+		if !strings.HasSuffix(q, want) {
+			t.Errorf("a query for %q reached the wire; only names under %q should, and a suffixed "+
+				"one means the search list was walked despite the trailing dot (all: %q)",
+				q, want, queries())
+		}
 	}
 }
