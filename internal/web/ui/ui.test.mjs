@@ -579,7 +579,9 @@ test('logMerge: a delta appends, an empty delta skips, anything else replaces', 
 // drew as the identical clean fully-observed square - the exact false-clean
 // disclosure failure the observation tooltip exists to prevent. This drives
 // the REAL drawHeatmap with a frozen clock and stub DOM.
-function driveHeatmap(rows, todayMs) {
+// `tip` stands in for #hmTip, which drawHeatmap now touches; pass one in to read
+// back what the rebuild did to it (see the rebuild test below).
+function driveHeatmap(rows, todayMs, tip = { hidden: true }) {
   const defs = extract('function _rgb') + '\n' + extract('function hmShade') + '\n'
     + extract('const fmtDur') + '\n'
     + script.match(/const fmtLocalDate = [^;]*;/)[0] + '\n'
@@ -593,7 +595,7 @@ function driveHeatmap(rows, todayMs) {
   class FrozenDate extends Date { constructor(...a) { a.length ? super(...a) : super(todayMs); } }
   new Function('ROWS', '$', 'document', 'Date', 'TC',
     'let hmData = ROWS, outageSelDay = null;\n' + defs + '\ndrawHeatmap();')(
-    rows, () => grid, doc, FrozenDate, { hm0: '#000000', down: '#ffffff' });
+    rows, id => (id === 'hmTip' ? tip : grid), doc, FrozenDate, { hm0: '#000000', down: '#ffffff' });
   return cells;
 }
 
@@ -621,6 +623,56 @@ test('heatmap: a Sunday-aligned year needs no padding at all', () => {
   const cells = driveHeatmap([], new Date(2026, 6, 27, 12, 0).getTime());
   assert.equal(cells.length, 366);
   assert.ok(cells.every(c => c.style.visibility !== 'hidden'));
+});
+
+// The grid rebuilds itself out from under whatever the tooltip is showing: the
+// 60s poll repaints it (refreshHeatmap -> drawHeatmap) and clicking an outage
+// cell calls drawHeatmap straight from the click handler. The rebuild is an
+// innerHTML='' over #heatmap, which deletes the cell the tooltip describes, and
+// on the keyboard path the cell that holds focus with it. Nothing else can be counted on
+// to take the tooltip down afterwards: mouseleave waits for the pointer to leave
+// the grid, focusout waits for focus to leave a cell that is being deleted rather
+// than blurred, and the Escape branch fires only while activeElement is still
+// inside #heatmap. Left up, it states the old day over a grid that has moved on.
+// So the rebuild takes it down itself, which costs nothing when nothing is up.
+test('heatmap: a rebuild takes the tooltip down with the cells it describes', () => {
+  const tip = { hidden: false }; // as a hover- or focus-raised tooltip leaves it
+  driveHeatmap([{ date: '2026-07-15', outages: 1, downtime_s: 60, window_s: 86400, observed_s: 86400 }],
+    new Date(2026, 6, 27, 12, 0).getTime(), tip);
+  assert.equal(tip.hidden, true,
+    'the tooltip outlived the cell it was describing: the next repaint leaves the previous day\'s text over a new grid');
+});
+
+// A date the response omits is not a date the response vouches for.
+// Store.Clear("downtime") (internal/store/store.go) drops the events and pauses
+// tables outright while first_seen_ts survives in `settings` (monitoringSince
+// reads it back), and outage retention prunes old events the same way - so after
+// "Delete downtime" or a retention roll-off, DowntimeByDay emits nothing for
+// those days, which is exactly what it emits for a genuinely clean one. The UI
+// cannot tell the two apart from a missing row, so the label may only describe
+// the RECORD it was handed, never the day.
+test('heatmap: a day with no row claims no more than the response recorded', () => {
+  const cells = driveHeatmap(
+    [{ date: '2026-07-15', outages: 1, downtime_s: 60, window_s: 86400, observed_s: 86400 }],
+    new Date(2026, 6, 27, 12, 0).getTime()); // Monday: no padding, every cell is real
+  const tips = cells.map(c => c.dataset.tip).filter(Boolean);
+  assert.equal(tips.length, 366, 'every in-window cell is labelled');
+  const unbacked = tips.filter(t => !/^2026-07-15:/.test(t));
+  assert.equal(unbacked.length, 365, 'one row in, 365 dates the response says nothing about');
+  assert.ok(unbacked.every(t => / no outages recorded$/.test(t)),
+    'a date with no row is described by what was recorded for it: ' + unbacked.find(t => !/ no outages recorded$/.test(t)));
+  assert.ok(!tips.some(t => /: no outages$/.test(t)),
+    '"no outages" is a claim about the day, which a missing row cannot support');
+  // "no recorded outages" reads as a claim about the outages (the ones nobody
+  // wrote down) rather than about the records, so it is not the softer wording.
+  assert.ok(!tips.some(t => /no recorded outages/.test(t)),
+    'the hedge belongs on the record, not on the outages');
+  // The accessible name is built from the same string, so a screen reader hears
+  // the same hedge the tooltip shows.
+  const ax = cells.map(c => c.attrs['aria-label']).filter(Boolean);
+  assert.equal(ax.length, 366);
+  assert.ok(ax.some(a => / no outages recorded$/.test(a)) && !ax.some(a => /: no outages$/.test(a)),
+    'the accessible name still makes the bare claim');
 });
 
 // --- heatmap: the days a multi-day outage spans but did not start on ----------
@@ -757,6 +809,136 @@ test('heatmap: a day that only continues an earlier outage says so, and stays cl
   assert.equal(c.dataset.day, '2026-07-14');
   assert.equal(c.attrs.role, 'button');
   assert.match(c.attrs['aria-label'], /Activate to view events\./);
+});
+
+// --- heatmap tooltip: the keyboard has to be able to read it too ---------------
+// drawHeatmap makes the outage days focusable (tabIndex + role=button) and they
+// answer Enter/Space, but the tooltip delegation listened for mouse and touch
+// only, so tabbing onto one of those cells showed nothing at all. The observation
+// gap ("not monitored", "monitored X of Y") is stated in the label and nowhere
+// else - the fill deliberately does not encode it - and drawHeatmap builds the
+// cell's aria-label out of that same string, so a screen reader had it on focus
+// already. What had no route to it was the SIGHTED keyboard user, left with the
+// fill.
+//
+// The block is an IIFE over $('heatmap')/$('hmTip'), so it is run here against
+// stub elements that record their listeners: this drives the REAL handlers rather
+// than pattern-matching the source.
+function heatmapTip() {
+  const start = script.indexOf("(function(){\n  const hm=$('heatmap'), tip=$('hmTip');");
+  assert.ok(start > 0, 'the heatmap tooltip delegation block moved');
+  const src = script.slice(start, script.indexOf('})();', start) + 5);
+  const mk = () => ({ on: {}, hidden: true, textContent: '', style: {},
+    addEventListener(t, fn) { (this.on[t] = this.on[t] || []).push(fn); },
+    getBoundingClientRect: () => ({ width: 160, height: 22, left: 0, top: 0, right: 160, bottom: 22 }) });
+  const hm = mk(), tip = mk();
+  new Function('$', 'window', src)(id => (id === 'heatmap' ? hm : tip), { innerWidth: 1200 });
+  const fire = (type, ev) => (hm.on[type] || []).forEach(fn => fn(ev));
+  return { hm, tip, fire };
+}
+// A cell as the delegate sees it: dataset.tip plus a rect, reachable via closest.
+const hmCell = (tipText, rect) => {
+  const c = { dataset: tipText == null ? {} : { tip: tipText },
+    getBoundingClientRect: () => rect, closest: s => (s === '.cell' ? c : null) };
+  return c;
+};
+
+test('heatmap tooltip: focusing a cell shows its label, anchored to the cell', () => {
+  const { hm, tip, fire } = heatmapTip();
+  // focus does not bubble, so a delegate on the container never hears it. Only
+  // focusin reaches a listener registered on the grid.
+  assert.ok(hm.on.focusin, 'no focusin listener: a focused cell shows nothing');
+  assert.ok(!hm.on.focus, 'focus does not bubble to a delegate - it would never fire');
+  assert.ok(hm.on.focusout, 'nothing hides the tooltip when focus leaves the grid');
+
+  // The valuable label: a day that was offline AND only partly watched. The
+  // observation half is stated nowhere else on screen.
+  const cell = hmCell('2026-07-14: 1 outage(s), 10m down · monitored 3h of 24h',
+    { left: 40, top: 60, right: 52, bottom: 72, width: 12, height: 12 });
+  fire('focusin', { target: cell });
+  assert.equal(tip.hidden, false, 'the tooltip stayed hidden on focus');
+  assert.match(tip.textContent, /monitored 3h of 24h/,
+    'the observation disclosure never reached the keyboard user');
+
+  // Anchored to the CELL, not to a cursor keyboard navigation never moves: the
+  // position has to track the cell's own rect. A second cell elsewhere on the
+  // grid must land somewhere else.
+  const first = { left: tip.style.left, top: tip.style.top };
+  fire('focusin', { target: hmCell('2026-07-20: not monitored',
+    { left: 400, top: 300, right: 412, bottom: 312, width: 12, height: 12 }) });
+  assert.notEqual(tip.style.left, first.left, 'the tooltip is pinned, not anchored to the focused cell');
+  assert.notEqual(tip.style.top, first.top, 'the tooltip is pinned, not anchored to the focused cell');
+  assert.ok(parseFloat(first.left) >= 40 && parseFloat(first.left) < 100,
+    `the first cell's tooltip landed at ${first.left}, nowhere near its rect`);
+  assert.ok(parseFloat(first.top) >= 72 && parseFloat(first.top) < 130,
+    `the first cell's tooltip landed at ${first.top}, nowhere near its rect`);
+
+  // Tabbing off hides it.
+  fire('focusout', {});
+  assert.equal(tip.hidden, true, 'the tooltip outlives the focus that raised it');
+
+  // The guard is two conditions and each gets its own case: a test that only ever
+  // fires at a target outside any cell exercises the first half, and the second
+  // can then be deleted in one token with the suite still green. Both start from a
+  // shown tooltip, so a fall-through shows up as the PREVIOUS day's text left
+  // standing under the new focus - the failure that actually reaches a reader.
+  const shown = () => fire('focusin', { target: hmCell('2026-07-21: no outages recorded',
+    { left: 1, top: 1, right: 13, bottom: 13 }) });
+  // No cell at all: focus landed on the grid container itself rather than on one
+  // of its children.
+  shown();
+  assert.equal(tip.hidden, false, 'the setup for the guard cases never showed a tooltip');
+  fire('focusin', { target: { closest: () => null } });
+  assert.equal(tip.hidden, true, 'focus on no cell at all leaves the previous day\'s text showing');
+  // A real cell carrying no label. drawHeatmap mints exactly this for the days
+  // older than the fetched window: className 'cell', visibility hidden, empty
+  // dataset. Nothing gives those a tabindex today, so this half of the guard is
+  // holding a line no other test would notice it dropping.
+  shown();
+  fire('focusin', { target: hmCell(null, { left: 5, top: 5, right: 17, bottom: 17 }) });
+  assert.equal(tip.hidden, true, 'a cell with no label shows the previous day\'s text');
+});
+
+// Escape is the standard dismiss, and a focus-raised tooltip has no pointer to
+// move away from it - short of tabbing off the cell or the grid repainting under
+// it, nothing a keyboard user does takes it down. Three things are pinned here: it
+// dismisses WITHOUT moving focus; it leaves alone the Escape the settings drawer
+// is waiting for when focus is somewhere else entirely; and it costs the drawer
+// exactly ONE press. That last one is the deliberate trade. Focusing a cell raises
+// its tooltip, and the drawer is reachable from the grid - it inerts
+// nothing behind it and traps no Tab, unlike Quick Setup - so an open drawer does
+// lose the first press. The tooltip is the innermost thing showing and focus never
+// moves, so the second press reaches the drawer exactly as the first would have;
+// the alternative leaves a keyboard user no way to dismiss the tooltip at all
+// while the drawer is open.
+test('Escape dismisses a focused heatmap tooltip, and only that one', () => {
+  const src = extract("document.addEventListener('keydown', e=>{");
+  const els = { qsDlg: { hidden: true }, dataPop: { hidden: true }, uptimePop: { hidden: true },
+    hmTip: { hidden: false }, families: { querySelector: () => null } };
+  let closed = 0;
+  const cell = { closest: s => (s === '#heatmap' ? cell : null) };
+  const doc = { activeElement: cell, addEventListener(_t, fn) { this.fn = fn; } };
+  new Function('document', '$', 'loginOverlay', 'qsDecline', 'hideDataPop', 'hideUptimePop',
+    '_drawer', 'requestCloseDrawer', src + ');')(
+    doc, id => els[id], { hidden: true }, () => {}, () => {}, () => {},
+    { classList: { contains: () => true } }, () => { closed++; });
+
+  doc.fn({ key: 'Escape' });
+  assert.equal(els.hmTip.hidden, true, 'Escape left the tooltip sitting over the grid');
+  assert.equal(closed, 0, 'one Escape also closed the drawer - two actions for one keypress');
+
+  // The drawer is one more press away and no further: focus has not moved, and the
+  // thing that won the first press is down.
+  doc.fn({ key: 'Escape' });
+  assert.equal(closed, 1, 'with its tooltip already down the grid went on eating the drawer\'s Escape');
+
+  // Focus outside the grid: this is a pointer-raised tooltip, which has a pointer
+  // to move away from it, so Escape belongs to the drawer on the FIRST press.
+  els.hmTip.hidden = false;
+  doc.activeElement = { closest: () => null };
+  doc.fn({ key: 'Escape' });
+  assert.equal(closed, 2, 'the heatmap tooltip ate the drawer\'s Escape');
+  assert.equal(els.hmTip.hidden, false, 'a tooltip nobody focused is not the keyboard\'s to dismiss');
 });
 
 // --- single-run graph: spanOne duplicates a lone point so it draws a flat line ---
@@ -2578,26 +2760,73 @@ test('Quick Setup cost note: never under-states the data spend', () => {
     assert.ok(m, 'the note must quote a down and an up figure: ' + s);
     return [Number(m[1]), Number(m[2])];
   };
-  // Runs per day per branch: 24 hourly, 4 six-hourly, and 24 for "Manually" too -
-  // that branch runs nothing on a schedule, but the on-reconnect trigger it
-  // cannot switch off is spaced by reconnectSpeedGap = max(15 min, the
-  // configured interval) (main.go), and Quick Setup leaves that interval alone
-  // under "Manually" (ApplyQuickSetup writes keySpeed only when tests are
-  // enabled), so on a DEFAULT install it is the shipped 1h. A shorter
-  // -speedtest-interval means more of these runs, which is why the copy hedges
-  // with "an hour by default"; the ceiling checked here is the default one.
-  for (const [sel, runs] of [[0, 24], [1, 4], [2, 24]]) {
-    const [down, up] = stated(qsUseNote(sel));
+  // Runs per day per branch, priced at the interval the install is ACTUALLY on.
+  // The on-reconnect trigger no choice here switches off is spaced by
+  // reconnectSpeedGap = max(15 min, the configured interval) (main.go), and
+  // reconnectGate.allow enforces that as a minimum SPACING, not a per-day quota:
+  // it refuses a run only while now-last is under the gap, so runs land at t,
+  // t+gap, t+2gap, ... and a day holds ceil(86400/gap) of them - one at the start
+  // plus one per whole gap after it. The two scheduled branches apply their own
+  // interval (qsSave posts speed_seconds 3600 / 21600), so 24 and 4 hold whatever
+  // the daemon is currently set to. "Manually" applies none (ApplyQuickSetup
+  // writes keySpeed only when tests are enabled), so it inherits the daemon's -
+  // and at any interval under 15 minutes the floor takes over at 96 runs a day,
+  // four times what the hourly default gets. That case is the reason the figure is
+  // derived rather than hardcoded, so it is priced here at 1m and 5m alike. 25m and
+  // 5h are the intervals that do NOT divide the day, where the run that starts the
+  // day is the whole difference between the two roundings.
+  //
+  // 8h is here for the OTHER way this figure could come in low: not the run count
+  // but the printing of it. 3 runs is 5.625 GB, which one decimal cannot express,
+  // and rounding to the nearest one printed "5.6" - 25 MB under what the install
+  // can spend. It is the smallest of the reachable ties (every runs%4===3 lands on
+  // .625 or .125: 3, 7, 11 ... 95, so 24 of the 96 reachable counts), and an
+  // 8-hour interval is an ordinary setting rather than a corner. The assertions
+  // below compare against the unrounded ceiling, so they catch a rounding that
+  // goes the wrong way as readily as a wrong run count.
+  for (const [sel, intervalS, runs] of [[0, 3600, 24], [1, 3600, 4], [2, 3600, 24],
+    [0, 60, 24], [1, 60, 4], [2, 60, 96], [2, 300, 96], [2, 900, 96], [2, 21600, 4],
+    [2, 1500, 58], [2, 18000, 5], [2, 28800, 3], [2, 12343, 7]]) {
+    const [down, up] = stated(qsUseNote(sel, intervalS));
     const ceil = runs * CEILING_GB;
-    assert.ok(down >= ceil, `sel=${sel} promises ${down} GB down, under the ${ceil} GB ceiling`);
-    assert.ok(up >= ceil, `sel=${sel} promises ${up} GB up, under the ${ceil} GB ceiling`);
+    assert.ok(down >= ceil, `sel=${sel} at ${intervalS}s promises ${down} GB down, under the ${ceil} GB ceiling`);
+    assert.ok(up >= ceil, `sel=${sel} at ${intervalS}s promises ${up} GB up, under the ${ceil} GB ceiling`);
   }
   // The exact figures, so a re-derivation has to come through this test.
-  assert.match(qsUseNote(0), /up to <b>45\.0\u00a0GB down \+ 45\.0\u00a0GB up per day<\/b>/);
-  assert.match(qsUseNote(1), /up to <b>7\.5\u00a0GB down \+ 7\.5\u00a0GB up per day<\/b>/);
+  assert.match(qsUseNote(0, 3600), /up to <b>45\.0\u00a0GB down \+ 45\.0\u00a0GB up per day<\/b>/);
+  assert.match(qsUseNote(1, 3600), /up to <b>7\.5\u00a0GB down \+ 7\.5\u00a0GB up per day<\/b>/);
+  // "Manually" on a 1-minute install: 15-minute floor, 96 runs, 180.0 GB per
+  // direction. A hardcoded 24 quoted 45.0 GB here - a quarter of the truth on
+  // the one screen whose job is consent for data on a metered link.
+  assert.match(qsUseNote(2, 60), /up to <b>180\.0\u00a0GB down \+ 180\.0\u00a0GB up per day<\/b>/);
+  assert.match(qsUseNote(2, 3600), /up to <b>45\.0\u00a0GB down \+ 45\.0\u00a0GB up per day<\/b>/);
+  assert.match(qsUseNote(2, 21600), /up to <b>7\.5\u00a0GB down \+ 7\.5\u00a0GB up per day<\/b>/);
+  // A gap that does not divide the day. 86400/1500 = 57.6, so 57 whole gaps fit -
+  // but the run that opens the day is a run too, and the 58th starts at 85500s,
+  // still inside it: 58 x 1.875 = 108.8 GB. floor() quoted 106.9 and left a whole
+  // run of consent unasked for.
+  assert.match(qsUseNote(2, 1500), /up to <b>108\.8\u00a0GB down \+ 108\.8\u00a0GB up per day<\/b>/);
+  // The same one-run miss, and the wider the gap the bigger a share of the day it
+  // is: 4 runs where 5 fit is a fifth of the spend.
+  assert.match(qsUseNote(2, 18000), /up to <b>9\.4\u00a0GB down \+ 9\.4\u00a0GB up per day<\/b>/);
+  // A run count the printed decimal cannot express: 3 x 1.875 = 5.625, rounded UP
+  // to 5.7 rather than to the nearer 5.6, which was 25 MB under the spend.
+  assert.match(qsUseNote(2, 28800), /up to <b>5\.7\u00a0GB down \+ 5\.7\u00a0GB up per day<\/b>/);
+  // The next tie up, to pin the rule rather than the one case: 7 x 1.875 = 13.125.
+  assert.match(qsUseNote(2, 12343), /up to <b>13\.2\u00a0GB down \+ 13\.2\u00a0GB up per day<\/b>/);
+  // The spacing the copy quotes has to be the spacing the figure came from, or
+  // the number is unexplainable on screen.
+  assert.match(qsUseNote(2, 60), /once every 15 minutes/);
+  assert.match(qsUseNote(2, 3600), /once every hour/);
+  assert.match(qsUseNote(2, 21600), /once every 6 hours/);
+  assert.match(qsUseNote(2, 1500), /once every 25 minutes/);
+  assert.match(qsUseNote(2, 18000), /once every 5 hours/);
+  // A payload that omits speed_interval_s falls back to the shipped 1h
+  // (config.Default) rather than pricing the screen at zero runs.
+  assert.equal(qsUseNote(2, undefined), qsUseNote(2, 3600));
   // "roughly" reads as a two-sided estimate; a ceiling is one-sided.
-  assert.doesNotMatch(qsUseNote(0), /roughly/, 'a ceiling is quoted as "up to", not "roughly"');
-  assert.doesNotMatch(qsUseNote(0), /month/, 'the monthly total was deliberately dropped');
+  assert.doesNotMatch(qsUseNote(0, 3600), /roughly/, 'a ceiling is quoted as "up to", not "roughly"');
+  assert.doesNotMatch(qsUseNote(0, 3600), /month/, 'the monthly total was deliberately dropped');
   // The retry is the difference between a per-attempt figure and a cap, so no
   // branch may quote the figure without it - and naming it has to mean asserting
   // it HAPPENS. A bare /retr(y|ies)/ pin passes just as happily on copy that says
@@ -2605,10 +2834,30 @@ test('Quick Setup cost note: never under-states the data spend', () => {
   // phrasing is pinned and a negated one is rejected outright.
   const retryClaim = {0: /\bretries once\b/, 1: /\bretries once\b/, 2: /\bfails? and retr(y|ies)\b/};
   for (const sel of [0, 1, 2]) {
-    assert.match(qsUseNote(sel), retryClaim[sel],
+    assert.match(qsUseNote(sel, 3600), retryClaim[sel],
       `sel=${sel} quotes a per-attempt figure without saying a failed test retries`);
-    assert.doesNotMatch(qsUseNote(sel), /\b(never|not|no|without)\b(\s+\w+){0,2}\s+retr/i,
+    assert.doesNotMatch(qsUseNote(sel, 3600), /\b(never|not|no|without)\b(\s+\w+){0,2}\s+retr/i,
       `sel=${sel} denies the retry that its per-attempt figure depends on`);
+  }
+});
+
+// reconnectGate holds its spacing in a plain time.Time field on an in-process
+// struct (main.go), whose zero value that file documents as an OPEN gate - the
+// first reconnect of a process is never suppressed. So a daemon that restarts
+// starts the day's budget over, and NO per-day ceiling on this screen survives a
+// crash loop. The disclosure has to sit on all three branches: the scheduled ones
+// carry the same hole, since their extra reconnect run is gated by the same
+// in-memory field. Persisting the timestamp instead was rejected - it would
+// invert the tested invariant in main.go and still leave the startup run open -
+// so this is a disclosure, and the disclosure is what gets pinned.
+test('Quick Setup says its daily ceilings assume the daemon stays up', () => {
+  const { qsUseNote } = F;
+  for (const [sel, intervalS] of [[0, 3600], [1, 3600], [2, 60], [2, 3600], [2, 21600]]) {
+    const note = qsUseNote(sel, intervalS);
+    assert.match(note, /assume the daemon keeps running/,
+      `sel=${sel} at ${intervalS}s quotes a daily figure without saying it assumes an uninterrupted daemon`);
+    assert.match(note, /\brestart\b/,
+      `sel=${sel} at ${intervalS}s names no restart, so nothing on screen says what breaks the ceiling`);
   }
 });
 
@@ -2616,25 +2865,26 @@ test('Quick Setup cost note: never under-states the data spend', () => {
 // without ever consulting SpeedtestEnabled - so no choice on this screen turns it
 // off. Under "Manually" Quick Setup leaves the interval alone (ApplyQuickSetup
 // writes keySpeed, "speed_interval_s", only when tests are enabled;
-// speed_seconds is the request field the screen POSTs), so on a default install
-// it is still the shipped 1h and reconnectSpeedGap = max(15 min, that interval)
-// lets a flapping line run 24 full tests a day: exactly the branch whose old
-// copy implied the data cost was near zero. Every branch has to disclose it.
+// speed_seconds is the request field the screen POSTs), so it inherits whatever
+// the daemon already runs at and reconnectSpeedGap = max(15 min, that interval)
+// lets a flapping line run 24 tests a day on the shipped 1h and 96 on a 1m
+// install: exactly the branch whose old copy implied the data cost was near
+// zero. Every branch has to disclose it, at every interval.
 test('Quick Setup discloses the after-outage tests this screen cannot switch off', () => {
   const { qsUseNote } = F;
-  for (const sel of [0, 1, 2]) {
-    assert.match(qsUseNote(sel), /outage/, `sel=${sel} must mention the after-outage run`);
-    assert.match(qsUseNote(sel), /on by default/, `sel=${sel} must say that trigger is on by default`);
+  for (const [sel, intervalS] of [[0, 3600], [1, 3600], [2, 60], [2, 3600], [2, 21600]]) {
+    assert.match(qsUseNote(sel, intervalS), /outage/, `sel=${sel} at ${intervalS}s must mention the after-outage run`);
+    assert.match(qsUseNote(sel, intervalS), /on by default/, `sel=${sel} at ${intervalS}s must say that trigger is on by default`);
   }
-  assert.match(qsUseNote(2), /not switched off here/, '"Manually" must say it does not disable the trigger');
+  assert.match(qsUseNote(2, 3600), /not switched off here/, '"Manually" must say it does not disable the trigger');
   // Both scheduled cadences get one extra run per interval at worst - the whole
   // figure again - and the default single retry can double each of those, so the
   // worst case they must quote is four times the headline, not two.
-  assert.match(qsUseNote(0), /four times that/);
-  assert.match(qsUseNote(1), /four times that/);
+  assert.match(qsUseNote(0, 3600), /four times that/);
+  assert.match(qsUseNote(1, 3600), /four times that/);
   // "Manually" has no schedule: its headline is already the reconnect runs, so
-  // the retry alone is what doubles it.
-  assert.match(qsUseNote(2), /twice that/);
+  // the retry alone is what doubles it - at every interval, not just the default.
+  for (const intervalS of [60, 3600, 21600]) assert.match(qsUseNote(2, intervalS), /twice that/);
 });
 
 // The gate is strict equality: an older daemon or the demo shim simply lacks
@@ -2651,6 +2901,38 @@ test('Quick Setup only shows on quick_setup_pending === true, and defaults acces
   // showQuickSetup preselects the access radio from the booted mode.
   assert.match(script, /segChoose\.qsAcc\(qsBootLocalOnly \? 0 : 1, false\)/,
     'the access choice defaults to the booted mode so accepting it never locks the operator out');
+});
+
+// qsUseNote is pure so its numbers can be pinned above, which only means anything
+// if the page hands it the real interval: both places that paint the note have to
+// pass it, and it has to come off the status payload on the POLLED path rather
+// than being read once at boot. The dialog is long-lived - it sits there until the
+// operator answers it - and the value is the daemon's, not the page's, so one read
+// at startup could be stale by the time anything prices itself from it.
+//
+// Source order is deliberately NOT asserted. The capture does sit above the
+// quick_setup_pending branch in refreshStatus, but nothing visible turns on that:
+// showQuickSetup runs at most once (qsShown) and paints qsSchedSel, which starts
+// at 0 - the Hourly branch, which never looks at intervalS - so the automatic
+// paint prices nothing from it. Every later paint is a segment click (wireSeg
+// 'qsSched'), with refreshStatus re-capturing on its 3s interval underneath.
+// Asserting that one line precedes the other would pin source order, not
+// behaviour, and the reason given for it before ("a 1m install priced at the
+// shipped 1h for the whole of its life") was not true of any of those paths.
+test('Quick Setup prices its note from the interval /api/status reported', () => {
+  assert.match(script, /let qsSpeedIntervalS=3600;/,
+    'the interval has a module-level default to fall back on');
+  const calls = script.match(/qsUseNote\([^)]*\)/g).filter(c => !/^qsUseNote\(sel/.test(c));
+  assert.ok(calls.length >= 2, 'both the initial paint and the segment change must be covered');
+  for (const c of calls) assert.match(c, /qsSpeedIntervalS/, `a caller quotes the default figure: ${c}`);
+  assert.ok(script.indexOf('qsSpeedIntervalS=s.speed_interval_s') > 0,
+    'nothing reads speed_interval_s off the status payload');
+  assert.ok(extract('async function refreshStatus').includes('qsSpeedIntervalS=s.speed_interval_s'),
+    'the capture sits outside refreshStatus, so the interval never refreshes under an open dialog');
+  // Guarded on a positive number: a payload without the field must leave the
+  // shipped default standing, not price the screen at zero runs a day.
+  assert.match(script, /typeof s\.speed_interval_s==='number' && s\.speed_interval_s>0/,
+    'an absent or nonsense interval must not reach the arithmetic');
 });
 
 // The two exits differ, permanently: dismissal persists the answer and applies
