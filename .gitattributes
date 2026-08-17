@@ -1,0 +1,24 @@
+# Check every text file out with LF on every platform.
+#
+# Without this, Git on Windows checks source out with CRLF by default, and the
+# UI test suite reads index.html, web.go and README.md as text and matches
+# multi-line source against patterns written with "\n". Those matches found
+# nothing on windows-latest and the suite reported that the code had moved,
+# while every other platform passed - CI failed exactly that way at a6f5778.
+# ui.test.mjs now normalises what it reads as well, so the two guards are
+# independent: this one keeps the working tree honest, that one keeps the tests
+# honest even if someone checks out with different settings.
+#
+# Safe to apply wholesale here: every tracked text file is already LF in the
+# index (git ls-files --eol), and the repo ships no .bat, .cmd or .ps1 that
+# would need CRLF to run.
+* text=auto eol=lf
+
+# Binaries Git must never touch. text=auto detects most of these on content,
+# but naming them keeps a hand-edited attribute from ever reaching them.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+*.gz binary
+*.zip binary
