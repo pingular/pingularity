@@ -100,7 +100,9 @@ type savedSnapshot struct {
 	// hardcoded 0600 would never match).
 	// Without this the skip would leave a snapshot someone chmodded 0644 readable
 	// by every account on the box for as long as the ring stays idle, and this file
-	// holds the raw unmasked lines.
+	// holds the raw unmasked lines. That is a Unix guarantee only: on Windows both
+	// sides of the comparison are the same constant, which is why the skip re-applies
+	// the protection outright rather than relying on this field there.
 	mode os.FileMode
 }
 
@@ -264,9 +266,10 @@ func (r *Ring) Clear() {
 // a crash mid-write can't leave a torn file. Mode 0600: the raw form holds
 // IPs/hostnames, so the file is owner-only.
 //
-// A call made when nothing has been logged since the last one does nothing, so a
-// caller may snapshot on a fixed timer without paying for it while the ring sits
-// idle. What that check compares is the ring's generation token plus the file's
+// A call made when nothing has been logged since the last one rewrites nothing -
+// it only re-applies the file's protection, for the reason the skip branch gives -
+// so a caller may snapshot on a fixed timer without paying for it while the ring
+// sits idle. What that check compares is the ring's generation token plus the file's
 // size and mode - not its content, so a same-length replacement is skipped over
 // too; savedSnapshot documents where it stops short.
 func (r *Ring) SaveFile(path string) error {
@@ -296,9 +299,12 @@ func (r *Ring) SaveFile(path string) error {
 	// Nothing has been logged since we last wrote this exact file, so writing it
 	// again would only rewrite bytes that are already there. The caller snapshots
 	// on a one-minute ticker whether or not anything was logged (main.go:462), and
-	// the default install runs with logging "off" (main.go:426, main.go:506-507).
+	// the default install runs with logging "off" - main.go:1823, the LogLevel in
+	// the defaults handed to settings.New, which is the line that MAKES it true
+	// (main.go:426 and main.go:506-507 read as citations for it but are comments
+	// relying on it).
 	// "Off" is not silence: it sets the level to WARN, and the ring shares that
-	// level (applyLogLevel, main.go:2357-2364; buildLogger, main.go:1851). So a
+	// level (applyLogLevel, main.go:2362-2373; buildLogger, main.go:1851). So a
 	// default install's ring is IDLE rather than empty - it fills exactly when
 	// something has gone wrong, and applyLogLevel's own comment puts real
 	// WARN/ERROR volume in normal operation at ~0. Idle is the case this skip is
@@ -324,9 +330,83 @@ func (r *Ring) SaveFile(path string) error {
 	//     osperm.SecureFile below and comes back owner-only. Skipping that would
 	//     leave the raw unmasked lines (IPs, hostnames) readable by other accounts
 	//     for as long as the ring stays idle - which, per the paragraph above, is a
-	//     default install's normal state rather than a brief one.
+	//     default install's normal state rather than a brief one. Windows cannot
+	//     express that loosening in a mode at all, so the skip re-applies the
+	//     protection there instead of detecting it; see the branch below.
 	if r.saved.written && r.saved.path == path && r.saved.epoch == epoch && r.saved.seq == seq {
 		if fi, err := os.Lstat(path); err == nil && fi.Size() == r.saved.size && fi.Mode() == r.saved.mode {
+			// Re-apply the file's protection even though we are not rewriting it,
+			// because on Windows the mode just compared cannot report that the
+			// protection was loosened. There os.Lstat derives the permission bits from
+			// FILE_ATTRIBUTE_READONLY alone (GOROOT/src/os/types_windows.go,
+			// fileStat.Mode) and the 0600 open below never sets that attribute
+			// (GOROOT/src/syscall/syscall_windows.go, syscall.Open, which os.OpenFile
+			// reaches through openFileNolog), so both sides of that comparison are the
+			// same constant whatever the DACL says. osperm cannot read a DACL back for
+			// comparison either: GroupOrWorldAccessible reports known=false on Windows
+			// (internal/osperm/perm_windows.go:27-30). So the only thing that can put
+			// the protected DACL back is applying it again, which is what SecureFile
+			// does (internal/osperm/perm_windows.go:25, delegating to secure below it).
+			// Before this skip existed the every-minute rewrite did that; without this
+			// call a loosened DACL would stand for as long as the ring stays idle, which
+			// the paragraph above puts at a default install's normal state, leaving the
+			// raw unmasked lines readable by other accounts all that time.
+			//
+			// AFTER the mode check on purpose, so do not lift it above: a snapshot
+			// swapped for a symlink fails that comparison and is rewritten below
+			// instead, which is what keeps this call off a link's target. Unix
+			// SecureFile is os.Chmod (internal/osperm/perm_unix.go:11) and chmod
+			// follows a symlink, so securing first would let whoever plants the link
+			// choose which file gets chmodded 0600. Guarded by
+			// TestSaveFileNeverSecuresThroughASymlinkedSnapshot, which watches the
+			// target's MODE. TestSaveFileRewritesASymlinkedSnapshot does NOT guard it,
+			// though it reads as though it does: it watches the target's bytes, and a
+			// chmod changes none - measured, with this call lifted above the mode
+			// comparison that test still passes and the target comes back 0600.
+			//
+			// The Lstat and this call are not atomic, so that argument holds only
+			// absent a race: someone who can create entries in this directory between
+			// the two can still aim the chmod. That takes write access to the
+			// snapshot's own directory, which pingularity locks owner-only when it
+			// created it, and otherwise leaves alone with a warning rather than
+			// re-permissioning a directory it does not own - with one narrow
+			// carve-out that tightens a pre-existing one instead (a container, at
+			// exactly the image's data path, owned by us), so the exception only
+			// ever moves in the safe direction (internal/store/store.go:352-394).
+			// The ordering does not close that window, it reduces a per-tick
+			// certainty to a race.
+			//
+			// The optimisation survives. The rewrite below is a file creation, a write,
+			// a securing call on the temp file, an fsync of the file, a rename, and off
+			// Windows an fsync of the directory too (the runtime.GOOS guard below skips
+			// that one there) - so it already contains this call's whole cost and adds
+			// the file I/O on top; skipping can only ever be cheaper. Securing alone
+			// creates no file and fsyncs nothing: one chmod on Unix
+			// (internal/osperm/perm_unix.go:11), and on Windows the short sequence in
+			// secure (internal/osperm/perm_windows.go:41-65) - token lookup, SDDL
+			// parse, SetNamedSecurityInfo - which is several calls rather than one but
+			// still no I/O on the file's contents.
+			if err := osperm.SecureFile(path); err != nil {
+				// Worded apart from the write path's securing failure below so a log
+				// line says which one failed; both wrap the same osperm call.
+				//
+				// The caller logs this at DEBUG (main.go:470-471), logging defaults
+				// to "off" (main.go:1823), and applyLogLevel maps "off" to WARN
+				// (main.go:2362-2373) - so on a default install a failure here is
+				// not merely quiet, it is filtered out and there is no line at all.
+				// Accepted, because the systemic cause cannot reach this line: a
+				// filesystem that cannot chmod fails the write path's SecureFile on
+				// the temp file in this same directory first, and r.saved is
+				// recorded only after every step of that path succeeded (its single
+				// assignment, at the end of this function), so written stays false
+				// and this branch is never taken. What is left is a per-file
+				// accident - the path removed between the Lstat and this call, which
+				// the next tick's Lstat catches and rewrites, or the path taken over
+				// by another account's file of the same size and mode, which the skip
+				// already declined to notice before this call existed
+				// (savedSnapshot.size).
+				return fmt.Errorf("re-secure log snapshot: %w", err)
+			}
 			return nil
 		}
 	}
@@ -346,7 +426,9 @@ func (r *Ring) SaveFile(path string) error {
 	if err := osperm.SecureFile(tmp); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return fmt.Errorf("secure log snapshot: %w", err)
+		// "new" so this is distinguishable from the skip path's re-securing of an
+		// existing snapshot above, which wraps the same call with the same %w.
+		return fmt.Errorf("secure new log snapshot: %w", err)
 	}
 	bw := bufio.NewWriter(f)
 	enc := json.NewEncoder(bw) // Encode appends its own '\n' per entry
