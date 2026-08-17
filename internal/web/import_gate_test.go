@@ -42,11 +42,14 @@ func newHeldBody(head, tail string) *heldBody {
 
 // A restore must never run beside another restore. The gate used to admit four,
 // and the extra slots bought no throughput at all - concurrent imports serialize
-// on SQLite's single writer regardless - only a race for it that the 5s
-// busy_timeout loses: a batch that waits it out fails with SQLITE_BUSY, and
-// because a restore is incremental rather than atomic the caller is handed HTTP
-// 500 {"partial":true} over an intact backup. Refusing the second caller outright
-// is the honest answer; a half-applied restore is not.
+// on SQLite's single writer regardless - only a race for it that a batch can
+// lose: one that waits out the 5s busy_timeout fails with SQLITE_BUSY, and
+// because a restore is incremental rather than atomic, that caller is handed HTTP
+// 500 {"partial":true} over an intact backup. Whether any given batch waits that
+// long is decided by SQLite's busy handler against timing this code does not
+// control, so the race is not always lost - which makes it worse to leave open,
+// not safer. Refusing the second caller outright is the honest answer; a
+// half-applied restore is not.
 func TestSecondConcurrentImportIsRefusedNotHalfApplied(t *testing.T) {
 	s := newTestServer(t)
 
@@ -74,8 +77,8 @@ func TestSecondConcurrentImportIsRefusedNotHalfApplied(t *testing.T) {
 			`{"ts":1700009001,"target":"b","latency_ms":12.5,"success":1,"family":"ipv4"}]}`))
 	if second.Code != http.StatusTooManyRequests {
 		t.Fatalf("a second import landing during a running restore got HTTP %d, want 429: %s\n"+
-			"Two restores now share SQLite's single writer, which buys no throughput and loses "+
-			"batches to the 5s busy_timeout as SQLITE_BUSY - each caller gets a partial restore.",
+			"Two restores now share SQLite's single writer, which buys no throughput and can lose "+
+			"a batch to the 5s busy_timeout as SQLITE_BUSY - leaving that caller a partial restore.",
 			second.Code, strings.TrimSpace(second.Body.String()))
 	}
 

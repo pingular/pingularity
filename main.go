@@ -1991,8 +1991,10 @@ func runCmd(args []string) error {
 			fmt.Fprintf(os.Stderr, "pingularity: restore log history: %v\n", err)
 		}
 	}
-	// Logging is binary: when on, debug streams to both stdout/journald and the ring;
-	// when off, the level filters everything out, so the ring stays empty on its own.
+	// Logging is binary: when on, debug streams to both stdout/journald and the ring.
+	// "Off" is not silence - it drops routine chatter but keeps WARN and ERROR (see
+	// applyLogLevel) - so on a healthy install the ring sits idle rather than empty,
+	// and fills exactly when something has gone wrong.
 	// The ring keeps each line raw and PII-masked; the dashboard chooses which to show.
 	log := buildLogger(os.Stdout, lvl, ring)
 	prg := &program{cfg: cfg, log: log, logLevel: lvl, ring: ring, optsIgnored: optsIgnored}
@@ -2347,11 +2349,16 @@ func fail(err error) {
 }
 
 // logLevelOff is far above slog.LevelError (8) so every record is filtered out.
-// Logging is binary: off = nothing anywhere; on = the single maximal level (debug).
+// It is the PRE-SETTINGS-LOAD pin only, where nothing should be emitted yet. The
+// "off" SETTING is not this silent: applyLogLevel maps it to WARN so a failure
+// still leaves a record. Logging is otherwise binary: on = the single maximal
+// level (debug).
 const logLevelOff = slog.Level(1 << 20)
 
-// applyLogLevel sets the live logger threshold: "off" suppresses everything, any
-// other value is the one "on" level - full debug to stdout/journald and the ring.
+// applyLogLevel sets the live logger threshold. "off" is not silence: it drops
+// routine INFO/DEBUG but keeps WARN and ERROR, for the reason the branch below
+// gives. Any other value is the one "on" level - full debug to stdout/journald
+// and the ring.
 func applyLogLevel(lv *slog.LevelVar, name string) {
 	if name == "off" {
 		// "off" silences routine INFO/DEBUG chatter but still surfaces WARN and
