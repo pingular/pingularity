@@ -90,9 +90,24 @@ type ExitInfo struct {
 	NextRTTms float64 `json:"next_rtt_ms,omitempty"`
 	NextASN   string  `json:"next_asn,omitempty"`
 	NextLoc   string  `json:"next_loc,omitempty"` // city of the handoff hop
-	// TargetFallback is true when the configured exit target didn't resolve to
-	// an IPv4 address, so this is the DEFAULT path (1.1.1.1), not the user's.
+	// TargetFallback is true when the configured exit target could not be used,
+	// so this is the DEFAULT path (1.1.1.1), not the user's.
 	TargetFallback bool `json:"target_fallback,omitempty"`
+	// TargetFallbackWhy says WHICH of the two reasons applied, because they need
+	// opposite responses and the bool alone sent readers to the wrong one: a
+	// target that resolves perfectly well but points somewhere internal was
+	// refused on purpose, and telling that operator it "did not resolve" starts a
+	// DNS hunt for a decision this code made deliberately.
+	//
+	//	"unresolved" - no IPv4 address (transient DNS failure, or an IPv6-only
+	//	               name the IPv4 traceroute cannot use). Retry or fix the name.
+	//	"internal"   - resolved to loopback or link-local, which would trace the
+	//	               host itself or the cloud-metadata endpoint rather than an
+	//	               exit path. Refused; pick a target outside the machine.
+	//
+	// Empty whenever TargetFallback is false. RFC1918 is deliberately NOT a
+	// reason - tracing a LAN gateway is legitimate (see isInternalTraceTarget).
+	TargetFallbackWhy string `json:"target_fallback_why,omitempty"`
 }
 
 // discoverExit traces toward target (resolved by cachedExit) and locates the
@@ -562,12 +577,12 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	// what was actually traced: an unresolvable target (transient DNS failure,
 	// or an IPv6-only name the IPv4 traceroute can't use) falls back to the
 	// default path, flagged so the UI doesn't present it as the chosen one.
-	target, fellBack := traceTarget, false
+	target, fellBackWhy := traceTarget, ""
 	if want != "" {
 		v, ok := resolveIPv4(ctx, want)
 		switch {
 		case !ok:
-			fellBack = true
+			fellBackWhy = "unresolved"
 			if ctx.Err() == nil { // don't blame the target when the caller aborted
 				m.log.Warn("exit target did not resolve to IPv4; tracing the default path", "target", want)
 			}
@@ -578,7 +593,7 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 			// and trace the default. RFC1918 stays allowed on purpose: tracing a LAN
 			// gateway is legitimate and the trust model already equates dashboard
 			// access with local-network reach.
-			fellBack = true
+			fellBackWhy = "internal"
 			m.log.Warn("exit target resolves to a loopback/link-local address; tracing the default path", "target", want)
 		default:
 			target = v
@@ -586,7 +601,8 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	}
 	ex, err := m.discoverExit(ctx, ourASN, target)
 	if err == nil && ex != nil {
-		ex.TargetFallback = fellBack
+		ex.TargetFallback = fellBackWhy != ""
+		ex.TargetFallbackWhy = fellBackWhy
 	}
 	// A trace cut short by the CALLER (browser abort mid-refresh, shutdown) is not
 	// a real failure: it must neither skew the trace_ok/trace_fail counters nor

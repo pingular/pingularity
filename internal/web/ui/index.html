@@ -4164,8 +4164,13 @@ async function refreshStatus() {
     : ms<10 ? hdot(100,v) : ms<100 ? hdot(45,v) : ms<200 ? hdot(30,v) : hdot(20,v);
   // DNS resolve-time intensity scale, shared by the top-bar DNS pill and the
   // latency-graph DNS pill - mirrors latDot's aggression with DNS-appropriate bands:
-  // full <30ms, a hard cliff to 45% under 100ms, then the 20% floor at ≥100ms.
-  const dnsPct = ms => ms<30 ? 100 : ms<100 ? 45 : 20;
+  // full <40ms, a hard cliff to 45% under 100ms, then the 20% floor at ≥100ms.
+  //
+  // The full band is 40ms, not the 10ms latDot uses, because this probe cannot be
+  // fast by construction: the random label defeats every cache on the path, so the
+  // resolver has to go and ask rather than answer from memory. A healthy lookup is
+  // therefore a real round trip to an authority, and 20-40ms is ordinary for one.
+  const dnsPct = ms => ms<40 ? 100 : ms<100 ? 45 : 20;
   const dnsDot = ms => hdot(dnsPct(ms), '--dot-dns');
   // Pill latency text: 1 decimal under 100 ms, whole ms at 100+ - keeps precision
   // where it's useful without widening the value slot on high/spiky readings.
@@ -6441,10 +6446,26 @@ async function refreshNetinfo(force) {
       parts.push(`${esc(ex.next_name||ex.next_ip)}${b.length?` <span class="muted">(${b.join(' · ')})</span>`:''}`);
     }
     let v=parts.join(' <span class="muted">→</span> ');
-    // The configured exit-path target didn't resolve over IPv4, so this trace
-    // followed the default path (1.1.1.1) - flag it so the row can't silently
-    // present the wrong route as the user's target.
-    if(ex && ex.target_fallback) v+=' <span class="muted">(default path - your exit-path target didn\'t resolve)</span>';
+    // The configured exit-path target could not be used, so this trace followed
+    // the default path (1.1.1.1) - flag it so the row can't silently present the
+    // wrong route as the user's target.
+    //
+    // Name the actual reason: the two need opposite responses. "unresolved" is a
+    // name to retry or fix; "internal" resolved fine and was refused on purpose,
+    // because loopback and link-local targets trace the host or the cloud
+    // metadata endpoint instead of an exit path (target_fallback_why, set in
+    // internal/netinfo/exit.go). Saying "did not resolve" for the second sent
+    // operators hunting a DNS fault that was never there. An older daemon sends
+    // the bool without the reason, so an unknown value falls back to the
+    // non-committal wording rather than guessing.
+    if(ex && ex.target_fallback){
+      const why = ex.target_fallback_why==='internal'
+        ? 'your exit-path target points inside this machine, so it cannot be traced'
+        : ex.target_fallback_why==='unresolved'
+          ? 'your exit-path target did not resolve'
+          : 'your exit-path target could not be used';
+      v+=' <span class="muted">(default path - '+why+')</span>';
+    }
     // Cloudflare PoP (colo) rides the Exit line after a · separator - a separate,
     // always-Cloudflare readout (/cdn-cgi/trace), not the exit-path target (see tooltip).
     if(n.cf_colo) v+=`${v?' <span class="muted">·</span> ':''}Cloudflare PoP <b>${esc(n.cf_colo)}</b>`;
