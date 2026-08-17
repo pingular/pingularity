@@ -75,7 +75,7 @@ const (
 	keyAuthSessEpoch   = "auth_session_epoch"   // logout revocation epoch (folded into token MACs; persisted so logout survives a restart)
 	keyUpdateCheck     = "update_check_enabled" // daily background poll for a newer release
 	keyQuickSetup      = "quick_setup_done"     // the first-run Quick Setup dialog was answered or dismissed; never show it again
-	keyLogLevel        = "log_level"            // logging: "off" (nothing) or any other value = on (full debug). UI sends debug|off
+	keyLogLevel        = "log_level"            // logging: "off" (warnings and errors only) or any other value = on (full debug). UI sends debug|off
 	keyLogRedactPII    = "log_redact_pii"       // censor PII values (IPs/ISP/hostnames/user) in logs
 	// Adaptive / event-driven speedtesting (see internal/speedtest, internal/monitor).
 	keySpeedAdaptive   = "speedtest_adaptive"    // shorten the interval while the last run was unhealthy
@@ -283,7 +283,8 @@ type Values struct {
 	// the status handler); either exit persists true so it never returns.
 	QuickSetupDone bool
 
-	// LogLevel is the logging switch: "off" logs nothing; any other value turns
+	// LogLevel is the logging switch: "off" keeps warnings and errors only (it maps
+	// to WARN, not to silence - see applyLogLevel in main); any other value turns
 	// full (debug) logging on, for both the console output and the in-memory buffer
 	// the dashboard shows (the UI only sends "debug" or "off"). Owned by the
 	// About-tab logging control, not the settings form.
@@ -2096,9 +2097,9 @@ func (c *Controller) QuickSetupOfferSinceErr(ctx context.Context) (int64, error)
 	return n, nil
 }
 
-// SetLogLevel sets the logging switch: "off" logs nothing, any other value turns
-// full (debug) logging on; an unrecognized value coerces to "info" (still on). The
-// UI only sends "debug" or "off".
+// SetLogLevel sets the logging switch: "off" keeps warnings and errors only, any
+// other value turns full (debug) logging on; an unrecognized value coerces to
+// "info" (still on). The UI only sends "debug" or "off".
 func (c *Controller) SetLogLevel(ctx context.Context, level string) error {
 	switch level {
 	case "debug", "info", "warn", "error", "off":
@@ -2288,8 +2289,8 @@ func normalize(v Values) Values {
 	if strings.HasPrefix(v.ExitTarget, "-") || strings.ContainsAny(v.ExitTarget, " \t\r\n") || len(v.ExitTarget) > 255 {
 		v.ExitTarget = ""
 	}
-	// Log level: "off" (nothing logged) or any other value = on (full debug);
-	// anything else (unset/corrupt) -> info, which applyLogLevel treats as on.
+	// Log level: "off" (warnings and errors only) or any other value = on (full
+	// debug); anything else (unset/corrupt) -> info, which applyLogLevel treats as on.
 	switch v.LogLevel {
 	case "debug", "info", "warn", "error", "off":
 	default:
