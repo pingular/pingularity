@@ -881,3 +881,38 @@ func TestAvailableCongestionControlFreeBSD(t *testing.T) {
 		t.Errorf("darwin: got %v, want nil", got)
 	}
 }
+
+// A firewall that DROPs UDP is the single most common reason loss and jitter go
+// missing, and it is the case the "no datagrams" branch cannot see: that branch
+// needs iperf3 to finish and report zero packets, but a drop gives it nothing to
+// finish on, so the per-run deadline fires and it arrives as a stall instead.
+// Real instance: 212 consecutive iperf3 runs recorded no loss and no jitter over
+// five days, every one of them warning "transfer stalled (killed after 8s)"
+// while the same run's TCP passes moved ~495/480 Mbps. The cause was one missing
+// ufw rule for 5201/udp; nothing in the warning pointed there.
+//
+// The message text is unchanged - the sentinel IS the text - so this also guards
+// that errStalled stays wrapped rather than being rebuilt as a plain string, which
+// is what would silently switch the hint back off.
+func TestStalledErrIsMatchableAndKeepsItsWording(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	<-expired.Done()
+
+	err := stalledErr(errors.New("signal: killed"), expired, context.Background(), 8*time.Second)
+	if err == nil {
+		t.Fatal("stalledErr returned nil for a deadline kill")
+	}
+	if got, want := err.Error(), "transfer stalled (killed after 8s)"; got != want {
+		t.Errorf("message = %q, want %q - callers and operators both read this string", got, want)
+	}
+	if !errors.Is(err, errStalled) {
+		t.Error("a stall is not errors.Is(errStalled): the UDP pass cannot tell a firewall " +
+			"drop from a busy server without it, so the firewall hint goes silent")
+	}
+	// A non-stall failure must not borrow the verdict: "no datagrams" means the
+	// server answered and reported nothing, which is a different fix.
+	if errors.Is(errors.New("no datagrams"), errStalled) {
+		t.Error("an unrelated error matched errStalled")
+	}
+}

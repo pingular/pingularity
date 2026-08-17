@@ -767,12 +767,36 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 			}
 		} else if udpErr != nil && i.Log != nil {
 			// The run still succeeds without loss/jitter, so this failure is
-			// invisible everywhere else. The message distinguishes the three cases
-			// that actually happen: UDP blocked upstream ("no datagrams"), the
-			// server rejecting the UDP pass ("authorization failed"), and a busy
-			// server - which need different answers from support.
-			i.Log.Warn("iperf3 udp pass failed, loss and jitter unrecorded",
-				"err", i.withEnvHint(udpErr), "downstream", downstream, "rate_mbps", rate)
+			// invisible everywhere else. The message distinguishes the cases that
+			// actually happen: UDP blocked upstream ("no datagrams"), the server
+			// rejecting the UDP pass ("authorization failed"), and a busy server -
+			// which need different answers from support.
+			//
+			// "no datagrams" only catches a server that ANSWERS and reports zero
+			// packets - iperf3 has to finish and print its JSON to be counted that
+			// way. A firewall that DROPs rather than REJECTs (the default for ufw
+			// and most cloud security groups) sends the datagrams into silence, so
+			// iperf3 never returns, the per-run deadline fires, and the failure
+			// arrives here as a stall instead. That is why the stall is worth a
+			// hint of its own: on its own it reads like a busy server.
+			//
+			// What makes it diagnosable is the pair. TCP and UDP use the same host
+			// and port here, so TCP moving data while UDP stalls leaves almost
+			// nothing but a filter that treats the two protocols differently. Both
+			// figures are the run's own, measured moments earlier.
+			hint := ""
+			if errors.Is(udpErr, errStalled) && (res.DownloadMbps > 0 || res.UploadMbps > 0) {
+				hint = "TCP moved data on this host and port while the UDP pass stalled - " +
+					"the far end is most likely dropping UDP (open the same port for UDP, e.g. ufw allow 5201/udp)"
+			}
+			if hint != "" {
+				i.Log.Warn("iperf3 udp pass failed, loss and jitter unrecorded",
+					"err", i.withEnvHint(udpErr), "downstream", downstream, "rate_mbps", rate,
+					"likely_cause", hint)
+			} else {
+				i.Log.Warn("iperf3 udp pass failed, loss and jitter unrecorded",
+					"err", i.withEnvHint(udpErr), "downstream", downstream, "rate_mbps", rate)
+			}
 		}
 	}
 	// Anything spent beyond what got MEASURED - a retried direction's earlier
@@ -1291,9 +1315,16 @@ func iperfBindArgs(bind string) []string {
 // keeps its own error. The message deliberately avoids the transient-error keywords: the
 // stall already ate the full window, so a retry costs another one and rarely helps (same
 // policy as "no data transferred").
+//
+// errStalled carries that verdict for callers who can say something useful about
+// WHY it stalled. The wording is unchanged - the sentinel is the whole message
+// text, so "%w (killed after 8s)" still reads "transfer stalled (killed after
+// 8s)" - it is just matchable now instead of only printable.
+var errStalled = errors.New("transfer stalled")
+
 func stalledErr(err error, rctx, ctx context.Context, budget time.Duration) error {
 	if err != nil && errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-		return fmt.Errorf("transfer stalled (killed after %v)", budget)
+		return fmt.Errorf("%w (killed after %v)", errStalled, budget)
 	}
 	return err
 }

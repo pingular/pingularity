@@ -680,6 +680,17 @@ stream. Set Ookla's retries to `0` and that fallback cannot run, so on a link th
 slow the upload - and with it the whole run - fails. The error says so and names the
 setting.
 
+That UDP pass needs the iperf3 port open for **UDP as well as TCP** - the same
+port, both protocols (`ufw allow 5201/tcp` and `ufw allow 5201/udp`, or the
+equivalent security-group rules). Allowing only TCP is the usual reason a server
+reports throughput perfectly while loss and jitter stay blank forever: the
+control connection and both transfers are TCP and connect fine, and the UDP
+datagrams are dropped without a refusal, so the pass waits out its window and
+gives up. The daemon logs `iperf3 udp pass failed, loss and jitter unrecorded`
+each time, and when the run's TCP transfers succeeded it names the firewall as
+the likely cause. Nothing is retried later, so runs taken while the port was
+closed have no loss or jitter to recover.
+
 For iperf3, the separate UDP loss/jitter pass probes the same direction you
 test: downstream normally, upstream for an upload-only run - so a one-direction
 test on an asymmetric line reports loss for the direction you asked about. That
