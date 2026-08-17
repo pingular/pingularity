@@ -16,34 +16,74 @@ import (
 	"github.com/pingular/pingularity/internal/config"
 )
 
-// DNS-resolution-latency probe (see ResolveTime). Each call prepends a random label
-// to the base so the resolver can't serve a cache hit and must query upstream,
-// measuring the real resolution path. The base is an anycast-NS domain (low, constant
-// authoritative RTT), so the variation reflects the host's resolver, not distance.
+// DNS-resolution-latency probe (see ResolveTime). Each call prepends a fresh random
+// label to the base (see probeName), so no two probes ask the same name. The base is
+// an anycast-NS domain (low, constant authoritative RTT), so the variation reflects
+// the host's resolver, not distance.
 // Vars so tests can redirect them.
 var (
-	dnsProbeDomain  = "cloudflare.com"
-	dnsProbeTimeout = 3 * time.Second // a resolver slower than this counts as failing
+	dnsProbeDomain  = "cloudflare.com" // written unrooted; probeName adds the trailing dot
+	dnsProbeTimeout = 3 * time.Second  // a resolver slower than this counts as failing
 )
 
-// ResolveTime times one cache-busted DNS lookup. ok is true when the resolver
-// answered - including the expected NXDOMAIN for the random name (DNS is healthy,
-// just no such record) - and false only when resolution actually fails (timeout,
-// SERVFAIL, no resolver). On failure it also returns the underlying error so the
-// caller can classify/log WHY (via DialErrClass); err is nil whenever ok is true.
+// probeName builds one name for the DNS probe. Every call draws a fresh random
+// label, so no two probes ask the same name: a repeated name is one a resolver
+// can answer out of the entry it cached for the previous probe, which would time
+// a cache hit instead of a resolution.
+//
+// The trailing dot roots the name, and it is load-bearing. Go looks up a rooted
+// name once; an unrooted one it also re-asks with each entry of the host's search
+// list appended (GOROOT/src/net/dnsclient_unix.go, dnsConfig.nameList). So on a
+// host that has a search domain, dropping the dot buys a second lookup per probe:
+// four wire queries instead of two, since network "ip" asks A and AAAA for each.
+// Go walks that name list in order and stops at the first name that comes back
+// with addresses (the `len(addrs) > 0` break closing goLookupIPCNAMEOrder's loop,
+// same file) - so the walk continues past a name that draws NXDOMAIN, which is
+// what the random label is meant to draw and what ResolveTime counts as healthy
+// below. The doomed second lookup therefore falls inside the window ResolveTime
+// times. (A resolver that hijacks NXDOMAIN into an address answer, as ResolveTime
+// notes, ends the walk on the first name instead.) The second lookup also hands
+// the random probe label, search domain appended, to the recursive resolver the
+// host is configured to use. Whether that name travels any further depends on the
+// search domain being a delegated zone, which this code cannot know.
+//
+// TestResolveTimeLooksUpARootedName pins the dot on the name ResolveTime hands
+// the resolver, on any host; TestResolveTimeAsksOneNamePerProbe pins the wire
+// count, though only a host whose search list contributes a name can fail it;
+// TestResolveTimeNameIsFreshEachProbe pins the per-probe label. The A/AAAA pair
+// itself is inherent to LookupHost and stays.
+func probeName() string {
+	var b [6]byte
+	_, _ = crand.Read(b[:])
+	return "pp" + hex.EncodeToString(b[:]) + "." + dnsProbeDomain + "."
+}
+
+// lookupHost is the resolver call ResolveTime makes. It is a var, and a closure
+// rather than a method value, so it re-reads net.DefaultResolver on every call:
+// that keeps a test's swapped-in resolver effective, and lets a test read the
+// exact name string ResolveTime passes, which no wire capture can recover (Go
+// roots every name before it reaches the wire).
+var lookupHost = func(ctx context.Context, name string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, name)
+}
+
+// ResolveTime times one DNS lookup of a freshly randomized name (see probeName).
+// ok is true when the resolver answered - including the expected NXDOMAIN for the
+// random name (DNS is healthy, just no such record) - and false only when
+// resolution actually fails (timeout, SERVFAIL, no resolver). On failure it also
+// returns the underlying error so the caller can classify/log WHY (via
+// DialErrClass); err is nil whenever ok is true.
 func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 	rctx, cancel := context.WithTimeout(ctx, dnsProbeTimeout)
 	defer cancel()
-	var b [6]byte
-	_, _ = crand.Read(b[:]) // unique label defeats every cache on the path
-	name := "pp" + hex.EncodeToString(b[:]) + "." + dnsProbeDomain
+	name := probeName() // fresh and rooted; see probeName for why the dot matters
 	start := time.Now()
-	// DefaultResolver is the host's OS-configured resolver (/etc/resolv.conf or
-	// libc) - deliberately NOT the latency anchors and not a Pingularity setting, so
-	// this times the resolution path the machine actually uses. A resolver that
-	// hijacks NXDOMAIN (returns an A record for the random name) reads as a healthy
-	// answer in the err==nil branch below.
-	_, err := net.DefaultResolver.LookupHost(rctx, name)
+	// lookupHost calls DefaultResolver, the host's OS-configured resolver
+	// (/etc/resolv.conf or libc) - deliberately NOT the latency anchors and not a
+	// Pingularity setting, so this times the resolution path the machine actually
+	// uses. A resolver that hijacks NXDOMAIN (returns an A record for the random
+	// name) reads as a healthy answer in the err==nil branch below.
+	_, err := lookupHost(rctx, name)
 	d := time.Since(start)
 	if err == nil {
 		return d, true, nil

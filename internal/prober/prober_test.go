@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -210,20 +212,31 @@ func TestFamilyOffFnAllOffDialsNothing(t *testing.T) {
 
 // dnsStub runs a minimal in-process UDP DNS server. Every query gets a reply
 // carrying the same ID and question, no answer records, and the given RCODE;
-// respond=false swallows queries so the lookup can only time out.
-func dnsStub(t *testing.T, rcode byte, respond bool) string {
+// respond=false swallows queries so the lookup can only time out. The returned
+// queries func reports the question name of every query the server received, in
+// order, so a test can count the wire queries one probe actually costs.
+func dnsStub(t *testing.T, rcode byte, respond bool) (addr string, queries func() []string) {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
 	}
 	t.Cleanup(func() { pc.Close() })
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
 	go func() {
 		buf := make([]byte, 512)
 		for {
 			n, addr, err := pc.ReadFrom(buf)
 			if err != nil {
 				return // listener closed by Cleanup
+			}
+			if n >= 12 {
+				mu.Lock()
+				seen = append(seen, dnsQName(buf[:n]))
+				mu.Unlock()
 			}
 			if !respond || n < 12 {
 				continue
@@ -249,7 +262,32 @@ func dnsStub(t *testing.T, rcode byte, respond bool) string {
 			pc.WriteTo(resp, addr)
 		}
 	}()
-	return pc.LocalAddr().String()
+	return pc.LocalAddr().String(), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// dnsQName decodes the question name of a DNS query as dotted labels. On the
+// wire every name is rooted, so the trailing dot here says nothing about how the
+// caller spelled it; what distinguishes a rooted lookup is that the resolver
+// asks for ONE such name instead of also appending its search domain.
+func dnsQName(msg []byte) string {
+	var b strings.Builder
+	for i := 12; i < len(msg); {
+		l := int(msg[i])
+		if l == 0 {
+			return b.String()
+		}
+		if l > 63 || i+1+l > len(msg) {
+			break
+		}
+		b.Write(msg[i+1 : i+1+l])
+		b.WriteByte('.')
+		i += 1 + l
+	}
+	return "<malformed>"
 }
 
 // stubResolver points net.DefaultResolver (what ResolveTime deliberately uses)
@@ -270,17 +308,171 @@ func stubResolver(t *testing.T, addr string) {
 // The cache-busting random label never exists, so NXDOMAIN is the healthy
 // answer: the resolver responded and the resolution path works.
 func TestResolveTimeNXDOMAINIsHealthy(t *testing.T) {
-	stubResolver(t, dnsStub(t, 3, true)) // RCODE 3 = NXDOMAIN
+	addr, _ := dnsStub(t, 3, true) // RCODE 3 = NXDOMAIN
+	stubResolver(t, addr)
 	_, ok, err := ResolveTime(context.Background())
 	if !ok || err != nil {
 		t.Fatalf("NXDOMAIN: ok=%v err=%v, want ok=true err=nil", ok, err)
 	}
 }
 
+// The trailing dot on the probe name is what keeps one probe to one lookup, and
+// it has to hold on every host, which is more than the wire-count test below can
+// check. Where the host's search list contributes no name - no resolv.conf
+// search line and a hostname with no domain part for Go to fall back on
+// (dnsDefaultSearch, GOROOT/src/net/dnsconfig_unix.go) - nameList returns a
+// single name for a relative name too, so that test counts 2 queries whether the
+// dot is there or not. Measured here: with the dot deleted from probeName and
+// the probe domain stretched so the search suffix no longer fits nameList's
+// 254-byte cap, the wire-count test passed.
+//
+// This test reads probeName's own string. TestResolveTimeLooksUpARootedName
+// reads the name ResolveTime actually hands the resolver, which is the property
+// that matters and the one a rewrite that stops calling probeName would break.
+func TestProbeNameIsRooted(t *testing.T) {
+	name := probeName()
+	if !strings.HasSuffix(name, ".") {
+		t.Fatalf("probe name %q is not rooted: a resolver takes a relative name as a hint, re-asks it with the host's search domain appended, and so doubles both the probe's query count and the lookup ResolveTime is timing", name)
+	}
+	base := "." + dnsProbeDomain + "."
+	label, ok := strings.CutSuffix(name, base)
+	if !ok {
+		t.Fatalf("probe name %q does not end in %q, so it is not a name under the probe domain at all", name, base)
+	}
+	if !strings.HasPrefix(label, "pp") || strings.Contains(label, ".") {
+		t.Fatalf("probe name %q: want a single pp-prefixed random label in front of %q, got %q", name, dnsProbeDomain, label)
+	}
+}
+
+// One probe must put exactly one question name on the wire. The A/AAAA pair is
+// unavoidable for network "ip" (LookupHost); a second pair for a search-domain
+// spelling of the same name is not. What that costs at the shipped defaults: the
+// DNS probe runs at most once per probe round (the dnsBusy CompareAndSwap in
+// Monitor.round, internal/monitor/monitor.go, launches nothing while the previous
+// lookup is still in flight), and the default probe interval is 5s (shippedDefaults'
+// def.Latency, internal/settings/settings.go), so up to 86400/5 = 17,280 probes a
+// day. Rooted, that ceiling is 34,560 wire queries; unrooted on a host with a
+// search domain it is 69,120, and the extra lookup is doomed.
+//
+// Only a host whose search list contributes a name can fail this test; see
+// TestResolveTimeLooksUpARootedName for the guard that holds on any host.
+func TestResolveTimeAsksOneNamePerProbe(t *testing.T) {
+	addr, queries := dnsStub(t, 3, true) // RCODE 3 = NXDOMAIN, the healthy answer
+	stubResolver(t, addr)
+
+	if _, ok, err := ResolveTime(context.Background()); !ok || err != nil {
+		t.Fatalf("probe: ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+
+	qs := queries()
+	if len(qs) != 2 {
+		t.Errorf("probe sent %d wire queries, want 2 (the A/AAAA pair): %q", len(qs), qs)
+	}
+	want := "." + dnsProbeDomain + "."
+	for _, q := range qs {
+		if !strings.HasSuffix(q, want) {
+			t.Errorf("probe asked %q, which is not a random label under %q: the name went out relative and the resolver appended its search domain (all queries: %q)", q, want, qs)
+		}
+	}
+}
+
+// captureLookupNames records the exact name string each ResolveTime call hands
+// the resolver, in order, for the test's duration. The wrapper still performs
+// the real lookup, so the probe runs end to end against whatever resolver
+// stubResolver installed - the capture observes the path, it does not replace it.
+func captureLookupNames(t *testing.T) func() []string {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		sent []string
+	)
+	prev := lookupHost
+	lookupHost = func(ctx context.Context, name string) ([]string, error) {
+		mu.Lock()
+		sent = append(sent, name)
+		mu.Unlock()
+		return prev(ctx, name)
+	}
+	t.Cleanup(func() { lookupHost = prev })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), sent...)
+	}
+}
+
+// The dot has to survive on the name ResolveTime hands the resolver, which is a
+// stricter claim than probeName returning a rooted string: a ResolveTime that
+// builds its own name inline leaves probeName untouched, so TestProbeNameIsRooted
+// keeps passing. The wire-count test cannot see that either on a host with an
+// empty search list, because Go roots every name before it reaches the wire and a
+// relative name then produces the same single query (dnsConfig.nameList). So read
+// the argument itself: that depends on no resolver configuration at all. Measured
+// here, with the probe domain stretched past nameList's 254-byte cap to emulate a
+// host whose search list contributes nothing: a ResolveTime that built the name
+// inline and unrooted, leaving probeName's dot alone, left TestProbeNameIsRooted
+// and the wire-count test both passing, and only this test failed.
+//
+// The last check ties the captured argument to the wire, so a seam that reported
+// one name while a different one went out would not pass either.
+func TestResolveTimeLooksUpARootedName(t *testing.T) {
+	addr, queries := dnsStub(t, 3, true) // RCODE 3 = NXDOMAIN, the healthy answer
+	stubResolver(t, addr)
+	sent := captureLookupNames(t)
+
+	if _, ok, err := ResolveTime(context.Background()); !ok || err != nil {
+		t.Fatalf("probe: ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+
+	names := sent()
+	if len(names) != 1 {
+		t.Fatalf("one probe made %d resolver lookups %q, want exactly 1: ResolveTime no longer resolves through lookupHost, so nothing here can see the name it sends", len(names), names)
+	}
+	name := names[0]
+	if !strings.HasSuffix(name, ".") {
+		t.Fatalf("ResolveTime looked up %q, which is not rooted: the resolver takes a relative name as a hint, re-asks it with the host's search domain appended, and so doubles both the probe's query count and the lookup ResolveTime is timing", name)
+	}
+	qs := queries()
+	if len(qs) == 0 {
+		t.Fatalf("the stub resolver saw no query, so %q never reached the wire and this test proved nothing", name)
+	}
+	for _, q := range qs {
+		if q != name {
+			t.Errorf("ResolveTime handed the resolver %q but the wire carried %q, so the captured name is not the one that goes out (all queries: %q)", name, q, qs)
+		}
+	}
+}
+
+// A repeated name is one a resolver can answer out of the entry it cached for the
+// previous probe, so a probe that reused a name would time a cache hit rather than
+// a resolution. Pinned on the name ResolveTime actually sends, for the same reason
+// as the test above: a rewrite that stops calling probeName takes the fresh label
+// with it while probeName itself still reads correctly.
+func TestResolveTimeNameIsFreshEachProbe(t *testing.T) {
+	addr, _ := dnsStub(t, 3, true) // RCODE 3 = NXDOMAIN, the healthy answer
+	stubResolver(t, addr)
+	sent := captureLookupNames(t)
+
+	for i := range 2 {
+		if _, ok, err := ResolveTime(context.Background()); !ok || err != nil {
+			t.Fatalf("probe %d: ok=%v err=%v, want ok=true err=nil", i, ok, err)
+		}
+	}
+
+	names := sent()
+	if len(names) != 2 {
+		t.Fatalf("two probes made %d resolver lookups %q, want one each", len(names), names)
+	}
+	if names[0] == names[1] {
+		t.Fatalf("two probes both asked %q: the label is not redrawn per probe, so a resolver holding the first answer can serve the second from cache instead of resolving it", names[0])
+	}
+}
+
 // SERVFAIL means the resolver could not resolve: unhealthy, with the error
 // returned so the caller can classify why.
 func TestResolveTimeSERVFAILIsUnhealthy(t *testing.T) {
-	stubResolver(t, dnsStub(t, 2, true)) // RCODE 2 = SERVFAIL
+	addr, _ := dnsStub(t, 2, true) // RCODE 2 = SERVFAIL
+	stubResolver(t, addr)
 	_, ok, err := ResolveTime(context.Background())
 	if ok || err == nil {
 		t.Fatalf("SERVFAIL: ok=%v err=%v, want ok=false with an error", ok, err)
@@ -289,7 +481,8 @@ func TestResolveTimeSERVFAILIsUnhealthy(t *testing.T) {
 
 // A resolver that never answers must fail within the probe timeout.
 func TestResolveTimeTimeoutIsUnhealthy(t *testing.T) {
-	stubResolver(t, dnsStub(t, 0, false)) // queries are swallowed
+	addr, _ := dnsStub(t, 0, false) // queries are swallowed
+	stubResolver(t, addr)
 	oldTimeout := dnsProbeTimeout
 	dnsProbeTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { dnsProbeTimeout = oldTimeout })
