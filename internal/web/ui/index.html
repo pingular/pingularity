@@ -429,7 +429,13 @@
      column AND so do the pills - which a flex row could not do, because the pill
      followed the label and the labels are different lengths. */
   .thr-toggles .viz-toggle{margin:0;display:grid;grid-template-columns:1fr auto;width:auto;}
-  .sgroup h3{margin:16px 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);}
+  /* 4px below, not 8: these headings sit in a grid whose .tab-uniform row-gap
+     adds another 6px, so 4+6 lands the first field 10px under the heading -
+     the same drop .data-card-h gives "Stored data" and "Access & authentication",
+     which are plain block flow and take their 10px from margin alone. Only
+     Thresholds and Notifications use this rule; the other six .sgroup blocks
+     carry no heading. */
+  .sgroup h3{margin:16px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);}
   .srow{display:grid;grid-template-columns:1fr 150px;align-items:center;gap:12px;min-height:33px;font-size:13px;}
   .lbl{display:flex;align-items:center;gap:7px;color:var(--fg);}
   .ctl{display:grid;grid-template-columns:1fr 30px;align-items:center;column-gap:6px;width:150px;}
@@ -1036,7 +1042,12 @@
   .targets::-webkit-scrollbar-thumb{background:var(--line2);border-radius:3px;}
   .targets::-webkit-scrollbar-track{background:transparent;}
   /* Configurable schedule: per-feature blocks of {days, time} window rows. */
+  /* 8px separates the two feature blocks (latency schedule, speedtest schedule)
+     from each other - but on the FIRST one it is 8px of dead air at the top of
+     the tab, where every other compact tab starts its first .srow flush against
+     the pane. Only the gap between them is wanted. */
   .sched-feat{grid-column:1/-1;margin-top:8px;}
+  .sched-feat:first-child{margin-top:0;}
   .sched-wins{display:flex;flex-direction:column;margin:6px 0 6px;}
   .sched-wins.disabled,.add-win.disabled{opacity:.45;pointer-events:none;}
   .sched-win{display:flex;flex-wrap:wrap;align-items:center;gap:7px 16px;padding:9px 0;border-top:1px solid var(--line);}
@@ -1312,6 +1323,9 @@
     border-radius:var(--radius);padding:26px 24px;box-shadow:0 24px 60px rgba(0,0,0,.55);}
   .login-box h2{margin:0;font-family:'Quicksand',system-ui,sans-serif;font-size:22px;font-weight:600;}
   .login-box p{margin:-6px 0 4px;font-size:13px;}
+  /* The overlay is a column, so the bubble needs an inline row of its own to sit
+     beside the text rather than under it. */
+  .login-sub{display:flex;align-items:center;gap:7px;}
   .login-box input{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;
     padding:9px 11px;font:inherit;}
   .login-box input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
@@ -1320,7 +1334,12 @@
   /* Access tab: toggles on the left column, credential fields on the right
      (each column is its own stack; the grid holds the two columns). Capped so
      the controls don't drift half a pane away from their labels. */
-  .access-note{font-size:12.5px;line-height:1.5;margin:2px 0 18px;}
+  /* Sits at the FOOT of the tab now, so the margin flipped: 18px of air above
+     it (the same drop .access-urls-row takes) and none below, since nothing
+     follows. The warn bubble between it and the address row collapses to zero
+     height while hidden, which is its normal state, so this usually reads as
+     18px under the addresses. */
+  .access-note{font-size:12.5px;line-height:1.5;margin:18px 0 0;}
   .access-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:24px 48px;align-items:start;} /* right column runs to the card edge so the credential inputs are full-width */
   @media(max-width:600px){.access-grid{grid-template-columns:1fr;}}
   /* Touch devices: raise every interactive control to a >=44px hit target. Scoped to
@@ -1365,7 +1384,11 @@
        >600px so the max-width:600px insets don't apply there - pad the page in on touch. */
     body{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right);}
   }
-  .access-col{display:flex;flex-direction:column;gap:14px;}
+  /* 6px, not 14: these hold the same .srow rows as the compact-field tabs, and
+     .access-col is a flex column that never inherits .tab-uniform's row-gap, so
+     the number has to be repeated here or Access sits at more than twice the
+     spacing of Latency for identical markup. */
+  .access-col{display:flex;flex-direction:column;gap:6px;}
   /* Credential fields mirror .srow exactly (label + a 150px control rail), so the
      right column's rows line up 1:1 with the toggles on the left. Both columns'
      rows share one min-height: pinning the ROW (not matching the controls) keeps
@@ -1391,9 +1414,23 @@
      the one on the default route leads, the rest (docker bridges, VPN taps, VM
      interfaces) follow, tagged with their interface so they aren't mistaken for
      the address worth sharing. */
-  .access-urls{margin-top:16px;}
+  .access-urls{margin-top:0;}
+  /* Log out rides the address line. flex-end so it aligns with the .url-a pills
+     (the last row of .access-urls), not with the caption above them; min-width:0
+     lets the address list wrap on narrow screens instead of pushing the button
+     off. When Log out is hidden (no active login) this collapses to the list.
+     18px and the 9px list gap below are taken from .targets, the anchor pill row
+     under the latency chart - the same shape of thing, so it should sit the same
+     way. Carried by the row rather than .access-urls so the wrapper owns its own
+     spacing. */
+  .access-urls-row{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-top:18px;}
+  .access-urls-row .access-urls{flex:1 1 auto;min-width:0;}
+  /* Same 30px box as .url-a and .url-copy so the three read as one row. Padding
+     and line-height replace .btn's vertical padding, which would otherwise make
+     it taller than the pills it sits beside. */
+  .url-logout{flex:none;height:30px;padding:0 12px;line-height:28px;border-radius:8px;}
   .url-head{display:flex;align-items:center;gap:7px;font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
-  .url-list{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;}
+  .url-list{display:flex;align-items:center;flex-wrap:wrap;gap:9px;}
   .url-row{display:flex;align-items:center;gap:6px;}
   .url-a{display:inline-flex;align-items:center;height:30px;padding:0 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg2);
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--accent);text-decoration:none;overflow-wrap:anywhere;}
@@ -1403,10 +1440,7 @@
     border:1px solid var(--line2);border-radius:8px;background:var(--bg2);color:var(--muted);font-size:12px;cursor:pointer;transition:color .12s,border-color .12s;}
   .url-copy:hover{border-color:var(--accent);color:var(--accent);}
   .url-copy.done{border-color:var(--up);color:var(--up);}
-  .url-sep{color:var(--muted);}
   .url-if{font-size:11.5px;color:var(--muted);}
-  .access-foot{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;border-top:1px solid var(--line);margin-top:18px;padding-top:14px;}
-  .access-foot .muted{font-size:11.5px;}
   /* FLAT-CORNERS: in Flat mode (default, no .round) square every rounded corner
      across the whole UI - buttons, toggle pills, fields, selects, dropdowns,
      tooltips, chips, badges, swatches, status marks - to a hair of softening
@@ -1960,7 +1994,6 @@
       <div class="tabpane tab-uniform" data-tab="access">
       <section class="data-card">
         <div class="data-card-h"><h3>Access &amp; authentication</h3></div>
-        <p class="muted access-note">Restrict who can reach the dashboard, API, and metrics. <b>Pingularity serves plain HTTP</b> - on untrusted networks, put a TLS reverse proxy in front. <span class="info" tabindex="0" data-tip="A login keeps people out, but over plain HTTP the password crosses the network unencrypted, so anyone snooping could read it. Put a TLS reverse proxy in front (caddy, nginx, cloudflared) to encrypt it.">i</span></p>
         <div class="access-grid">
           <div class="access-col">
             <label class="srow"><span class="lbl">Network access
@@ -1989,16 +2022,22 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
             <div class="afield" id="curPassField" style="display:none">
               <span class="lbl">Current password
                 <span class="info" tabindex="0" data-tip="While a login is active, changing ANY access setting requires re-entering the current password - so a stolen or walk-up session cannot quietly take over the account.">i</span></span>
-              <input type="password" id="authCurPass" autocomplete="current-password" placeholder="Required to change access" maxlength="72">
+              <input type="password" id="authCurPass" autocomplete="current-password" placeholder="Required to change" maxlength="72">
             </div>
           </div>
         </div>
-        <div class="access-urls" id="accessUrls"></div>
-        <div class="warn-bubble" id="localOnlyWarn"><span class="wi">⚠&#xFE0E;</span><span>Turning off <b>Network access</b> from another device will <b>cut your own access</b> once you Save - do it from the machine running Pingularity.</span></div>
-        <div class="access-foot" id="accessFoot">
-          <button class="btn ghost" id="logoutBtn" type="button">Log out</button>
-          <span class="muted" id="resetHint">Forgot the password? Run <span class="mono">pingularity reset-auth</span> on the host to clear it and disable auth.</span>
+        <!-- Log out sits BESIDE the address list, not under it: it is an action on
+             this session, and the addresses are where that session is reachable
+             from. Kept OUTSIDE #accessUrls because renderAccessUrls replaces that
+             element's innerHTML on every toggle, which would take the button and
+             its listener with it. align-items:flex-end lands it on the pill row
+             rather than the "Reachable at" caption above them. -->
+        <div class="access-urls-row">
+          <div class="access-urls" id="accessUrls"></div>
+          <button class="btn ghost url-logout" id="logoutBtn" type="button">Log out</button>
         </div>
+        <div class="warn-bubble" id="localOnlyWarn"><span class="wi">⚠&#xFE0E;</span><span>Turning off <b>Network access</b> from another device will <b>cut your own access</b> once you Save - do it from the machine running Pingularity.</span></div>
+        <p class="muted access-note">Restrict who can reach the dashboard, API, and metrics. <b>Pingularity serves plain HTTP</b> - on untrusted networks, put a TLS reverse proxy in front. <span class="info" tabindex="0" data-tip="A login keeps people out, but over plain HTTP the password crosses the network unencrypted, so anyone snooping could read it. Put a TLS reverse proxy in front (caddy, nginx, cloudflared) to encrypt it.">i</span></p>
       </section>
       </div><!-- /access pane -->
       <div class="tabpane" data-tab="themes">
@@ -2181,7 +2220,11 @@ Applies live and persists.">i</span></span>
 <div class="login-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-label="Sign in" hidden>
   <form class="login-box" id="loginForm">
     <h2>Pingularity</h2>
-    <p class="muted">Sign in to continue</p>
+    <!-- The recovery route has to be reachable from HERE. The same hint exists in
+         the Access tab, which is behind this overlay - so the one person who
+         needs it, someone locked out, is the one person who cannot read it. -->
+    <p class="muted login-sub">Sign in to continue
+      <span class="info" tabindex="0" id="loginResetInfo" data-tip="Locked out? Run pingularity reset-auth on the host to clear it and disable auth - this page then lets you straight in, and you can set a new password under Settings &gt; Access.">i</span></p>
     <input type="text" id="loginUser" autocomplete="username" placeholder="Username" value="admin" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next">
     <input type="password" id="loginPass" autocomplete="current-password" placeholder="Password" autofocus>
     <button class="btn" type="submit">Sign in</button>
@@ -7901,12 +7944,12 @@ function resetAuthText(s, containerized){
 // Working from the stashed copy, what is shown depends on the flag alone and
 // never on what the repaint before it left behind.
 function updateResetAuthHint(){
-  const hint=$('resetHint'), info=$('pwInfo');
-  if(hint){
-    if(hint.dataset.native===undefined) hint.dataset.native=hint.innerHTML;
-    hint.innerHTML=resetAuthText(hint.dataset.native, iperfInContainer);
-  }
-  if(info){
+  // Both surviving places are info bubbles: the Password field's, and the login
+  // overlay's. The overlay one matters most - it is the only copy a locked-out
+  // operator can reach, since the Access tab sits behind the overlay - and it is
+  // exactly the operator most likely to be in a container.
+  [$('pwInfo'), $('loginResetInfo')].forEach(info=>{
+    if(!info) return;
     if(info.dataset.native===undefined) info.dataset.native=info.dataset.tip;
     const tip=resetAuthText(info.dataset.native, iperfInContainer);
     info.dataset.tip=tip;
@@ -7914,7 +7957,7 @@ function updateResetAuthHint(){
     // skips bubbles that already carry one, so the accessible name has to be
     // rewritten here too or a screen reader keeps reading "on the host".
     info.setAttribute('aria-label', tip);
-  }
+  });
 }
 // loadAccess populates the Access tab and shows the login overlay if required.
 async function loadAccess(){
@@ -7936,10 +7979,6 @@ async function loadAccess(){
   // Step-up: with auth ACTIVE the server refuses access changes without the
   // current password, so surface the field exactly when it is required.
   $('curPassField').style.display = a.auth_active ? '' : 'none';
-  // The recovery hint only matters once a password exists; hide the whole
-  // footer (rule included) when neither it nor Log out has anything to say.
-  $('resetHint').style.display = a.has_password ? '' : 'none';
-  $('accessFoot').style.display = (a.auth_active || a.has_password) ? '' : 'none';
   updateAuthFields();
   // auth_active (not the intent flag) gates the overlay - an enabled-but-no-
   // password state isn't enforced, so it must not lock anyone out.
@@ -8002,7 +8041,7 @@ function renderAccessUrls(){
   const tip = (on && accessLanUrls.length)
     ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers. The first address is the one on your network - use it from another device. Others belong to virtual interfaces this host holds (docker bridges, VPNs, VMs) and only work from those. A LAN address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation.">i</span>' : '';
   $('accessUrls').innerHTML = `<div class="url-head">Reachable at ${tip}</div>`
-    + `<div class="url-list">${rows.map(row).join('<span class="url-sep">-</span>')}`
+    + `<div class="url-list">${rows.map(row).join('')}`
     + (on ? '' : '<span class="url-if">this machine only</span>') + '</div>';
   labelInfoBubbles(); // the freshly-rendered info bubble gets the shared role/name
 }

@@ -3724,9 +3724,9 @@ function mustExtract(re, what) {
     'password-reset tests below are no longer reading the shipped markup');
   return m[1];
 }
-let pageResetHint = '', pagePwTip = '', resetMarkupErr = null;
+let pageLoginTip = '', pagePwTip = '', resetMarkupErr = null;
 try {
-  pageResetHint = mustExtract(/id="resetHint"[^>]*>([\s\S]*?)<\/span>\s*<\/div>/, 'the reset-hint element');
+  pageLoginTip = mustExtract(/id="loginResetInfo"[^>]*data-tip="([^"]*reset-auth[^"]*)"/, 'the login-overlay reset tooltip');
   pagePwTip = mustExtract(/data-tip="([^"]*Forgot it\? Run pingularity reset-auth[^"]*)"/, 'the password tooltip');
 } catch (e) {
   resetMarkupErr = e;
@@ -3738,7 +3738,7 @@ test('the password-reset markup these tests read is still present', () => {
 
 test('the password-reset instructions send a container operator into the container, not to the host', () => {
   const resetAuthText = new Function(extract('function resetAuthText') + '\nreturn resetAuthText;')();
-  for (const [what, s] of [['the footer hint', pageResetHint], ['the password tooltip', pagePwTip]]) {
+  for (const [what, s] of [['the login-overlay tooltip', pageLoginTip], ['the password tooltip', pagePwTip]]) {
     assert.match(s, /pingularity reset-auth/, what + ' must still name the recovery command');
     assert.equal(resetAuthText(s, false), s, what + ' must keep its wording word-for-word on a native host');
     assert.equal(resetAuthText(s, undefined), s,
@@ -3757,8 +3757,8 @@ test('the password-reset instructions send a container operator into the contain
 // carrying the real shipped strings.
 function resetHintHarness() {
   const els = {
-    resetHint: { innerHTML: pageResetHint, dataset: {} },
     pwInfo: { dataset: { tip: pagePwTip }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    loginResetInfo: { dataset: { tip: pageLoginTip }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
   };
   const src = extract('function resetAuthText') + '\n' + extract('function updateResetAuthHint');
   const repaint = new Function('$',
@@ -3769,12 +3769,12 @@ function resetHintHarness() {
 test('both password-reset instructions turn container-aware together, screen readers included', () => {
   const native = resetHintHarness();
   native.repaint(false);
-  assert.equal(native.els.resetHint.innerHTML, pageResetHint, 'a native host must see today’s footer hint untouched');
+  assert.equal(native.els.loginResetInfo.dataset.tip, pageLoginTip, 'a native host must see today’s login tooltip untouched');
   assert.equal(native.els.pwInfo.dataset.tip, pagePwTip, 'a native host must see today’s tooltip untouched');
 
   const h = resetHintHarness();
   h.repaint(true);
-  assert.match(h.els.resetHint.innerHTML, /one-off container sharing the volume/, 'the visible footer hint stayed host-only in a container');
+  assert.match(h.els.loginResetInfo.dataset.tip, /one-off container sharing the volume/, 'the login-overlay tooltip stayed host-only in a container - the one copy a locked-out operator can reach');
   assert.match(h.els.pwInfo.dataset.tip, /one-off container sharing the volume/, 'the password tooltip stayed host-only in a container');
   // labelInfoBubbles copies data-tip into aria-label ONCE at startup and skips
   // bubbles that already have one, so without rewriting the label here a screen
@@ -3792,8 +3792,8 @@ test('both password-reset instructions turn container-aware together, screen rea
   // return word-for-word. (Repainting container twice proves nothing here - the
   // replace simply finds nothing the second time, cache or no cache.)
   h.repaint(false);
-  assert.equal(h.els.resetHint.innerHTML, pageResetHint,
-    'the footer hint would not paint back to the shipped wording - the repaint is rewriting its own output, not the page’s sentence');
+  assert.equal(h.els.loginResetInfo.dataset.tip, pageLoginTip,
+    'the login tooltip would not paint back to the shipped wording - the repaint is rewriting its own output, not the page’s sentence');
   assert.equal(h.els.pwInfo.dataset.tip, pagePwTip,
     'the tooltip would not paint back to the shipped wording - the repaint is rewriting its own output, not the page’s sentence');
 
