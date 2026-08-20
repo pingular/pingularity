@@ -57,6 +57,21 @@ jobs:
         # access they were written to catch when the race detector is on.
         run: go test ./... -count=1 -race
 
+      - name: test (file-backed store)
+        # The ordinary run's ":memory:" stores pin the SQLite pool to ONE
+        # connection, which makes every multi-connection WAL failure mode
+        # structurally invisible - the snapshot-upgrade class busy_timeout
+        # cannot absorb (SQLITE_BUSY_SNAPSHOT) shipped a measurement-loss bug
+        # past this entire matrix exactly that way. This leg reruns the
+        # database-heavy packages against real files and the production
+        # four-connection pool (see PINGULARITY_TEST_DB_DIR in store.go).
+        # speedtest is excluded deliberately: its wall clock is capture
+        # windows, not database work, and its file-backed coverage rides its
+        # own concurrency hammer test.
+        env:
+          PINGULARITY_TEST_DB_DIR: ${{ runner.temp }}
+        run: go test ./internal/store/ ./internal/settings/ . -count=1
+
       - name: ui test
         run: node --test internal/web/ui/*.test.mjs
 
@@ -121,7 +136,7 @@ jobs:
       - name: vet
         run: go vet ./...
 
-  # Native run: macOS + Windows runners EXECUTE the OS-tagged tests (which xbuild
+  # Native run: macOS, Windows and arm64-Linux runners EXECUTE the OS-tagged tests (which xbuild
   # only cross-compiles - trace_darwin/windows, resolver, netstat, disk_free, the
   # Windows DACL), run the frontend tests, and smoke-boot the binary. The two
   # privileged paths - raw-socket traceroute and service install - are exercised
@@ -131,7 +146,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # ubuntu-24.04-arm is the closest CI gets to the Raspberry Pi class
+        # this daemon most often runs on: before it, linux/arm64 was BUILT here
+        # but never EXECUTED anywhere in the pipeline.
+        os: [macos-latest, windows-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -168,6 +186,49 @@ jobs:
 
   # Validate the release config so a broken .goreleaser.yaml is caught on a PR
   # instead of at tag-push time (when it would abort a release mid-flight). Pinned
+  # Browser smoke: ui.test.mjs proves the page's FUNCTIONS; nothing proved the
+  # page PAINTS. A real Chromium loads the dashboard from a live daemon and
+  # asserts the floor - panels and chart render, zero console errors, zero
+  # failed requests. Coarse anchors only; fine-grained selectors rot into
+  # flakes. release.yml gates on this via its `ci` job like everything here.
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: install playwright chromium
+        run: |
+          npm install --no-save playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: boot the daemon and drive the browser
+        run: |
+          go build -o smoke_bin .
+          ./smoke_bin run -listen 127.0.0.1:9109 -db "$RUNNER_TEMP/browser-smoke.db" &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9109/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          [ -n "$ok" ] || { echo "daemon did not come up"; exit 1; }
+          node internal/web/ui/browser_smoke.mjs 9109
+          rc=$?
+          kill "$pid" 2>/dev/null || true
+          exit $rc
+
   # to the exact goreleaser version release.yml publishes with, so what CI checks is
   # what the release runs.
   goreleaser-check:
@@ -184,6 +245,145 @@ jobs:
         with:
           version: 'v2.17.0'
           args: check
+
+  # Artifact smoke: the one distribution class nothing else executes. The native
+  # jobs test SOURCE builds and the docker job compiles its own binary - the
+  # goreleaser artifacts users actually download (release ldflags, -s -w, the
+  # stamped version) were never run before publish. This builds the snapshot
+  # artifacts with the same pinned goreleaser the release uses, asserts the
+  # version stamp landed, and boots the Linux binary until /healthz answers.
+  # release.yml gates on this via its `ci` job, like every job in this file.
+  artifact-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: build snapshot artifacts (binaries, archives, deb/rpm)
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: 'v2.17.0'
+          # The docker pipeline has its own dedicated gate (the `docker` job);
+          # everything publish-shaped is skipped, everything package-shaped is
+          # built - the deb/rpm below are installed for real further down.
+          args: release --snapshot --clean --skip=docker,publish,announce,homebrew,winget,sign,sbom
+
+      - name: smoke the Linux artifact (version stamp + boot)
+        run: |
+          bin=$(echo dist/pingularity_linux_amd64*/pingularity)
+          v=$("$bin" version)
+          echo "artifact reports: $v"
+          # An unstamped artifact reports the source default; the ldflags path
+          # is exactly what source-built test binaries never exercise.
+          case "$v" in
+            *SNAPSHOT*) ;;
+            *) echo "version stamp missing - ldflags did not apply"; exit 1;;
+          esac
+          "$bin" run -listen 127.0.0.1:9100 -db "$RUNNER_TEMP/artifact-smoke.db" &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9100/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          [ -n "$ok" ] || { echo "the shipped-shape binary did not serve /healthz within 30s"; exit 1; }
+          echo "artifact smoke OK: stamped, booted, healthy"
+
+      - name: install the deb and run the service lifecycle
+        # The packages were built on every push and installed by no one until a
+        # user did it. This does what a Debian user does: install (postinstall
+        # creates the service account and auto-starts the unit), verify the
+        # daemon answers AND runs de-rooted as the dedicated account with only
+        # CAP_NET_RAW, stop it, remove the package (preremove stops/disables).
+        run: |
+          sudo dpkg -i dist/pingularity_*_linux_amd64.deb
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          [ -n "$ok" ] || { echo "packaged service did not serve /healthz"; sudo systemctl status pingularity || true; sudo journalctl -u pingularity --no-pager | tail -30 || true; exit 1; }
+          svcuser=$(ps -o user= -p "$(systemctl show -p MainPID --value pingularity)")
+          [ "$svcuser" = "pingularity" ] || { echo "service runs as '$svcuser', want the dedicated 'pingularity' account"; exit 1; }
+          sudo systemctl stop pingularity
+          sudo dpkg -r pingularity
+          systemctl is-active pingularity >/dev/null 2>&1 && { echo "service still active after package removal"; exit 1; }
+          echo "deb lifecycle OK: installed, de-rooted, healthy, removed cleanly"
+
+      - name: install the rpm in a Rocky Linux container
+        # No systemd in the container - the scriptlets are written to degrade
+        # gracefully there (verified in packaging/postinstall.sh) - so this leg
+        # asserts the rpm installs, the account is created, and the binary runs.
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" rockylinux:9 bash -ec '
+            rpm -i /dist/pingularity_*_linux_amd64.rpm
+            getent passwd pingularity >/dev/null
+            pingularity version
+          '
+          echo "rpm install OK"
+
+  # Downgrade gate: the previous RELEASED binary must open a database created by
+  # this commit's schema. Migration tests synthesize old schemas in-process; this
+  # is the other direction with the real prior artifact - the safety net for a
+  # user who upgrades, hits trouble, and steps back. Rehearsed against v0.70.1:
+  # healthz answers and the log stays clean.
+  downgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: create a current-schema database
+        run: |
+          go build -o new_pingularity .
+          ./new_pingularity run -listen 127.0.0.1:9107 -db "$RUNNER_TEMP/downgrade.db" &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9107/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          [ -n "$ok" ] || { echo "current build failed to create its own database"; exit 1; }
+
+      - name: previous release opens it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release download --pattern '*linux_amd64.tar.gz' -D prev; then
+            echo "no prior release to test against - skipping"
+            exit 0
+          fi
+          tar xzf prev/*.tar.gz -C prev
+          ./prev/pingularity version
+          ./prev/pingularity run -listen 127.0.0.1:9108 -db "$RUNNER_TEMP/downgrade.db" > old.log 2>&1 &
+          pid=$!
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9108/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          [ -n "$ok" ] || { echo "the PREVIOUS release cannot open a database this commit creates - a user who downgrades is stranded"; tail -30 old.log; exit 1; }
+          if grep -ciE 'panic' old.log >/dev/null 2>&1 && [ "$(grep -ciE 'panic' old.log)" -gt 0 ]; then
+            echo "previous release panicked on the new schema:"; tail -30 old.log; exit 1
+          fi
+          echo "downgrade OK: previous release serves healthz on the new schema"
 
   # Image gate: builds BOTH Dockerfiles from the exact context layout goreleaser
   # stages (linux/<arch>/pingularity, COPY'd via $TARGETPLATFORM) and proves the

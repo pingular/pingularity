@@ -336,6 +336,27 @@ func looseDataDirWarning(dir string) string {
 // openAtClock is the full seam: the judging clock AND the wall/monotonic
 // reading the step detector baselines on, as one pair.
 func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
+	// PINGULARITY_TEST_DB_DIR redirects a ":memory:" open to a unique file
+	// under the named directory - CI's file-backed matrix leg, and nothing
+	// else. The in-memory pool is pinned to ONE connection (see Open below),
+	// which makes every multi-connection failure mode structurally invisible
+	// to the ordinary test run: the WAL snapshot-upgrade class busy_timeout
+	// cannot absorb (SQLITE_BUSY_SNAPSHOT) shipped a measurement-loss bug past
+	// this entire suite exactly that way, and had broken settings saves once
+	// before. With the variable set, the SAME tests run against the
+	// four-connection file-backed pool the daemon actually uses in production.
+	// Production is unaffected: real deployments never pass ":memory:", and
+	// the variable does nothing for a file path.
+	if path == ":memory:" {
+		if dir := os.Getenv("PINGULARITY_TEST_DB_DIR"); dir != "" {
+			f, err := os.CreateTemp(dir, "pingularity-testdb-*.db")
+			if err != nil {
+				return nil, fmt.Errorf("test db dir: %w", err)
+			}
+			path = f.Name()
+			_ = f.Close()
+		}
+	}
 	// Create the parent dir for file-backed databases (skips ":memory:" and bare
 	// filenames, whose dir is "."). 0o700 because the DB holds secrets at rest
 	// (bcrypt auth hash, webhook URLs) - not readable by other local users.

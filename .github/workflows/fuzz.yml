@@ -1,0 +1,54 @@
+name: fuzz
+
+# Scheduled fuzz time for every parser that eats input this daemon does not
+# control. The targets have always existed as seed-corpus unit tests (netinfo's
+# RDNS/ASN parsers) or do now (the iperf3 output and server-address parsers,
+# the sealed-servers unseal path) - but no pipeline ever gave them -fuzz time,
+# so they only ever replayed their own seeds. Each leg gets eight minutes of
+# real mutation weekly; a finding uploads its reproducer corpus as an artifact
+# and fails the run.
+on:
+  workflow_dispatch:
+  schedule:
+    # Wednesdays 05:29 UTC - its own slot among Monday's vuln re-scan,
+    # Tuesday's race stress, Thursday's fleet probe and Saturday's deep-test.
+    - cron: '29 5 * * 3'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: ./internal/netinfo/
+            target: FuzzCityFromRDNS
+          - pkg: ./internal/netinfo/
+            target: FuzzPickCymruASN
+          - pkg: ./internal/speedtest/
+            target: FuzzParseIperfServer
+          - pkg: ./internal/speedtest/
+            target: FuzzIperfOutput
+          - pkg: ./internal/settings/
+            target: FuzzUnsealServers
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: fuzz ${{ matrix.target }}
+        run: go test ${{ matrix.pkg }} -run '^$' -fuzz "^${{ matrix.target }}$" -fuzztime 8m
+
+      - name: upload reproducer corpus
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: '**/testdata/fuzz/${{ matrix.target }}/**'
+          if-no-files-found: ignore
