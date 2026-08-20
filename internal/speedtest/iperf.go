@@ -691,6 +691,11 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 		// rate instead of being invisible.
 		if dir == "both" && (dnErr != nil || upErr != nil) {
 			stats.Inc("speed.iperf_partial")
+			// Recorded on the Result so a configured threshold on the FAILED
+			// direction reads as a breach instead of being silenced by the
+			// very failure it watches (see Result.UploadFailed).
+			res.DownloadFailed = dnErr != nil
+			res.UploadFailed = upErr != nil
 			if i.Log != nil {
 				if dnErr != nil {
 					i.Log.Warn("iperf3 direction failed, partial result kept", "direction", "down", "err", i.withEnvHint(dnErr))

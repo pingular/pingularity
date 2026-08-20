@@ -47,9 +47,16 @@ type naServer struct {
 	retries int           // attempts-1; production default is speedDefaultRetries (1)
 	threads int           // 0 = library default min(NumCPU,8); else forced worker count
 	delay   time.Duration // simulated server-side RTT before the response
-	mu      sync.Mutex
-	posts   atomic.Int64
-	read    atomic.Int64
+	dir     string        // test direction; "" = "both". "up" keeps a case on the
+	// error contract: a partial success needs a measured download to keep, so
+	// upload-only runs still fail whole and carry the diagnosis in the error.
+	path string // upload endpoint path; "" = the standard /speedtest/upload.php.
+	// Catalogue servers with non-standard directories exist (probeFallback
+	// derives its probe path for exactly that reason), and the relative-redirect
+	// fix adopts trailing-slash paths - the recorder must see those uploads too.
+	mu    sync.Mutex
+	posts atomic.Int64
+	read  atomic.Int64
 
 	trace     bool // per-POST timeline, for diagnosing the rescue path
 	t0        time.Time
@@ -124,7 +131,11 @@ func (s *naServer) start(t *testing.T) string {
 	s.bw = newBandwidth(s.rateBPS, s.stopBW)
 	t.Cleanup(func() { close(s.stopBW) })
 	mux := http.NewServeMux()
-	mux.HandleFunc("/speedtest/upload.php", func(w http.ResponseWriter, r *http.Request) {
+	pth := s.path
+	if pth == "" {
+		pth = "/speedtest/upload.php"
+	}
+	mux.HandleFunc(pth, func(w http.ResponseWriter, r *http.Request) {
 		n0 := s.posts.Add(1)
 		fl := s.inflight.Add(1)
 		for {
@@ -195,7 +206,24 @@ func (s *naServer) start(t *testing.T) string {
 // which the throttle below is chosen against.
 const naCaptureTime = 4 * time.Second
 
+// naRunOpts are the knobs the naServer fixture's callers diverge on. The
+// fixture is ONE function on purpose: five near-copies of this block once
+// drifted apart (a hardcoded capture window here, a skipped fbMap cleanup
+// there, the CI worker-count pin only in one), and every divergence was a
+// case one suite covered and its siblings silently did not.
+type naRunOpts struct {
+	logger  *slog.Logger  // nil = the test writer at debug
+	lossOn  bool          // run the UDP loss pass (stub ooklaLoss to observe it)
+	timeout time.Duration // 0 = 90s
+	id      string        // srv.ID override; "" keeps CustomServer's "Custom"
+}
+
 func runNACase(t *testing.T, s *naServer) (Result, error) {
+	t.Helper()
+	return runNACaseOpts(t, s, naRunOpts{})
+}
+
+func runNACaseOpts(t *testing.T, s *naServer, opts naRunOpts) (Result, error) {
 	t.Helper()
 	allowLoopbackProbes(t)
 	base := s.start(t)
@@ -207,6 +235,21 @@ func runNACase(t *testing.T, s *naServer) (Result, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if s.path != "" {
+		srv.URL = base + s.path // the non-standard endpoint the catalogue named
+	}
+	if opts.id != "" {
+		srv.ID = opts.id
+	}
+	// A rejecting case writes the server's ID (CustomServer's hardcoded
+	// "Custom" unless overridden) into the selection health cache
+	// (noteUploadRejection) - clean it so a verdict from one case can never
+	// leak into another test's selection.
+	t.Cleanup(func() {
+		fbMu.Lock()
+		delete(fbMap, srv.ID)
+		fbMu.Unlock()
+	})
 	capture := s.capture
 	if capture == 0 {
 		capture = naCaptureTime
@@ -228,7 +271,7 @@ func runNACase(t *testing.T, s *naServer) (Result, error) {
 	ooklaDownload = func(ctx context.Context, sv *ookla.Server) error { sv.DLSpeed = 1e7; return nil }
 	t.Cleanup(func() { ooklaPing, ooklaDownload = oldPing, oldDown })
 
-	o := &Ookla{LossFn: func() bool { return false }, upRec: rec} // no UDP probe in a unit test
+	o := &Ookla{LossFn: func() bool { return opts.lossOn }, upRec: rec}
 	if s.threads > 0 {
 		// Force the worker count through o.uc - the ONLY channel freshManager
 		// preserves. SetNThread on srv.Context above is thrown away when measure
@@ -238,11 +281,22 @@ func runNACase(t *testing.T, s *naServer) (Result, error) {
 		// pass locally but flake in CI; pinning it here makes them CPU-independent.
 		o.uc = &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent, MaxConnections: s.threads}
 	}
-	o.Log = slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	o.Log = opts.logger
+	if o.Log == nil {
+		o.Log = slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+	timeout := opts.timeout
+	if timeout == 0 {
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	res, err := o.measure(ctx, srv, "both", s.retries)
+	dir := s.dir
+	if dir == "" {
+		dir = "both"
+	}
+	res, err := o.measure(ctx, srv, dir, s.retries)
 	t.Logf("server: POSTs=%d, body read=%.2f MB | result: UploadMbps=%v UploadBytes=%d | err=%v",
 		s.posts.Load(), float64(s.read.Load())/1e6, res.UploadMbps, res.UploadBytes, err)
 	return res, err
@@ -281,10 +335,13 @@ func assertNA(t *testing.T, err error, wantDiag string) {
 
 // TestUploadNA_Rejection: a fast link where every POST is answered non-2xx. The
 // bytes demonstrably transfer; only the acknowledgement is withheld.
+// Runs upload-only: a "both" run now keeps its download as a partial success
+// (see uploadpartial_test.go), so the error contract these diagnosis strings
+// ride lives on runs with nothing to keep.
 func TestUploadNA_Rejection(t *testing.T) {
 	for _, mode := range []string{"403", "500", "307"} {
 		t.Run(mode, func(t *testing.T) {
-			s := &naServer{mode: mode} // no throttle: starvation cannot be the cause
+			s := &naServer{mode: mode, dir: "up"} // no throttle: starvation cannot be the cause
 			_, err := runNACase(t, s)
 			wantDiag := "server rejects the upload endpoint"
 			if mode == "307" {
@@ -306,7 +363,9 @@ func TestUploadNA_Starvation(t *testing.T) {
 	// window the 8-worker starvation threshold is 8*999490*8/15s ~= 4.3 Mbps, and
 	// 2 Mbps sits ~2x under it - so this starves deterministically on a 2-core CI
 	// runner and an 8-core dev box alike.
-	s := &naServer{rateBPS: 250000, threads: 8} // 2 Mbps, forced 8 workers
+	// Upload-only for the same reason as TestUploadNA_Rejection: the failure
+	// contract now lives where there is no download to keep.
+	s := &naServer{rateBPS: 250000, threads: 8, dir: "up"} // 2 Mbps, forced 8 workers
 	_, err := runNACase(t, s)
 	assertNA(t, err, "no attempt completed inside the capture window")
 	if s.read.Load() == 0 {
@@ -334,15 +393,21 @@ func TestUploadNA_HealthyControl(t *testing.T) {
 func TestUploadNA_DataUsage(t *testing.T) {
 	s := &naServer{mode: "403"}
 	res, err := runNACase(t, s)
-	if err == nil {
-		t.Fatal("expected the N/A failure")
+	// A "both" run keeps its download as a partial success now, so the failed
+	// upload's spend arrives on the usage-only channel: UploadBytes would mark
+	// the direction measured, ExtraUpBytes bills it without claiming that.
+	if err != nil {
+		t.Fatalf("expected a kept partial, got %v", err)
 	}
-	if res.UploadBytes <= 0 {
+	if res.UploadBytes != 0 {
+		t.Fatalf("a failed upload must not carry measured bytes, got %d", res.UploadBytes)
+	}
+	if res.ExtraUpBytes <= 0 {
 		t.Fatalf("data-usage regression: server read %d bytes, run recorded %d",
-			s.read.Load(), res.UploadBytes)
+			s.read.Load(), res.ExtraUpBytes)
 	}
 	t.Logf("data used accounted: %.2f MB recorded vs %.2f MB actually read by the server",
-		float64(res.UploadBytes)/1e6, float64(s.read.Load())/1e6)
+		float64(res.ExtraUpBytes)/1e6, float64(s.read.Load())/1e6)
 }
 
 // TestUploadNA_StarvationProductionTiming closes the interpolation in the
@@ -351,7 +416,10 @@ func TestUploadNA_DataUsage(t *testing.T) {
 // This one uses ooklaCaptureTime - the 15s the library actually runs in
 // production - at 2 Mbps, and asserts the exact string from the #18 log.
 func TestUploadNA_StarvationProductionTiming(t *testing.T) {
-	s := &naServer{rateBPS: 250000, capture: ooklaCaptureTime, threads: 8} // 2 Mbps, 15s window, forced 8 workers
+	// Upload-only: the "both" variant of this exact case now keeps its download
+	// (TestUploadPartial_StarvationProductionTiming), so the error string this
+	// pins is only reachable with no download in hand.
+	s := &naServer{rateBPS: 250000, capture: ooklaCaptureTime, threads: 8, dir: "up"} // 2 Mbps, 15s window, forced 8 workers
 	_, err := runNACase(t, s)
 	assertNA(t, err, "no attempt completed inside the capture window")
 	t.Logf("PRODUCTION TIMING: %s window, 2 Mbps -> %q", ooklaCaptureTime, err)
@@ -525,7 +593,7 @@ func TestFreshManagerCarriesCaptureWindowState(t *testing.T) {
 func TestStarvationDiagnosisSurvivesRescueAttempt(t *testing.T) {
 	// Slow enough that even one stream cannot land a chunk, so the rescue fires
 	// AND fails - the case the wording is for.
-	s := &naServer{rateBPS: 40000, capture: naCaptureTime, retries: speedDefaultRetries}
+	s := &naServer{rateBPS: 40000, capture: naCaptureTime, retries: speedDefaultRetries, dir: "up"}
 	_, err := runNACase(t, s)
 	if err == nil {
 		t.Fatal("expected the run to still fail at 0.32 Mbps")

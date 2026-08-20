@@ -2913,7 +2913,29 @@ func clampSpeedBytes(v *int64) *int64 {
 	}
 }
 
+// InsertSpeed stores a speed row; see InsertSpeedTS for the second it lands on.
 func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
+	_, err := s.InsertSpeedTS(ctx, sp)
+	return err
+}
+
+// InsertSpeedTS stores a speed row and returns the second it actually landed
+// on. ts is a speed row's IDENTITY - DeleteSpeed's key (whose first statement
+// removes every unreferenced row on that second), the backup merge's key
+// (keep-first: two rows sharing a second means a restore silently drops one),
+// and the UI's run handle. Runs are serialized, but the accounting rows are
+// not clock-spaced: a wholly-failed or aborted run stamps time.Now() and can
+// land on a measurement's second, an extra-usage row's +1 sentinel can land
+// on a neighbouring run's, and a stepped clock can re-visit an occupied
+// second. So uniqueness is enforced where the row is born: the insert walks
+// forward to the first free second and reports which one it took, so a caller
+// can key dependent rows (usage_run_ts, speed_servers.run_ts) to the second
+// the row really sits on. The walk is bounded by the length of the contiguous
+// occupied stretch starting at the requested second - a handful at worst in
+// real data, each probe an indexed point lookup - and all speed writers are
+// serialized (the scheduler's single flight), which is what makes
+// check-then-insert inside one transaction sufficient.
+func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error) {
 	// Optional measurements unwrap *T -> any (NULL when nil) via ptrArg below;
 	// healthy is the exception (bool -> 1/0).
 	var healthy any
@@ -2935,20 +2957,54 @@ func (s *Store) InsertSpeed(ctx context.Context, sp SpeedSample) error {
 	if sp.Failed {
 		failed = int64(1)
 	}
-	_, err := s.db.ExecContext(ctx,
+	// ONE autocommit statement, deliberately: a deferred read-then-write
+	// transaction here fails with SQLITE_BUSY_SNAPSHOT the moment another
+	// pooled connection commits between the read and the write - the daemon
+	// commits probe samples every few seconds, busy_timeout does NOT absorb a
+	// snapshot upgrade, and this exact shape already broke settings saves once
+	// (see SetSettingsDiff) and the outage repair once (see the pre-computed
+	// list above deleteResolvedOutage). Measured here: a hammer test lost a
+	// measurement within ~5-50 inserts. A single INSERT..SELECT computes the
+	// first free second and inserts it atomically - no window even against a
+	// concurrent import - and lock acquisition is the plain kind busy_timeout
+	// has always covered. The landed second is read back by rowid.
+	//
+	// The free-second expression: the requested second if nothing occupies it,
+	// else the smallest successor of an occupied second >= the request whose
+	// successor is free (the first gap after the contiguous occupied stretch).
+	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id,
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
 			packet_loss, healthy, jitter_ms, download_bytes, upload_bytes, cf_colo, exit_summary, run_trigger,
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
 			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 SELECT COALESCE((SELECT MIN(t) FROM (
+					SELECT ?1 AS t WHERE NOT EXISTS (SELECT 1 FROM speed WHERE ts = ?1)
+					UNION ALL
+					SELECT ts + 1 FROM speed WHERE ts >= ?1
+					  AND NOT EXISTS (SELECT 1 FROM speed s2 WHERE s2.ts = speed.ts + 1)
+				)), ?1),
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
 		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS))
-	recordDBErr(err)
-	return err
+	if err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	rowid, err := res.LastInsertId()
+	if err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	var ts int64
+	if err := s.db.QueryRowContext(ctx, `SELECT ts FROM speed WHERE rowid = ?`, rowid).Scan(&ts); err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	return ts, nil
 }
 
 // SpeedServerRow is one candidate's row of a run's server-selection report
@@ -3456,9 +3512,11 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 // DeleteSpeed removes a single speedtest run by its timestamp - the run's
 // identity throughout the UI/API (the same key SpeedRunOffset and the
 // chart<->table link use). Returns rows removed: 0 when no run matched (already
-// gone), which the caller treats as an idempotent no-op, not an error. Runs are
-// serialized, so ts is effectively unique; a same-second collision would delete
-// both, consistent with ts-as-identity everywhere else.
+// gone), which the caller treats as an idempotent no-op, not an error. ts is
+// GUARANTEED unique per row: InsertSpeedTS allocates each row the first free
+// second, precisely because this delete (and the backup merge, and the UI)
+// treat ts as identity - "runs are serialized" was never enough once the
+// accounting rows started stamping their own clocks.
 //
 // A run that retried a direction also has a usage-accounting row one second
 // later (the scheduler writes it at measuredTS+1 so a backup's ts merge key
@@ -4314,14 +4372,24 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	//
 	// The type filter: same reason the readers grew one. An event type this build
 	// cannot interpret must not silently close an outage.
-	pruneHorizon := currentHorizon(nowU)
+	pruneHorizon := nowU + int64(pruneFutureSlack/time.Second)
+	// Selected alongside the dangling shapes: a 'down' PAIRED with an 'up' the
+	// readers cannot see yet (past currentHorizon, inside pruneFutureSlack).
+	// Such a pair is closed on disk but reads as an open outage for up to 48h,
+	// and its only other proof - the recovery samples - is being pruned in
+	// this same call; a later backward clock step could then delete the future
+	// 'up' and leave the outage open forever (the exact hazard the correction
+	// block below documents as tried-and-rejected). When the samples prove an
+	// earlier recovery, that specific 'up' is moved back to the proven second
+	// - correction by identity, so it can never seize a different outage's row.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, next_ts, next_type FROM (
 			SELECT ts, type,
 			       LEAD(ts)   OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_ts,
 			       LEAD(type) OVER (ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END) AS next_type
 			FROM events WHERE type IN ('down','up') AND ts <= ?)
-		WHERE type='down' AND (next_type='down' OR next_type IS NULL)`, pruneHorizon)
+		WHERE type='down' AND (next_type='down' OR next_type IS NULL
+			OR (next_type='up' AND next_ts > ?))`, pruneHorizon, currentHorizon(nowU))
 	if err != nil {
 		return err
 	}
@@ -4334,6 +4402,10 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 		// future-dated 'up' belongs to, because any 'up' the clock has reached
 		// would have paired with this 'down' and it would not be dangling.
 		final bool
+		// pairUp: this 'down' is already paired with an 'up' the readers cannot
+		// see yet - the row named here, to be corrected BY IDENTITY when the
+		// samples prove an earlier recovery. 0 for the dangling shapes.
+		pairUp int64
 	}
 	var gaps []gap
 	for rows.Next() {
@@ -4344,11 +4416,16 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			rows.Close()
 			return err
 		}
-		end, final := nowU, true
-		if nextType.Valid && nextType.String == "down" && nextTS.Valid {
-			end, final = nextTS.Int64, false
+		end, final, pairUp := nowU, true, int64(0)
+		if nextType.Valid && nextTS.Valid {
+			switch nextType.String {
+			case "down":
+				end, final = nextTS.Int64, false
+			case "up": // the future-paired shape; recovery can only lie in the observed past
+				final, pairUp = false, nextTS.Int64
+			}
 		}
-		gaps = append(gaps, gap{down: down, end: end, final: final})
+		gaps = append(gaps, gap{down: down, end: end, final: final, pairUp: pairUp})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -4357,6 +4434,7 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	type synthUp struct {
 		ts, dur, down int64
 		final         bool
+		pairUp        int64 // non-zero: correct THIS 'up' to ts instead of searching or inserting
 	}
 	var synth []synthUp
 	for _, g := range gaps {
@@ -4392,17 +4470,18 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			if dur -= paused; dur < 0 {
 				dur = 0
 			}
-			synth = append(synth, synthUp{ts: rec, dur: dur, down: g.down, final: g.final})
+			synth = append(synth, synthUp{ts: rec, dur: dur, down: g.down, final: g.final, pairUp: g.pairUp})
 		}
 	}
 	for _, u := range synth {
 		// An outage gets ONE closing event. A 'down' can look dangling while an
-		// 'up' for it already exists, dated ahead of the clock - an import from a
-		// host whose clock ran fast, or a clock excursion here. The reads
-		// deliberately ignore such a row (it has not happened yet), which is why
-		// the pairing above does not see it either, and that is the safe reading:
-		// the samples are about to be pruned, so something must record the
-		// recovery before the evidence goes.
+		// 'up' for it already exists, dated PAST pruneFutureSlack - an import
+		// from a host whose clock ran fast, or a clock excursion here. The
+		// pairing above stops at the slack (a row inside it survives the sweep
+		// and closes the outage by itself once the clock arrives), so anything
+		// the final-gap lookup finds here is a row the sweep below is about to
+		// DELETE - and the samples are about to be pruned too, so something
+		// must record the recovery before both proofs go.
 		//
 		// But INSERTING beside it leaves two closing events for one outage. Once
 		// the clock passes the future row, the second one anchors its own outage
@@ -4417,11 +4496,36 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 		// the past where no future sweep can remove it. That last part matters:
 		// declining to write anything at all was tried, and a backward clock step
 		// then deleted the future row and left the outage open forever.
+		//
+		// Only an 'up' that is NEXT is this outage's, though. If a 'down' sits
+		// between (a complete future pair - the same fast-clock import), the
+		// 'up' beyond it is THAT outage's recovery: seizing it would rewrite a
+		// different outage's closing event into the past and leave its 'down'
+		// open forever once the clock reaches it - the exact phantom this block
+		// exists to prevent, manufactured instead of avoided. The dangling
+		// 'down' takes a synthetic recovery of its own, and the future pair is
+		// left to the sweep's judgement.
 		moved := false
+		if u.pairUp != 0 {
+			// The outage's own future 'up', already identified by the pairing -
+			// moved to the second the samples prove, by its identity, so no
+			// search can hand it a different outage's recovery.
+			if _, err := s.db.ExecContext(ctx,
+				`UPDATE events SET ts = ?, duration_s = ? WHERE type = 'up' AND ts = ?`, u.ts, u.dur, u.pairUp); err != nil {
+				recordDBErr(err)
+				return err
+			}
+			log.Printf("pingularity: an outage recovery was recorded %ds in the future (a clock that ran fast, or an import from one); moved it back to the second the probe history proves the link returned", u.pairUp-u.ts)
+			moved = true
+		}
 		if u.final {
 			var at int64
+			var kind string
 			switch err := s.db.QueryRowContext(ctx,
-				`SELECT ts FROM events WHERE type = 'up' AND ts > ? ORDER BY ts LIMIT 1`, u.down).Scan(&at); {
+				`SELECT ts, type FROM events WHERE type IN ('down','up') AND ts > ?
+				 ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END LIMIT 1`, u.down).Scan(&at, &kind); {
+			case err == nil && kind != "up":
+				// A different outage begins first - nothing here to correct.
 			case err == nil:
 				if _, err := s.db.ExecContext(ctx,
 					`UPDATE events SET ts = ?, duration_s = ? WHERE type = 'up' AND ts = ?`, u.ts, u.dur, at); err != nil {

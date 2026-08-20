@@ -9,7 +9,9 @@ import "testing"
 // per word, and this path makes thousands of accesses - so this is a
 // documentation test, not a reliable detector.
 func TestRetryRacePreexisting(t *testing.T) {
-	s := &naServer{mode: "403", retries: speedDefaultRetries}
+	// Upload-only: a "both" run keeps its download as a partial success now, and
+	// what this test needs is only the two rejected upload attempts.
+	s := &naServer{mode: "403", retries: speedDefaultRetries, dir: "up"}
 	if _, err := runNACase(t, s); err == nil {
 		t.Fatal("expected rejection failure")
 	}

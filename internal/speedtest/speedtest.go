@@ -30,6 +30,17 @@ type Result struct {
 	ExtraDownBytes int64
 	ExtraUpBytes   int64
 
+	// UploadFailed / DownloadFailed record that a 'both' run TRIED the
+	// direction and it failed, with the run kept as a partial (the other
+	// direction measured). A stored sample cannot carry this - a nil byte
+	// count is also what a deliberate single-direction run looks like - and
+	// the distinction decides alerting: a threshold configured on a direction
+	// that FAILED is a breach (the connection cannot do the thing the
+	// threshold watches), where the same threshold on a direction never
+	// requested is simply not in play.
+	UploadFailed   bool
+	DownloadFailed bool
+
 	// IPFamily is the address family the transfer actually used ("4"/"6"),
 	// read back from the run itself (iperf3: the control connection's peer
 	// literal); "" when unknown (Ookla, an old/errored JSON body). Recorded
