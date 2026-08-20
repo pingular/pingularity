@@ -1,0 +1,71 @@
+name: go-next canary
+
+# Runs the full suite - and the fleet probe, the one test that talks to the
+# real world - against the NEXT Go release while it is still a release
+# candidate. The 1.27 upgrade compressed a day of validation into a deadline
+# because 1.25 had already lost security support by the time 1.27 shipped;
+# with this canary the same evidence accumulates for free during the rc
+# window, and "do the removed TLS defaults strand any real Ookla servers"
+# gets answered by Thursday's baseline vs Sunday's rc run instead of by an
+# urgent one-off.
+on:
+  workflow_dispatch:
+  schedule:
+    # Sundays 06:11 UTC. Most weeks this exits early at the detection step -
+    # a release candidate only exists for a couple of months per cycle.
+    - cron: '11 6 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: detect a newer Go release candidate
+        id: rc
+        run: |
+          cur=$(sed -n 's/^go \([0-9]*\)\.\([0-9]*\).*/\1 \2/p' go.mod)
+          rc=$(python3 - $cur <<'PYEOF'
+          import json, re, sys, urllib.request
+          cur = (int(sys.argv[1]), int(sys.argv[2]))
+          data = json.load(urllib.request.urlopen('https://go.dev/dl/?mode=json&include=all'))
+          for v in data:  # feed is newest-first
+              if v.get('stable'):
+                  continue
+              m = re.match(r'go(\d+)\.(\d+)', v['version'])
+              if m and (int(m.group(1)), int(m.group(2))) > cur:
+                  print(v['version'])
+                  break
+          PYEOF
+          )
+          echo "version=$rc" >> "$GITHUB_OUTPUT"
+          if [ -n "$rc" ]; then
+            echo "release candidate available: $rc"
+          else
+            echo "no Go release candidate newer than go.mod - nothing to canary this week"
+          fi
+
+      - name: full suite on the release candidate
+        if: steps.rc.outputs.version != ''
+        env:
+          GOTOOLCHAIN: ${{ steps.rc.outputs.version }}
+        run: |
+          go version
+          go test ./... -count=1
+
+      - name: fleet probe on the release candidate
+        # The only leg that can answer "does the next toolchain still talk to
+        # the real Ookla fleet" - compare against Thursday's stable baseline.
+        if: steps.rc.outputs.version != ''
+        env:
+          GOTOOLCHAIN: ${{ steps.rc.outputs.version }}
+          FLEET_PROBE: "1"
+        run: go test ./internal/speedtest/ -run TestServerFleetProbe -v -count=1 -timeout 25m

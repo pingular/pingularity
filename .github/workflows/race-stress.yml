@@ -1,0 +1,37 @@
+name: race stress
+
+# The main CI job runs the race detector once (-count=1), which is the right
+# per-push cost but statistically misses one-in-N interleavings: both a
+# first-load race in settings and a web-suite flake were single-occurrence
+# events that clean reruns could not reproduce. This weekly leg buys the
+# repetitions - five racing passes over the concurrency-heavy packages, plus
+# five more over the database-heavy ones against real files (the
+# multi-connection pool the ordinary run's ":memory:" stores hide).
+on:
+  workflow_dispatch:
+  schedule:
+    # Tuesdays 05:19 UTC - a slot of its own among Monday's vuln re-scan,
+    # Thursday's fleet probe and Saturday's deep-test.
+    - cron: '19 5 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  race-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: race x5, concurrency-heavy packages
+        run: go test -race -count=5 ./internal/store/ ./internal/settings/ ./internal/speedtest/ . -timeout 100m
+
+      - name: race x5, file-backed stores
+        env:
+          PINGULARITY_TEST_DB_DIR: ${{ runner.temp }}
+        run: go test -race -count=5 ./internal/store/ ./internal/settings/ . -timeout 30m

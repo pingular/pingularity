@@ -5,7 +5,15 @@ name: Deep test
 # restart -> uninstall), data-dir permissions, netinfo/traceroute paths, and the
 # Docker image + the canonical compose flow. Dispatch after platform-sensitive
 # changes; artifacts carry assertion output and diagnostic log tails per leg.
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  schedule:
+    # Saturdays 05:37 UTC - a slot of its own, clear of ci.yml's Monday vuln
+    # re-scan and the fleet probe's Thursday, so service-lifecycle drift is
+    # never tangled with either's noise. Dispatch-only coverage rotted quietly:
+    # the best platform validation in the pipeline only ran when someone
+    # remembered to ask for it.
+    - cron: '37 5 * * 6'
 
 permissions:
   contents: read
