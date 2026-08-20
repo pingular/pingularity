@@ -73,14 +73,14 @@ func TestProbeEndpointDoesNotPoisonURLOnBlockedRedirect(t *testing.T) {
 	defer first.Close()
 
 	_, internalPort, _ := net.SplitHostPort(internal.Listener.Addr().String())
-	old := probeDialControl
-	probeDialControl = func(_, address string, _ syscall.RawConn) error {
+	old := probeDialControl()
+	setProbeDialControl(func(_, address string, _ syscall.RawConn) error {
 		if _, p, _ := net.SplitHostPort(address); p == internalPort {
 			return fmt.Errorf("blocked internal port %s", p)
 		}
 		return nil // the "public" first hop is allowed
-	}
-	t.Cleanup(func() { probeDialControl = old })
+	})
+	t.Cleanup(func() { setProbeDialControl(old) })
 
 	srv := &ookla.Server{ID: "poison-me", URL: first.URL + "/speedtest/upload.php"}
 	orig := srv.URL

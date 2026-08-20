@@ -188,7 +188,7 @@ func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder)
 	// unset, so a caller-supplied control (e.g. a future source-interface bind)
 	// still wins.
 	if uc != nil && uc.DialerControl == nil {
-		uc.DialerControl = probeDialControl
+		uc.DialerControl = probeDialControl()
 	}
 	doer := &http.Client{}
 	client := ookla.New(ookla.WithDoer(doer), ookla.WithUserConfig(uc))
@@ -1206,7 +1206,7 @@ func resolveProxiedDest(ctx context.Context, host string) ([]net.IP, error) {
 // and under the same relaxation the dial guard honours (probeDialControl set
 // nil by allowLoopbackProbes), so loopback-served tests keep working.
 func guardProxiedDestination(ctx context.Context, hostport string) error {
-	if probeDialControl == nil || len(proxyAddrs()) == 0 {
+	if probeDialControl() == nil || len(proxyAddrs()) == 0 {
 		return nil
 	}
 	host := hostport
@@ -1270,7 +1270,7 @@ func serverDestination(s *ookla.Server) string {
 // makes URL and Host name the same endpoint on the fetchServerList path, so a
 // benign Host paired with a hostile URL would otherwise keep its ping.
 func guardedServers(ctx context.Context, servers ookla.Servers) ookla.Servers {
-	if probeDialControl == nil || len(proxyAddrs()) == 0 {
+	if probeDialControl() == nil || len(proxyAddrs()) == 0 {
 		return servers
 	}
 	out := make(ookla.Servers, 0, len(servers))
@@ -1318,14 +1318,42 @@ func init() {
 }
 
 // probeDialControl is the dial guard the probes AND the measurement client
-// install (see probeClient and newOoklaClientRec). A package var for the same
-// reason as ooklaPing and fetchServerList: the offline tests serve their fakes
-// on loopback, which the guard exists to refuse, so allowLoopbackProbes relaxes
-// this one var to cover both the probes and the real transfer. Production never
-// reassigns it, and TestProbeRefusesInternalDestinations exercises the real
-// probeDialGuard directly so relaxing this in a test cannot hide a regression
-// in the guard itself.
-var probeDialControl = probeDialGuard
+// install (see probeClient and newOoklaClientRec). A package-level slot for the
+// same reason as ooklaPing and fetchServerList: the offline tests serve their
+// fakes on loopback, which the guard exists to refuse, so allowLoopbackProbes
+// relaxes this one slot to cover both the probes and the real transfer.
+// Production never reassigns it, and TestProbeRefusesInternalDestinations
+// exercises the real probeDialGuard directly so relaxing this in a test cannot
+// hide a regression in the guard itself.
+//
+// An atomic slot, not a plain var: the test swap is not the only traffic. An
+// abandoned run's upload workers keep draining briefly after cancellation and
+// re-enter the transport - and so guardedEnvProxy and this slot - while the
+// next test's helper swaps it back; a plain var there is a data race (caught
+// by the race detector, Aug 2026). Readers capture one coherent value; whether
+// a straggler sees the old guard or the new one, both are safe.
+type probeDialControlFunc = func(network, address string, c syscall.RawConn) error
+
+var probeDialControlSlot atomic.Pointer[probeDialControlFunc]
+
+func init() { setProbeDialControl(probeDialGuard) }
+
+// probeDialControl returns the guard currently installed; nil means the
+// loopback relaxation is in effect.
+func probeDialControl() probeDialControlFunc {
+	if p := probeDialControlSlot.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func setProbeDialControl(f probeDialControlFunc) {
+	if f == nil {
+		probeDialControlSlot.Store(nil)
+		return
+	}
+	probeDialControlSlot.Store(&f)
+}
 
 // probeClient is the only client the endpoint probes use. Its dialer refuses
 // internal destinations (see probeDialGuard) on every hop, redirects included -
@@ -1344,7 +1372,7 @@ func probeClient(timeout time.Duration) *http.Client {
 			// URL and the proxied upload still hit the non-replayable 307 -
 			// issues #17/#18, alive behind proxies.
 			Proxy:       guardedEnvProxy,
-			DialContext: (&net.Dialer{Timeout: timeout, Control: probeDialControl}).DialContext,
+			DialContext: (&net.Dialer{Timeout: timeout, Control: probeDialControl()}).DialContext,
 			// Every caller builds this client for a single request and drops it,
 			// so a kept-alive socket can never be reused - it would only sit in
 			// the abandoned transport's idle pool (zero IdleConnTimeout: forever)
@@ -3415,8 +3443,8 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 	// mirrors the library's own default (PacketSendingTimeout).
 	analyzer := ookla.NewPacketLossAnalyzer(&ookla.PacketLossAnalyzerOptions{
 		SamplingDuration: packetLossSampleDuration,
-		TCPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl},
-		UDPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl},
+		TCPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl()},
+		UDPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl()},
 	})
 	var loss *float64
 	// Upstream leak (speedtest-go v1.7.11): RunWithContext opens a TCP sampler conn

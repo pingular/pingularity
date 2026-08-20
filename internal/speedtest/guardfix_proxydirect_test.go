@@ -43,13 +43,13 @@ func TestProxyAddressIsNotReachableAsADirectDestination(t *testing.T) {
 	flushDestResolveCache()
 
 	// The real guard, as production runs it - not the loopback relaxation.
-	if probeDialControl == nil {
+	if probeDialControl() == nil {
 		t.Skip("dial guard disarmed in this build")
 	}
 
 	tr := &http.Transport{
 		Proxy:       guardedEnvProxy,
-		DialContext: (&net.Dialer{Timeout: 2 * time.Second, Control: probeDialControl}).DialContext,
+		DialContext: (&net.Dialer{Timeout: 2 * time.Second, Control: probeDialControl()}).DialContext,
 	}
 	defer tr.CloseIdleConnections()
 	c := &http.Client{Transport: tr, Timeout: 3 * time.Second}
@@ -94,7 +94,7 @@ func TestOrdinaryDestinationStillRoutesThroughTheProxy(t *testing.T) {
 
 	tr := &http.Transport{
 		Proxy:       guardedEnvProxy,
-		DialContext: (&net.Dialer{Timeout: 2 * time.Second, Control: probeDialControl}).DialContext,
+		DialContext: (&net.Dialer{Timeout: 2 * time.Second, Control: probeDialControl()}).DialContext,
 	}
 	defer tr.CloseIdleConnections()
 	c := &http.Client{Transport: tr, Timeout: 3 * time.Second}
