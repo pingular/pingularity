@@ -1552,7 +1552,7 @@
           <span class="info" tabindex="0" data-tip="Run the probe round: the dials that measure latency and decide whether the link is up or down.
 • Off = no probe rounds at all: outages go undetected and unalerted, and the DNS check stops too.
 • Scheduled and manual speedtests still run, but the reconnect and degraded ones can't fire - the probe round is what triggers those.
-• The power button stops everything.">i</span></span>
+• The power button pauses all automatic measuring - the manual RUN and refresh buttons still work.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setLatEnabled"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Check every
           <span class="info" tabindex="0" data-tip="How often to run a probe round.">i</span></span>
@@ -1576,9 +1576,9 @@
 • Needs latency probing on.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setDNSProbe"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Connection info
-          <span class="info" tabindex="0" data-tip="Looks up your public IP, your ISP and roughly where it sits, the DNS server actually answering you, and the path your traffic takes leaving the ISP. This is what fills the Connection panel at the top of the dashboard.
-• It asks a handful of outside services, so your public IP does leave this machine. The README lists every one of them.
-• Turn it off and none of those lookups run at all. The panel keeps whatever it last knew.
+          <span class="info" tabindex="0" data-tip="Looks up your public IP, ISP and rough location, the DNS server actually answering you, and where your traffic leaves the ISP - the Connection panel at the top.
+• Asks a handful of outside services, so your public IP does leave this machine. The README lists every one.
+• Off = no lookups on their own; the panel keeps what it last knew, and its refresh button can still run one by hand.
 • Pausing monitoring pauses these lookups too.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setNetinfo"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Exit-path target
@@ -1610,7 +1610,7 @@
           <span class="ctl"><input type="number" id="setDegradedPing" min="0" max="5000" step="any"><span class="unit">ms</span></span></label>
         <label class="srow"><span class="lbl">Test more often while failing
           <span class="info" tabindex="0" data-tip="While a run keeps breaching an alert threshold, test four times as often, so you catch the recovery rather than waiting out the whole gap.
-• Never slower than every 5 min, never faster than every 30 sec.
+• Never slower than every 5 min, never faster than every 1 min.
 • Back to normal once a run passes.
 • Needs a threshold set in Alerts.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setStAdaptive"><span class="unit"></span></span></label>
@@ -1710,11 +1710,9 @@
 • Longer is steadier, but uses more data and takes longer.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfDur" min="1" max="30" step="1"><span class="unit">sec</span></span></label>
         <label class="srow iperf-opt"><span class="lbl">Parallel streams
-          <span class="info" tabindex="0" data-tip="Parallel TCP streams.
-• More streams fill a fast or high-latency link better than one does: a single stream is limited by its own congestion window, so it measures that window rather than the line.
-• 8 suits a 500 Mbps-1 Gbps link; 1 often under-reads badly.
-• Past about 12 the differences are mostly run-to-run noise.
-• Keep it FIXED once chosen - changing it shifts every later number, so your history stops comparing like with like.
+          <span class="info" tabindex="0" data-tip="How many connections send at once during each transfer (default 8).
+• 1 often under-reads badly - a single connection is capped by how much data TCP lets it keep in flight (a roughly 350 Mbps line measured 116 Mbps with 1 stream, 268 with 8).
+• Keep it fixed once chosen - changing it shifts every later number, so your history stops comparing like with like.
 • Raise it cautiously: weak servers struggle.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfStreams" min="1" max="32" step="1"><span class="unit"></span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Parallel connections
@@ -1735,7 +1733,7 @@
         <label class="srow ookla-opt"><span class="lbl">Retries
           <span class="info" tabindex="0" data-tip="Retry a transfer that fails - often the server was still busy from the last test.
 • Ookla retries any failed direction.
-• 0 = no retry.
+• 0 = no retry. Careful on a very slow uplink (roughly under 6 Mbps): the retry is also what drops the upload to a single stream so it can finish at all - at 0 that upload always fails and records nothing, though the download half of the run is kept.
 • Independent of the iperf3 Retries setting.">i</span></span>
           <span class="ctl"><input type="number" id="setSpeedRetries" min="0" max="3" step="1"><span class="unit"></span></span></label>
         <label class="srow iperf-opt"><span class="lbl">Retries
@@ -1782,7 +1780,7 @@
           <span class="info" tabindex="0" data-tip="Which directions to test.
 • Both runs them one after the other.
 • Download- or upload-only halves the data and time.
-• 'Both, simultaneous' (--bidir) runs them at once to expose full-duplex contention.
+• 'Both, simultaneous' (--bidir) loads both directions at once, catching slowdowns that only show when traffic flows both ways at the same time.
 • Independent of the Ookla Direction setting.">i</span></span>
           <span class="ctl"><select id="setIperfDirection"><option value="both">Both</option><option value="down">Download only</option><option value="up">Upload only</option><option value="bidir">Both, simultaneous</option></select><span class="unit"></span></span></label>
         <label class="srow iperf-opt"><span class="lbl">Loss &amp; jitter probe
@@ -1790,9 +1788,10 @@
 • Turn off for servers that block UDP, or to save a little data.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setIperfUDP"><span class="unit"></span></span></label>
         <label class="srow hidden iperf-opt" id="iperfUdpRateRow"><span class="lbl">UDP rate
-          <span class="info" tabindex="0" data-tip="Send rate for the loss/jitter probe.
-• 0 = auto: about half your measured speed, held between 5 and 50 Mbps.
-• Raise it to sample loss on a fast link.">i</span></span>
+          <span class="info" tabindex="0" data-tip="Send rate for the loss/jitter probe (a 2-second burst).
+• 0 = auto: about half your measured speed, capped at 50 Mbps and normally no lower than 5 - on a very slow link it drops below 5 so the probe doesn't cause the loss it measures.
+• Raise it to sample loss on a fast link.
+• The probe's data isn't counted in the usage figure - at 1000 Mbps that's about 250 MB per test.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfUDPRate" min="0" max="10000" step="1"><span class="unit">Mbps</span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Packet-loss probe
           <span class="info" tabindex="0" data-tip="A short UDP pass after the transfers to measure packet loss (TCP can't).
@@ -1802,25 +1801,24 @@
           <span class="ctl"><input type="checkbox" id="setOoklaLoss"><span class="unit"></span></span></label>
         </div>
         <label class="srow" id="autoLocRow"><span class="lbl">Auto location
-          <span class="info" tabindex="0" data-tip="Picks where to test from by measurement. The cities your connection names - the exit router found by traceroute, your IP's geolocation, and where speedtest.net places you - each enter their closest servers into one ping race, and the city that answers fastest becomes the centre of the server search. Turn it off to search a city instead.
-• It also reads off when you pin a server, because the search then centres on that server rather than on the raced city.">i</span></span>
+          <span class="info" tabindex="0" data-tip="Picks where to test from by measurement, fresh on every test.
+• The places your connection names - where your traffic leaves the ISP, where your IP is registered, and where speedtest.net places you - race on ping, and the fastest becomes the centre of the server search.
+• Turn it off to type a city and search there instead.
+• Pinning a server shows this as off too - the test then uses that server.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setAutoLoc"><span class="unit"></span></span></label>
         <label class="srow ookla-opt"><span class="lbl">Best of 3 servers
-          <span class="info" tabindex="0" data-tip="Runs the test against your chosen server AND two more picked by ping, then keeps only the best result. The other two are thrown away.
-• The two extra servers are picked near the server you chose - or near your auto location when you have not chosen one - so the round always stays in the area you asked for.
-• Best result = highest score: a capacity figure weighting download 70% and upload 30% relative to each other - not as raw Mbps, so it means the same on a symmetric line as on a 20:1 asymmetric one - then discounted by ping (about 1% per millisecond, topping out at 20ms). A server that measured a fifth of your real upload can't hide behind a big download number; a near-tie on speed goes to the lower-ping server; a clearly faster server still wins. Ties break on ping, then jitter, then bufferbloat.
-• The run that is kept is one real test, so its ping, jitter and bufferbloat are the winner's too. A round decided on throughput can store a much higher latency than the server you usually land on - that is the round changing hands, not your connection changing. Read latency and jitter from the charts below, which sample continuously and do not depend on who won.
-• Useful when one server is having a bad day and you'd rather not have it define your history.
+          <span class="info" tabindex="0" data-tip="Runs each scheduled test against your chosen server plus two nearby ones, and keeps only the best result.
 • Costs about 3x the time and 3x the data of a normal test.
-• A server that hasn't finished within 90 seconds is dropped and the next one is tried, so one stalled server can't hold up the round.
-• Scheduled tests and the RUN button only - reconnect tests stay quick and cheap.">i</span></span>
+• Useful when one server is having a bad day and you'd rather it didn't define your history.
+• The kept run is one real test, so its ping and jitter belong to whichever server won - those columns can jump when a round changes hands, not because your connection did. Read latency from the charts below.
+• Scheduled tests and the RUN button only.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setSpeedBestOf"><span class="unit"></span></span></label>
         <div class="srow-wide" id="serverRow">
           <span class="lbl">Speedtest server
-            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table). Type a city instead and it becomes the centre Auto location uses when you switch it OFF - it moves where Auto searches, it does not pin a server.
-• With no city typed, Auto races the cities your connection points at - your ISP's exit, where your IP is registered, and wherever speedtest.net places you - and centres on whichever answers fastest, fresh on every test.
-• Inside that centre it fetches one list, pings every server about as close as the nearest (one per provider, your own ISP always included), and keeps the lowest ping.
-• The list in this box is only for browsing: it shows the city of the server your last auto test used (that server is always in it), or before any auto run, a city the race would consider.">i</span></span>
+            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table).
+• Typing a city instead centres the server search there - the server is still picked by lowest ping, not pinned.
+• Your ISP's own server always gets to compete when Ookla lists one.
+• The list is for browsing: it centres on your last auto test's server (always included), or before any auto run, on a city Auto location would consider.">i</span></span>
           <div class="server-search">
             <input type="text" id="serverCity" placeholder="City or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
             <button class="btn" id="serverSearchBtn" type="button">Search</button>
@@ -1962,7 +1960,10 @@
         </div>
         <div class="notif-inline">
           <label class="srow"><span class="lbl">Webhook format
-            <span class="info" tabindex="0" data-tip="How the alert is shaped for the receiver. Auto recognizes Discord, Slack, ntfy.sh, and Healthchecks from the address; pick ntfy for a self-hosted ntfy server on your own domain (title, priority, and icon arrive properly instead of a JSON blob), or plain JSON to force the generic payload.">i</span></span>
+            <span class="info" tabindex="0" data-tip="How the alert is shaped for the receiver.
+• Auto recognizes Discord, Slack, ntfy.sh, and Healthchecks from the address.
+• Pick ntfy for a self-hosted ntfy server on your own domain - title, priority, and icon then arrive properly instead of a JSON blob.
+• Plain JSON forces the generic payload.">i</span></span>
             <span class="ctl"><select id="setWebhookFormat"><option value="auto">Auto</option><option value="ntfy">ntfy</option><option value="generic">plain JSON</option></select></span></label>
           <label class="srow"><span class="lbl">Alert on outage
             <span class="info" tabindex="0" data-tip="Send a webhook alert whenever the link goes down and when it comes back.">i</span></span>
@@ -1997,14 +1998,16 @@
         <div class="access-grid">
           <div class="access-col">
             <label class="srow"><span class="lbl">Network access
-              <span class="info" tabindex="0" data-tip="Let other devices on your network reach the dashboard, API, and metrics. Off = this machine only; others get 403. The address is shown below. Applied on Save.
-Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote visitors as local connections, which 'this machine only' cannot block.">i</span></span>
+              <span class="info" tabindex="0" data-tip="Let other devices on your network reach the dashboard, API, and metrics.
+• Off = this machine only: other devices get an access-denied error (403).
+• A reverse proxy on this machine (cloudflared, nginx, caddy) delivers remote visitors as local connections, which 'this machine only' cannot block.
+• Applied on Save; the addresses to use are shown below.">i</span></span>
               <span class="ctl"><input type="checkbox" id="setNetAccess"><span class="unit"></span></span></label>
             <label class="srow"><span class="lbl">Require login
-              <span class="info" tabindex="0" data-tip="Require a login for everything.
-• Browsers use a cookie; API clients and Prometheus use HTTP Basic with the same credentials.
-• Turn it on and set a password to activate.
-• Over plain HTTP the password crosses the network unencrypted.">i</span></span>
+              <span class="info" tabindex="0" data-tip="Lock the dashboard, API, and metrics behind a username and password.
+• The toggle alone does nothing until a password is set below.
+• Over plain HTTP the password crosses the network unencrypted.
+• Browsers log in once (a cookie); API clients and Prometheus send the same username and password with each request (HTTP Basic).">i</span></span>
               <span class="ctl"><input type="checkbox" id="setAuthEnabled"><span class="unit"></span></span></label>
           </div>
           <div class="access-col">
@@ -2073,11 +2076,14 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
             <span class="info" tabindex="0" data-tip="Flat squares off the panels and separates the top bar by shade alone. Round keeps the classic rounded panels and the line under the bar.">i</span></span>
             <span class="ctl corners"><input type="checkbox" id="setCorners" checked><span class="unit"></span></span></label>
           <span class="viz-accpair"><button class="viz-acc" type="button" aria-expanded="false" aria-controls="vizPalBody">UI colours</button>
-            <span class="info" tabindex="0" data-tip="Recolour the active theme's building blocks - every surface, border, text, and status colour derives from these. Pickers show the current colour; changes preview live and apply on Save. The main accent lives under Chart customization (Accents). Reset returns to the theme's own palette.">i</span></span>
+            <span class="info" tabindex="0" data-tip="Recolour the active theme's building blocks - every surface, border, text, and status colour derives from these.
+• Pickers show the current colour; changes preview live and apply on Save.
+• The main accent lives under Chart customization (Accents).
+• Reset returns to the theme's own palette.">i</span></span>
           <span class="viz-accpair"><button class="viz-acc" type="button" aria-expanded="false" aria-controls="vizBarBody">Top bar</button>
             <span class="info" tabindex="0" data-tip="Colour the top bar: the status dots, the power button in each state, and the two halves of the wordmark.
 • Each dot keeps its health shading - full colour when healthy, fading as latency or DNS get worse.
-• The latency colour also legends the anchor pills under the chart.">i</span></span>
+• Top bar only: the anchor pills under the latency chart aren't recoloured here.">i</span></span>
           <span class="viz-accpair"><button class="viz-acc" type="button" aria-expanded="false" aria-controls="vizChartBody">Chart customization</button>
             <span class="info" tabindex="0" data-tip="Override the active theme's chart colours, plus line thickness, area fill and grid. Changes preview live and apply on Save.
 • Accents recolours the UI itself - buttons, links, status dots - not the chart lines.">i</span></span>
@@ -2178,8 +2184,9 @@ Caveat: a reverse proxy on this machine (cloudflared, nginx…) delivers remote 
         <div class="srow-div"></div>
         <label class="srow"><span class="lbl">Logging
           <span class="info" tabindex="0" data-tip="Record activity for the console, journald, and the viewer below.
-• On - full detail (debug); the viewer auto-refreshes too.
-• Off - warnings and errors only, so a failure still leaves a record here.
+• On - full detail (debug).
+• Off (default) - warnings and errors only, so a failure still leaves a record here.
+• The viewer refreshes on its own while this tab is open, whichever way this is set.
 Applies live and persists.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setLogOn"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Redact PII
@@ -2312,9 +2319,8 @@ Turn it back on in Settings → Latency.">!</span>
 • Ping - round-trip delay to the test server (ms; lower is better).
 • Jitter - how much the ping wobbles (steadier is better).
 • Packet loss - share of data that didn't arrive (%; lower is better).
-• Bufferbloat - extra delay that builds up under load; what makes calls and games lag during a big download. High? Turn on SQM (Smart Queue Management: CAKE or fq_codel) on your router, or cap its speed just under your line's real speed. Measured at the speed this test actually reached: if the server was the bottleneck rather than your line, your buffers never filled and this reads cleaner than your connection really is. The typical figure is the middle of the samples taken during the transfer; the second figure is the 95th percentile, the slow tail.
-
-The window button takes a duration (7d) or a date range typed how you like it - &quot;jul 1 to jul 8&quot;, &quot;since jul 1&quot;, &quot;yesterday&quot;, &quot;2026&quot;, &quot;9am to 5pm&quot;. It shows you the dates it read back before you apply them, and the charts zoom to whatever runs the range actually holds.">i</span>
+• Bufferbloat - extra delay while the line is busy; why calls and games lag during a big download. First figure = the middle sample, second = the 95th percentile (the slow tail). High? Turn on SQM (Smart Queue Management: CAKE or fq_codel) on your router, or cap it just under your line's real speed. If the test server was the bottleneck, this reads cleaner than your line really is.
+• The window button takes a duration (7d) or a typed date range - jul 1 to jul 8, since jul 1, yesterday, 9am to 5pm. It echoes the dates it read before you apply; the charts zoom to the runs the range holds.">i</span>
       <span class="win-dd" id="speedWindow" style="margin-left:0"></span></span>
     </h2>
     <div class="cards">
@@ -2381,9 +2387,8 @@ The window button takes a duration (7d) or a date range typed how you like it - 
 • Latency line - how long it takes to reach the nearest of Cloudflare, Google or Quad9. Your distance to the internet's edge, not to a particular site.
 • DNS line - how long a name lookup takes on the DNS server this machine uses. Gaps mean lookups were failing, or the DNS check was off.
 • Shaded bands - rounds where the link failed its checks.
-• Pills below - each anchor's latest latency; click one to drop it from the line, or to bring it back in.
-
-The window button takes a duration (1h) or a date range typed how you like it - &quot;jul 1 to jul 8&quot;, &quot;since jul 1&quot;, &quot;yesterday&quot;, &quot;2026&quot;, &quot;9am to 5pm&quot;. It shows you the dates it read back before you apply them, and the chart zooms to whatever data the range actually holds.">i</span>
+• Pills below - each anchor's latest latency; click one to drop it from the line, or bring it back.
+• The window button takes a duration (1h) or a typed date range - jul 1 to jul 8, since jul 1, yesterday. It echoes the dates it read before you apply; the chart zooms to the data the range holds.">i</span>
       <span class="win-dd" id="latencyWindow" style="margin-left:0"></span></span>
     </h2>
     <button class="chart-save" type="button" data-chart-save="latency" title="Save this chart as an image" aria-label="Save this chart as an image"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="3.6"/></svg></button>
@@ -6587,9 +6592,10 @@ function updateScopeNote(){
     if(bestOf) t += ' Best of 3 also measures the two nearest responsive servers and keeps the best result.';
     el.innerHTML=t; return;
   }
-  // Best of 3 measures its candidates and keeps the best, so "fastest" is earned
-  // there. A single run just takes the lowest-latency candidate.
-  const what = bestOf ? 'the 3 nearest responsive servers, keeping the fastest result,' : 'the nearest responsive server';
+  // Best of 3 measures its candidates and keeps the best-SCORING one - "best",
+  // not "fastest": a near-tie on speed goes to the lower-ping server. A single
+  // run just takes the lowest-latency candidate.
+  const what = bestOf ? 'the 3 nearest responsive servers, keeping the best result,' : 'the nearest responsive server';
   el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
 // serverOptionText renders one dropdown row. The daemon's by-ID resolve can
@@ -8039,7 +8045,7 @@ function renderAccessUrls(){
     + `<button class="url-copy" type="button" data-url="${esc(e.url)}" title="Copy address" aria-label="Copy ${esc(e.url)}">⧉</button>`
     + '</span>';
   const tip = (on && accessLanUrls.length)
-    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers. The first address is the one on your network - use it from another device. Others belong to virtual interfaces this host holds (docker bridges, VPNs, VMs) and only work from those. A LAN address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation.">i</span>' : '';
+    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers.\n• The first address is the one on your network - use it from another device.\n• The rest are this host\'s other interfaces (a second network card or Wi-Fi, docker bridges, VPNs, VMs) - each answers only from its own network.\n• A LAN address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation.">i</span>' : '';
   $('accessUrls').innerHTML = `<div class="url-head">Reachable at ${tip}</div>`
     + `<div class="url-list">${rows.map(row).join('')}`
     + (on ? '' : '<span class="url-if">this machine only</span>') + '</div>';

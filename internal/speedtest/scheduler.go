@@ -529,13 +529,27 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	if s.ThresholdsFn != nil {
 		if t := s.ThresholdsFn(); t.Any() {
 			thresholdsActive = true
-			// Only judge the run if it actually measured at least one quantity the
-			// active thresholds cover. Otherwise len(failures)==0 would mean
-			// "nothing was checked", not "everything passed" - recording the run
-			// green and (below) clearing a real breach streak. Happens with iperf3
-			// 'both' when the only threshold is on the direction that failed.
+			// A direction the run TRIED and lost is a verdict, not a gap: with a
+			// minimum configured on it, the breach is that it measures nothing
+			// at all. Without this, a kept partial read as healthy - the upload
+			// alert silenced by the very failure it watches, and an in-progress
+			// breach streak actively reset at the moment the uplink fell off
+			// the cliff. Judged before the measurability gate on purpose: a
+			// failed direction is a verdict even when it is the ONLY thing the
+			// active thresholds cover.
+			if t.UpMbps > 0 && res.UploadFailed {
+				failures = append(failures, fmt.Sprintf("upload unmeasured (the upload failed) with a %.0f Mbps minimum set", t.UpMbps))
+			}
+			if t.DownMbps > 0 && res.DownloadFailed {
+				failures = append(failures, fmt.Sprintf("download unmeasured (the download failed) with a %.0f Mbps minimum set", t.DownMbps))
+			}
+			// Only judge the run further if it actually measured at least one
+			// quantity the active thresholds cover. Otherwise a clean sweep would
+			// mean "nothing was checked", not "everything passed" - recording the
+			// run green and (below) clearing a real breach streak. Happens with
+			// iperf3 'both' when the only threshold is on the direction that failed.
 			if thresholdsMeasurable(sp, t) {
-				failures = evalThresholds(sp, t)
+				failures = append(failures, evalThresholds(sp, t)...)
 				// A breach is a breach whatever else went unmeasured - evidence of
 				// failure needs no corroboration. But a CLEAN sweep only means
 				// "everything passed" if everything was actually checked. Without
@@ -563,6 +577,13 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 					sp.Healthy = &healthy
 					s.log.Debug("speedtest thresholds", "healthy", true, "failures", failures)
 				}
+			} else if len(failures) > 0 {
+				// Nothing measurable, but a tried-and-failed direction already
+				// delivered its verdict.
+				judged = true
+				healthy := false
+				sp.Healthy = &healthy
+				s.log.Debug("speedtest thresholds", "healthy", false, "failures", failures)
 			} else {
 				s.log.Debug("speedtest thresholds active but nothing measurable to check them against")
 			}
@@ -576,14 +597,18 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	if err := ctx.Err(); err != nil {
 		return sp, err
 	}
-	// A retried direction, or one that failed while the other succeeded, spent
-	// bytes that never reach the row above: only the winning attempt's count
-	// lands there, because a byte count on a successful row is what says the
-	// direction ran. Bill the remainder as its own usage-only row so a metered
-	// link is told the truth about what the run cost, without inventing a second
-	// measurement. Same shape and same filtering as a failed run's row.
-	s.recordExtraUsage(ctx, res, reason, sp.TS)
-	if err := s.store.InsertSpeed(ctx, sp); err != nil {
+	// The measurement FIRST, and on the second the store actually gave it
+	// (InsertSpeedTS walks to a free second: ts is the run's identity for
+	// delete, merge and the UI, and a shared second silently merges two
+	// records into one). The extra-usage row comes after, keyed to that
+	// second - written before the measurement it references, a crash or a
+	// failed insert between the two left a durable orphan naming a run that
+	// never landed, inflating the usage total forever with nothing to sweep
+	// it. Written after, the worst a crash costs is the extra row itself: an
+	// undercount, the same cost its own insert failure has always been
+	// allowed to carry.
+	finalTS, err := s.store.InsertSpeedTS(ctx, sp)
+	if err != nil {
 		// The result is not durable. Do NOT advance the breach streak, the adaptive
 		// cadence (lastUnhealthy), or fire an alert on a run that was never recorded -
 		// a restart would then re-evaluate from persisted history and disagree with an
@@ -592,6 +617,14 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		s.log.Error("speedtest store", "err", err)
 		return sp, fmt.Errorf("speedtest: persist result: %w", err)
 	}
+	sp.TS = finalTS
+	// A retried direction, or one that failed while the other succeeded, spent
+	// bytes that never reach the row above: only the winning attempt's count
+	// lands there, because a byte count on a successful row is what says the
+	// direction ran. Bill the remainder as its own usage-only row so a metered
+	// link is told the truth about what the run cost, without inventing a second
+	// measurement. Same shape and same filtering as a failed run's row.
+	s.recordExtraUsage(ctx, res, reason, sp.TS)
 	// The run's selection report, keyed to the row just written (sp.TS, never a
 	// second clock read - the next second would detach the rows from their run).
 	// nil is the normal case for every engine but Ookla. Non-fatal on error: the

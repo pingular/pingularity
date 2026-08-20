@@ -315,6 +315,49 @@ func (r *uploadRecorder) note(status int, err error) {
 	}
 }
 
+// uploadRejectMinRefusals is how many refused POSTs a run must show before its
+// server is condemned. Real rejection racks up thousands (each fails
+// instantly, see the measured 2336 above), so any meaningful floor passes it;
+// the floor exists for the other direction, an aborted run whose recorder
+// caught only a stray refusal or two before the cancel landed.
+const uploadRejectMinRefusals = 4
+
+// refusedByServer reports whether this recorder's evidence convicts the
+// SERVER of refusing uploads: every POST that got an answer was refused, no
+// answer was an acceptance, and there are enough refusals to rule out an
+// abort edge. The recorder is reset per attempt (see the reset call by the
+// retry loop), so the verdict rests on the FINAL attempt's answers alone -
+// with the uploadRejectMinRefusals floor and the caller's cancellation guard
+// as the safeguards against judging a truncated sample.
+// The exemptions each name a failure that says nothing about the endpoint
+// being gone: transport errors (status 0) are the user's link or a starved
+// uplink; any 2xx means the endpoint works and the failure lies elsewhere;
+// 3xx is a move, not a refusal (currentEndpoint and probeEndpoint own that
+// case); and 408/429/502/503/504 are load symptoms - a server alive enough
+// to say "not right now" (429 and 503 carry Retry-After semantics; 502/504
+// are its gateway saying the same) is a server worth retrying, and ANY of
+// them acquits the whole sample. Only 500 convicts among the 5xx: the fleet
+// probe measured ~14% of the catalogue answering a persistent 500 from a
+// never-installed legacy bundle, and that class does not recover.
+func (r *uploadRecorder) refusedByServer() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	refusals := 0
+	for status, n := range r.byStatus {
+		switch {
+		case status >= 200 && status < 300:
+			return false
+		case status == 408 || status == 429 || status == 502 || status == 503 || status == 504:
+			return false
+		case status >= 300 && status < 400:
+			return false
+		case status >= 400 && status < 600:
+			refusals += n
+		}
+	}
+	return refusals >= uploadRejectMinRefusals
+}
+
 // snapshot returns attempts so far and how many of them were confirmed (2xx).
 // The retry loop uses the delta across one attempt to tell STARVATION (nothing
 // ever completed) from REJECTION (thousands completed and were refused).
@@ -381,7 +424,20 @@ type recordingTransport struct {
 }
 
 func (t recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/speedtest/upload.php") {
+	// Method IS the discriminator: the library makes exactly one kind of POST
+	// through this client - the upload chunks, posted to s.URL verbatim
+	// (speedtest-go v1.7.11 request.go) - while downloads, the ping probe and
+	// the server list all ride GETs. Any path test is therefore a liability,
+	// not a guard: the literal "/speedtest/upload.php" suffix missed every
+	// endpoint whose directory is not named speedtest (the Ookla mini shape)
+	// and the trailing-slash path the relative-redirect adoption writes, and a
+	// filename heuristic would miss the next rewrite target the adoption
+	// stores (an arbitrary server-supplied Location, /backend/xfer.php). On a
+	// missed shape the recorder counted NOTHING: the starvation rescue could
+	// never fire, the diagnosis said "no upload requests were issued" about a
+	// run that made thousands, the rejected traffic vanished from the
+	// data-used figure, and a refusing server was never excluded.
+	if req.Method != http.MethodPost {
 		return t.base.RoundTrip(req)
 	}
 	resp, err := t.base.RoundTrip(req)
@@ -1411,9 +1467,36 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 		ttl = fallbackUnknownTTL
 	}
 	fbMu.Lock()
+	storeFallbackVerdictLocked(s.ID, fallbackVerdict{state: st, expires: now.Add(ttl), fails: fails})
+	delete(fbProbing, s.ID)
+	fl.st = st
+	close(fl.done)
+	fbMu.Unlock()
+	return st
+}
+
+// storeFallbackVerdictLocked is the ONE insert path into fbMap - both writers
+// (the GET probe above and the run-feedback noteUploadRejection) go through
+// it, so the cap invariant cannot diverge between them. Caller holds fbMu.
+//
+// An unexpired RETIRED verdict is only ever replaced by another retired one.
+// The web server picker fans out up to a dozen concurrent GET probes from
+// HTTP handler goroutines (annotateFallback) - a probe registered before a
+// run convicted the server can land after it, and its verdict would be OK,
+// because the broken-upload server's latency.txt GET succeeding is exactly
+// why it kept ranking OK. Letting that landing overwrite the conviction
+// silently un-excludes the server for another failed run cycle. Readmission
+// is expiry's job alone: the TTL is the designed second chance, and nothing
+// weaker than a fresh conviction may shorten a standing one.
+func storeFallbackVerdictLocked(id string, v fallbackVerdict) {
+	now := time.Now()
+	if cur, ok := fbMap[id]; ok && cur.state == endpointRetired &&
+		now.Before(cur.expires) && v.state != endpointRetired {
+		return
+	}
 	if len(fbMap) >= fallbackMapCap {
-		for k, v := range fbMap { // expired entries first - they cost nothing to lose
-			if now.After(v.expires) {
+		for k, old := range fbMap { // expired entries first - they cost nothing to lose
+			if now.After(old.expires) {
 				delete(fbMap, k)
 			}
 		}
@@ -1427,12 +1510,88 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 			delete(fbMap, k)
 		}
 	}
-	fbMap[s.ID] = fallbackVerdict{state: st, expires: now.Add(ttl), fails: fails}
-	delete(fbProbing, s.ID)
-	fl.st = st
-	close(fl.done)
+	fbMap[id] = v
+}
+
+// noteUploadRejection records a run's own upload outcome in the selection
+// health cache. Selection judges a server's legacy bundle by GETting its
+// latency probe (fallbackHealth), and that proxy has a blind spot: a host
+// whose static latency.txt still serves while its upload.php refuses every
+// POST (WAF method filtering, a rotted PHP handler, the fleet probe's
+// measured never-installed-bundle class) ranks endpointOK forever, wins every
+// selection pass on proximity, and fails every run - with nothing feeding the
+// failure back, the install's speed history goes permanently empty.
+//
+// A finished run IS the honest probe the GET cannot be. The recorder resets
+// per attempt, so the conviction rests on the FINAL attempt's answers: an
+// uninterrupted capture window of instant refusals is thousands of answered
+// POSTs with zero acceptances (measured: 2336), and two safeguards cover
+// smaller samples - refusedByServer's floor of uploadRejectMinRefusals, and
+// the caller's cancellation guard, so an aborted run's truncated evidence
+// never convicts. That outweighs the probe's one-request two-strike caution,
+// so the verdict is written retired outright, for the same fallbackTTL a
+// probe verdict lasts. On expiry the ordinary GET judges
+// again and readmits the server, so a wrongly-condemned one costs one TTL of
+// absence - where the hole this closes cost every run forever.
+//
+// Written under fbMu but outside the fbFlight protocol: this is not a probe
+// and owns no flight. A GET probe in flight this instant can land after us
+// and overwrite the verdict with OK - selection and runs are sequential per
+// scheduler, so the window is a real race but a rare one, and the next failed
+// run re-convicts. Not worth entangling run teardown with probe ownership.
+func noteUploadRejection(s *ookla.Server) (suspectOwnNetwork bool) {
+	if s == nil || s.ID == "" {
+		return false
+	}
+	now := time.Now()
+	fbMu.Lock()
+	storeFallbackVerdictLocked(s.ID, fallbackVerdict{
+		state:   endpointRetired,
+		expires: now.Add(fallbackTTL),
+		fails:   fallbackStrikes,
+	})
+	suspectOwnNetwork = noteConvictionLocked(s.ID, now)
 	fbMu.Unlock()
-	return st
+	return suspectOwnNetwork
+}
+
+// convictionWindow / convictionSuspectAt: DIFFERENT servers convicted in quick
+// succession indict the CLIENT's network, not the servers. A corporate
+// DPI/proxy that passes GETs but answers large upload POSTs with 403 makes
+// every server look refusing: each gets excluded in turn, selection walks
+// outward through the metro, and every log line blames the wrong side. The
+// evidence available here cannot DISTINGUISH the two cases per server - so
+// the exclusion still happens (it is self-healing per server) - but the
+// pattern across servers is nameable, and naming it is what points an
+// operator at their own firewall instead of a wild goose chase.
+const (
+	convictionWindow    = 24 * time.Hour
+	convictionSuspectAt = 3 // distinct servers convicted inside the window
+)
+
+var recentConvictions []struct {
+	id string
+	at time.Time
+} // under fbMu, like the verdicts the entries mirror
+
+// noteConvictionLocked records a conviction and reports whether the pattern
+// now looks like the client's own network. Caller holds fbMu.
+func noteConvictionLocked(id string, now time.Time) bool {
+	kept := recentConvictions[:0]
+	for _, c := range recentConvictions {
+		if now.Sub(c.at) <= convictionWindow && c.id != id {
+			kept = append(kept, c)
+		}
+	}
+	recentConvictions = append(kept, struct {
+		id string
+		at time.Time
+	}{id, now})
+	distinct := map[string]bool{}
+	for _, c := range recentConvictions {
+		distinct[c.id] = true
+	}
+	return len(distinct) >= convictionSuspectAt
 }
 
 // probeFallback GETs the bundle's latency probe and judges by STATUS, which is
@@ -1557,10 +1716,28 @@ var probeEndpoint = func(ctx context.Context, s *ookla.Server) endpointState {
 
 	code, loc := do(s.URL)
 	if code >= 300 && code < 400 && loc != "" {
-		// Take the redirect's HOST but keep our own scheme and path: the target
-		// advertises https, and plain http on the same host works everywhere it
-		// was measured, while https fails outright on hosts with no TLS listener.
-		if u, err := url.Parse(loc); err == nil && u.Host != "" {
+		// A RELATIVE Location (u.Host == "") is the ordinary nginx rewrite
+		// shape - "307 -> /speedtest/upload.php/" - and it is same-host BY
+		// CONSTRUCTION (a scheme-relative //host/path parses with a host and
+		// takes the absolute branch below), so there is no new destination
+		// for the SSRF guard to judge: resolve it against the URL just probed
+		// and follow the one hop, adopting the corrected path on a real
+		// answer exactly as the absolute branch adopts a corrected host.
+		// Skipping the hop - the old behaviour - fell through to retired and
+		// blacklisted a pinned server whose endpoint was one followable hop
+		// away, where the GET probe (probeFallback) deliberately refuses to
+		// condemn on an unfollowed redirect.
+		if u, err := url.Parse(loc); err == nil && u.Host == "" {
+			if base, berr := url.Parse(s.URL); berr == nil && base.Host != "" {
+				candidate := base.ResolveReference(u).String()
+				if code, _ = do(candidate); code != 0 {
+					s.URL = candidate
+				}
+			}
+		} else if err == nil && u.Host != "" {
+			// Take the redirect's HOST but keep our own scheme and path: the target
+			// advertises https, and plain http on the same host works everywhere it
+			// was measured, while https fails outright on hosts with no TLS listener.
 			// Adopt the redirect target into s.URL only AFTER the guarded re-probe
 			// gets a real response (code != 0). A guard refusal or transport
 			// failure leaves code == 0; writing s.URL then would poison it with an
@@ -2158,8 +2335,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		winReason = winReasonPingBoot
 	}
 	best.Selection = finishSelection(sel, results, errByID, dir, best.ServerID, winReason)
-	dn, up := totalBytes(results)
-	best.DownloadBytes, best.UploadBytes = dn+spentDown, up+spentUp
+	foldRoundBytes(&best, results, spentDown, spentUp)
 	// Always name the server whose numbers are being returned. Without this a run
 	// whose last target failed would leave the mid-run label - a server that
 	// contributed nothing - showing as the current one.
@@ -2859,6 +3035,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	// numbers - so a retried transfer no longer understates "data used".
 	var loadedDown, loadedUp *loadStat
 	var downBytes, upBytes int64
+	upPartial := false // a "both" run keeping its download after a failed upload
 	if dir != "up" {
 		err = withRetryPred(ctx, retries, anyErr, func() error {
 			freshManager(o, srv, o.uc) // per-attempt manager; see freshManager
@@ -2965,17 +3142,18 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 					o.logf("retrying upload with a single stream after no chunk completed",
 						"server", serverLabel(srv), "attempts", a)
 
-					// A longer window as well as fewer streams. One stream needs
-					// chunk/uplink seconds to land - 4 s at 2 Mbps - and it does not
-					// get a clean link to do it in: the previous attempt's transfers
-					// keep pulling bytes after their window closes (the same orphan
-					// behaviour awaitQuietTransfers exists for), so the rescue starts
-					// while the link is still busy. Doubling the window absorbs that
-					// without changing anything for a healthy run, which never
-					// reaches this branch.
-					// NOT extended past ooklaCaptureTime: both orphan-drain waits are
-					// sized at ooklaCaptureTime+5s, so a longer window would let an
-					// abandoned rescue outlive the wait meant to outlast it.
+					// Fewer streams ONLY - the capture window is deliberately not
+					// lengthened. It cannot safely be: both orphan-drain waits are
+					// sized at ooklaCaptureTime+5s, so a window past ooklaCaptureTime
+					// would let an abandoned rescue outlive the wait meant to outlast
+					// it - and production already runs AT ooklaCaptureTime, so a
+					// capped extension would be a no-op exactly where it matters.
+					// What the rescue gets instead is the settle wait below. Its
+					// floor is real: one stream needs chunk/uplink seconds per chunk
+					// (4 s at 2 Mbps) on a link the starved attempt's orphans are
+					// still draining, and the measured limit is ~3.2 Mbps - at 2 Mbps
+					// the rescue double-N/As. Below that cliff the partial-success
+					// path is what saves the run's download.
 
 					// Let the link settle first. The previous attempt's transfers
 					// keep pulling bytes after their window closed, and the rescue
@@ -3062,18 +3240,87 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			if retries <= 0 {
 				hint = " (no retry budget: the single-stream fallback for a starved upload only runs on a second attempt - raise Retries above 0 in Settings to allow it)"
 			}
-			if o.upRec != nil {
+			// The recorder's evidence must outlive this error string: a server
+			// that answered every POST and accepted none is refused-by-server,
+			// and the selection cache learns it here or the same server wins
+			// the next pass and fails the next run, forever (its GET health
+			// probe succeeds - that is how it kept ranking endpointOK).
+			// Never on a cancelled run: an abort truncates the evidence (a few
+			// hundred milliseconds of instant 403s clears the refusal floor),
+			// and condemning a server for 12h on a run WE cut short is the
+			// aborted-run edge the floor exists to rule out - the same guard
+			// the partial-keep below applies.
+			if ctx.Err() == nil && o.upRec != nil && o.upRec.refusedByServer() {
+				suspect := noteUploadRejection(srv)
+				o.logf("excluding server whose upload endpoint refused every request",
+					"server", serverLabel(srv), "for", fallbackTTL.String())
+				stats.Inc("speed.upload_rejected_server_excluded")
+				if suspect {
+					o.warnf("several different servers have refused every upload in a row - a firewall or proxy on YOUR network may be filtering upload POSTs (each server is retried after its exclusion expires)",
+						"distinct_servers", convictionSuspectAt, "window", convictionWindow.String())
+				}
+			}
+			// A "both" run that measured its download and lost only its upload
+			// is KEPT, mirroring iperf3 ("A 'both' run that lost ONE direction
+			// is kept as a partial success") and the Result contract's
+			// half-failed-run clause. Reaching here with dir=="both" means the
+			// download DID measure - a failed download returns before the
+			// upload phase starts - and below the v1.7.11 starvation cliff
+			// (rescue included: measured, 2 Mbps double-N/As) this is the
+			// difference between a chart and a permanent blank. The diagnosis
+			// moves to the Warn ring: the run no longer fails, so there is no
+			// error string left to carry it.
+			// A cancelled run is NOT laundered into a healthy partial: with the
+			// context done the cause is the cancellation, not the upload - the
+			// same guard iperf3 applies.
+			if dir == "both" && ctx.Err() == nil {
+				diag := ""
+				if o.upRec != nil {
+					diag = o.upRec.summary()
+				}
+				o.warnf("ookla upload failed, partial result kept",
+					"server", serverLabel(srv), "err", err.Error(), "detail", diag+hint)
+				stats.Inc("speed.ookla_partial")
+				upPartial = true
+			} else if o.upRec != nil {
 				return Result{DownloadBytes: downBytes, UploadBytes: upBytes},
 					fmt.Errorf("upload: %w [%s]%s", err, o.upRec.summary(), hint)
+			} else {
+				return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w%s", err, hint)
 			}
-			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("upload: %w%s", err, hint)
 		}
 	}
 
-	// Packet loss needs its own UDP pass; it stays nil when the user turns it off.
+	// Every upload-derived output of the run is decided HERE, in one block the
+	// Result literal below reads directly - a kept partial must not leak any
+	// number taken under an upload that never measured, and a scrub scattered
+	// across the run body is how exactly that happened once (the loss probe
+	// below). iperf3 holds the same contract structurally by assigning upload
+	// fields only on success.
+	// On a partial: the failed upload's traffic is real spend but not a
+	// measurement, so it rides the usage-only Extra channel - a byte count on
+	// UploadBytes is what marks the direction MEASURED on every surface
+	// (spMeasured, the upload threshold's UpBytes gate, best-of). The
+	// library's -1 N/A sentinel is never read as an Mbps, and bufferbloat
+	// sampled under a load that never measured is not a measurement.
+	upMbps, upLoad := 0.0, loadedUp
+	var extraUp int64
+	if upPartial {
+		upLoad = nil
+		extraUp, upBytes = upBytes, 0
+	} else {
+		upMbps = srv.ULSpeed.Mbps()
+	}
+
+	// Packet loss needs its own UDP pass; it stays nil when the user turns it
+	// off - and it is SKIPPED on a kept partial: the datagrams would ride the
+	// same uplink the failed attempts' orphan transfers are still draining
+	// (the condition both drain waits exist to prevent), so the figure would
+	// be loss under a load that never measured. Before partials existed the
+	// run errored out above and the probe could never follow a failed upload.
 	var loss *float64
 	var udpDir string
-	if o.LossFn == nil || o.LossFn() {
+	if !upPartial && (o.LossFn == nil || o.LossFn()) {
 		loss = ooklaLoss(ctx, srv)
 		// The probe SENDS its datagrams (speedtest-go's PacketLossSender), so a
 		// successful one measured the upstream path - the only direction this
@@ -3086,7 +3333,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	return Result{
 		Engine:          "ookla",
 		DownloadMbps:    srv.DLSpeed.Mbps(),
-		UploadMbps:      srv.ULSpeed.Mbps(),
+		UploadMbps:      upMbps,
 		PingMS:          util.DurMS(srv.Latency),
 		PingBestMS:      msIfPositive(bestPing),
 		JitterMS:        f64p(util.DurMS(srv.Jitter)),
@@ -3095,13 +3342,15 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		PacketLoss:      loss,
 		UDPDirection:    udpDir,
 		IPFamily:        fams.family(),
+		UploadFailed:    upPartial,
 		DownloadBytes:   downBytes,
 		UploadBytes:     upBytes,
+		ExtraUpBytes:    extraUp,
 		IdleMS:          idleMS,
 		LoadedDownMS:    loadedDown.medPtr(),
-		LoadedUpMS:      loadedUp.medPtr(),
+		LoadedUpMS:      upLoad.medPtr(),
 		LoadedDownP95MS: loadedDown.tailPtr(),
-		LoadedUpP95MS:   loadedUp.tailPtr(),
+		LoadedUpP95MS:   upLoad.tailPtr(),
 	}, nil
 }
 
@@ -3789,6 +4038,46 @@ func totalBytes(rs []Result) (down, up int64) {
 		up += r.UploadBytes
 	}
 	return down, up
+}
+
+// totalExtraBytes is totalBytes for the usage-only channel: partial
+// candidates' failed-direction spend (and any retry spend they carried).
+func totalExtraBytes(rs []Result) (down, up int64) {
+	for _, r := range rs {
+		down += r.ExtraDownBytes
+		up += r.ExtraUpBytes
+	}
+	return down, up
+}
+
+// foldRoundBytes stamps the ROUND's traffic onto the winner row, which is the
+// row the scheduler bills (see the comment above totalBytes). The measured
+// channels take every candidate's measured bytes plus failed candidates'
+// spend - EXCEPT when no candidate measured an upload at all (an all-partial
+// round, or a down-only direction): a byte count on UploadBytes is what marks
+// the direction MEASURED on every surface, so folding spend into it would
+// render the winner's absent upload as a measured 0.0. That spend rides the
+// usage-only Extra channel instead, and is billed identically. The download
+// side needs no twin guard: a run without a measured download fails outright,
+// so a winner always carries download bytes of its own.
+func foldRoundBytes(best *Result, results []Result, spentDown, spentUp int64) {
+	dn, up := totalBytes(results)
+	xd, xu := totalExtraBytes(results)
+	best.DownloadBytes = dn + spentDown
+	best.ExtraDownBytes, best.ExtraUpBytes = xd, xu
+	if best.UploadBytes == 0 {
+		// The WINNER's own upload never measured. Usually that means no
+		// candidate's did (a partial cannot outscore a full measurement) -
+		// but not always: the first-ever round's ping bootstrap picks its
+		// winner by latency alone, so a kept partial can beat a loser that
+		// measured both directions. Folding that loser's bytes into
+		// UploadBytes would mark the winner's absent upload as a measured
+		// 0.0 Mbps and fire a false upload-below-threshold alert, so ALL of
+		// the round's upload traffic rides the usage-only channel instead.
+		best.ExtraUpBytes += up + spentUp
+		return
+	}
+	best.UploadBytes = up + spentUp
 }
 
 // bestIndex is bestResult's position, so callers can tell the winner apart from

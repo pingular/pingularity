@@ -385,6 +385,15 @@ type Controller struct {
 	// persisting the blank, so an unrelated form save can't erase a still-recoverable
 	// password. Rebuilt each load; set under wmu in New/Reload, read under wmu in mutate.
 	sealedByAddr map[string]string
+	// onLoaded, when set, is called after every load that leaves the controller
+	// usable (Reload returning nil or ErrLegacyReseal), OUTSIDE the controller's
+	// locks, with firstLoad reporting whether this load took the controller from
+	// unloaded to loaded. It exists so the process can hang behavior off "settings
+	// (re)loaded" without every call site of Reload - the boot retry loop, the
+	// reload signal, the web import - having to remember to invoke it: a forgotten
+	// site is how an explicit access override once silently stopped applying.
+	// Set once, before any concurrent Reload can fire.
+	onLoaded atomic.Pointer[func(firstLoad bool)]
 	// initErr records that the initial settings read failed, so the controller is
 	// running on defaults rather than stored config. Writes are refused (see
 	// mutate) to avoid clobbering the stored config with defaults, and the web
@@ -671,6 +680,17 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	return c, nil
 }
 
+// LoadedOK is the ONE definition of "this load left the controller usable":
+// a clean load, or ErrLegacyReseal - settings fully live, only the legacy
+// iperf3 password re-encryption failed. The boot path, the retry loop, the
+// reload signal, the web import and the controller's own post-load hook all
+// judge loads with it; scattered inline copies once disagreed, and the reload
+// signal silently skipped the whole post-load sequence on exactly the
+// installs where nothing else would run it.
+func LoadedOK(err error) bool {
+	return err == nil || errors.Is(err, ErrLegacyReseal)
+}
+
 // ErrLegacyReseal marks a settings load that SUCCEEDED but could not rewrite
 // legacy plaintext iperf3 passwords in their sealed form. Settings are in
 // effect; only the at-rest re-encryption is pending.
@@ -897,11 +917,33 @@ func overlay(v Values, m map[string]string) Values {
 // writer lock so a concurrent setter can't slip between the DB read and the
 // broadcast and have its change stomped by stale data.
 func (c *Controller) Reload(ctx context.Context) error {
+	// wasLoaded comes from reload itself, read under wmu: sampled out here,
+	// two concurrent first loads (the boot retry loop racing a SIGHUP or a
+	// web import) both saw unloaded and both fired the hook with
+	// firstLoad=true - a duplicate boot-shaped warning and a duplicate
+	// store-wide read, the exact cost gating on firstLoad exists to avoid.
+	wasLoaded, err := c.reload(ctx)
+	if LoadedOK(err) {
+		// Fire the post-load hook with every lock released: the hook may write
+		// settings (the access override does), and a write takes wmu.
+		if fn := c.onLoaded.Load(); fn != nil {
+			(*fn)(!wasLoaded)
+		}
+	}
+	return err
+}
+
+// OnLoaded registers the post-load hook (see the field). Call before any
+// concurrent Reload is possible.
+func (c *Controller) OnLoaded(fn func(firstLoad bool)) { c.onLoaded.Store(&fn) }
+
+func (c *Controller) reload(ctx context.Context) (wasLoaded bool, err error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	wasLoaded = c.Loaded() // under wmu: serialized against every other load
 	m, err := c.store.AllSettings(ctx)
 	if err != nil {
-		return err
+		return wasLoaded, err
 	}
 	// Reload is the recovery path's first successful read when New's failed (the
 	// settings-retry loop, SIGHUP): the fresh install it just recovered starts
@@ -929,15 +971,15 @@ func (c *Controller) Reload(ctx context.Context) error {
 			// Sealing failed: don't rewrite the imported passwords in the clear. The
 			// config is already live in memory (broadcast above); report the same
 			// distinguishable ErrLegacyReseal a failed write would.
-			return fmt.Errorf("%w: %v", ErrLegacyReseal, err)
+			return wasLoaded, fmt.Errorf("%w: %v", ErrLegacyReseal, err)
 		}
 		if _, err := c.store.SetSettingsDiff(ctx, map[string]string{
 			keyIperfServers: sealed,
 		}); err != nil {
-			return fmt.Errorf("%w: %v", ErrLegacyReseal, err)
+			return wasLoaded, fmt.Errorf("%w: %v", ErrLegacyReseal, err)
 		}
 	}
-	return nil
+	return wasLoaded, nil
 }
 
 // Getters (each safe for concurrent use).

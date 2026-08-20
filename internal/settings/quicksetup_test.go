@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -497,5 +499,43 @@ func TestQuickSetupOfferSinceErr(t *testing.T) {
 	st.Close() // now reads fail
 	if _, err := c.QuickSetupOfferSinceErr(ctx); err == nil {
 		t.Error("a store read error must be surfaced, not masked as 0 (the hold must fail-safe)")
+	}
+}
+
+// TestConcurrentFirstLoadsFireOneFirstLoadHook: wasLoaded is read under wmu
+// inside reload, so of N concurrent Reloads racing an unloaded controller,
+// exactly ONE observes the unloaded->loaded transition. Sampled outside the
+// lock, several could - each firing the boot-shaped ambiguity warning and a
+// store-wide read the firstLoad gate exists to avoid.
+func TestConcurrentFirstLoadsFireOneFirstLoadHook(t *testing.T) {
+	ctx := context.Background()
+	st, err0 := store.Open(":memory:")
+	if err0 != nil {
+		t.Fatal(err0)
+	}
+	t.Cleanup(func() { st.Close() })
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	c, err := New(dead, st, Values{Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second, DownAfter: 3, UpAfter: 2})
+	if err == nil {
+		t.Fatal("fixture: initial load must fail")
+	}
+	var firstLoads atomic.Int64
+	c.OnLoaded(func(firstLoad bool) {
+		if firstLoad {
+			firstLoads.Add(1)
+		}
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.Reload(ctx)
+		}()
+	}
+	wg.Wait()
+	if got := firstLoads.Load(); got != 1 {
+		t.Fatalf("%d hooks fired with firstLoad=true across 8 concurrent reloads, want exactly 1", got)
 	}
 }

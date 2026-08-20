@@ -677,8 +677,10 @@ switching engines switches which pair is in force. On Ookla, retries are also wh
 let a very slow uplink finish at all: when parallel upload streams are too slow for
 any of them to complete inside the capture window, the retry falls back to a single
 stream. Set Ookla's retries to `0` and that fallback cannot run, so on a link that
-slow the upload - and with it the whole run - fails. The error says so and names the
-setting.
+slow the upload always fails and records nothing. The run's download half is kept
+either way - a "both" run that loses only its upload stores its download, ping and
+jitter as a partial result, with the upload shown as unmeasured (the same contract
+iperf3 has always had) - and the warning in the log says why and names the setting.
 
 That UDP pass needs the iperf3 port open for **UDP as well as TCP** - the same
 port, both protocols (`ufw allow 5201/tcp` and `ufw allow 5201/udp`, or the

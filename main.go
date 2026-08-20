@@ -370,7 +370,7 @@ func (p *program) run(ctx context.Context) {
 	// and once seeded it would hold an established install's monitoring for
 	// 48h). Skipping costs nothing - the same decision runs next boot, or after
 	// the retry loop's successful Reload via the next restart.
-	if err == nil || errors.Is(err, settings.ErrLegacyReseal) {
+	if settings.LoadedOK(err) {
 		// Record the first-run decision on the loaded controller (consent-by-flags
 		// then offer seeding). Deferred logging - the real logger isn't up yet. The
 		// settings-retry loop runs the SAME step after a successful reload, so a
@@ -388,31 +388,19 @@ func (p *program) run(ctx context.Context) {
 		// never opens access on the guess (see warnAmbiguousContainerAccess).
 		// The WARN rides earlyLog like the rest, so it survives the default
 		// "off" level.
-		if werr := warnAmbiguousContainerAccess(ctx, p.cfg, p.store, set, containerized,
-			func(msg string, args ...any) {
-				earlyLog = append(earlyLog, func() { p.log.Warn(msg, args...) })
-			}); werr != nil {
-			earlyLog = append(earlyLog, func() {
-				p.log.Warn("container access provenance could not be judged; nothing changed, re-judged next boot", "err", werr)
-			})
-		}
 		// An EXPLICIT -access / PINGULARITY_ACCESS is authoritative over a
-		// disagreeing stored access_local_only (see reconcileAccess) - the
+		// disagreeing stored access_local_only (see applyExplicitAccess) - the
 		// recovery path for a container whose stored local-only would 403 its
-		// own published port with no shell to fix it from.
-		if changed, aerr := reconcileAccess(ctx, p.cfg, set); aerr != nil {
-			earlyLog = append(earlyLog, func() {
-				p.log.Warn("explicit -access/PINGULARITY_ACCESS could not override the stored access setting", "err", aerr)
-			})
-		} else if changed {
-			localOnly := p.cfg.Access != "network"
-			earlyLog = append(earlyLog, func() {
-				p.log.Info("stored access setting overridden by explicit operator input",
-					"access", p.cfg.Access, "access_local_only", localOnly,
-					"why", "-access/PINGULARITY_ACCESS was passed explicitly, and explicit operator intent beats the stored value")
-			})
-		}
+		// own published port with no shell to fix it from. Deferred sinks: the
+		// real logger is not up yet.
+		p.applyExplicitAccess(ctx, set, true,
+			func(msg string, args ...any) { earlyLog = append(earlyLog, func() { p.log.Warn(msg, args...) }) },
+			func(msg string, args ...any) { earlyLog = append(earlyLog, func() { p.log.Info(msg, args...) }) })
 	}
+	// Every LATER load - the retry loop, a reload signal, a web import - runs
+	// the same sequence through the controller's post-load hook, so no load
+	// path can miss it. Registered before any of those can fire.
+	p.registerSettingsLoadedHook(ctx, set)
 
 	// The one always-on startup line, straight to stdout past the level gate.
 	// After the access reconcile above so the mode it states is the one actually
@@ -540,23 +528,7 @@ func (p *program) run(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-hup:
-					// A SIGHUP is a THIRD path (besides boot and the retry loop)
-					// that takes an unloaded controller to loaded - e.g. a first
-					// boot whose settings load failed, recovered by SIGHUP before
-					// the retry ticked. Seed the offer clock BEFORE Reload flips
-					// Loaded and broadcasts (a no-op on a loaded controller), for
-					// the same latch window the retry loop closes.
-					p.seedQuickSetupOfferEarly(ctx, set)
-					if err := set.Reload(ctx); err != nil {
-						p.log.Warn("settings reload on signal", "err", err)
-					} else {
-						p.log.Info("settings reloaded on signal")
-						// Materialize the rest of the first-run decision here too
-						// (answer markers refuse while unloaded), or a fresh install
-						// would never get its consent hold and would start probing
-						// unasked.
-						p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
-					}
+					p.handleReload(ctx, set)
 				}
 			}
 		})
@@ -1163,9 +1135,23 @@ func quickSetupHoldState(ctx context.Context, set *settings.Controller) qsHoldSt
 		}
 		return qsProvisional
 	}
+	// Answered is decided FIRST: it is permanent, it lives in the loaded
+	// settings (no store read), and QuickSetupHold(true, ...) is false for
+	// every clock value - so nothing the offer clock could say changes the
+	// answer. Deciding it after the store read put an ANSWERED install on the
+	// first-run hold whenever that read failed transiently (a busy disk at
+	// boot): monitoring paused and the boot notice claimed a first run, on an
+	// install that consented long ago. Held-on-error is the right direction
+	// only for the unanswered cases below - and this order also spares
+	// monitoringLive a store-wide read per probe round on every answered
+	// install.
+	if set.QuickSetupDone() {
+		return qsReleased
+	}
 	// Read the offer clock with its error surfaced: a transient store read
 	// error must HOLD, not read as "no clock -> release" and then latch that
-	// release forever off a single failed read.
+	// release forever off a single failed read. (Only unanswered installs
+	// reach here, so held is always the safe direction now.)
 	since, err := set.QuickSetupOfferSinceErr(ctx)
 	if err != nil {
 		return qsHeld
@@ -1234,6 +1220,36 @@ func (p *program) materializeQuickSetup(ctx context.Context, set *settings.Contr
 	}
 }
 
+// handleReload is a reload signal's whole effect (SIGHUP; `systemctl reload`).
+// A SIGHUP is a THIRD path (besides boot and the retry loop) that takes an
+// unloaded controller to loaded - e.g. a first boot whose settings load
+// failed, recovered by SIGHUP before the retry ticked. Seed the offer clock
+// BEFORE Reload flips Loaded and broadcasts (a no-op on a loaded controller),
+// for the same latch window the retry loop closes.
+func (p *program) handleReload(ctx context.Context, set *settings.Controller) {
+	p.seedQuickSetupOfferEarly(ctx, set)
+	// ErrLegacyReseal means LOADED - settings are fully live, only the legacy
+	// iperf3 password re-encryption failed - and the boot path and retry loop
+	// both continue on it. Bailing here skipped the whole post-load sequence
+	// on exactly the installs where no other path would ever run it.
+	if err := set.Reload(ctx); !settings.LoadedOK(err) {
+		p.log.Warn("settings reload on signal", "err", err)
+		return
+	} else if err != nil {
+		p.log.Warn("settings reloaded on signal; legacy iperf3 password re-encryption still failing", "err", err)
+	} else {
+		p.log.Info("settings reloaded on signal")
+	}
+	// Materialize the rest of the first-run decision here too (answer markers
+	// refuse while unloaded), or a fresh install would never get its consent
+	// hold and would start probing unasked. The access sequence already ran:
+	// the controller's post-load hook fires inside Reload - on this path, the
+	// retry loop, and the web import path alike - so a reload that pulls in a
+	// stored value disagreeing with a still-set explicit override re-applies
+	// the override every time.
+	p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
+}
+
 // retrySettingsLoad re-attempts the initial settings read until it succeeds.
 //
 // It exists because the web guard fails CLOSED when settings never loaded: that
@@ -1265,7 +1281,7 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 		// a loaded controller, an open Quick Setup, and a bare offer clock -
 		// and would have latched its hold released for good.
 		p.seedQuickSetupOfferEarly(ctx, set)
-		if err := set.Reload(ctx); err == nil || errors.Is(err, settings.ErrLegacyReseal) {
+		if err := set.Reload(ctx); settings.LoadedOK(err) {
 			p.log.Warn("settings loaded on retry; serving normally again")
 			// The boot path skipped the first-run decision on the failed load. Take
 			// the rest of it now (the offer clock was pre-seeded above; the answer
@@ -1273,6 +1289,8 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 			// install must get its consent hold rather than having started probing
 			// unasked while unloaded.
 			p.materializeQuickSetup(ctx, set, func(msg string, e error) { p.log.Warn(msg, "err", e) })
+			// The access sequence already ran: the controller's post-load hook
+			// fires inside Reload, on this path and every other one.
 			// This Reload is where a fresh install whose first load failed gets
 			// its birth marker - the boot path already passed, and this loop stops
 			// as soon as settings load, so it is this process's last SCHEDULED
@@ -1720,6 +1738,56 @@ func reconcileAccess(ctx context.Context, cfg config.Config, set *settings.Contr
 		return false, nil
 	}
 	return true, set.SetAccessLocalOnly(ctx, wantLocalOnly)
+}
+
+// registerSettingsLoadedHook makes every FUTURE settings load run the access
+// sequence: the retry loop, the reload signal, and the web import path - which
+// calls Controller.Reload directly and is invisible to main's handlers, so a
+// restored backup carrying access_local_only could adopt a lockout over a
+// still-set explicit override. The boot load has already run its own sequence
+// (through earlyLog, before the log level is known) by the time this
+// registers. The ambiguity warning rides only firstLoad: it is a boot-shaped
+// explanation ('re-judged next boot'), and re-emitting it on every reload of
+// an ambiguous container - which reconcileAccess can never resolve without
+// the explicit flag - would spam a WARN and a store-wide read per HUP.
+func (p *program) registerSettingsLoadedHook(ctx context.Context, set *settings.Controller) {
+	set.OnLoaded(func(firstLoad bool) {
+		p.applyExplicitAccess(ctx, set, firstLoad,
+			func(msg string, args ...any) { p.log.Warn(msg, args...) },
+			func(msg string, args ...any) { p.log.Info(msg, args...) })
+	})
+}
+
+// applyExplicitAccess runs the post-load access sequence - the container
+// ambiguity warning, then the explicit -access/PINGULARITY_ACCESS override -
+// and must run on EVERY path that takes settings from unloaded to loaded, and
+// on every later reload. The docs promise the explicit override is
+// authoritative at every start; it used to be applied only on the boot whose
+// FIRST settings read succeeded, so the one boot most likely to be a
+// container-lockout recovery attempt (a restart mid-fault, recovered by the
+// retry loop) silently ignored the override and kept answering 403 - with no
+// shell in the image to see why. A reload needs it for the same reason from
+// the other direction: a reload can pull in a disagreeing stored value (an
+// out-of-band edit, a restored backup), and the still-set override must beat
+// it. reconcileAccess itself keeps the we-never-guess rule: without the
+// explicit flag this warns at most and writes nothing.
+// warn/info abstract the sink: the boot path replays through earlyLog before
+// the log level is known; every other caller logs directly.
+func (p *program) applyExplicitAccess(ctx context.Context, set *settings.Controller, warnAmbiguity bool,
+	warn func(msg string, args ...any), info func(msg string, args ...any)) {
+	if warnAmbiguity {
+		if werr := warnAmbiguousContainerAccess(ctx, p.cfg, p.store, set, util.InContainer(), warn); werr != nil {
+			warn("container access provenance could not be judged; nothing changed, re-judged next boot", "err", werr)
+		}
+	}
+	if changed, aerr := reconcileAccess(ctx, p.cfg, set); aerr != nil {
+		warn("explicit -access/PINGULARITY_ACCESS could not override the stored access setting", "err", aerr)
+	} else if changed {
+		localOnly := p.cfg.Access != "network"
+		info("stored access setting overridden by explicit operator input",
+			"access", p.cfg.Access, "access_local_only", localOnly,
+			"why", "-access/PINGULARITY_ACCESS was passed explicitly, and explicit operator intent beats the stored value")
+	}
 }
 
 // accessAmbiguousWarnMsg is the one WARN warnAmbiguousContainerAccess emits.

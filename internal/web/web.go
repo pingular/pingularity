@@ -3469,8 +3469,8 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		// the backup never went live there is nothing to repair, and the blanket
 		// restore below has already put the pre-import keys back.
 		backupLive := true
-		if rerr != nil && !errors.Is(rerr, settings.ErrLegacyReseal) {
-			if rerr = s.settings.Reload(rctx); rerr != nil && !errors.Is(rerr, settings.ErrLegacyReseal) {
+		if !settings.LoadedOK(rerr) {
+			if rerr = s.settings.Reload(rctx); !settings.LoadedOK(rerr) {
 				backupLive = false
 				// rctx may be the very thing that failed (the shared budget can be
 				// exhausted before the reload even runs), so the last-resort restore
@@ -3501,7 +3501,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 					}
 				} else {
 					s.log.Error("post-import reload failed; kept the pre-import login and access settings", "err", rerr)
-					if err := s.settings.Reload(sctx); err != nil && !errors.Is(err, settings.ErrLegacyReseal) {
+					if err := s.settings.Reload(sctx); !settings.LoadedOK(err) {
 						// Still not live, but now safe: the stored auth/access keys are
 						// the pre-import ones, so a restart changes nothing the operator
 						// owns.

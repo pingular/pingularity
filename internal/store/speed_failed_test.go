@@ -287,7 +287,7 @@ func TestHasHistoryIgnoresAccountingRows(t *testing.T) {
 func TestSpeedFilterCoversEveryMeasurementRead(t *testing.T) {
 	// Reads/writes that must NOT filter, each with the reason it is exempt.
 	exempt := map[string]string{
-		"InsertSpeed":                  "the writer; it SETS the marker",
+		"InsertSpeedTS":                "the writer; it SETS the marker (and its free-second probe must see every row - an accounting row occupies its second as much as a measurement does)",
 		"SpeedDataUsage":               "the sums the accounting row exists for",
 		"SpeedDataUsageSince":          "same, for an arbitrary window",
 		"DeleteSpeed":                  "delete-by-ts is idempotent and must reach every row",
