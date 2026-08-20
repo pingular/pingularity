@@ -8,6 +8,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -35,7 +36,8 @@ var (
 // name once; an unrooted one it also re-asks with each entry of the host's search
 // list appended (GOROOT/src/net/dnsclient_unix.go, dnsConfig.nameList). So on a
 // host that has a search domain, dropping the dot buys a second lookup per probe:
-// four wire queries instead of two, since network "ip" asks A and AAAA for each.
+// two wire queries instead of one, since the probe asks a single A question per
+// name (see lookupHost).
 // Go walks that name list in order and stops at the first name that comes back
 // with addresses (the `len(addrs) > 0` break closing goLookupIPCNAMEOrder's loop,
 // same file) - so the walk continues past a name that resolves to nothing, which
@@ -63,29 +65,46 @@ var (
 // TestResolveTimeLooksUpARootedName pins the dot on the name ResolveTime hands
 // the resolver, on any host; TestResolveTimeAsksOneNamePerProbe pins the wire
 // count, though only a host whose search list contributes a name can fail it;
-// TestResolveTimeNameIsFreshEachProbe pins the per-probe label. The A/AAAA pair
-// itself is inherent to LookupHost and stays.
+// TestResolveTimeNameIsFreshEachProbe pins the per-probe label; the wire-count
+// test also pins the single-question lookup, and
+// TestResolveTimeLostLaneIsNotHealthyLatency pins why it is single (below).
 func probeName() string {
 	var b [6]byte
 	_, _ = crand.Read(b[:])
 	return "pp" + hex.EncodeToString(b[:]) + "." + dnsProbeDomain + "."
 }
 
-// lookupHost is the resolver call ResolveTime makes. It is a var, and a closure
-// rather than a method value, so it re-reads net.DefaultResolver on every call:
-// that keeps a test's swapped-in resolver effective, and lets a test read the
-// exact name string ResolveTime passes, which no wire capture can recover (Go
-// roots every name before it reaches the wire).
-var lookupHost = func(ctx context.Context, name string) ([]string, error) {
-	return net.DefaultResolver.LookupHost(ctx, name)
+// lookupHost is the resolver call ResolveTime makes: a single A question via
+// LookupIP("ip4"), not LookupHost's A+AAAA pair. One question makes the sample
+// one round trip. The pair recorded the SLOWER of two round trips - a few ms
+// of steady inflation and a doubled spike tail - and, worse, one lost packet
+// on either lane held the call open to the full budget while the answered
+// lane's NXDOMAIN surfaced as IsNotFound, so the probe plotted a healthy
+// budget-length "latency" sample on a resolver that had answered instantly
+// (Go's built-in resolver path - the shipped Linux binaries; the macOS and
+// Windows system-resolver builds surfaced that stall as a timeout already.
+// Measured Aug 2026: 8 of 8 lost-packet runs). The record TYPE is orthogonal
+// to transport - an IPv6-only host still asks its resolver for A records over
+// IPv6, and the probe's random name has no records of any type anyway.
+//
+// It is a var, and a closure rather than a method value, so it re-reads
+// net.DefaultResolver on every call: that keeps a test's swapped-in resolver
+// effective, and lets a test read the exact name string ResolveTime passes,
+// which no wire capture can recover (Go roots every name before it reaches
+// the wire).
+var lookupHost = func(ctx context.Context, name string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip4", name)
 }
 
 // ResolveTime times one DNS lookup of a freshly randomized name (see probeName).
 // ok is true when the resolver answered - including the expected NXDOMAIN for the
 // random name (DNS is healthy, just no such record) - and false only when
-// resolution actually fails (timeout, SERVFAIL, no resolver). On failure it also
-// returns the underlying error so the caller can classify/log WHY (via
-// DialErrClass); err is nil whenever ok is true.
+// resolution actually fails (timeout, SERVFAIL, no resolver) or the lookup
+// consumed the whole probe budget, whatever error the library reports: an
+// answer that surfaces only at the deadline is a timeout wearing an answer's
+// error value, not health. On failure it also returns the underlying error so
+// the caller can classify/log WHY (via DialErrClass); err is nil whenever ok
+// is true.
 func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 	rctx, cancel := context.WithTimeout(ctx, dnsProbeTimeout)
 	defer cancel()
@@ -102,8 +121,22 @@ func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 		return d, true, nil
 	}
 	var de *net.DNSError
-	if errors.As(err, &de) && de.IsNotFound {
-		return d, true, nil // NXDOMAIN: the resolver answered; the path works
+	// dnsAnsweredErrno widens the answered check for Windows, whose system
+	// resolver can report the probe's NODATA answer as WSANO_DATA - an errno
+	// Go does not map to IsNotFound (see dialerr_windows.go).
+	if errors.As(err, &de) && (de.IsNotFound || dnsAnsweredErrno(err)) {
+		// Only an answer that arrived inside the budget counts. Go's resolver
+		// aggregates errors across lookup lanes and retries, and a benign
+		// IsNotFound from one lane used to mask another lane that never
+		// answered - the call then returned at the deadline and the whole
+		// budget plotted as healthy latency (one lost UDP packet was enough).
+		// The single-question lookup closes the two-lane case, but retries and
+		// multi-nameserver walks can still land an IsNotFound on the deadline,
+		// so the rule is pinned here, where the verdict is made.
+		if rctx.Err() == nil {
+			return d, true, nil // NXDOMAIN: the resolver answered; the path works
+		}
+		return d, false, fmt.Errorf("resolver answered only at the %v budget: %w", dnsProbeTimeout, rctx.Err())
 	}
 	return d, false, err // timeout / SERVFAIL / no resolver -> DNS unhealthy
 }

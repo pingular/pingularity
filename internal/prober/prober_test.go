@@ -298,7 +298,13 @@ func stubResolver(t *testing.T, addr string) {
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var d net.Dialer
+			// The Resolver must be non-nil, or this dial reads the
+			// net.DefaultResolver global: LookupIP parks the real lookup on a
+			// detached singleflight goroutine that can outlive the test, and
+			// that read racing the next test's resolver swap is a data race
+			// (caught by -race -count=20). The stub address is an IP literal,
+			// so the resolver value is never used to resolve anything.
+			d := net.Dialer{Resolver: &net.Resolver{}}
 			return d.DialContext(ctx, "udp", addr)
 		},
 	}
@@ -325,7 +331,7 @@ func TestResolveTimeNXDOMAINIsHealthy(t *testing.T) {
 // check. Where the host's search list contributes no name - no resolv.conf
 // search line and a hostname with no domain part for Go to fall back on
 // (dnsDefaultSearch, GOROOT/src/net/dnsconfig_unix.go) - nameList returns a
-// single name for a relative name too, so that test counts 2 queries whether the
+// single name for a relative name too, so that test counts 1 query whether the
 // dot is there or not. Measured here: with the dot deleted from probeName and
 // the probe domain stretched so the search suffix no longer fits nameList's
 // 254-byte cap, the wire-count test passed.
@@ -348,15 +354,15 @@ func TestProbeNameIsRooted(t *testing.T) {
 	}
 }
 
-// One probe must put exactly one question name on the wire. The A/AAAA pair is
-// unavoidable for network "ip" (LookupHost); a second pair for a search-domain
-// spelling of the same name is not. What that costs at the shipped defaults: the
-// DNS probe runs at most once per probe round (the dnsBusy CompareAndSwap in
-// Monitor.round, internal/monitor/monitor.go, launches nothing while the previous
-// lookup is still in flight), and the default probe interval is 5s (shippedDefaults'
-// def.Latency, internal/settings/settings.go), so up to 86400/5 = 17,280 probes a
-// day. Rooted, that ceiling is 34,560 wire queries; unrooted on a host with a
-// search domain it is 69,120, and the extra lookup is doomed.
+// One probe must put exactly one question on the wire: a single A query (see
+// lookupHost for why not the A/AAAA pair), and no second query for a
+// search-domain spelling of the same name. What that costs at the shipped
+// defaults: the DNS probe runs at most once per probe round (the dnsBusy
+// CompareAndSwap in Monitor.round, internal/monitor/monitor.go, launches
+// nothing while the previous lookup is still in flight), and the default probe
+// interval is 5s (shippedDefaults' def.Latency, internal/settings/settings.go),
+// so up to 86400/5 = 17,280 probes and wire queries a day. Unrooted on a host
+// with a search domain that ceiling is 34,560, and the extra lookup is doomed.
 //
 // Only a host whose search list contributes a name can fail this test; see
 // TestResolveTimeLooksUpARootedName for the guard that holds on any host.
@@ -369,8 +375,8 @@ func TestResolveTimeAsksOneNamePerProbe(t *testing.T) {
 	}
 
 	qs := queries()
-	if len(qs) != 2 {
-		t.Errorf("probe sent %d wire queries, want 2 (the A/AAAA pair): %q", len(qs), qs)
+	if len(qs) != 1 {
+		t.Errorf("probe sent %d wire queries, want exactly 1 (a single A question): %q", len(qs), qs)
 	}
 	want := "." + dnsProbeDomain + "."
 	for _, q := range qs {
@@ -391,7 +397,7 @@ func captureLookupNames(t *testing.T) func() []string {
 		sent []string
 	)
 	prev := lookupHost
-	lookupHost = func(ctx context.Context, name string) ([]string, error) {
+	lookupHost = func(ctx context.Context, name string) ([]net.IP, error) {
 		mu.Lock()
 		sent = append(sent, name)
 		mu.Unlock()
@@ -539,5 +545,112 @@ func TestResolveTimeIgnoresAnAnsweringSearchDomain(t *testing.T) {
 				"one means the search list was walked despite the trailing dot (all: %q)",
 				q, want, queries())
 		}
+	}
+}
+
+// dnsQType decodes the question type of a DNS query: the two bytes after the
+// question name's terminating zero byte. 1 = A, 28 = AAAA.
+func dnsQType(msg []byte) uint16 {
+	i := 12
+	for i < len(msg) && msg[i] != 0 {
+		i += int(msg[i]) + 1
+	}
+	if i+2 >= len(msg) {
+		return 0
+	}
+	return uint16(msg[i+1])<<8 | uint16(msg[i+2])
+}
+
+// dnsStubAnswerAOnly serves the lost-packet scenario: every A question gets an
+// instant NXDOMAIN, everything else is silently dropped - which is what one
+// lost UDP packet looks like from the client, since the resolver never answers
+// and Go's earliest retransmit (a 1s per-try floor) sits beyond a sub-second
+// probe budget.
+func dnsStubAnswerAOnly(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("stub listen: %v", err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return // listener closed by Cleanup
+			}
+			if n < 12 || dnsQType(buf[:n]) != 1 {
+				continue // the lost lane: drop anything that is not an A question
+			}
+			end := 12
+			for end < n && buf[end] != 0 {
+				end += int(buf[end]) + 1
+			}
+			end += 1 + 4
+			if end > n {
+				continue
+			}
+			resp := make([]byte, end)
+			copy(resp, buf[:end])
+			resp[2] = 0x81     // QR=1 (response), RD kept
+			resp[3] = 0x80 | 3 // RA=1, RCODE 3 = NXDOMAIN, the healthy answer
+			resp[6], resp[7] = 0, 0
+			resp[8], resp[9] = 0, 0
+			resp[10], resp[11] = 0, 0
+			pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+// One lost UDP packet must not read as a healthy, budget-length latency
+// sample. The stub answers the A question instantly and never answers anything
+// else; a probe that waits on an unanswered lane can only return when the
+// budget expires, and the answered lane's NXDOMAIN then surfaces as
+// IsNotFound, which ResolveTime counts healthy - so the plotted "latency" is
+// the probe budget, measured to the millisecond, on a resolver that answered
+// instantly. Caught live (Aug 2026 audit): 8 of 8 lost-packet runs plotted as
+// ok=true samples pinned at the full 3s budget.
+//
+// The assertion is arithmetic, not wall-clock: a healthy verdict must not cost
+// the bulk of the budget. A healthy answer well under the budget passes (the
+// stub answers in microseconds) and a failure verdict passes; healthy at
+// budget length is exactly the artifact. The budget is shrunk below Go's 1s
+// per-try floor so no retransmit can land inside it on any host's resolv.conf.
+func TestResolveTimeLostLaneIsNotHealthyLatency(t *testing.T) {
+	stubResolver(t, dnsStubAnswerAOnly(t))
+	oldTO := dnsProbeTimeout
+	dnsProbeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { dnsProbeTimeout = oldTO })
+
+	d, ok, err := ResolveTime(context.Background())
+	if ok && d >= dnsProbeTimeout/2 {
+		t.Fatalf("probe reported healthy after consuming %v of its %v budget (err=%v): a lane the resolver never answered was masked by the answered lane's NXDOMAIN and plotted as latency", d, dnsProbeTimeout, err)
+	}
+}
+
+// A lookup that consumes the entire budget is a failure, whatever error the
+// resolver library reports. Go's resolver aggregates errors across lookup
+// lanes and retries, and a benign IsNotFound from one lane can mask another
+// that never answered (the artifact above); this pins the classification rule
+// itself, independent of resolver internals: budget exhausted means ok=false,
+// classed as a timeout.
+func TestResolveTimeBudgetExhaustedIsFailure(t *testing.T) {
+	oldTO := dnsProbeTimeout
+	dnsProbeTimeout = 50 * time.Millisecond
+	prev := lookupHost
+	lookupHost = func(ctx context.Context, name string) ([]net.IP, error) {
+		<-ctx.Done() // the resolver "answers" only once the budget is gone
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	}
+	t.Cleanup(func() { lookupHost = prev; dnsProbeTimeout = oldTO })
+
+	d, ok, err := ResolveTime(context.Background())
+	if ok {
+		t.Fatalf("budget-long lookup (d=%v) reported ok=true: an IsNotFound surfacing at the deadline is the lost-packet artifact, not an answer", d)
+	}
+	if got := DialErrClass(err); got != "timeout" {
+		t.Fatalf("DialErrClass(%v) = %q, want %q: the budget-exhausted failure must count as a timeout", err, got, "timeout")
 	}
 }
