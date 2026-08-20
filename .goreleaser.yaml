@@ -157,6 +157,12 @@ homebrew_casks:
     homepage: https://github.com/pingular/pingularity
     description: Single-binary internet-connectivity monitor.
     license: MIT
+    # Go 1.27 binaries require macOS 13 Ventura or newer. Without this guard a
+    # Monterey user gets a clean install and a binary that will not run; with it,
+    # brew refuses up front with a version message. goreleaser has no first-class
+    # field for a cask's depends_on, so the raw cask DSL rides custom_block.
+    custom_block: |
+      depends_on macos: ">= :ventura"
     # The binary is unsigned/un-notarized, so Homebrew's cask download carries the
     # com.apple.quarantine xattr and Gatekeeper blocks the first run. The old
     # formula never hit this (formulae are not quarantined); strip the xattr on

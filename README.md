@@ -103,6 +103,8 @@ docker run -d --name pingularity --restart unless-stopped \
 
 ### macOS
 
+> Requires macOS 13 Ventura or newer (the Go 1.27 toolchain's floor).
+
 ```bash
 brew install pingular/tap/pingularity
 sudo pingularity install    # registers the launchd service and starts it
@@ -140,6 +142,14 @@ spells out the exe's path because winget adds `pingularity` to the PATH of
 If the install fails silently right after "Successfully verified installer
 hash", your winget is outdated: update **App Installer** in the Microsoft
 Store and re-run.
+
+> **Custom certificate stores (macOS, Windows):** if `SSL_CERT_FILE` or
+> `SSL_CERT_DIR` is set in the daemon's environment, its outbound TLS
+> (webhooks, speedtests, the update check) now trusts the roots in those files
+> instead of the operating system's keychain - a Go 1.27 behavior change. A
+> stale or truncated file there breaks every TLS connection with certificate
+> errors; unset the variable, or start with
+> `GODEBUG=x509sslcertoverrideplatform=0` to restore the old behavior.
 
 > **Downloaded a raw binary in a browser?** macOS Gatekeeper or Windows
 > SmartScreen may block it as "unidentified". Clear the quarantine flag once and

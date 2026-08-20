@@ -1,6 +1,6 @@
 module github.com/pingular/pingularity
 
-go 1.25.13
+go 1.27.0
 
 require (
 	github.com/kardianos/service v1.2.4
