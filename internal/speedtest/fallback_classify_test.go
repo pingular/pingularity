@@ -370,7 +370,7 @@ func TestStarvationCeilingTracksWorkers(t *testing.T) {
 // probeDialGuard, so this cannot mask a regression in it.
 func allowLoopbackProbes(t *testing.T) {
 	t.Helper()
-	old := probeDialControl
-	probeDialControl = nil
-	t.Cleanup(func() { probeDialControl = old })
+	old := probeDialControl()
+	setProbeDialControl(nil)
+	t.Cleanup(func() { setProbeDialControl(old) })
 }

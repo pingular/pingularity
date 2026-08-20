@@ -175,9 +175,9 @@ func TestGuardProxiedDestination(t *testing.T) {
 
 	// The relaxation the loopback-served suites rely on disables the pre-check
 	// the same way it disables the dial guard.
-	old := probeDialControl
-	probeDialControl = nil
-	t.Cleanup(func() { probeDialControl = old })
+	old := probeDialControl()
+	setProbeDialControl(nil)
+	t.Cleanup(func() { setProbeDialControl(old) })
 	if err := guardProxiedDestination(ctx, "127.0.0.1:9000"); err != nil {
 		t.Errorf("pre-check fired despite the loopback relaxation: %v", err)
 	}
@@ -254,9 +254,9 @@ func TestProbeEndpointRefusesProxiedInternalRedirect(t *testing.T) {
 	// destination pre-check stands between the redirect and adoption, and it
 	// needs a proxy configured to arm itself. probeDialControl stays NON-nil so
 	// the pre-check does not read it as the loopback relaxation.
-	old := probeDialControl
-	probeDialControl = func(string, string, syscall.RawConn) error { return nil }
-	t.Cleanup(func() { probeDialControl = old })
+	old := probeDialControl()
+	setProbeDialControl(func(string, string, syscall.RawConn) error { return nil })
+	t.Cleanup(func() { setProbeDialControl(old) })
 	t.Setenv("HTTP_PROXY", "http://192.168.1.10:3128") // never dialed; probeClient goes direct
 
 	srv := &ookla.Server{ID: "proxied-poison", URL: first.URL + "/speedtest/upload.php"}
