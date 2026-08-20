@@ -957,7 +957,17 @@ Below that:
   high, while on one whose search domain answers wildcards they timed a fast
   local hit for a different name and read low. Either way the two are not
   comparable, and the change can move the number in either direction - re-baseline
-  any DNS alert thresholds rather than assuming which way it went.
+  any DNS alert thresholds rather than assuming which way it went. Readings from
+  **0.80.0-rc.1 and earlier** also sit a few ms above later versions and spike
+  harder: every version through 0.80.0-rc.1 asked an IPv4/IPv6 question *pair*
+  and timed the slower answer, and on the Linux binaries - which use Go's
+  built-in resolver - one lost reply pinned a "healthy" reading at the full 3s
+  budget (the macOS and Windows binaries resolve through the system resolver,
+  which already reported that case as a failure; on 0.61 and earlier the pair
+  stacks on top of the search-domain effect above). Later versions ask a
+  **single IPv4 question**, and a lookup that eats its whole budget now always
+  counts as a failure - after upgrading expect the DNS line slightly lower and
+  calmer, and re-baseline DNS thresholds one more time.
   A round skips its lookup while the previous one is still in
   flight, so a hung resolver cannot pile lookups up behind it; a lookup gives up
   after 3s, so in practice that needs a probe interval shorter than that. The DNS
