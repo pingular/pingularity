@@ -83,6 +83,68 @@ func TestThirdPartyNoticesMatchGoMod(t *testing.T) {
 	}
 }
 
+// goDirective matches go.mod's language floor - "go 1.27.0", or "go 1.27".
+// Anchored per line AND to end-of-line so a tab-indented require inside a
+// require block ("\tgithub.com/... v1.2.3") can never be read as the directive.
+// The trailing-comment branch is not hypothetical tidiness: `go 1.27.0 // see
+// RELEASING.md` is legal go.mod, and without it this guard fails the build on a
+// perfectly good edit while claiming the parser "has lost the file's shape".
+// The `^go ` prefix is what keeps a tab-indented require line out.
+var goDirective = regexp.MustCompile(`(?m)^go (\d+\.\d+(?:\.\d+)?)[ \t]*(?://.*)?$`)
+
+// readmeGoFloor matches the Quick start's build prerequisite, "requires Go
+// 1.27.0+". Every occurrence is checked, so a second copy added elsewhere in
+// the README is covered without touching this test.
+var readmeGoFloor = regexp.MustCompile(`requires Go (\d+\.\d+(?:\.\d+)?)\+`)
+
+// TestREADMEGoVersionMatchesGoMod holds README.md's build prerequisite to
+// go.mod's `go` directive, for the same reason as the notices test above: a
+// hand-maintained mirror of go.mod drifts. This one sits in the four most-read
+// lines in the repository and nothing regenerates it, while every CI workflow
+// takes its toolchain from `go-version-file: go.mod` - so the mirror can be
+// wrong with the whole suite green.
+//
+// The pair has been hand-carried once and dropped once: 510e9d3 carried
+// 1.25.12 -> 1.25.13 in both files, then d8fe73f bumped go.mod to 1.27.0 and
+// left the README on 1.25.13 - and that commit's own subject was "Build with
+// Go 1.27", which is how little a human reviewer catches this line.
+//
+// The cost is invisible under the default GOTOOLCHAIN=auto, which quietly
+// downloads the newer toolchain and builds anyway. Under GOTOOLCHAIN=local (how
+// distro-packaged Go ships) or on an offline builder, a contributor who
+// installed exactly what the README asked for gets "go.mod requires go >=
+// 1.27.0" from the command the README just gave them.
+func TestREADMEGoVersionMatchesGoMod(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate the module root")
+	}
+	root := filepath.Dir(thisFile) // this file lives at the module root
+
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(b)
+	}
+
+	want := goDirective.FindStringSubmatch(read("go.mod"))
+	if want == nil {
+		t.Fatal("no `go <version>` directive found in go.mod - the parser has lost the file's shape, and this test would pass on anything")
+	}
+	found := readmeGoFloor.FindAllStringSubmatch(read("README.md"), -1)
+	if len(found) == 0 {
+		t.Fatal("README.md no longer says \"requires Go <version>+\" - the Quick start's prerequisite was reworded, so this test can no longer see the number it holds to go.mod")
+	}
+	for _, m := range found {
+		if m[1] != want[1] {
+			t.Errorf("README.md says %q but go.mod requires go %s - update the Quick start comment; under GOTOOLCHAIN=local a build following the README fails outright",
+				m[0], want[1])
+		}
+	}
+}
+
 // requiredModules returns the module path -> version pairs of every require in
 // a go.mod, direct and indirect alike (both are linked into the binary, so both
 // need attribution). Only require blocks and single-line requires are read, so a

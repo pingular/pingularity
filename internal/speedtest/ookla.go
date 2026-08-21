@@ -1385,6 +1385,23 @@ func probeClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// probeDrainCap bounds what a probe reads off a body it did not choose. Every
+// probe verdict is decided by the status line and the Location header, both
+// parsed before the body is touched, so the body is diagnostic noise - and with
+// DisableKeepAlives above there is no socket to hand back to a pool, so
+// draining it buys nothing at all. What it cost was unbounded: a catalogue
+// entry, a redirect target or a captive portal that simply keeps writing held
+// the probe reading at line rate for the whole 6s/8s timeout, and because
+// probeClient carries no recorder (unlike newOoklaClientRec) not one of those
+// bytes reaches the run's byte accounting - on a metered link they surface only
+// as a gap between our "Data used" and the ISP's meter. Measured Aug 2026
+// against a peer paced to ~16 MB/s, 2 of 2 runs: 86 MB drained over
+// probeFallback's 6s and 115 MB over probeEndpoint's 8s, both still classified
+// "ok". A well-behaved bundle answers 9 bytes ("test=test"), so this reads
+// every real body whole; see TestProbeDrainIsBounded. Same shape as
+// internal/notify.
+const probeDrainCap = 4 << 10
+
 const (
 	// fallbackTTL: a missing component is stable, but an operator CAN install it,
 	// so this expires rather than being permanent. Long enough that a scheduled
@@ -1655,7 +1672,7 @@ var probeFallback = func(ctx context.Context, s *ookla.Server) endpointState {
 		return endpointUnknown // says nothing about the endpoint; retry soon
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, probeDrainCap))
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return endpointOK
@@ -1738,7 +1755,7 @@ var probeEndpoint = func(ctx context.Context, s *ookla.Server) endpointState {
 			return 0, ""
 		}
 		defer func() { _ = resp.Body.Close() }()
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, probeDrainCap))
 		return resp.StatusCode, resp.Header.Get("Location")
 	}
 

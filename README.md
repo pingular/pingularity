@@ -17,7 +17,7 @@ This is the [live demo](https://demo.pingularity.dev) - same dashboard, syntheti
 ## Quick start
 
 ```bash
-go build -o pingularity .   # requires Go 1.25.13+; pure Go, no cgo
+go build -o pingularity .   # requires Go 1.27.0+ (go.mod); pure Go, no cgo
 ./pingularity               # UI on http://localhost:9000
 ```
 
@@ -428,6 +428,31 @@ The in-app **update badge** notifies you when a newer release exists - it's a
 poll of a maintainer-controlled feed (`latest.json`), notify-only, and never
 touches your install. See [RELEASING.md](RELEASING.md) for how that feed is
 published.
+
+> **Rolling back to an older release?** Stepping the binary back (and forward
+> again) is fine on its own - a downgrade does not rewrite your history. The one
+> boundary that matters is **0.70**. That release added a marker on the
+> bookkeeping rows a failed or partly-retried speedtest leaves behind so their
+> bytes still count toward **Speedtest data used** without being shown as runs;
+> builds older than 0.70 don't know the column is there. Point one at a database
+> a 0.70-or-newer build has written and it reads those rows as real runs: a
+> `0 Mbps / 0 ms` speedtest at the top of the dashboard, folded into the run
+> averages, and published on `/metrics` as `pingularity_speed_download_mbps 0` -
+> enough to fire a "download below X" alert. *Reading* is safe: nothing is
+> damaged, the marker is left untouched, and coming back up on 0.70+ hides those
+> rows again. *Deleting* is not: the older build removes only the row you
+> clicked. Delete the bogus `0 Mbps` row and you have deleted an accounting row
+> 0.70+ keeps on purpose, so its bytes leave **Speedtest data used** for good.
+> Delete the real run it was billing for and that row is stranded instead -
+> hidden again on 0.70+, still counting, with no run left to delete it by until
+> retention prunes it. Do your deleting before you step down, or after you come
+> back up. What does *not* heal is a **backup taken by the older build**: its
+> export has no marker to carry, so restoring that file onto an install that
+> does not already hold those rows - a fresh box, a rebuilt volume - brings them
+> back as permanent 0 Mbps runs. Take the backup with the newer build, before
+> you step down - though that file is your way back *up*, not a rescue while you
+> are down: any run carrying the new columns stamps the export for 0.70+, and an
+> older build refuses a newer stamp outright rather than restoring half of it.
 
 ## Run in the background (systemd / launchd / Windows service)
 
@@ -1337,13 +1362,17 @@ than quietly dropping the flags).
 
 > **Headless installs:** a genuinely fresh install waits (monitoring paused) for
 > a first-run consent - either the browser **Quick Setup** dialog or an explicit
-> flag - so it never starts probing before someone has said to. Passing any
-> monitoring flag (`-speedtest`, `-speedtest-interval`, `-latency`, `-interval`)
-> counts as that consent - unless you explicitly pass `-quick-setup=prompt`
-> alongside them, which keeps the dialog in charge and makes those flags
-> configure values only. If you only tune other knobs (say `-timeout` or
-> `-ipv6`) pass `-quick-setup=skip` so the service starts monitoring at boot
-> instead of holding for the dialog.
+> flag - so it does not start probing until someone has said to, or until the
+> offer lapses: left unanswered, the hold releases 48h after first launch and
+> monitoring starts with the defaults in the table above (which include
+> `-speedtest-on-reconnect`, on by default, so a later link flap can run a full
+> speedtest). The daemon prints that fallback on stdout at boot, so a headless
+> install has it in its own log. Passing any monitoring flag (`-speedtest`,
+> `-speedtest-interval`, `-latency`, `-interval`) counts as that consent -
+> unless you explicitly pass `-quick-setup=prompt` alongside them, which keeps
+> the dialog in charge and makes those flags configure values only. If you only
+> tune other knobs (say `-timeout` or `-ipv6`) pass `-quick-setup=skip` so the
+> service starts monitoring at boot instead of holding for the dialog.
 
 ## Metrics (optional)
 
