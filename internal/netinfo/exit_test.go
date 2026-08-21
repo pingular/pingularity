@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -458,5 +459,198 @@ func TestExitTargetFallbackNamesItsReason(t *testing.T) {
 					"on this exact string", w, present, c.why)
 			}
 		})
+	}
+}
+
+// A failed discovery with NO exit to show must not sit behind the full cache
+// window. Measured on a fresh install (Aug 2026): the consent-time first trace
+// failed during a resolver hiccup, the failure was cached exactly like a
+// success, no error state hurried the Loop, and the Exit row stayed empty for
+// the hour to the next scheduled refresh - the user had to click refresh. Two
+// minutes is between the fail-retry window and the full cache window, so this
+// call must re-trace.
+func TestCachedExitRetriesFasterWithNoExitToShow(t *testing.T) {
+	var calls int
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		calls++
+		return nil, errors.New("no raw socket")
+	})
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.cachedExit(context.Background(), "1403")
+	m.traceMu.Lock()
+	m.traceAt = time.Now().Add(-2 * time.Minute)
+	m.traceMu.Unlock()
+	m.cachedExit(context.Background(), "1403")
+	if calls != 2 {
+		t.Fatalf("traceFn ran %d times, want 2: a failure with no exit on display must retry after the short window, not wait out the full exitCacheFor", calls)
+	}
+}
+
+// The fast retry applies ONLY while the Exit row is empty. Once an exit is on
+// display, a later transient failure keeps the last-known exit (no flicker)
+// and waits out the full window - re-tracing two minutes after a failure with
+// an exit in hand would buy nothing. Pins the boundary of the change above.
+func TestCachedExitFailureWithPriorExitKeepsFullWindow(t *testing.T) {
+	var calls int
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		calls++
+		return nil, errors.New("silent hops this round")
+	})
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// The exact state a successful trace leaves behind, aged two minutes: an
+	// exit on display, the attempt stamped for the current (default) target.
+	m.traceMu.Lock()
+	m.exit = &ExitInfo{IP: "203.0.113.1", Name: "gw.example.net"}
+	m.tracedFor, m.attemptedFor = "", ""
+	m.traceAt = time.Now().Add(-2 * time.Minute)
+	m.traceMu.Unlock()
+	if got := m.cachedExit(context.Background(), "1403"); got == nil {
+		t.Fatal("cachedExit returned nil with a cached exit inside the window")
+	}
+	if calls != 0 {
+		t.Fatalf("traceFn ran %d times, want 0: with an exit on display a two-minute-old attempt is still inside the cache window", calls)
+	}
+}
+
+// exitMissing drives the Loop's fast retry cadence; pin each state edge. True
+// only in the exact state the first-boot gap produced: a completed attempt,
+// no exit to show, and no reason to believe tracing cannot work.
+func TestExitMissingStates(t *testing.T) {
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if m.exitMissing() {
+		t.Fatal("exitMissing true before any attempt: nothing failed yet, nothing to hurry")
+	}
+	m.traceMu.Lock()
+	m.traceAt = time.Now()
+	m.traceMu.Unlock()
+	if !m.exitMissing() {
+		t.Fatal("exitMissing false after a completed attempt left no exit: this is the state the fast retry exists for")
+	}
+	m.traceMu.Lock()
+	m.exit = &ExitInfo{IP: "203.0.113.1"}
+	m.traceMu.Unlock()
+	if m.exitMissing() {
+		t.Fatal("exitMissing true with an exit on display: nothing is missing")
+	}
+	m.traceMu.Lock()
+	m.exit = nil
+	m.traceFails = exitFailFastTries
+	m.traceMu.Unlock()
+	if m.exitMissing() {
+		t.Fatal("exitMissing true past the failure streak bound: the failure is structural, hurrying the Loop would re-trace a doomed path every errRetryStale forever")
+	}
+	m.traceMu.Lock()
+	m.traceFails = 0
+	m.traceMu.Unlock()
+	m.mu.Lock()
+	m.info.ExitUnavailable = "the exit traceroute is IPv4-only"
+	m.mu.Unlock()
+	if m.exitMissing() {
+		t.Fatal("exitMissing true despite ExitUnavailable: hurrying a trace that cannot work is pointless")
+	}
+}
+
+// The fast retry is for the transient first-boot case; a failure streak means
+// the trace cannot work here (no raw socket, userspace NAT), and re-running a
+// doomed multi-second trace on every refresh forever - including the
+// latency-sensitive post-speedtest one - is the regression the streak bound
+// prevents. After exitFailFastTries completed failures the full window applies
+// again; a deliberate cache-bust (manual refresh, IP change) starts a fresh
+// episode.
+func TestCachedExitFastRetryStandsDownAfterStreak(t *testing.T) {
+	var calls int
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		calls++
+		return nil, errors.New("no raw socket")
+	})
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	backdate := func(d time.Duration) {
+		m.traceMu.Lock()
+		m.traceAt = time.Now().Add(-d)
+		m.traceMu.Unlock()
+	}
+	for i := 1; i < exitFailFastTries; i++ {
+		m.cachedExit(context.Background(), "1403")
+		backdate(2 * time.Minute)
+	}
+	m.cachedExit(context.Background(), "1403") // completes the streak
+	if calls != exitFailFastTries {
+		t.Fatalf("traceFn ran %d times, want %d (one per fast retry)", calls, exitFailFastTries)
+	}
+	backdate(2 * time.Minute)
+	m.cachedExit(context.Background(), "1403")
+	if calls != exitFailFastTries {
+		t.Fatalf("traceFn ran %d times after the streak completed, want %d: past exitFailFastTries a two-minute-old failure must wait out the full exitCacheFor", calls, exitFailFastTries)
+	}
+	backdate(exitCacheFor + time.Minute)
+	m.cachedExit(context.Background(), "1403")
+	if calls != exitFailFastTries+1 {
+		t.Fatalf("traceFn ran %d times past the full window, want %d: standing down must not mean never retrying", calls, exitFailFastTries+1)
+	}
+	m.traceMu.Lock()
+	m.traceAt = time.Time{}
+	m.traceFails, m.warnedNoExit = 0, false // what every cache-bust site does
+	m.traceMu.Unlock()
+	m.cachedExit(context.Background(), "1403")
+	if calls != exitFailFastTries+2 {
+		t.Fatalf("traceFn ran %d times after a cache-bust, want %d: a bust must start a fresh fast-retry episode", calls, exitFailFastTries+2)
+	}
+}
+
+// recordingHandler captures log records so a test can count Warns.
+type recordingHandler struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recs = append(h.recs, r)
+	return nil
+}
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+func (h *recordingHandler) warns() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.recs {
+		if r.Level >= slog.LevelWarn {
+			n++
+		}
+	}
+	return n
+}
+
+// The empty-row failure Warns exactly once per episode: the first failure that
+// leaves nothing on display is the diagnosable event (the first-boot case was
+// invisible at Debug), and repeating it every retry would fill the log ring
+// with the same line on a permanently failing host. A cache-bust re-arms it.
+func TestExitFailureWarnsOncePerEpisode(t *testing.T) {
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		return nil, errors.New("no raw socket")
+	})
+	h := &recordingHandler{}
+	m := NewManager(slog.New(h))
+	m.cachedExit(context.Background(), "1403")
+	if got := h.warns(); got != 1 {
+		t.Fatalf("first empty-row failure logged %d warns, want exactly 1", got)
+	}
+	m.traceMu.Lock()
+	m.traceAt = time.Now().Add(-2 * time.Minute)
+	m.traceMu.Unlock()
+	m.cachedExit(context.Background(), "1403")
+	if got := h.warns(); got != 1 {
+		t.Fatalf("repeat failure in the same episode logged %d warns total, want still 1 (Debug for repeats)", got)
+	}
+	m.traceMu.Lock()
+	m.traceAt = time.Time{}
+	m.traceFails, m.warnedNoExit = 0, false // what every cache-bust site does
+	m.traceMu.Unlock()
+	m.cachedExit(context.Background(), "1403")
+	if got := h.warns(); got != 2 {
+		t.Fatalf("first failure of a NEW episode logged %d warns total, want 2 (the bust re-arms the Warn)", got)
 	}
 }

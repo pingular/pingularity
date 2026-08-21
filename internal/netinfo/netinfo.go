@@ -146,6 +146,16 @@ type Manager struct {
 	tracedFor    string // ExitTargetFn() value the cached exit answers for (success only)
 	attemptedFor string // ExitTargetFn() value of the last completed attempt (success or failure)
 	tracing      chan struct{}
+	// traceFails counts consecutive COMPLETED failed attempts; a success or a
+	// deliberate cache-bust resets it. While it is below exitFailFastTries and
+	// no exit is on display, cachedExit retries on the short exitFailRetry
+	// window and Loop hurries via exitMissing. Past it the failure is treated
+	// as structural (no raw socket, userspace NAT) and both stand down to the
+	// normal cadence, so a host where tracing can never work is not re-traced
+	// on every refresh forever. warnedNoExit dedupes the empty-row Warn to one
+	// per episode; the same events that reset the streak re-arm it.
+	traceFails   int
+	warnedNoExit bool
 
 	// traceGen counts deliberate exit-cache invalidations (an IP-change bust in
 	// refresh, or a manual RefreshNow). A trace captures it when it claims the
@@ -241,6 +251,10 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 			// on display and re-stamp it fresh every cache window, so it would never
 			// recover. An empty Exit row is correct here; a wrong one is not.
 			m.exit, m.tracedFor = nil, ""
+			// A confirmed network change also resets the failure streak and
+			// re-arms the empty-row Warn: the old network's failures say nothing
+			// about the new one.
+			m.traceFails, m.warnedNoExit = 0, false
 			// Invalidate any trace already in flight (started on the OLD network),
 			// so its result can't overwrite this bust when it lands (cachedExit).
 			m.traceGen++
@@ -260,6 +274,16 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 			m.info.Exit = ex
 		}
 		m.mu.Unlock()
+	}
+	// A refresh can be driven from outside the Loop (reconnect, post-speedtest,
+	// manual, exit-target change) - and when ITS attempt leaves the Exit row
+	// missing, the Loop is mid-sleep on a timer armed back when the row was
+	// fine, up to a full maxStale away. Poke it so the staleness-cap recompute
+	// sees the missing state and re-arms at errRetryStale. For the Loop's own
+	// refreshes this costs one harmless extra re-evaluation (age fresh, no
+	// network call).
+	if m.exitMissing() {
+		m.Nudge()
 	}
 }
 
@@ -328,8 +352,9 @@ func (m *Manager) claimPublish(g uint64) bool {
 // an explicit request, and the setting only stops lookups happening on their own.
 func (m *Manager) RefreshNow(ctx context.Context) Info {
 	m.traceMu.Lock()
-	m.traceAt = time.Time{} // bust the exit cache so the traceroute re-runs
-	m.traceGen++            // and drop any trace already in flight, so a stale in-flight result can't be served for the re-run
+	m.traceAt = time.Time{}                 // bust the exit cache so the traceroute re-runs
+	m.traceGen++                            // and drop any trace already in flight, so a stale in-flight result can't be served for the re-run
+	m.traceFails, m.warnedNoExit = 0, false // an explicit re-run starts a fresh fast-retry episode
 	m.traceMu.Unlock()
 	m.refresh(ctx, true)
 	// A manual refresh often follows a network change (new Wi-Fi, tethering),
@@ -347,6 +372,7 @@ func (m *Manager) RefreshNow(ctx context.Context) Info {
 			m.traceMu.Lock()
 			m.traceAt = time.Time{}
 			m.traceGen++
+			m.traceFails, m.warnedNoExit = 0, false
 			m.traceMu.Unlock()
 			m.refresh(ctx, true)
 		}
@@ -420,9 +446,11 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 		// Staleness cap: a failed fetch still stamps UpdatedAt (it carried
 		// last-known data forward), so after an error staleness is capped at
 		// errRetryStale - otherwise a transient 429 would suppress any retry
-		// for a full maxStale.
+		// for a full maxStale. exitMissing gets the same cap: a trace-only
+		// failure records no Error, so without it an empty Exit row waited out
+		// the full maxStale (the Aug 2026 first-boot hour-long empty row).
 		stale := maxStale
-		if m.Get().Error != "" && stale > errRetryStale {
+		if (m.Get().Error != "" || m.exitMissing()) && stale > errRetryStale {
 			stale = errRetryStale
 		}
 		switch {
@@ -443,7 +471,7 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 		// path wants (and would delay the IPv6-only transition, which assumes the
 		// faster retry). `stale` above sized nothing but the pre-refresh read.
 		stale = maxStale
-		if m.Get().Error != "" && stale > errRetryStale {
+		if (m.Get().Error != "" || m.exitMissing()) && stale > errRetryStale {
 			stale = errRetryStale
 		}
 		// Sleep until the data would reach the cap. If something else
@@ -476,6 +504,25 @@ func (m *Manager) Loop(ctx context.Context, maxStale time.Duration) {
 // errRetryStale caps staleness before Loop retries after a failed fetch (vs. the
 // much longer maxStale for healthy data).
 const errRetryStale = 5 * time.Minute
+
+// exitMissing reports that exit discovery should work here, has completed at
+// least one attempt, and has never produced an exit - the Loop paces retries
+// for that state like an error (see the staleness caps above), because a
+// trace-only failure records no Info.Error and would otherwise leave the Exit
+// row empty for a full maxStale. False before any attempt (nothing to hurry),
+// after a success (exit on display), and where ExitUnavailable says a trace
+// cannot work (retrying is pointless there).
+func (m *Manager) exitMissing() bool {
+	if m.Get().ExitUnavailable != "" {
+		return false
+	}
+	m.traceMu.Lock()
+	defer m.traceMu.Unlock()
+	// The streak bound mirrors cachedExit's window choice: once the failure
+	// looks structural, hurrying the Loop would just re-trace a doomed path
+	// every errRetryStale forever.
+	return m.exit == nil && !m.traceAt.IsZero() && m.traceFails < exitFailFastTries
+}
 
 // v6FlipAfter is how long the public IPv4 echo must keep failing - while IPv6
 // keeps answering - before a host with a prior IPv4 identity is treated as
