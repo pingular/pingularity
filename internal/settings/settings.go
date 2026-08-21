@@ -2602,11 +2602,12 @@ func sanitizeIperfServers(ts []IperfTarget) []IperfTarget {
 	out := make([]IperfTarget, 0, len(ts))
 	seen := make(map[string]bool)
 	for _, t := range ts {
-		addr := strings.TrimSpace(t.Addr)
+		// Cap before the duplicate check: two addresses that differ only past the cap
+		// store the same value, so checking first would keep both.
+		addr := capLen(strings.TrimSpace(t.Addr), maxAddr) // rune-safe: never cut a multi-byte host mid-codepoint
 		if addr == "" || strings.HasPrefix(addr, "-") || seen[addr] {
 			continue
 		}
-		addr = capLen(addr, maxAddr)                          // rune-safe: never cut a multi-byte host mid-codepoint
 		label := capLen(strings.TrimSpace(t.Label), maxLabel) // rune-safe: labels are free-form text
 		bind := strings.TrimSpace(t.Bind)
 		if strings.HasPrefix(bind, "-") || strings.ContainsAny(bind, " \t\r\n") {

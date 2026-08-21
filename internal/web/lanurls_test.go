@@ -86,6 +86,8 @@ func TestLanEntriesFollowTheBindAndCoverBothFamilies(t *testing.T) {
 		{"loopback by name, as the operator typed it", "LocalHost:9000", nil,
 			"DNS is case-insensitive and so is Go's resolver - net.Listen binds \"LocalHost:9000\" to 127.0.0.1 (measured Aug 2026, darwin, Go 1.27), so the capitalisation an operator happened to type must not change what is advertised"},
 		{"loopback by name, shouted", "LOCALHOST:9000", nil, "same, at the other extreme of the casing"},
+		{"loopback by name, rooted", "localhost.:9000", nil,
+			"a trailing dot only roots the name, so this binds loopback too - nonLoopbackListen in main treats it the same way, and the two must agree about what counts as this-machine-only"},
 		{"zoned loopback literal", "[::1%lo0]:9000", nil,
 			"net.ParseIP rejects the zone, but the socket is still loopback-only (it binds, measured Aug 2026, darwin, Go 1.27), so the zone-stripped address has to answer the loopback question"},
 		{"pinned to one LAN address", "192.168.1.24:9000", []string{v4},

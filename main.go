@@ -2453,7 +2453,12 @@ func nonLoopbackListen(addr string) bool {
 	switch host {
 	case "", "0.0.0.0", "::":
 		return true // all interfaces
-	case "localhost":
+	}
+	// Names ignore case and a trailing dot only roots one, so "LOCALHOST:9000" and
+	// "localhost.:9000" bind 127.0.0.1 like "localhost:9000" does - an exact compare
+	// warned about a dashboard nobody else could open. lanEntriesFor in internal/web
+	// answers the same question this way.
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
 		return false
 	}
 	if ip := net.ParseIP(host); ip != nil {

@@ -45,6 +45,7 @@ updates:
           - "*"
     # Default is 5; said out loud so nobody has to wonder whether a silent
     # 0-limit is why no PRs appear. With the group above, one open PR is the
-    # steady state. No cooldown: a CVE-driven base rebuild should be offered
-    # the week it ships, which is the entire point of this file.
+    # steady state. Dependabot now holds routine version bumps three days by
+    # default; security updates skip that wait, and the main image's base is
+    # distroless static, so little rides on a routine bump.
     open-pull-requests-limit: 5
