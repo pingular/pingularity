@@ -123,9 +123,31 @@ type program struct {
 	// been printed by then - this replays the event into the structured log and
 	// ring once they exist, so the About tab shows it too.
 	optsIgnored bool
+
+	// dbCreated records that this boot found nothing at cfg.DBPath, so the
+	// store.Open that followed is what created the database. Only Start can see
+	// that, which is why it is carried across to run and handed to settings as
+	// half the evidence behind settings.KeyInstallBornVersion.
+	dbCreated bool
+}
+
+// dbCreatedNow reports whether the store.Open that follows will be what creates
+// the database at path. Split out of Start so tests can reach it.
+//
+// Only a definite "it is not there" answers yes; every other stat outcome - the
+// file exists, a directory sits at the path, the stat failed - answers no,
+// because a birth recorded that never happened silences a warning that matters
+// while an unproven one only costs a warning. A ":memory:" path stats as
+// not-there, which is right for it: opening one always creates a fresh database.
+func dbCreatedNow(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func (p *program) Start(s service.Service) error {
+	// Must stay above the open: the open is what creates the file.
+	p.dbCreated = dbCreatedNow(p.cfg.DBPath)
+
 	st, err := store.Open(p.cfg.DBPath)
 	if err != nil {
 		return err
@@ -314,10 +336,14 @@ func (p *program) run(ctx context.Context) {
 	}
 	// Name the release that initializes a brand-new store in its birth marker
 	// (settings.KeyInstallBornVersion); the marker's presence - not this value -
-	// is forward provenance: a store carrying it was born under the fail-closed
-	// default, so its missing access key means "never chose", and the
-	// ambiguity warning below stays quiet for it.
-	setOpts = append(setOpts, settings.WithBornVersion(version))
+	// is forward provenance: a store stamped by this build was born under the
+	// fail-closed default, so its missing access key means "never chose", and the
+	// ambiguity warning below stays quiet for it. dbCreated goes with it because
+	// settings cannot see the filesystem: an install stopped before it ever
+	// measured leaves a database whose contents read brand-new, so a version-only
+	// stamp would mark an upgraded 0.61 store as born under this release and
+	// silence the warning explaining its published port's new 403.
+	setOpts = append(setOpts, settings.WithBornVersion(version), settings.WithDatabaseCreated(p.dbCreated))
 	set, err := settings.New(ctx, p.store, def, setOpts...)
 	if errors.Is(err, settings.ErrLegacyReseal) {
 		// Settings loaded and are in effect; only re-encrypting old plaintext
@@ -1677,7 +1703,10 @@ func resetAuthCmd(args []string) error {
 		return err
 	}
 	defer st.Close()
-	set, _ := settings.New(context.Background(), st, settings.Values{})
+	// The stat above refuses to create a database, so this command never witnesses
+	// a birth. Without saying so, an empty-but-existing store would come out of
+	// here wearing a birth marker naming the release that cleared its password.
+	set, _ := settings.New(context.Background(), st, settings.Values{}, settings.WithDatabaseCreated(false))
 	if err := set.ClearAuth(context.Background()); err != nil {
 		return err
 	}
@@ -1847,10 +1876,15 @@ const accessAmbiguousWarnMsg = "container install with no recorded access choice
 //     is indistinguishable from a stored agreement. A stored key - the
 //     operator's or quick setup's - means the choice was made, so there is
 //     nothing to explain;
-//   - no birth marker is STORED. Present means the store was initialized by a
-//     build that stamps it, and every build that stamps it already defaulted
-//     closed, so its missing access key means "never chose" and the install was
-//     never reachable to begin with;
+//   - no birth marker is STORED. Presence is READ here as "initialized by a
+//     build that already defaulted closed, so its missing access key means never
+//     chose and the install was never reachable to begin with". Sound for
+//     markers written under the creation verdict (settings.WithDatabaseCreated);
+//     not for the ones v0.70.0-rc.1 through v0.80.0-rc.2 wrote on emptiness
+//     alone, so a 0.61 container still un-established when one of those releases
+//     opened it came out marked, and this gate stays silent about its 403.
+//     Accepted: nothing can un-stamp those markers, and ignoring presence would
+//     instead warn every genuinely fresh container born in that window;
 //   - the STORE is established (settings.EstablishedInStore - the same signal
 //     the quick-setup upgrade gate keys on), so a genuinely fresh container,
 //     which was never reachable either, is not lectured;

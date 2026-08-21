@@ -11,11 +11,18 @@ package netinfo
 // be found, or a call fails, it returns (partial hops, err) so the caller falls
 // back to the "unavailable" exit panel; the reply buffer is size-checked before
 // it is interpreted, so a short reply can never panic.
+//
+// IcmpSendEcho reports every failure the same way - zero replies - whether the
+// hop stayed quiet or the call never left the machine. Only the GetLastError
+// value Proc.Call returns tells them apart; discarding it made a dead ICMP API
+// look exactly like a filtered network, so wsClassifyEcho now splits the two.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -32,7 +39,8 @@ var (
 	procIcmpCloseHandle = dllIphlpapi.NewProc("IcmpCloseHandle")
 )
 
-// IcmpSendEcho reply status codes (from ipexport.h) that the trace acts on.
+// IcmpSendEcho status codes (from ipexport.h) that the trace acts on: in
+// ICMP_ECHO_REPLY.Status when a reply came back, via GetLastError when none did.
 const (
 	wsIPSuccess            = 0
 	wsIPDestNetUnreachable = 11002
@@ -40,7 +48,58 @@ const (
 	wsIPDestProtUnreach    = 11004
 	wsIPDestPortUnreach    = 11005
 	wsIPTTLExpiredTransit  = 11013
+
+	// IcmpSendEcho reports the IP stack's verdict on the probe through
+	// GetLastError as an IP_STATUS code (11000 and up); anything below that is an
+	// ordinary Win32 failure of the call itself. Only these two kinds arrive here,
+	// so wsClassifyEcho reads both off the one errno.
+
+	// Our reply buffer is too small. An IP_STATUS number describing our buffer
+	// rather than the network, so wsClassifyEcho tiers it with the call failures.
+	wsIPBufTooSmall = 11001
+	// The ordinary silent hop: nobody answered within the probe timeout.
+	wsIPReqTimedOut = 11010
 )
+
+// wsEchoOutcome says what a zero return from IcmpSendEcho means for the trace.
+type wsEchoOutcome int
+
+const (
+	wsEchoSilent  wsEchoOutcome = iota // nobody answered this TTL: skip the hop, keep probing
+	wsEchoRefused                      // this probe was refused, but a later TTL may still answer
+	wsEchoFatal                        // no probe can succeed now: every remaining TTL fails the same way
+)
+
+// wsClassifyEcho turns the GetLastError value behind a zero return from
+// IcmpSendEcho into what the trace should do next.
+//
+// Fatal is an enumerated list, not a range: only errors that make every later
+// probe fail the same way - a rejected handle, a buffer we sized wrong, an ICMP
+// API that is blocked or missing. Everything else is a refusal of this one probe
+// - keep probing, remember why - because fatal is the expensive guess:
+// discoverExit discards every hop already collected once the trace returns an
+// error, and transient Win32 errors (ERROR_NO_SYSTEM_RESOURCES) can pass on a
+// later try. Keeping the list short costs nothing an empty walk would have
+// shown: a trace ending with no hops reports the refusal through wsFinishTrace.
+// A refusal alongside any hop is dropped on purpose - we have a path to show. Errno 0, or no errno at all,
+// counts as a silent hop: neither should happen, and reading either as a failure
+// would end traces that work.
+func wsClassifyEcho(callErr error) wsEchoOutcome {
+	var errno syscall.Errno
+	if !errors.As(callErr, &errno) {
+		return wsEchoSilent
+	}
+	switch errno {
+	case 0, wsIPReqTimedOut:
+		return wsEchoSilent
+	case windows.ERROR_ACCESS_DENIED, windows.ERROR_INVALID_HANDLE,
+		windows.ERROR_NOT_SUPPORTED, windows.ERROR_INSUFFICIENT_BUFFER,
+		wsIPBufTooSmall:
+		return wsEchoFatal
+	default:
+		return wsEchoRefused
+	}
+}
 
 // ipOptionInformation mirrors IP_OPTION_INFORMATION. On the 64-bit targets we
 // build (amd64/arm64) OptionsData is an 8-byte pointer; Go inserts the 4 bytes of
@@ -72,7 +131,10 @@ type icmpEchoReply struct {
 // via IP_OPTION_INFORMATION; the returned ICMP_ECHO_REPLY carries the responding
 // router (TTL_EXPIRED_TRANSIT) or the destination (SUCCESS). Matches the shared
 // traceroute contract: partial hops + ctx.Err() on cancellation, (nil, err) when
-// the ICMP handle can't be created.
+// the ICMP handle can't be created, and (partial hops, err) when a call fails in
+// a way that leaves the rest of the trace pointless (wsClassifyEcho names those).
+// A merely refused probe costs only its own TTL, but if the trace ends with no
+// hops, wsFinishTrace reports that refusal rather than an empty success.
 func traceroute(ctx context.Context, dst [4]byte, maxTTL int, probeTimeout time.Duration) ([]tHop, error) {
 	if err := icmpProcs(); err != nil {
 		return nil, err
@@ -98,6 +160,11 @@ func traceroute(ctx context.Context, dst [4]byte, maxTTL int, probeTimeout time.
 	reply := make([]byte, int(unsafe.Sizeof(icmpEchoReply{}))+len(reqData)+64)
 
 	var hops []tHop
+	// The first refused probe (anything but a plain timeout), kept in case the
+	// trace ends with nothing to show: a host that refuses every TTL has a broken
+	// ICMP path, not a quiet one, and the log should say so rather than "no
+	// responsive hops".
+	var refusal error
 	for ttl := 1; ttl <= maxTTL; ttl++ {
 		if ctx.Err() != nil {
 			// A caller-aborted partial trace must not be cached as complete.
@@ -105,7 +172,7 @@ func traceroute(ctx context.Context, dst [4]byte, maxTTL int, probeTimeout time.
 		}
 		opt := ipOptionInformation{TTL: uint8(ttl)}
 		start := time.Now()
-		n, _, _ := procIcmpSendEcho.Call(
+		n, _, echoErr := procIcmpSendEcho.Call(
 			uintptr(handle),
 			uintptr(destAddr),
 			uintptr(unsafe.Pointer(&reqData[0])),
@@ -115,9 +182,19 @@ func traceroute(ctx context.Context, dst [4]byte, maxTTL int, probeTimeout time.
 			uintptr(len(reply)),
 			uintptr(timeoutMS),
 		)
-		// n == 0 means no reply (timeout / unreachable-with-no-source): a normal
-		// silent hop, simply absent - not a fatal error.
+		// n == 0 covers both an ordinary silent hop and a call that failed outright,
+		// so echoErr (GetLastError) is the only thing separating them.
 		if n == 0 {
+			switch wsClassifyEcho(echoErr) {
+			case wsEchoFatal:
+				// The call failed, not the network: stop, handing back the hops
+				// collected so far.
+				return hops, fmt.Errorf("IcmpSendEcho (ttl %d): %w", ttl, echoErr)
+			case wsEchoRefused:
+				if refusal == nil {
+					refusal = fmt.Errorf("IcmpSendEcho (ttl %d): %w", ttl, echoErr)
+				}
+			}
 			continue
 		}
 		if len(reply) < int(unsafe.Sizeof(icmpEchoReply{})) {
@@ -139,12 +216,30 @@ func traceroute(ctx context.Context, dst [4]byte, maxTTL int, probeTimeout time.
 			hops = append(hops, tHop{TTL: ttl, IP: ip, RTT: rtt}) // intermediate router
 		case wsIPDestNetUnreachable, wsIPDestHostUnreach, wsIPDestProtUnreach, wsIPDestPortUnreach:
 			// A router says the target can't be reached: record it and stop, as
-			// probing on would just re-report the same filtering router.
+			// probing on would just re-report the same filtering router. The append is
+			// conditional, so this exit can leave with nothing - hence wsFinishTrace.
 			if r.Address != 0 {
 				hops = append(hops, tHop{TTL: ttl, IP: ip, RTT: rtt})
 			}
-			return hops, nil
+			return wsFinishTrace(hops, refusal)
 		}
+	}
+	return wsFinishTrace(hops, refusal)
+}
+
+// wsFinishTrace ends a trace stopping for a non-fatal reason: it returns the
+// hops, unless there are none and a probe was refused along the way, in which
+// case the refusal is the result instead. Any hop at all outranks the refusal.
+//
+// Both exits that can end with no hops go through here - the ttl loop running
+// out, and a Destination Unreachable reply with no source address to record -
+// because discoverExit reads (no hops, nil error) as "no responsive hops",
+// blaming the network for a send the local stack refused. It is also what lets
+// wsClassifyEcho keep its fatal list short: a non-fatal error that repeats on
+// every TTL still reaches the operator, one walk later.
+func wsFinishTrace(hops []tHop, refusal error) ([]tHop, error) {
+	if len(hops) == 0 && refusal != nil {
+		return nil, refusal
 	}
 	return hops, nil
 }
