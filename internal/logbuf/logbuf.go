@@ -69,10 +69,11 @@ type Ring struct {
 	dropped uint64
 	epoch   string // rotated by Clear (and per Ring); read under mu. See newEpoch
 	// saveMu serializes SaveFile calls with each other (NOT with mu, which guards
-	// the in-memory ring and must never be held across file I/O). Two concurrent
-	// SaveFiles - a periodic checkpoint racing a shutdown save - otherwise share the
-	// one fixed ".tmp" path: their O_TRUNC opens and renames interleave and can
-	// produce a torn or truncated snapshot.
+	// the in-memory ring and must never be held across file I/O). Each save writes
+	// its own scratch file, so the point is no longer torn bytes: it is that the
+	// rename and the `saved` memo describing it stay in the same order. Otherwise
+	// two saves could publish in one order and memoise in the other, and the skip
+	// below would trust a memo describing the file that lost.
 	saveMu sync.Mutex
 	saved  savedSnapshot // what the last successful SaveFile left on disk; guarded by saveMu
 }
@@ -273,9 +274,10 @@ func (r *Ring) Clear() {
 // size and mode - not its content, so a same-length replacement is skipped over
 // too; savedSnapshot documents where it stops short.
 func (r *Ring) SaveFile(path string) error {
-	// Serialize with any other in-flight SaveFile: they share the fixed path+".tmp"
-	// scratch file, so overlapping writes/renames would corrupt the snapshot. This
-	// lock covers only file I/O, never the logging path (Append takes r.mu, not this).
+	// Serialize with any other in-flight SaveFile: r.saved is a plain struct read
+	// and written here with no other lock, so two savers would race it and could
+	// leave it describing a snapshot the other one replaced. Covers only file I/O,
+	// never the logging path (Append takes r.mu, not this).
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
 	// Snapshot just the slice header under the lock (cheap - entries are string
@@ -411,36 +413,59 @@ func (r *Ring) SaveFile(path string) error {
 		}
 	}
 
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Create the scratch file at an unpredictable name rather than opening a fixed
+	// path+".tmp". os.CreateTemp gives both halves of that: O_EXCL, so an existing
+	// name is never opened and a symlink planted there cannot be written through,
+	// and a random suffix, so there is no name to plant at - which matters because
+	// the SecureFile and rename below still work by name.
+	//
+	// The old fixed-name open (O_WRONLY|O_CREATE|O_TRUNC) followed such a link all
+	// the way: it emptied the link's target, wrote the raw log lines into it, let
+	// SecureFile chmod it 0600, and published the LINK as the snapshot - which
+	// LoadFile refuses on the next start, losing the viewer's history for good.
+	//
+	// The directory is not always ours alone: store leaves a pre-existing group- or
+	// world-accessible data directory as it found it, with a warning, tightening
+	// only a container's own data path (docs/security-model.md, "Data and secrets
+	// at rest"). That covers a -db pointed at a shared directory and the
+	// os.TempDir() fallback taken when there is no HOME. secret.go creates the key
+	// file in this same directory the same way.
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	// OpenFile's 0600 is honoured on Unix and IGNORED on Windows, where a new file
+	tmp := f.Name()
+	// Until the rename below consumes it, every path out must remove tmp. The old fixed name was
+	// self-cleaning - the next tick's O_TRUNC reused it - but a random one is not,
+	// and the caller saves on a one-minute ticker, so a persistent failure would
+	// strand one more file in the data directory every minute.
+	fail := func(err error) error {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// CreateTemp's 0600 is honoured on Unix and IGNORED on Windows, where a new file
 	// simply inherits the parent's ACEs - and a supported layout puts this beside the
 	// database in C:\ProgramData, whose inherited ACEs grant BUILTIN\Users read. This
 	// snapshot holds the unmasked log lines (IPs, hostnames), so it needs its own
 	// DACL rather than the directory's. Applied BEFORE the rename, so the file is
 	// never briefly readable under its final name; secret.go locks the key file the
-	// same way and for the same reason.
+	// same way. On Unix it also pins the mode to 0600 whatever the umask took.
 	if err := osperm.SecureFile(tmp); err != nil {
-		f.Close()
-		os.Remove(tmp)
 		// "new" so this is distinguishable from the skip path's re-securing of an
 		// existing snapshot above, which wraps the same call with the same %w.
-		return fmt.Errorf("secure new log snapshot: %w", err)
+		return fail(fmt.Errorf("secure new log snapshot: %w", err))
 	}
 	bw := bufio.NewWriter(f)
 	enc := json.NewEncoder(bw) // Encode appends its own '\n' per entry
 	for _, e := range snapshot {
 		if err := enc.Encode(e); err != nil {
-			f.Close()
-			return err
+			return fail(err)
 		}
 	}
 	if err := bw.Flush(); err != nil {
-		f.Close()
-		return err
+		return fail(err)
 	}
 	// Size and mode of what we just wrote, taken from the descriptor we wrote it
 	// through and after osperm.SecureFile has tightened it. The skip above compares
@@ -448,8 +473,7 @@ func (r *Ring) SaveFile(path string) error {
 	// chmodded snapshot gets repaired instead of being assumed good forever.
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
-		return err
+		return fail(err)
 	}
 	// fsync the temp file's bytes to stable storage BEFORE the rename. A rename
 	// is atomic only for the directory entry; it makes no promise about the data
@@ -457,13 +481,16 @@ func (r *Ring) SaveFile(path string) error {
 	// the new name pointing at an inode whose bytes never reached disk - a
 	// zero-length or partial snapshot.
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+		return fail(err)
 	}
+	// Past this Close, fail's f.Close would only return an ErrClosed it discards,
+	// so the two error paths below remove tmp directly instead.
 	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	// fsync the parent directory so the rename itself is durable. The rename is
@@ -475,15 +502,16 @@ func (r *Ring) SaveFile(path string) error {
 	// returns ERROR_ACCESS_DENIED. Rename durability there is the filesystem's
 	// responsibility, so skip this step rather than fail the snapshot.
 	if runtime.GOOS != "windows" {
-		dir, err := os.Open(filepath.Dir(path))
+		// `d` rather than shadowing `dir`, which already names this same directory.
+		d, err := os.Open(dir)
 		if err != nil {
 			return err
 		}
-		if err := dir.Sync(); err != nil {
-			dir.Close()
+		if err := d.Sync(); err != nil {
+			d.Close()
 			return err
 		}
-		if err := dir.Close(); err != nil {
+		if err := d.Close(); err != nil {
 			return err
 		}
 	}

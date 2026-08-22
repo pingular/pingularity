@@ -282,9 +282,18 @@ func TestConcurrent(t *testing.T) {
 }
 
 // SaveFile must be safe to call concurrently: a periodic checkpoint can race a
-// shutdown save, and both use the same fixed path+".tmp" scratch file. Without
-// the save mutex their O_TRUNC opens and renames interleave into a torn snapshot;
-// with it every load sees the complete ring (#21).
+// shutdown save (#21). Eight concurrent saves must leave one snapshot that loads
+// back as N entries rather than a blend of several.
+//
+// It takes both defences being gone to fail: with per-save scratch files removed
+// saveMu still serializes the writes, and with saveMu removed the separate scratch
+// files still keep the two savers' bytes apart. LoadFile caps at N, so only a
+// SHORT count can show here, which is how a tear presents.
+//
+// A pass is no evidence for the atomic rename (every load runs after wg.Wait(), so
+// none overlaps a save) nor for saveMu, whose remaining job - keeping the rename
+// and the r.saved memo in the same order - only -race objects to, which is how CI
+// runs the suite.
 //
 // Each goroutine appends its own line before saving. SaveFile skips the rewrite
 // when the ring has not changed since it last wrote this file, so against a
