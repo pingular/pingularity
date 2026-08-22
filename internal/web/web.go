@@ -1218,14 +1218,7 @@ func parseRangeParams(r *http.Request, now time.Time) (since, until time.Time, o
 	if err != nil || f <= 0 {
 		return time.Time{}, time.Time{}, false
 	}
-	floor, ceil := now.Add(-maxWinMins*time.Minute), now.Add(maxWinMins*time.Minute)
 	since = time.Unix(f, 0)
-	// A window beyond the far future is clamped, not refused: refusing would
-	// fall back to the default window and draw the last 7 days under a label
-	// saying 2030. Clamped, it selects nothing and the empty state says so.
-	if since.After(ceil) {
-		since = ceil
-	}
 	if tv := r.URL.Query().Get("to"); tv != "" {
 		t, err := strconv.ParseInt(tv, 10, 64)
 		if err != nil {
@@ -1234,20 +1227,27 @@ func parseRangeParams(r *http.Request, now time.Time) (since, until time.Time, o
 		if t != 0 {
 			// Reversedness is judged on what was ASKED for, before any clamping.
 			// A caller-reversed pair is bad input and falls back to ?mins=, but a
-			// window that only becomes empty because the floor below raised its
-			// start is a legitimate request for pruned history: the honest answer
-			// there is no rows, not a silently different window.
+			// window that only becomes empty because the clamps below moved an end
+			// is a legitimate request for history outside the band: the honest
+			// answer there is no rows, not a silently different window.
 			if !time.Unix(t, 0).After(since) {
 				return time.Time{}, time.Time{}, false
 			}
 			until = time.Unix(t, 0)
-			if until.After(ceil) {
-				until = ceil
-			}
 		}
+	}
+	// Each end is clamped into the band, not refused: refusing would fall back to
+	// the default window and draw the last 7 days under a label saying 2030.
+	// Clamped, the window selects nothing and the empty state says so.
+	floor, ceil := now.Add(-maxWinMins*time.Minute), now.Add(maxWinMins*time.Minute)
+	if since.After(ceil) {
+		since = ceil
 	}
 	if since.Before(floor) {
 		since = floor
+	}
+	if until.After(ceil) {
+		until = ceil
 	}
 	return since, until, true
 }

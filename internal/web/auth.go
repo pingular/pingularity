@@ -1273,10 +1273,11 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 		}
 	}
 	switch {
-	// EqualFold because DNS and Go's resolver are case-insensitive: "LocalHost:9000"
-	// binds 127.0.0.1 like "localhost:9000" does, and an exact compare advertised the
-	// LAN address for that loopback-only socket.
-	case strings.EqualFold(host, "localhost") || (loop != nil && loop.IsLoopback()):
+	// Names ignore case and a trailing dot only roots one, so "LocalHost:9000" and
+	// "localhost.:9000" bind 127.0.0.1 like "localhost:9000" does; an exact compare
+	// advertised the LAN address for that loopback-only socket. nonLoopbackListen in
+	// main answers the same question the same way.
+	case strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") || (loop != nil && loop.IsLoopback()):
 		return port, entries // this machine only - nothing another device can use
 	case bind != nil && !bind.IsUnspecified():
 		// Pinned to one address: that address is the answer, listed even if the
