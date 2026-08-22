@@ -12,7 +12,7 @@ to install.
 
 This is the [live demo](https://demo.pingularity.dev) - same dashboard, synthetic data:
 
-![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), a speedtest with bufferbloat, the latency-over-time chart, and a year-long downtime heatmap](docs/dashboard.png)
+![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), a speedtest with bufferbloat, the latency-over-time chart, and a year-long downtime heatmap](https://raw.githubusercontent.com/pingular/pingularity/main/docs/dashboard.png)
 
 ## Quick start
 
@@ -637,7 +637,7 @@ transfer, reported as their **median** (if none of them land, iperf3's own
 `min_rtt`, and failing that the idle baseline). There is no separate fastest
 figure on those runs, so that median is both what is shown and what decides.
 
-![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, and a save-as-image button](docs/speed-panel.png)
+![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, and a save-as-image button](https://raw.githubusercontent.com/pingular/pingularity/main/docs/speed-panel.png)
 
 **Bufferbloat** is the extra lag that appears only while the line is busy - the
 reason a video call breaks up the moment a big download starts. Pingularity
@@ -751,7 +751,7 @@ errors mean exactly what they say, and get no such note):
   error says so. Separately, on kernels older than 5.7 `SO_BINDTODEVICE`
   needs `CAP_NET_RAW`, which the `-iperf` image's `iperf3` deliberately does
   not have (the capability is stamped on the `pingularity` binary alone - see
-  [docs/security-model.md](docs/security-model.md)) - so on those kernels
+  [docs/security-model.md](https://github.com/pingular/pingularity/blob/main/docs/security-model.md)) - so on those kernels
   `--bind-dev` fails in the container even for an interface that does exist
   inside it. Native installs are unaffected: the deb/rpm unit's *ambient*
   `CAP_NET_RAW` carries into the iperf3 child.
@@ -1001,7 +1001,7 @@ Below that:
   much shorter than the wall time it spans. A restart mid-outage is different: it
   splits the log into two rows, the first with no duration at all.
 
-![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day shaded by how many outages it saw, above a Show recent outages button](docs/downtime-heatmap.png)
+![The Downtime panel: a GitHub-style calendar heatmap of the past year, each cell a day shaded by how many outages it saw, above a Show recent outages button](https://raw.githubusercontent.com/pingular/pingularity/main/docs/downtime-heatmap.png)
 
 > **Who does Pingularity talk to?** Every service it picks for you is keyless
 > public infrastructure - no API token, no signup - and nothing is ever *pushed*
@@ -1033,11 +1033,14 @@ Below that:
 > you and the answer describes the resolver. Rows marked (DNS) are questions
 > handed to that resolver rather than connections the daemon makes itself, so
 > what the service at the far end sees is your resolver arriving with an address
-> in the query. "Connection refresh" means: once an hour on its own
-> (every 5 minutes while a lookup is failing), once after a reconnect at most
-> every 5 minutes, and once after every speedtest - so turning speedtests on
-> multiplies these too. Exit discovery rides those refreshes but re-traces at
-> most every 10 minutes. They stop when monitoring is paused, and the
+> in the query. "Connection refresh" means: once an hour on its own (every 5
+> minutes while a lookup is failing, or while exit discovery has yet to
+> succeed), once after a reconnect at most every 5 minutes, and once after
+> every speedtest - so turning speedtests on multiplies these too. Exit
+> discovery rides those refreshes and re-traces at most every 10 minutes once
+> an exit is known; until one is, a failed trace retries after a minute, and
+> three straight failures stand it down to the slow cadence. They stop when
+> monitoring is paused, and the
 > **Connection info** toggle (Latency tab) stops them for good. Both cover the
 > automatic lookups only - the Connection panel's refresh button still fetches
 > on demand, and the panel says when it is no longer refreshing itself.
@@ -1078,7 +1081,7 @@ Below that:
 > if the daemon has direct egress. Where DNS genuinely lives only at the proxy (a
 > `socks5h` setup), there is no way round it and Ookla speedtests stop rather than
 > run unvetted. Full reasoning in
-> [docs/security-model.md](docs/security-model.md).
+> [docs/security-model.md](https://github.com/pingular/pingularity/blob/main/docs/security-model.md).
 
 The **logo** (top-right) opens a tabbed settings drawer; a **power** toggle in
 the tab row starts/stops all monitoring. Changes apply **live** (no restart)
@@ -1241,7 +1244,7 @@ and persist across restarts:
 **Nine built-in themes**, every one fully recolourable (backgrounds, panels,
 status colours, chart series - each picker previews live and resets to the theme):
 
-![Six of Pingularity's built-in themes side by side: Retro, Dark, Light, Cyber, Solarized, and Amoled](docs/themes.png)
+![Six of Pingularity's built-in themes side by side: Retro, Dark, Light, Cyber, Solarized, and Amoled](https://raw.githubusercontent.com/pingular/pingularity/main/docs/themes.png)
 
 > **Notifications** post to one webhook URL, shaped per host so the common
 > targets just work - JSON everywhere except ntfy. Discord → `{content}`,
@@ -1920,7 +1923,7 @@ and `-d '{…}'` where a body is listed below.
 >
 > The full picture - what the trust boundary is, what privilege each install
 > channel runs with, what the defaults protect and how to deploy it safely - is in
-> [docs/security-model.md](docs/security-model.md). To report a vulnerability,
+> [docs/security-model.md](https://github.com/pingular/pingularity/blob/main/docs/security-model.md). To report a vulnerability,
 > see [SECURITY.md](SECURITY.md).
 
 ## How it works
