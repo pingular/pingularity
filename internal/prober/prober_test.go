@@ -654,3 +654,80 @@ func TestResolveTimeBudgetExhaustedIsFailure(t *testing.T) {
 		t.Fatalf("DialErrClass(%v) = %q, want %q: the budget-exhausted failure must count as a timeout", err, got, "timeout")
 	}
 }
+
+// The positive-answer twin of the test above, and the other half of the same
+// rule. A resolver that hijacks the random probe name - an ISP redirect, a
+// captive portal, a wildcard corporate zone - synthesises an A record, so its
+// reply reaches ResolveTime as err==nil rather than IsNotFound. That branch is
+// live in production (ResolveTime's own comment names the hijack case), and it
+// must obey the budget rule too: an answer that surfaces only once the budget
+// is gone is a timeout wearing an answer, not health.
+//
+// Left unguarded, this is not a mismeasured latency - the ~3s reading is
+// truthful - but a verdict on the wrong side of the 3s line, and the DNS
+// verdict is published with no debounce, so one escaped probe flips the pill,
+// pingularity_dns_up and the stored sample, then flips back. Measured Aug 2026
+// against a hijacking stub scheduled on a 30ms budget +/- 3ms, through the real
+// resolver: 10 of 600 probes came back ok=true with d past the budget, up to
+// 30.115ms.
+//
+// The fake resolver answers exactly at the deadline instead of racing it, so
+// the verdict is arithmetic rather than a race the test has to win.
+func TestResolveTimePositiveAnswerAtBudgetIsFailure(t *testing.T) {
+	oldTO := dnsProbeTimeout
+	dnsProbeTimeout = 50 * time.Millisecond
+	prev := lookupHost
+	lookupHost = func(ctx context.Context, name string) ([]net.IP, error) {
+		<-ctx.Done() // a hijacking resolver's A record, surfacing only at the deadline
+		return []net.IP{net.IPv4(1, 2, 3, 4)}, nil
+	}
+	t.Cleanup(func() { lookupHost = prev; dnsProbeTimeout = oldTO })
+
+	d, ok, err := ResolveTime(context.Background())
+	if ok {
+		t.Fatalf("budget-long positive answer (d=%v of a %v budget) reported ok=true: a hijacked A record that only surfaces at the deadline plots the entire budget as a HEALTHY DNS latency, which is the verdict the budget rule exists to refuse", d, dnsProbeTimeout)
+	}
+	if got := DialErrClass(err); got != "timeout" {
+		t.Fatalf("DialErrClass(%v) = %q, want %q: the budget-exhausted failure must count as a timeout, like its IsNotFound twin above", err, got, "timeout")
+	}
+}
+
+// The budget check reads the clock as well as the context, and the clock half
+// is the one that does the work at the boundary: context.WithTimeout sets Err()
+// from a timer callback that runs AFTER the nominal deadline, so an answer
+// landing in that gap meets a context still reporting nil. Measured Aug 2026:
+// reading Err() at the instant time.Since(start) >= budget returned nil in 2000
+// of 2000 trials, and with only the context consulted a hijacking stub
+// scheduled on a 30ms budget still leaked 6 of 600 probes as healthy past the
+// budget (up to 32.281ms) - versus 0 of 600 once the clock is consulted too.
+//
+// context.Background() never reports an error, so it stands in for that gap
+// exactly, with no race to lose. The third case is the other half of the
+// bargain: the clock check must not fail an answer that came in under the wire,
+// or a slow-but-working resolver would be called broken.
+func TestOverBudgetCatchesWhatTheContextTimerMisses(t *testing.T) {
+	oldTO := dnsProbeTimeout
+	dnsProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { dnsProbeTimeout = oldTO })
+
+	err := overBudget(context.Background(), dnsProbeTimeout)
+	if err == nil {
+		t.Fatalf("a lookup that spent the entire %v budget passed the check while its context still read Err()==nil: the deadline timer fires late, and the answers that land in that window are precisely the ones a context-only check waves through as healthy", dnsProbeTimeout)
+	}
+	if got := DialErrClass(err); got != "timeout" {
+		t.Fatalf("DialErrClass(%v) = %q, want %q: with no context error to wrap yet, the failure must still name the deadline itself, or budget-exhausted probes are counted in dns.fail.other instead of dns.fail.timeout", err, got, "timeout")
+	}
+	if err := overBudget(context.Background(), dnsProbeTimeout-time.Nanosecond); err != nil {
+		t.Fatalf("an answer that arrived inside the %v budget was failed as over-budget (%v): the clock check must trip only when the call outlived the whole budget, never on a legitimately fast or merely slow answer", dnsProbeTimeout, err)
+	}
+	// The other half, and it needs its own case: every assertion above runs on
+	// a live context, so deleting the rctx.Err() term leaves them all passing.
+	// This is the ordinary expiry the clock check exists to BACKSTOP - the
+	// timer has caught up, and the answer is over budget on the context's own
+	// account.
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := overBudget(expired, time.Nanosecond); err == nil {
+		t.Fatal("a fast answer on an already-cancelled context passed the check: the context term is what catches an expiry the clock has not reached yet, and without it a probe that outlived its budget by the context's own account still reports healthy")
+	}
+}

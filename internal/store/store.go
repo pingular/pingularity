@@ -3735,14 +3735,29 @@ func (s *Store) SpeedAvgBytes(ctx context.Context) (avgDown, avgUp int64, err er
 	// a real run's, so counting them predicts a bill no schedule produces. The
 	// bytes still count in what was ACTUALLY used (SpeedDataUsage), which is the
 	// number they belong to.
+	// Bounded at currentHorizon like SpeedDataUsage beside it - /api/status prints
+	// both in one object, and two answers off two different presents read as a
+	// contradiction the operator cannot resolve. ORDER BY ts DESC makes a
+	// future-dated run (an import, a clock jump) sort FIRST, so it would not merely
+	// join the newest 20, it would take a slot and EVICT a real run: one row an hour
+	// ahead owns a twentieth of a mean whose other members it displaced, and Prune
+	// keeps it for pruneFutureSlack. The predicate belongs INSIDE each derived table,
+	// before ORDER BY/LIMIT - wrapped around it, the row still spends its slot and
+	// the average is silently taken over 19 runs.
+	// One horizon captured for both directions, not one time.Now() each: two calls
+	// can straddle a second boundary and answer download and upload off presents a
+	// second apart, which is the same disagreement in miniature.
+	horizon := currentHorizon(time.Now().Unix())
 	err = s.db.QueryRowContext(ctx, `
 		SELECT
 		  (SELECT COALESCE(CAST(AVG(download_bytes) AS INTEGER), 0)
 		     FROM (SELECT download_bytes FROM speed
-		           WHERE `+speedNotFailed+` AND download_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20)),
+		           WHERE `+speedNotFailed+` AND download_bytes IS NOT NULL AND ts <= ?
+		           ORDER BY ts DESC LIMIT 20)),
 		  (SELECT COALESCE(CAST(AVG(upload_bytes) AS INTEGER), 0)
 		     FROM (SELECT upload_bytes FROM speed
-		           WHERE `+speedNotFailed+` AND upload_bytes IS NOT NULL ORDER BY ts DESC LIMIT 20))`).Scan(&avgDown, &avgUp)
+		           WHERE `+speedNotFailed+` AND upload_bytes IS NOT NULL AND ts <= ?
+		           ORDER BY ts DESC LIMIT 20))`, horizon, horizon).Scan(&avgDown, &avgUp)
 	if err != nil {
 		recordDBErr(err)
 		return 0, 0, err
