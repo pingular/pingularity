@@ -8028,27 +8028,37 @@ function copyText(t){
     let ok=false; try{ ok=document.execCommand('copy'); }catch(_){}
     ta.remove(); ok?res():rej(); });
 }
-// renderAccessUrls shows where the dashboard is reachable, reflecting the
-// (pending) toggle: network on → LAN addresses, off → localhost only.
 // renderAccessUrls lists where the dashboard answers, reflecting the (pending)
-// Network-access toggle: on -> every address of this host, the default-route one
-// first; off -> localhost only. Each row copies with one click, because the
-// point of the address is to type it into another device.
+// Network-access toggle. The list follows the listen address, not the addresses
+// this host holds: a wildcard bind advertises every usable address in both
+// families (a global IPv6 among them, which can answer from outside the LAN), a
+// loopback bind advertises none, a pinned -listen only its own. So the localhost
+// fallback below also fires with the toggle on, whenever the bind is loopback.
+// The rule, with the two binds that over-list (a hostname other than localhost,
+// a zoned literal), is lanEntriesFor in internal/web/auth.go.
 function renderAccessUrls(){
   const on=$('setNetAccess').checked;
   const rows = (on && accessLanUrls.length) ? accessLanUrls
     : [{ url:'http://localhost:'+accessPort, iface:'', primary:true, local:true }];
-  // Each address is a pill + a copy button; the default-route one leads (accent),
-  // the rest are muted. What each address IS lives in the (i), not in the row.
+  // Each address is a pill + a copy button - the point of an address is to type it
+  // into another device. The default-route row leads (accent) when there is one; a
+  // v6-only host, or a bind pinned elsewhere, leaves every row muted. What each
+  // address is lives in the (i), not in the row - the interface name is only a title.
   const row = e => `<span class="url-row${e.primary?'':' alt'}" title="${e.iface?esc(e.iface):''}">`
     + `<a class="url-a" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)}</a>`
     + `<button class="url-copy" type="button" data-url="${esc(e.url)}" title="Copy address" aria-label="Copy ${esc(e.url)}">⧉</button>`
     + '</span>';
-  const tip = (on && accessLanUrls.length)
-    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers.\n• The first address is the one on your network - use it from another device.\n• The rest are this host\'s other interfaces (a second network card or Wi-Fi, docker bridges, VPNs, VMs) - each answers only from its own network.\n• A LAN address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation.">i</span>' : '';
+  // Two tips: with the toggle on and a loopback bind the list is empty, and with
+  // no tip there the switch looks inert rather than overruled by the bind.
+  const tip = !on ? ''
+    : accessLanUrls.length
+    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers - the addresses Pingularity is listening on (-listen). The default listens on all of them; a -listen naming one address narrows this to that address, though a -listen naming a hostname, or an IPv6 with a %zone, falls back to listing them all.\n• The highlighted address is the one on your network - use it from another device. Nothing is highlighted when none of these is the address this host routes out through: a v6-only host, or a -listen pinned elsewhere.\n• The other rows are this same host under its other addresses - usually the IPv6 addresses of the same network card, sometimes a second card, Wi-Fi, a docker bridge, a VPN or a VM.\n• Most of those answer only from their own network. The exception is a public address - on a home connection that means an IPv6 starting 2 or 3: it is reachable from outside your network if your router allows inbound, over plain HTTP. Worth a login password, or bind loopback with -listen 127.0.0.1:9000.\n• An IPv4 address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation. Some public IPv6 addresses rotate on their own every day or so and nothing here says which, so do not bookmark one.">i</span>'
+    : '<span class="info" tabindex="0" data-tip="Network access is on, but there is no address to hand to another device.\n• Pingularity answers only where it is listening. With -listen 127.0.0.1:9000 (or localhost) that is this machine alone, and the toggle cannot widen it - point -listen at a network address instead.\n• The list is also empty when no interface is up with an address worth sharing.">i</span>';
+  // The caption follows the addresses, not the toggle: a loopback bind leaves
+  // localhost as the only row even with the toggle on, and that is this machine only.
+  const scope = (on && accessLanUrls.length) ? '' : '<span class="url-if">this machine only</span>';
   $('accessUrls').innerHTML = `<div class="url-head">Reachable at ${tip}</div>`
-    + `<div class="url-list">${rows.map(row).join('')}`
-    + (on ? '' : '<span class="url-if">this machine only</span>') + '</div>';
+    + `<div class="url-list">${rows.map(row).join('')}` + scope + '</div>';
   labelInfoBubbles(); // the freshly-rendered info bubble gets the shared role/name
 }
 // Copy a listed address (delegated - the rows are re-rendered on every toggle).

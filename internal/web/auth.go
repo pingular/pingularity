@@ -1174,65 +1174,148 @@ func (s *Server) accessStatus(r *http.Request) map[string]any {
 		port, lan := s.lanURLs()
 		out["user"] = s.settings.AuthUser()
 		out["port"] = port
-		out["lan_urls"] = lan // http://<lan-ip>:<port> for each non-loopback IPv4
+		out["lan_urls"] = lan // one http://<ip>:<port> per advertised address; see lanEntriesFor (two binds list more than the socket answers on)
 	}
 	return out
 }
 
-// lanEntry is one address the dashboard answers on. The interface name and the
-// primary flag let the UI separate the address worth sharing from the virtual
-// bridges a host also holds (docker0, VPN, VM taps), which the old flat URL
-// list presented as equal peers.
+// lanEntry is one address the dashboard answers on, in the shape the Access tab
+// renders it: URL is what a row links and copies, Primary picks the row that leads
+// and is accented, Iface is only a hover title - on a dual-stack host the extra rows
+// are usually the same interface in another family, so the name separates nothing.
 type lanEntry struct {
 	URL     string `json:"url"`
 	IP      string `json:"ip"`
 	Iface   string `json:"iface"`
-	Primary bool   `json:"primary"` // the address on the default route - the one to hand to another device
+	Primary bool   `json:"primary"` // the IPv4 default-route source - the one to hand to another device; no entry has it on a host with no IPv4 route out, or a bind pinned elsewhere
 }
 
-// lanURLs returns the listen port and the dashboard addresses reachable from
-// other devices (one per non-loopback IPv4 on an up interface), primary first.
-func (s *Server) lanURLs() (port string, entries []lanEntry) {
-	if _, p, err := net.SplitHostPort(s.listenAddr); err == nil && p != "" {
-		port = p
-	} else {
-		port = "9000"
-	}
-	entries = []lanEntry{}
-	primary := defaultRouteIP()
+// hostAddr is one address this host holds and the interface carrying it. Passing a
+// list in is what lets a test pose a host to lanEntriesFor: net.Interface.Addrs()
+// only ever reports the real machine.
+type hostAddr struct {
+	iface string
+	ip    net.IP
+}
+
+// hostAddrs lists every address on an interface that is up and not loopback: a
+// down interface answers nothing, and loopback is not another device.
+func hostAddrs() []hostAddr {
 	ifaces, _ := net.Interfaces()
+	out := make([]hostAddr, 0, len(ifaces))
 	for _, ifc := range ifaces {
 		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, _ := ifc.Addrs()
 		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok {
-				continue
+			if ipn, ok := a.(*net.IPNet); ok {
+				out = append(out, hostAddr{iface: ifc.Name, ip: ipn.IP})
 			}
-			ip := ipn.IP
-			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-				continue
-			}
-			v4 := ip.To4()
-			if v4 == nil {
-				continue
-			}
-			entries = append(entries, lanEntry{
-				URL: "http://" + v4.String() + ":" + port, IP: v4.String(),
-				Iface: ifc.Name, Primary: v4.String() == primary,
-			})
 		}
+	}
+	return out
+}
+
+// lanURLs returns the listen port and the addresses another device can use to reach
+// this dashboard, primary first. lanEntriesFor holds the rule.
+func (s *Server) lanURLs() (port string, entries []lanEntry) {
+	return lanEntriesFor(s.listenAddr, hostAddrs(), defaultRouteIP())
+}
+
+// lanEntriesFor picks the addresses to advertise for a listen address: where the
+// dashboard is reachable from, which follows the socket and not the host's interface
+// list. It used to print the second one, offering the LAN URL even for a loopback
+// bind that refuses connections to it.
+//
+//   - The bind decides. `-listen 127.0.0.1:9000` answers on loopback alone, so
+//     nothing is advertised and the UI falls back to http://localhost:<port>. A
+//     bind pinned to one address advertises that address alone.
+//   - Both families count. A wildcard bind is dual-stack however it is spelled -
+//     ":9000", "0.0.0.0:9000" and "[::]:9000" all answer on both - and listing
+//     IPv4 only hid a plain-HTTP dashboard answering on a globally routable IPv6
+//     address. (OpenBSD and DragonFly refuse a dual-stack socket, so a wildcard
+//     takes one family there and this over-promises in the other. We ship neither.)
+//   - The enumeration drops link-local and loopback in both families: 169.254/16
+//     and fe80::/10 mean nothing typed into another device (an IPv6 link-local URL
+//     needs the reader's own zone index), and loopback is not another device.
+//     Private IPv4 and ULA stay - that is the normal home LAN. A pin is the
+//     exception, echoed unfiltered because the socket really is bound there, so
+//     `-listen 169.254.10.5:9000` does advertise that address.
+//   - Primary marks the IPv4 default-route source only. The kernel's outbound IPv6
+//     source is a privacy address that rotates every day or so, so flagging it would
+//     be advice with an expiry date.
+//
+// Two listen addresses fall through to the full enumeration though the socket is
+// narrower, so the list can name more than it answers on: a hostname other than
+// localhost (resolving it would cost a DNS round-trip inside a UI request) and a
+// zoned literal like `[fe80::1%en0]:9000` (pinning it would echo the address without
+// the zone its reader has to supply).
+func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port string, entries []lanEntry) {
+	host, p, err := net.SplitHostPort(listenAddr)
+	if err != nil || p == "" {
+		// Config validation refuses a -listen without a port, so this is the zero
+		// value - a Server that never reached Serve.
+		host, port = listenAddr, "9000"
+	} else {
+		port = p
+	}
+	entries = []lanEntry{}
+	bind := net.ParseIP(host) // nil for "", "localhost", a hostname, or a zoned literal
+	// A zoned literal is nil to ParseIP, so ask the address half on its own - that is
+	// what makes `-listen [::1%lo0]:9000` advertise nothing. For the loopback question
+	// only: `bind` stays nil so a zoned link-local misses the pinned branch, which
+	// would echo it without its zone.
+	loop := bind
+	if loop == nil {
+		if h, _, zoned := strings.Cut(host, "%"); zoned {
+			loop = net.ParseIP(h)
+		}
+	}
+	switch {
+	// EqualFold because DNS and Go's resolver are case-insensitive: "LocalHost:9000"
+	// binds 127.0.0.1 like "localhost:9000" does, and an exact compare advertised the
+	// LAN address for that loopback-only socket.
+	case strings.EqualFold(host, "localhost") || (loop != nil && loop.IsLoopback()):
+		return port, entries // this machine only - nothing another device can use
+	case bind != nil && !bind.IsUnspecified():
+		// Pinned to one address: that address is the answer, listed even if the
+		// enumeration no longer carries it, because the socket is bound there. The
+		// interface name is only a label, so an address that has moved just loses it.
+		e := lanEntry{IP: bind.String(), Primary: bind.String() == primary}
+		e.URL = "http://" + net.JoinHostPort(e.IP, port)
+		for _, a := range addrs {
+			if a.ip.Equal(bind) {
+				e.Iface = a.iface
+				break
+			}
+		}
+		return port, append(entries, e)
+	}
+	for _, a := range addrs {
+		// IsGlobalUnicast is the rule above in one call: it rejects loopback,
+		// link-local, multicast, the IPv4 broadcast and the unspecified address, and
+		// admits private IPv4 and ULA.
+		if !a.ip.IsGlobalUnicast() {
+			continue
+		}
+		ip := a.ip.String()
+		entries = append(entries, lanEntry{
+			// JoinHostPort brackets an IPv6 literal; unbracketed, the trailing :9000
+			// reads as part of the address and the result is not a URL.
+			URL: "http://" + net.JoinHostPort(ip, port), IP: ip,
+			Iface: a.iface, Primary: ip == primary,
+		})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Primary && !entries[j].Primary })
 	return port, entries
 }
 
-// defaultRouteIP reports the source address the host would use to reach the
+// defaultRouteIP reports the IPv4 source address the host would use to reach the
 // internet - the one another device on the network can actually use. A UDP
 // "connect" only asks the kernel's routing table which source it would pick;
-// no packet is sent and nothing is contacted. "" when there is no route.
+// no packet is sent and nothing is contacted. "" when there is no route. IPv4
+// only: an IPv6 twin would name an address that rotates - see lanEntriesFor.
 func defaultRouteIP() string {
 	c, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {

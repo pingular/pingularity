@@ -115,10 +115,19 @@ const (
 // app version that initialized a BRAND-NEW database, stamped exactly once by
 // the controller that watched it come into existence (ensureBornMarker, from
 // New/Reload, or a later settings write finishing a stamp a transient store
-// fault lost) and never rewritten. PRESENCE is the contract,
-// not the value: a store created before the marker existed can never gain it.
-// PRESENCE is the trustworthy direction - it proves the store was born under a
-// build that stamps it. ABSENCE proves much less than it looks: the marker
+// fault lost) and never rewritten. PRESENCE is the contract, not the value, and
+// a database the caller reports it did not create is never stamped at all
+// (WithDatabaseCreated).
+//
+// Presence is trustworthy only for markers written under that rule, which is
+// forward-only: it changes what gets stamped from here on and touches nothing
+// already on disk. Markers from v0.70.0-rc.1 (the marker's first release)
+// through v0.80.0-rc.2 prove nothing about who created the database - those
+// releases stamped any store that merely read NOT established when they opened
+// it. Nothing can re-derive their truth, so main's gate goes on trusting
+// presence anyway; see warnAmbiguousContainerAccess for what that costs.
+//
+// ABSENCE proves much less than it looks: the marker
 // landed after the fail-closed access default did, so a store born private
 // under a build from that window and a store carried up from 0.61 or earlier
 // are indistinguishable, which is why nothing OPENS access from it and main
@@ -127,6 +136,12 @@ const (
 // install that consented (skip/dismiss/power-on) and only then accrued history.
 // Exported so main can gate on raw key presence; listed in installStateKeys so
 // it never reads as operator configuration.
+//
+// "Never rewritten" is enforced where it matters - ensureBornMarker refuses on a
+// marker it can SEE - but it is a read-then-write, not an atomic
+// insert-if-absent: a stamp left pending by a failed write (bornPending) can
+// land over a marker another initializer wrote in between. Only the VALUE can
+// differ that way, never the presence every decision keys on.
 const KeyInstallBornVersion = "install_born_version"
 
 // Test-parameter bounds (mirrored by the UI inputs' min/max).
@@ -408,6 +423,16 @@ type Controller struct {
 	// when this controller initializes a brand-new store (WithBornVersion;
 	// "unknown" when the caller didn't say). Immutable after New.
 	bornVersion string
+	// creationKnown/createdHere hold the caller's verdict on whether THIS process
+	// brought the database into existence (WithDatabaseCreated). Three states,
+	// each acting differently: known-false never stamps, whatever the store looks
+	// like; known-true still needs the emptiness reading to agree; not known (no
+	// verdict passed) skips the creation check and stamps on emptiness alone -
+	// only tests reach that leg, nearly all over store.Open(":memory:"), where
+	// opening is always a creation. Set by an Option, so both are immutable after
+	// New - no lock needed, same as bornVersion.
+	creationKnown bool
+	createdHere   bool
 	// bornMarkerErr holds the reason the birth marker is NOT on disk although
 	// this controller had a stamp to take: either the write failed, or the
 	// brand-new-vs-established judgement could not be made at all (nil while
@@ -423,10 +448,11 @@ type Controller struct {
 	// read by the caller without the writer lock.
 	bornMarkerErr atomic.Pointer[error]
 	// bornPending records that THIS controller WITNESSED the birth - it read a
-	// genuinely brand-new store (EstablishedInStore said not established, and no
-	// marker) - and the stamp has not landed yet. It is what lets a later attempt
-	// finish the job even once the store has become established in the meantime,
-	// and the distinction it encodes is the whole point:
+	// genuinely brand-new store (the caller saw the database created,
+	// EstablishedInStore said not established, no marker) - and the stamp has not
+	// landed yet. It is what lets a later attempt finish the job even once the
+	// store has become established in the meantime, and the distinction it
+	// encodes is the whole point:
 	//
 	//   - The immutability rule exists so a LATER PROCESS cannot claim a birth it
 	//     never saw. A controller that first met the database when it already had
@@ -484,6 +510,22 @@ func WithCrypter(cr Crypter) Option { return func(c *Controller) { c.crypter = c
 // its presence, never this value - it exists so a bug report's settings dump
 // says which release created the database.
 func WithBornVersion(v string) Option { return func(c *Controller) { c.bornVersion = v } }
+
+// WithDatabaseCreated reports whether THIS process brought the database into
+// existence - the half of the birth evidence only the caller can supply, since
+// a database an earlier release left behind reads just as empty as one created
+// a moment ago.
+//
+// Pass it from a DEFINITE observation taken BEFORE the store is opened (main
+// stats the database path; opening creates it), and pass false for any other
+// answer, the failed check included: a false marker permanently silences main's
+// ambiguous-container-access warning on an install that really was reachable
+// before its upgrade, while a refused birth costs only provenance, which an
+// explicit -access/PINGULARITY_ACCESS settles. Omitting the option is not inert
+// either - with no verdict the stamp rests on emptiness alone (creationKnown).
+func WithDatabaseCreated(created bool) Option {
+	return func(c *Controller) { c.creationKnown, c.createdHere = true, created }
+}
 
 // sealed/unsealed convert the iperf_servers VALUE (a JSON blob) on its way to and
 // from the store, so overlay/formKeys stay pure functions over plaintext Values and
@@ -1914,15 +1956,19 @@ func (c *Controller) seedOfferClock(ctx context.Context, since int64, rerr error
 // ensureBornMarker stamps a BRAND-NEW store, exactly once, with the version
 // that initialized it (KeyInstallBornVersion). m is the pristine AllSettings
 // snapshot New/Reload just read, consulted before their in-place edits so
-// nothing can masquerade as the marker or as configuration. Brand-new means
-// NOT established (EstablishedInStore: no history, no anchor, no operator
-// config) and no marker yet - an established store WITHOUT one predates the
-// marker's introduction and must never gain it retroactively, since a stamp
-// added later would claim a birth that cannot be proven. That absence is what
-// main's ambiguous-container-access WARNING keys on; it decides nothing on its
-// own, because it cannot separate a store that predates the marker from one
-// born private under a build too early to stamp it. The marker is bookkeeping,
-// not configuration (installStateKeys), so stamping it flips neither
+// nothing can masquerade as the marker or as configuration. Brand-new takes TWO
+// readings, and a store with no marker yet is stamped only when both agree: the
+// caller saw the database come into existence (WithDatabaseCreated, skipped only
+// when no verdict was supplied - see creationKnown), and the store is NOT
+// established (EstablishedInStore: no history, no anchor, no operator config).
+// Neither stands in for the other: an empty store may predate this process, and
+// an import or a restore can fill one it did create.
+//
+// An established store WITHOUT a marker predates the marker's introduction and
+// must never gain it retroactively, since a stamp added later would claim a
+// birth that cannot be proven; that absence is what main's
+// ambiguous-container-access WARNING keys on. The marker is bookkeeping, not
+// configuration (installStateKeys), so stamping it flips neither
 // EstablishedInStore nor the fresh-install consent hold.
 //
 // The establishment check has THREE outcomes, and collapsing two of them is how
@@ -1945,6 +1991,13 @@ func (c *Controller) ensureBornMarker(ctx context.Context, m map[string]string) 
 		// reported (this controller's own retry, or another process entirely).
 		c.bornPending.Store(false)
 		c.bornMarkerErr.Store(nil)
+		return
+	}
+	// The caller says the database was already there, and nothing the store
+	// contains can change that, so this is settled for the life of the controller.
+	// Silent, and no bornMarkerErr: an upgrade is the ordinary shape here, not a
+	// failure to record anything.
+	if c.creationKnown && !c.createdHere {
 		return
 	}
 	// Skip the establishment read once this controller has already WITNESSED the
