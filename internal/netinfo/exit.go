@@ -518,6 +518,26 @@ func cityFromRDNS(name string) string {
 // trace would delay the recorded result.
 const exitCacheFor = 10 * time.Minute
 
+// exitFailRetry is the much shorter window applied while there is NO exit to
+// show: with the row empty, waiting out the full exitCacheFor protects nothing.
+// A fresh install's first trace fires at the consent moment, where a boot-time
+// resolver or network hiccup can fail it - and because a trace-only failure
+// records no Info.Error, nothing hurried a retry: the Exit row sat empty for
+// the hour to the next scheduled refresh until the user clicked refresh
+// (measured Aug 2026). With this window the post-consent-speedtest refresh a
+// minute later fills it in. Once an exit exists, failures keep the full window:
+// the last-known exit stays on display (no flicker) and re-tracing early buys
+// nothing.
+const exitFailRetry = time.Minute
+
+// exitFailFastTries bounds how many consecutive completed failures retry on the
+// short window before standing down to exitCacheFor (and before exitMissing
+// stops hurrying the Loop). A transient boot-time hiccup recovers on the first
+// retry or two; a host where the trace can never work (no raw socket, userspace
+// NAT that reveals no path) would otherwise re-run a doomed multi-second trace
+// on every refresh, including the latency-sensitive post-speedtest one, forever.
+const exitFailFastTries = 3
+
 // cachedExit returns the exit info, re-discovering at most every exitCacheFor. A
 // failed discovery (e.g. no raw-socket privilege) is cached too, so it isn't
 // retried on every refresh.
@@ -544,8 +564,16 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 		// Serve the cache only when fresh AND the last attempt aimed at the current
 		// target - changing the target must force a re-trace, while a target whose
 		// discovery keeps failing waits out the window like any other failure
-		// instead of re-tracing on every refresh.
-		if !m.traceAt.IsZero() && m.attemptedFor == want && time.Since(m.traceAt) < exitCacheFor {
+		// instead of re-tracing on every refresh. The window is short while there
+		// is no exit to show (see exitFailRetry): m.exit == nil with a stamped
+		// traceAt can only mean the last completed attempt failed with nothing on
+		// display - a success always assigns m.exit, and the cache-bust paths zero
+		// traceAt - so the full window's no-flicker rationale does not apply.
+		window := exitCacheFor
+		if m.exit == nil && m.traceFails < exitFailFastTries {
+			window = exitFailRetry
+		}
+		if !m.traceAt.IsZero() && m.attemptedFor == want && time.Since(m.traceAt) < window {
 			ex := m.exit
 			m.traceMu.Unlock()
 			return ex
@@ -614,7 +642,6 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 		if !cancelled {
 			stats.Inc("netinfo.trace_fail")
 		}
-		m.log.Debug("exit discovery unavailable", "err", err)
 	} else {
 		stats.Inc("netinfo.trace_ok")
 		if ex != nil {
@@ -624,11 +651,14 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	}
 
 	m.traceMu.Lock()
-	defer m.traceMu.Unlock()
 	// Release the single-flight slot first so a waiter (or the next refresh) can
 	// re-trace if we discard below; both re-check the cache under this same lock,
-	// which we hold until the deferred unlock, so they can't observe a half-updated
-	// state.
+	// which we hold across every mutation below, so they can't observe a
+	// half-updated state. Unlocks are explicit (not deferred) because the
+	// failure log level must be decided from the COMMITTED state - the
+	// pre-commit exit says nothing about what this attempt leaves on display
+	// (the retarget branch below drops it) - and logging belongs outside the
+	// lock.
 	m.tracing = nil
 	close(done)
 	// A deliberate cache-bust (IP change / manual refresh) bumped traceGen while
@@ -637,7 +667,14 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	// traceAt/attemptedFor untouched keeps the cache "stale" so the next caller
 	// re-traces the current network.
 	if m.traceGen != startGen {
-		return m.exit
+		ret := m.exit
+		m.traceMu.Unlock()
+		if err != nil {
+			// Dropped result: the bust owns the row's state, so this failure is
+			// noise regardless of what is on display.
+			m.log.Debug("exit discovery unavailable", "err", err)
+		}
+		return ret
 	}
 	// Replace the cached exit only on success - a transient failure (silent hop,
 	// no AS boundary this round) must not wipe the last-known exit, or the Exit
@@ -648,6 +685,7 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	if err == nil {
 		m.exit = ex
 		m.tracedFor = want // the target setting this exit answers for
+		m.traceFails, m.warnedNoExit = 0, false
 	} else if !cancelled && m.tracedFor != want {
 		// Failed while aiming at a target the cached exit was NOT traced for:
 		// keeping the old target's path on display under the new setting would
@@ -657,8 +695,28 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 	if !cancelled {
 		m.attemptedFor = want
 		m.traceAt = time.Now()
+		if err != nil {
+			m.traceFails++
+		}
 	}
-	return m.exit
+	// Warn once per empty-row episode - the state was invisible at Debug, which
+	// made the first-boot empty-row case (Aug 2026) undiagnosable from the log
+	// ring - then stay at Debug so a permanently failing host does not fill the
+	// ring with the same line. A success or a cache-bust re-arms the Warn.
+	warn := err != nil && !cancelled && m.exit == nil && !m.warnedNoExit
+	if warn {
+		m.warnedNoExit = true
+	}
+	ret := m.exit
+	m.traceMu.Unlock()
+	if err != nil {
+		if warn {
+			m.log.Warn("exit discovery unavailable", "err", err)
+		} else {
+			m.log.Debug("exit discovery unavailable", "err", err)
+		}
+	}
+	return ret
 }
 
 // snapshotExit returns the last discovered exit info under the lock.
