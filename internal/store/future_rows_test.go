@@ -233,6 +233,26 @@ func TestFutureRowsExcludedFromCurrentReads(t *testing.T) {
 		}
 	})
 
+	// SpeedAvgBytes is the projection twin of the two bubbles above: same rows, same
+	// bytes, asked "what will the NEXT run cost" instead of "what did these cost".
+	// It is asked here because /api/status prints all three in one object - a payload
+	// that says 1000 bytes used and 4,500,500 bytes per run is answering off two
+	// different presents, and the operator reading "based on your recent tests" in
+	// the interval dialog has no way to see which one is which.
+	t.Run("SpeedAvgBytes", func(t *testing.T) {
+		st := open(t)
+		seedFutureRows(t, st, now, bareFutureUp)
+		ad, _, err := st.SpeedAvgBytes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ad != 1_000 {
+			t.Errorf("SpeedAvgBytes down = %d bytes, want 1000: a run an hour ahead is inflating "+
+				"the usage forecast and pingularity_speed_avg_run_bytes while every surface beside "+
+				"it - the pill, the chart, the usage bubble - hides that run", ad)
+		}
+	})
+
 	// The three outage surfaces are asked together, off each shape of the future
 	// row, because they share their scans: uptime, the digest and the heatmap read
 	// the same events log through different branches, and a bound applied to one
@@ -281,6 +301,81 @@ func TestFutureRowsExcludedFromCurrentReads(t *testing.T) {
 					"and ResolvedOutagesSince)", outages, down)
 			}
 		})
+	}
+}
+
+// SpeedAvgBytes averages a fixed newest-20 by RANK, so where its upper bound sits
+// matters as much as whether it exists. ORDER BY ts DESC makes a future-dated row
+// sort FIRST: it does not join the window as a 21st sample, it takes a slot and
+// EVICTS the oldest real run. A bound wrapped AROUND the derived table stops the
+// row contributing its value but not its slot, silently averaging 19 runs and
+// calling it 20 - which the fixture above cannot see, because there both rows are
+// worth the same 1,000 bytes. Distinct values are what tell the two placements
+// apart, so this test spends 20 runs to pin the predicate INSIDE the subquery.
+//
+// Both directions are seeded and both are asserted. SpeedAvgBytes averages them
+// in two SEPARATE subqueries, each with its own copy of the predicate and its own
+// bind argument, so a download-only test leaves half the bound unpinned: dropping
+// it from the upload subquery alone left the whole store and web suites green.
+// That is the same half-applied bound the fixture above exists to prevent, one
+// query lower down - /api/status prints speed_avg_down_bytes and
+// speed_avg_up_bytes in the same object.
+func TestSpeedAvgBytesFutureRowEvictsNoRun(t *testing.T) {
+	ctx := context.Background()
+	st := open(t)
+	now := time.Now().Truncate(time.Second)
+
+	// Down 1000..20000 and up 2000..40000 bytes, oldest first, all comfortably
+	// behind the wall clock. Down: the mean of the whole window is 10500; drop the
+	// oldest and it is 11000; average the future row in with the survivors and it
+	// is 460450. Up, off its own subquery: 21000, 22000, and 920900.
+	const runs = 20
+	for i := 1; i <= runs; i++ {
+		b, u := int64(i)*1_000, int64(i)*2_000
+		if err := st.InsertSpeed(ctx, SpeedSample{
+			TS:       now.Add(-time.Duration(runs+1-i) * time.Minute).Unix(),
+			DownMbps: 100, Server: "s", DownBytes: &b, UpBytes: &u,
+		}); err != nil {
+			t.Fatalf("insert present run %d: %v", i, err)
+		}
+	}
+	futBytes, futUp := int64(9_000_000), int64(18_000_000)
+	if err := st.InsertSpeed(ctx, SpeedSample{
+		TS: now.Add(futureRowAhead).Unix(), DownMbps: 900, Server: "s",
+		DownBytes: &futBytes, UpBytes: &futUp,
+	}); err != nil {
+		t.Fatalf("insert future run: %v", err)
+	}
+
+	ad, au, err := st.SpeedAvgBytes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch ad {
+	case 10_500: // every one of the 20 real runs, and only those
+	case 11_000:
+		t.Errorf("SpeedAvgBytes down = %d, want 10500: the future run is excluded from the AVERAGE "+
+			"but still holds a slot in the newest-20, so the oldest real run was evicted and the "+
+			"forecast is built from 19 samples - the bound has to sit inside the ORDER BY/LIMIT "+
+			"subquery, not around it", ad)
+	default:
+		t.Errorf("SpeedAvgBytes down = %d, want 10500: a single run stamped %v ahead owns a "+
+			"twentieth of the mean and evicts a real run from it, so the error does not dilute as "+
+			"the database fills", ad, futureRowAhead)
+	}
+	// The upload half is a separate subquery carrying its own copy of the bound and
+	// its own bind argument, so it is asserted separately: losing either one has to
+	// fail a test rather than nothing.
+	switch au {
+	case 21_000: // every one of the 20 real runs, and only those
+	case 22_000:
+		t.Errorf("SpeedAvgBytes up = %d, want 21000: the future run is excluded from the AVERAGE "+
+			"but still holds a slot in the upload newest-20, so the oldest real run was evicted - "+
+			"the upload bound has to sit inside its own ORDER BY/LIMIT subquery, not around it", au)
+	default:
+		t.Errorf("SpeedAvgBytes up = %d, want 21000: the upload subquery is unbounded, so a run "+
+			"stamped %v ahead owns a twentieth of speed_avg_up_bytes while the download average "+
+			"beside it in the same /api/status object is still right", au, futureRowAhead)
 	}
 }
 

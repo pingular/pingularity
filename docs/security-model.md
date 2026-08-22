@@ -175,9 +175,9 @@ Two things worth knowing about the filter:
   everything else. A bridged container NATs external traffic through the gateway,
   so even its own published port (`-p`) reaches the daemon as a non-loopback peer
   and gets a 403 until you opt in with `-access network` (or `-e
-  PINGULARITY_ACCESS=network`) - set a login at the same time. A `--network=host`
-  container sees real peer addresses, so local-only there behaves exactly as it
-  does natively. Pingularity still detects a bridged container, but only to
+  PINGULARITY_ACCESS=network`). A `--network=host` container
+  sees real peer addresses, so local-only there behaves exactly as it does
+  natively. Pingularity still detects a bridged container, but only to
   inform - the dashboard's container notice and the iperf3 container hints -
   never to decide access. An explicitly passed `-access` or `PINGULARITY_ACCESS`
   is authoritative at every start: if it disagrees with the stored setting, the
@@ -475,7 +475,50 @@ Shortest version:
 - **On your LAN**: set a password first, then enable Network access.
 - **Reachable from the internet**: set a password, and put it behind a reverse
   proxy that terminates TLS. Do not expose `:9000` directly.
-- **In a container**: local-only is enforced there too - a published port
-  returns 403 until you opt in with `-access network`. Do that deliberately,
-  and set a password at the same time. An upgrade from 0.61 or earlier is no
-  exception: it needs the same explicit opt-in as a new install.
+- **In a container**: local-only is enforced there too - a bridged container's
+  published port returns 403 until you opt in with `-access network`. Do that
+  deliberately, and claim the dashboard with a password the moment it is open;
+  with `--network=host` the password can come first, from the host itself (see
+  below). An upgrade from 0.61 or earlier is no exception: it needs the same
+  explicit opt-in as a new install.
+
+### Claiming a container before someone else does
+
+That last bullet hides an ordering problem worth stating plainly, and which
+container mode you run decides whether it bites. On `--network=host` it does
+not: the daemon sees real peer addresses, so the dashboard answers on the
+host's own `localhost:9000` as a loopback peer. Open it there (directly, or
+over `ssh -L 9000:localhost:9000`), set the password with local-only still on,
+then enable Network access - the same order as the LAN bullet above, and the
+dashboard is never reachable from the LAN without a password.
+
+A **bridged** container is the case where the password cannot come first.
+There is no set-password subcommand and no bootstrap password variable -
+`PINGULARITY_ACCESS` is the only setting the images take from the
+environment - and while local-only is on, a bridged container's own published
+port arrives as a non-loopback peer and is refused like any other. So there
+the listener `-access network` opens is the only route to the first
+credential, and until that credential exists the dashboard is unauthenticated:
+whoever sets a username and password first owns the install, and the
+legitimate operator is the one left at a login screen. Open network access
+from a client you trust and set the password straight away. To keep it off the
+LAN while you do, publish to the host alone (`-p 127.0.0.1:9000:9000`) and set
+the password there before republishing on the LAN - keep `-access network` on
+that run too, since a published port is a non-loopback peer either way.
+
+If someone else claimed it first, `pingularity reset-auth` clears the password
+(the README's Docker section has the one-off container that runs it against
+the volume), but mind the same ordering on the way back. It clears the
+*login*, not the intruder: auth goes off with the password, the running daemon
+has to reload or restart before that takes effect (it caches settings; a
+container is simplest to recreate, which you need anyway to change bindings),
+and the stored access choice is untouched - so coming back up leaves the
+install unclaimed and still
+LAN-published, with whoever claimed it still on that network and free to claim
+it again. Close the window first: recreate the bridged container with `-p
+127.0.0.1:9000:9000` (a restart alone cannot change bindings), or on
+`--network=host` recreate with `-e PINGULARITY_ACCESS=local`, and set the new
+password before the LAN can reach it again. Do not use local-only to close the
+window on a bridged container - it refuses your own published port too, and
+then nobody can set a password. Once the new password is set the old session
+token dies with the old hash, so the party that claimed it is out.

@@ -100,11 +100,12 @@ var lookupHost = func(ctx context.Context, name string) ([]net.IP, error) {
 // ok is true when the resolver answered - including the expected NXDOMAIN for the
 // random name (DNS is healthy, just no such record) - and false only when
 // resolution actually fails (timeout, SERVFAIL, no resolver) or the lookup
-// consumed the whole probe budget, whatever error the library reports: an
-// answer that surfaces only at the deadline is a timeout wearing an answer's
-// error value, not health. On failure it also returns the underlying error so
-// the caller can classify/log WHY (via DialErrClass); err is nil whenever ok
-// is true.
+// consumed the whole probe budget, whatever the library hands back - a nil
+// error and a real address included: an answer that surfaces only at the
+// deadline is a timeout wearing an answer, not health. Both healthy returns
+// enforce that, through overBudget. On failure it also returns the underlying
+// error so the caller can classify/log WHY (via DialErrClass); err is nil
+// whenever ok is true.
 func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 	rctx, cancel := context.WithTimeout(ctx, dnsProbeTimeout)
 	defer cancel()
@@ -114,10 +115,21 @@ func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 	// (/etc/resolv.conf or libc) - deliberately NOT the latency anchors and not a
 	// Pingularity setting, so this times the resolution path the machine actually
 	// uses. A resolver that hijacks NXDOMAIN (returns an A record for the random
-	// name) reads as a healthy answer in the err==nil branch below.
+	// name) reads as a healthy answer in the err==nil branch below - as it should,
+	// since the resolution path demonstrably works - but only when it answered
+	// inside the budget, which is why that branch runs the same overBudget check
+	// as the IsNotFound one.
 	_, err := lookupHost(rctx, name)
 	d := time.Since(start)
 	if err == nil {
+		// A synthesised A record is still an answer, so the only way this branch
+		// can lie is by timing: a hijacking resolver parked on the deadline hands
+		// back a positive reply just as the budget runs out, and the probe would
+		// plot a truthful ~3s latency labelled HEALTHY. The reading is not wrong;
+		// the verdict is, and nothing downstream debounces it.
+		if berr := overBudget(rctx, d); berr != nil {
+			return d, false, berr
+		}
 		return d, true, nil
 	}
 	var de *net.DNSError
@@ -133,12 +145,69 @@ func ResolveTime(ctx context.Context) (time.Duration, bool, error) {
 		// The single-question lookup closes the two-lane case, but retries and
 		// multi-nameserver walks can still land an IsNotFound on the deadline,
 		// so the rule is pinned here, where the verdict is made.
-		if rctx.Err() == nil {
-			return d, true, nil // NXDOMAIN: the resolver answered; the path works
+		if berr := overBudget(rctx, d); berr != nil {
+			return d, false, berr
 		}
-		return d, false, fmt.Errorf("resolver answered only at the %v budget: %w", dnsProbeTimeout, rctx.Err())
+		return d, true, nil // NXDOMAIN: the resolver answered; the path works
 	}
 	return d, false, err // timeout / SERVFAIL / no resolver -> DNS unhealthy
+}
+
+// overBudget decides whether a lookup that produced SOMETHING - a positive
+// answer or a benign IsNotFound - nevertheless took the whole probe budget to
+// produce it. It returns the failure error to report, or nil when the answer
+// arrived in time. Both healthy returns in ResolveTime run it, because the
+// contract there ("the lookup consumed the whole probe budget, whatever the
+// library hands back") is about elapsed time, not about which of the two shapes
+// the answer happened to arrive in.
+//
+// Two checks, and the second is not redundant with the first. rctx.Err() is set
+// by the timer goroutine context.WithTimeout arms, and that callback runs a
+// moment AFTER the nominal deadline - so an answer landing in that gap sees a
+// context that still reads nil. Measured Aug 2026, spinning to the instant
+// time.Since(start) >= budget and reading Err() right there: nil in 2000 of
+// 2000 trials. End to end, against a hijacking resolver stub scheduled on a
+// 30ms budget +/- 3ms, 600 probes each: unguarded leaked 10 healthy verdicts
+// past the budget (up to 30.115ms), the context check alone still leaked 6 (up
+// to 32.281ms), and both checks together leaked 0, with the healthy count
+// otherwise unchanged (157 vs 173 and 153, all inside the ~50/50 split's
+// noise).
+//
+// The arithmetic check cannot fail a legitimate answer: d is measured from
+// after the deadline was armed (probeName runs in between), so the budget
+// remaining at start is already less than dnsProbeTimeout, and d >=
+// dnsProbeTimeout means the call outlived every bit of it. An answer that
+// really arrived inside the budget has d < dnsProbeTimeout by construction.
+//
+// The fallback to context.DeadlineExceeded is load-bearing rather than tidy: in
+// exactly the timer-lag case rctx.Err() is nil, and wrapping nil would leave
+// DialErrClass no deadline to recognise, filing a budget-exhausted probe under
+// dns.fail.other instead of dns.fail.timeout - the class its IsNotFound twin's
+// test pins.
+//
+// A cancelled PARENT context arrives here as context.Canceled rather than that
+// fallback: rctx is a child of the monitor's ctx and its own cancel runs only
+// on the way out, so Canceled can only have come from above. For the IsNotFound
+// branch that is what the old inline rctx.Err() check already did. For the
+// err==nil branch it is new - that branch used to return healthy whatever rctx
+// said - so a lookup that genuinely answered in 10ms while the monitor was
+// stopping now returns ok=false under an error text that misdescribes it. That
+// is deliberate and safe: the sole caller (monitor.go, "if !ok && ctx.Err() !=
+// nil { return }") drops the sample before any dns.fail.* bump, "dns down"
+// warning or InsertDNS, so a shutdown cannot fabricate a DNS failure. Note it
+// is NOT dropped before every counter - dns.attempts and dns.last_attempt_ts
+// are bumped above that guard, as they are for every probe - and what such a
+// sample does lose is its dns.latency / dns.last_ok_ts observation, on the last
+// probe of a run that is being torn down anyway.
+func overBudget(rctx context.Context, d time.Duration) error {
+	if d < dnsProbeTimeout && rctx.Err() == nil {
+		return nil
+	}
+	cause := rctx.Err()
+	if cause == nil {
+		cause = context.DeadlineExceeded // the timer callback has not run yet
+	}
+	return fmt.Errorf("resolver answered only at the %v budget: %w", dnsProbeTimeout, cause)
 }
 
 // DialErrClass reduces a failed-dial error to a coarse, closed enum for the

@@ -1705,6 +1705,15 @@ func healthzCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// The same footgun config.ParseFlags rejects for `run`/`install`, and it is
+	// worse here: Go's flag package stops at the first non-flag token, so
+	// `healthz typo -addr 10.0.0.5:9001` never sees -addr, probes
+	// healthzDefaultAddr instead, and exits 0 if anything healthy answers there
+	// - a liveness probe reporting green for a machine nobody asked about,
+	// silently. Refuse before the probe rather than reporting on the wrong one.
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("unexpected argument %q", rest[0])
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get("http://" + *addr + "/healthz")
 	if err != nil {
@@ -2522,6 +2531,14 @@ func joinNonEmpty(parts ...string) string {
 	return strings.Join(nz, ", ")
 }
 
+// usage prints the curated help behind `pingularity help`, `-h` and `--help`.
+// It is hand-written rather than flag's PrintDefaults so the flags arrive in a
+// useful order with room to explain themselves - which means nothing but a test
+// keeps it honest about what internal/config actually defines. It drifted twice
+// for that reason (-quick-setup, then -access, the flag that decides whether
+// anyone but loopback may open the dashboard at all), so
+// TestCuratedHelpDocumentsEveryRunFlag now reads the flag list out of the real
+// FlagSet and requires an entry here for each name, in both directions.
 func usage() {
 	db := config.DefaultDBPath()
 	fmt.Printf(`pingularity - internet connectivity monitor with a built-in web dashboard
@@ -2538,8 +2555,16 @@ Usage:
   pingularity version          Print version
 
 Run flags (all optional - defaults work with no flags):
+  -access string   Who may open the dashboard: 'local' (loopback only, the
+                   default) or 'network' (reachable from the LAN - set a login
+                   too). A container that publishes a port needs 'network', or
+                   -e PINGULARITY_ACCESS=network; without it every request from
+                   off the machine is refused with a 403 explaining this - bar
+                   /healthz and /readyz, which answer any peer (verdict only).
   -listen string   Web UI + metrics address (default ":9000" = all interfaces,
-                   IPv4 + IPv6; use 127.0.0.1:9000 for local-only)
+                   IPv4 + IPv6). Binding is not access: while -access is 'local'
+                   only loopback gets in, whatever this binds. Narrow it to
+                   127.0.0.1:9000 to refuse the connection outright instead.
   -allow-host s    Extra Host header values to accept, comma-separated. Only
                    needed behind a reverse proxy on a public domain - IPs,
                    localhost, dotless names, and .local/.lan/.home/.internal
@@ -2547,6 +2572,9 @@ Run flags (all optional - defaults work with no flags):
   -trusted-proxy s Proxy IPs/CIDRs whose X-Forwarded-For identifies the real
                    client, comma-separated. Behind a same-host proxy this keeps
                    one visitor's failed logins from rate-limiting everyone.
+  -metrics-token s Read-only token for /metrics (sent as a Bearer token or as
+                   the Basic password), so Prometheus needn't hold the admin
+                   login. Only consulted while Require login is on.
   -db string       SQLite path (default: %s;
                    a system path when run as a service, else a per-user data dir;
                    the directory is auto-created)
