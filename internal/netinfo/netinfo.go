@@ -924,6 +924,9 @@ func publicIPv4(ctx context.Context) string {
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "" // an error page can still read as an address; only a 200 is the echo's answer
+	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
 	ip := strings.TrimSpace(string(b))
 	if p := net.ParseIP(ip); p == nil || p.To4() == nil {
@@ -944,6 +947,9 @@ func publicIPv6(ctx context.Context) string {
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "" // same as publicIPv4: a non-200 body is not an address we can trust
+	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
 	ip := strings.TrimSpace(string(b))
 	if p := net.ParseIP(ip); p == nil || p.To4() != nil {

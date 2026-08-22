@@ -45,8 +45,8 @@ type Iperf struct {
 	// in one; the engine itself stays environment-blind). Text only - it never
 	// changes behavior or retry classification. An empty return appends nothing.
 	EnvHint func(errText string) string
-	// congestionSkipOnce coalesces the "ignored -C off Linux" warning so it
-	// logs once per Iperf, not once per transfer.
+	// congestionSkipOnce coalesces the "-C ignored" warning so it logs once per
+	// Iperf, not once per transfer.
 	congestionSkipOnce sync.Once
 	ServerFn           func() string // "host" or "host:port" - the user's iperf3 server
 	LabelFn            func() string // friendly name for the active server; "" -> fall back to the host
@@ -116,35 +116,34 @@ func IperfVersion() string {
 	return iperfVerStr
 }
 
-// AvailableCongestionControl returns TCP congestion-control algorithms to offer in the
-// congestion field. On Linux it reads the ones the kernel lets an unprivileged process
-// set (nil if the sysctl can't be read); elsewhere the kernel has no such enumerable
-// sysctl, so it returns a small curated list of widely available algorithms. Note -C
-// applies on the SENDER: for a download that's the remote server, so this list only
-// really governs uploads, not downloads (where the server's kernel decides).
 // congestionForOS resolves the -C value actually passed to iperf3 and reports
 // whether a requested value was DROPPED because the platform cannot set it.
-// Only Linux iperf3 has the -C socket option; on macOS and Windows passing it
-// aborts the whole run at startup, so a value that arrived via an imported
-// backup from a Linux box is dropped and the run uses the system default.
+// Linux and FreeBSD iperf3 have the -C socket option; on macOS and Windows
+// passing it aborts the whole run at startup, so a value that arrived via an
+// imported backup from a Linux box is dropped and the run uses the system default.
 func congestionForOS(requested, goos string) (effective string, dropped bool) {
-	// Linux and FreeBSD iperf3 both support -C; only macOS and Windows abort on
-	// it. Dropping it on FreeBSD stripped a working knob.
+	// Narrowing this to Linux once stripped a working knob on FreeBSD.
 	if requested != "" && goos != "linux" && goos != "freebsd" {
 		return "", true
 	}
 	return requested, false
 }
 
+// AvailableCongestionControl returns TCP congestion-control algorithms to offer in the
+// congestion field. On Linux it reads the ones the kernel lets an unprivileged process
+// set (nil if the sysctl can't be read); elsewhere the kernel has no such enumerable
+// sysctl, so it returns a small curated list of widely available algorithms. Note -C
+// applies on the SENDER: for a download that's the remote server, so this list only
+// really governs uploads, not downloads (where the server's kernel decides).
 func AvailableCongestionControl() []string { return availableCongestionControlFor(runtime.GOOS) }
 
 // availableCongestionControlFor is AvailableCongestionControl with the OS as a
 // parameter, so the FreeBSD sysctl-reading + table-parsing branch is testable on
 // ANY host (through the injectable ccSysctl seam) rather than only when
-// GOOS==freebsd. Only Linux iperf3 has the -C socket option; on macOS and Windows
-// passing it aborts the whole run at startup, so offer nothing there and let the
-// field mean "system default". (setCongestionSkipped mirrors this at run time for
-// a value that arrived via an imported backup from a Linux box.)
+// GOOS==freebsd. Only macOS and Windows iperf3 lack the -C socket option; passing
+// it there aborts the whole run at startup, so offer nothing and let the field mean
+// "system default". (congestionForOS mirrors this at run time for a value that
+// arrived via an imported backup from a Linux box.)
 func availableCongestionControlFor(goos string) []string {
 	switch goos {
 	case "linux":
@@ -528,6 +527,17 @@ func isIPLiteral(s string) bool {
 	return err == nil
 }
 
+// warnCongestionSkipped says why a requested -C value is not taking effect. Takes
+// goos rather than reading it, so the message is testable on any host.
+func (i *Iperf) warnCongestionSkipped(requested, goos string) {
+	i.congestionSkipOnce.Do(func() {
+		if i.Log != nil {
+			i.Log.Warn("iperf3 congestion control ignored: -C needs Linux or FreeBSD; running with the system default",
+				"requested", requested, "os", goos)
+		}
+	})
+}
+
 // Run measures download then upload against the configured iperf3 server, with the
 // bufferbloat sampler running during each transfer.
 func (i *Iperf) Run(ctx context.Context) (Result, error) {
@@ -556,12 +566,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	// with the system default instead of failing every test; log once so the
 	// operator can see why their setting is not taking effect.
 	if eff, dropped := congestionForOS(tp.congestion, runtime.GOOS); dropped {
-		i.congestionSkipOnce.Do(func() {
-			if i.Log != nil {
-				i.Log.Warn("iperf3 congestion control ignored: -C is Linux-only; running with the system default",
-					"requested", tp.congestion, "os", runtime.GOOS)
-			}
-		})
+		i.warnCongestionSkipped(tp.congestion, runtime.GOOS)
 		tp.congestion = eff
 	}
 	dir := speedDirection(i.DirectionFn)
