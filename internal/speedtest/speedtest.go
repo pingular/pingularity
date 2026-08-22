@@ -60,7 +60,9 @@ type Result struct {
 	// Latency under load (see lul.go): medians of TCP-connect RTTs to a fixed anycast
 	// target - idle just before the transfers, then during each phase. Loaded minus idle
 	// is the bufferbloat. nil when unmeasurable (phase too short, too few samples, target
-	// unreachable). The P95 fields are the 95th percentile (nearest-rank) of each phase -
+	// unreachable, or too few idle probes left after the retransmit filter to hold a
+	// baseline - one retransmit is worth ~1s, enough to zero real bloat). The P95 fields
+	// are the 95th percentile (nearest-rank) of each phase -
 	// the sustained bad end of the distribution, not the single worst sample, which on a
 	// TCP-connect probe is usually a SYN retransmission rather than queue delay.
 	IdleMS          *float64

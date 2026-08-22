@@ -640,8 +640,12 @@ or upload-only run has no figures for the direction it skipped, packet loss is
 optional and not always measurable, family and probe direction are recorded
 only when the run really established them (the engine notes below say when
 that is), and bufferbloat is absent when a transfer
-phase was too short to sample, returned too few samples, or the latency target
-was unreachable. Missing is stored as missing rather than as a zero, so charts
+phase was too short to sample, returned too few samples, the latency target
+was unreachable, or too few idle probes survived the retransmit filter to leave a
+baseline. That last case drops the figure on purpose: a single retransmit in the
+idle number is worth about a second, enough on its own to cancel real bloat down
+to zero, so a polluted baseline would report a clean link instead of an
+unmeasurable one. Missing is stored as missing rather than as a zero, so charts
 and thresholds can tell "not measured" from "measured, and it was bad". A run
 that failed outright isn't a measurement at all: it is kept only as a flagged
 data-usage row, which every measurement view filters out (see the data-usage
@@ -678,14 +682,26 @@ flowchart LR
   queued --> bloat["bufferbloat = 190 - 24<br/>= +166 ms under load"]
 ```
 
-Both figures are **medians** of their probes, and the headline bufferbloat number
-- the one the tiles show and the one your **max bufferbloat** threshold is
+Both figures are **medians** of their probes - the idle one over only the probes
+that survive a retransmit filter, since on an unloaded link a sample more than
+500 ms above that burst's own minimum is an OS retry rather than latency. A burst
+whose own fastest probe is already at or above a second holds no honest sample to
+measure the rest against, and yields no baseline at all. The loaded phases keep
+theirs, where a near-second sample is the bloat itself. The headline bufferbloat
+number - the one the tiles show and the one your **max bufferbloat** threshold is
 compared against - is `median(loaded) - median(idle)`. The chart also plots a
 **p95** per direction, the sustained bad end of the distribution. p95 is
 deliberately not the maximum: these are TCP-connect probes, and a single worst
 sample on one is usually a SYN retransmission (a fixed ~1000 ms OS retry, and
 ~2000 ms for a second one) rather than queue delay, so a max-based number
-reports round figures that say more about packet loss than about buffering.
+reports round figures that say more about packet loss than about buffering. The
+probes go to a fixed dual-stack name, and the address family that wins their
+connection race is not taken on trust - a path that drops half its handshakes
+still wins races constantly, and its retries would land in the baseline. So the
+winner is graded with a short burst first, and only if that burst comes back
+lossy is the other family resolved and measured, taking the job only if it grades
+cleaner. A host reachable in just one family keeps it however lossy: lossy data
+beats none.
 
 There are two engines, picked in the settings drawer:
 

@@ -3056,7 +3056,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	// Idle baseline for latency-under-load: same method/target as the loaded
 	// samplers below (NOT the Ookla ping above), taken while the link is quiet, so
 	// the idle-vs-loaded delta isolates the load effect.
-	probeAddr := lulRunEndpoint()
+	probeAddr := lulRunEndpoint(ctx)
 	idleMS := measureIdleLatency(ctx, probeAddr)
 	anyErr := func(error) bool { return true } // a failed transfer is worth retrying
 

@@ -584,7 +584,7 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	// reject) - version caveats are surfaced to the UI via IperfVersion, not gated
 	// here (see iperfArgs).
 	res := Result{Engine: "iperf3", Server: name}
-	probeAddr := lulRunEndpoint()
+	probeAddr := lulRunEndpoint(ctx)
 	res.IdleMS = measureIdleLatency(ctx, probeAddr)
 	// Unloaded ping to the server, taken now while the link is idle (see measureServerRTT
 	// for why iperf3's own min_rtt isn't trusted here).
