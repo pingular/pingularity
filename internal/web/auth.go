@@ -1051,15 +1051,29 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 				s.rememberGood(s.settings.AuthUser(), in.CurrentPassword)
 			}
 		}
+		// The caveat below describes a CHANGE, so it is gated on the posture actually
+		// moving. The drawer echoes local_only on every Save, so comparing against the
+		// stored value is what stops an unrelated save on an already-local-only box
+		// from repeating "access is now limited" until the operator stops reading it.
+		turnedLocalOnly := false
 		if in.LocalOnly != nil {
+			turnedLocalOnly = *in.LocalOnly && !s.settings.AccessLocalOnly()
 			if err := s.settings.SetAccessLocalOnly(ctx, *in.LocalOnly); err != nil {
 				s.internalError(w, err)
 				return
 			}
+			// Ungated on purpose, unlike the two caveats that follow. This records the
+			// value that was just WRITTEN, and the write runs on every save carrying
+			// local_only, so it is the only trace that a save touched network reach at
+			// all - gating it on the transition would leave the re-affirming saves
+			// (the drawer's every Save) with no record to read back. The caveats
+			// describe a CHANGE, which is why they ride the transition: repeated on a
+			// box that is already local-only they are noise, and noise is what buries
+			// the one line that mattered.
 			s.log.Info("network access changed", "local_only", *in.LocalOnly)
 			// -allow-host declares a reverse proxy, and proxied visitors reach
 			// this machine as loopback connections - local-only can't see them.
-			if *in.LocalOnly && len(s.AllowedHosts) > 0 {
+			if turnedLocalOnly && len(s.AllowedHosts) > 0 {
 				s.log.Warn("local-only enabled, but -allow-host declares a reverse proxy: visitors arriving through it are not blocked",
 					"allowed_hosts", strings.Join(s.AllowedHosts, ","))
 			}
@@ -1068,7 +1082,7 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 		// Surface the same proxy caveat the log records above to the CALLER, not only
 		// the server log: setting local-only while a same-host proxy is declared does
 		// NOT keep proxied visitors out, and the operator saving this needs to know.
-		if in.LocalOnly != nil && *in.LocalOnly {
+		if turnedLocalOnly {
 			if c := proxyLocalOnlyCaveat(s.AllowedHosts); c != "" {
 				status["warnings"] = []string{"Access is now limited to this machine, but " + c}
 			}
@@ -1188,6 +1202,10 @@ type lanEntry struct {
 	IP      string `json:"ip"`
 	Iface   string `json:"iface"`
 	Primary bool   `json:"primary"` // the IPv4 default-route source - the one to hand to another device; no entry has it on a host with no IPv4 route out, or a bind pinned elsewhere
+	// Public means globally routable, not confirmed reachable from outside: whether
+	// anything on the internet can open a connection is the router's inbound policy,
+	// which this machine cannot see. The UI carries that hedge in its wording.
+	Public bool `json:"public"`
 }
 
 // hostAddr is one address this host holds and the interface carrying it. Passing a
@@ -1251,6 +1269,13 @@ func (s *Server) lanURLs() (port string, entries []lanEntry) {
 // localhost (resolving it would cost a DNS round-trip inside a UI request) and a
 // zoned literal like `[fe80::1%en0]:9000` (pinning it would echo the address without
 // the zone its reader has to supply).
+//
+// Public keeps following the address on those two rather than being withheld: the
+// socket does answer on one of the listed addresses, the panel already tells the
+// reader that both forms fall back to the whole list, and so the tag reads there as
+// "one of these candidates is routable" - which is established. Withholding it would
+// leave a globally routable plain-HTTP URL listed and described like a LAN address,
+// which is the exposure the flag exists to announce.
 func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port string, entries []lanEntry) {
 	host, p, err := net.SplitHostPort(listenAddr)
 	if err != nil || p == "" {
@@ -1283,7 +1308,7 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 		// Pinned to one address: that address is the answer, listed even if the
 		// enumeration no longer carries it, because the socket is bound there. The
 		// interface name is only a label, so an address that has moved just loses it.
-		e := lanEntry{IP: bind.String(), Primary: bind.String() == primary}
+		e := lanEntry{IP: bind.String(), Primary: bind.String() == primary, Public: isPublicIP(bind)}
 		e.URL = "http://" + net.JoinHostPort(e.IP, port)
 		for _, a := range addrs {
 			if a.ip.Equal(bind) {
@@ -1293,6 +1318,7 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 		}
 		return port, append(entries, e)
 	}
+	seen64 := map[string]bool{}
 	for _, a := range addrs {
 		// IsGlobalUnicast is the rule above in one call: it rejects loopback,
 		// link-local, multicast, the IPv4 broadcast and the unspecified address, and
@@ -1300,16 +1326,48 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 		if !a.ip.IsGlobalUnicast() {
 			continue
 		}
+		// One interface usually holds several IPv6 addresses out of one /64, because
+		// privacy addressing (RFC 8981) keeps minting them - the same dashboard on the
+		// same network, so the rest are duplicate rows rather than extra answers. The
+		// tie-break is enumeration order, not stability: net.Interface.Addrs() carries
+		// no temporary-address flag, so the kept address may be one that rotates, which
+		// is why the panel still tells the reader not to bookmark one. IPv4 is left
+		// alone - two IPv4 addresses on one interface are two separate answers.
+		if a.ip.To4() == nil {
+			key := a.iface + "|" + string(a.ip.To16()[:8])
+			if seen64[key] {
+				continue
+			}
+			seen64[key] = true
+		}
 		ip := a.ip.String()
 		entries = append(entries, lanEntry{
 			// JoinHostPort brackets an IPv6 literal; unbracketed, the trailing :9000
 			// reads as part of the address and the result is not a URL.
 			URL: "http://" + net.JoinHostPort(ip, port), IP: ip,
-			Iface: a.iface, Primary: ip == primary,
+			Iface: a.iface, Primary: ip == primary, Public: isPublicIP(a.ip),
 		})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Primary && !entries[j].Primary })
 	return port, entries
+}
+
+// isPublicIP reports whether an address is globally routable - reachable from off
+// the network in principle. It cannot say whether anything outside actually gets
+// through: that is the router's inbound policy, which is not visible from here.
+func isPublicIP(ip net.IP) bool {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	// 100.64.0.0/10 is carrier-grade NAT, and it is also where Tailscale hands out
+	// its IPv4 addresses. Go calls it global unicast and not private, so without this
+	// clause a tailnet address - very common in this audience - would be reported as
+	// reachable from the internet. Tailscale's IPv6 range is a ULA, so IsPrivate
+	// already covers it.
+	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	return true
 }
 
 // defaultRouteIP reports the IPv4 source address the host would use to reach the
