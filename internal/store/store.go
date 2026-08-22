@@ -557,7 +557,7 @@ func applySchema(db *sql.DB) error {
 	}
 	// Migrate older DBs: per-run speed connection columns (TEXT), numeric per-run
 	// columns (packet loss %, health flag, jitter, data volumes), latency under
-	// load (idle baseline + per-phase loaded medians, then maxes), and the
+	// load (idle baseline + per-phase loaded medians, then p95 tails), and the
 	// per-sample address family (so series/uptime group by the family the monitor
 	// assigned rather than inferring it from the target name).
 	migrations := []struct{ table, col, typ string }{
