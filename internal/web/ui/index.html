@@ -1141,6 +1141,15 @@
     padding:7px 14px;font:inherit;font-weight:600;font-size:12px;cursor:pointer;
     transition:filter .15s,transform .08s;}
   .btn:hover{filter:brightness(1.09);} .btn:active{transform:translateY(1px);} .btn:disabled{opacity:.55;cursor:default;}
+  /* Busy state for ordinary buttons, same swap the RUN pill uses: the label goes
+     visibility:hidden rather than display:none so the button keeps its own width
+     and nothing on the row shifts while the work runs. Opacity stays up - a busy
+     button is not a disabled one to look at, even though it is one to click. */
+  .btn .btn-busy{display:none;color:currentColor;}
+  .btn.busy{position:relative;}
+  .btn.busy:disabled{opacity:1;}
+  .btn.busy .btn-lbl{visibility:hidden;}
+  .btn.busy .btn-busy{display:block;position:absolute;inset:0;margin:auto;}
   /* Speed panel "RUN" button - a matte pill. Keeps the old pill shape and
      footprint. It is a .btn (flat accent fill, like every other button here) - only its
      size, the uppercase label, and the spinner swap are its own. */
@@ -1914,7 +1923,7 @@
               <button class="cat on" type="button" data-cat="downtime">Downtime</button>
             </div>
           </div>
-          <button class="btn" id="exportBtn" type="button">Export</button>
+          <button class="btn" id="exportBtn" type="button"><span class="btn-lbl">Export</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
         </div>
         <span class="muted card-foot">Exports the selected categories as one JSON file. <b>No passwords are exported</b> - not your login, not your iperf3 servers'. Restoring here keeps the iperf3 passwords already saved on this machine; on a different machine you re-enter them. <b>Your webhook and heartbeat URLs are included</b>, and those act as credentials - keep the file private.</span>
         <span class="muted card-foot" id="exportMsg"></span>
@@ -1930,7 +1939,7 @@
             </div>
           </div>
           <div class="bk-actions">
-            <button class="btn" id="importBtn" type="button">Import</button>
+            <button class="btn" id="importBtn" type="button"><span class="btn-lbl">Import</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
             <label class="filebtn" id="importFileBtn"><span class="flabel" id="importFileName">Choose file…</span><input type="file" id="importFile" accept="application/json,.json"></label>
           </div>
         </div>
@@ -7561,13 +7570,29 @@ $('exportBtn').addEventListener('click', async ()=>{
   const c=getCats('exportCats');
   if(!c.length){ $('exportMsg').textContent='Select at least one category to export.'; return; }
   $('exportMsg').textContent='';
-  const res=await downloadVia('api/export?'+c.map(x=>x+'=1').join('&'), 'pingularity-export.json');
+  btnBusy($('exportBtn'), true);
+  let res;
+  try{
+    res=await downloadVia('api/export?'+c.map(x=>x+'=1').join('&'), 'pingularity-export.json');
+  } finally {
+    btnBusy($('exportBtn'), false);
+  }
   if(res==='toobig'){
     $('exportMsg').textContent='This backup is too large to download in the browser. Fetch it with curl, or stop the service first and copy the database file with its -wal sidecar and pingularity.key - see the docs.';
   } else if(res==='fail'){
     $('exportMsg').textContent='Export failed.';
   }
 });
+// Swap a button's label for a spinner while its work runs, and refuse a second
+// click for the same reason the import handler already disabled itself: a repeat
+// send would upload the whole file again into a half-applied import. aria-busy
+// carries the same state to a screen reader, which cannot see the swap.
+function btnBusy(b, on){
+  if(!b) return;
+  b.classList.toggle('busy', on);
+  b.disabled = on;
+  if(on) b.setAttribute('aria-busy','true'); else b.removeAttribute('aria-busy');
+}
 // Transient status via the shared role=status toast (announced to screen readers).
 function flashStatus(msg){ const tb=$('undoToast'); if(!tb) return; tb.textContent=msg; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 6000); }
 $('logDownload').addEventListener('click', async e=>{ e.preventDefault();
@@ -7596,7 +7621,7 @@ $('importBtn').addEventListener('click', async ()=>{
   // A big restore takes minutes, and a second click would send the whole file again
   // into a half-applied import. The button comes back in the finally below, whatever
   // the outcome.
-  $('importBtn').disabled=true;
+  btnBusy($('importBtn'), true);
   try{
     // The File goes to fetch AS IS. f.text() first would materialise the entire
     // backup as a JS string and then a second UTF-8 copy of it, which a default
@@ -7637,7 +7662,7 @@ $('importBtn').addEventListener('click', async ()=>{
       } else { msg.textContent='Import failed: '+(raw.trim().slice(0,200)||('HTTP '+r.status)); }
     }
   }catch(e){ msg.textContent='Import failed: '+e.message; }
-  finally{ $('importBtn').disabled=false; }
+  finally{ btnBusy($('importBtn'), false); }
 });
 // Outage detection only pauses when LATENCY probing is scheduled, so warn (here
 // and on the Alerts tab) when that's on AND a webhook is set - alerts would miss

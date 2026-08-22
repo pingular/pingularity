@@ -2112,7 +2112,15 @@ function driveImport({ ok = true, resp = {}, fetchFails = false } = {}) {
   let handler = null;
   const file = { name: 'backup.json', size: 290 * 1024 * 1024, reads: 0,
     async text() { this.reads++; return '{}'; } };
-  const btn = { disabled: false, addEventListener: (_ev, fn) => { handler = fn; } };
+  // A real classList, so the shipped btnBusy runs unmodified and the spinner swap
+  // is observed rather than stubbed away.
+  const classes = new Set();
+  const btn = { disabled: false, addEventListener: (_ev, fn) => { handler = fn; },
+    classList: { toggle: (c, on) => { on ? classes.add(c) : classes.delete(c); },
+      add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) },
+    setAttribute: (k, v) => { btn._attrs = Object.assign(btn._attrs || {}, { [k]: v }); },
+    removeAttribute: k => { if (btn._attrs) delete btn._attrs[k]; },
+    _attrs: {}, classes };
   const msg = { textContent: '' };
   const els = { importBtn: btn, importFile: { files: [file] }, importMsg: msg,
     outagesSection: { style: { display: 'none' } } };
@@ -2120,6 +2128,7 @@ function driveImport({ ok = true, resp = {}, fetchFails = false } = {}) {
   const fetchStub = async (_url, opt) => {
     sent.body = opt.body; sent.headers = opt.headers;
     sent.disabledMidUpload = btn.disabled; // a second click here would upload twice
+    sent.busyMidUpload = classes.has('busy'); // and the label is a spinner while it runs
     if (fetchFails) throw new Error('network went away');
     return { ok, status: ok ? 200 : 500, json: async () => resp,
       text: async () => JSON.stringify(resp) };
@@ -2128,10 +2137,13 @@ function driveImport({ ok = true, resp = {}, fetchFails = false } = {}) {
   const register = new Function('$', 'getCats', 'fetch', 'confirm', 'loadSettings',
     'loadAccess', 'formSnapshot', 'refreshStatus', 'refreshChart', 'refreshSpeedChart',
     'refreshHeatmap', 'loadOutages',
-    'let savedBody = null;\n' + extract("$('importBtn').addEventListener('click'") + ');');
+    'let savedBody = null;\n' + extract('function btnBusy(') + '\n' +
+    extract("$('importBtn').addEventListener('click'") + ');');
   register(id => els[id], () => ['pings'], fetchStub, () => true, noop, noop,
     () => '', () => {}, () => {}, () => {}, () => {}, noop);
-  return handler().then(() => ({ file, btn, msg, sent }));
+  sent.busyMidUpload = null;
+  const origFetch = fetchStub;
+  return handler().then(() => ({ file, btn, msg, sent, classes }));
 }
 
 test('import hands the file to fetch instead of reading it into memory', async () => {
@@ -2145,6 +2157,22 @@ test('import hands the file to fetch instead of reading it into memory', async (
   // Content-Type at all, and the import handler answers that with a 415.
   assert.equal(sent.headers['Content-Type'], 'application/json',
     'the explicit Content-Type must survive - the File cannot be relied on to carry one');
+});
+
+// The spinner is the only feedback a long import gives: the message line says
+// "Importing" once and never changes again, so a restore that takes minutes looks
+// identical to one that hung. It has to go up for the whole upload and come down
+// on every exit, including the ones that threw.
+test('import swaps its label for a spinner while the upload runs, and puts it back', async () => {
+  const done = await driveImport();
+  assert.equal(done.sent.busyMidUpload, true,
+    'a multi-minute restore has to show it is working, or the operator cannot tell it from a hang');
+  assert.equal(done.classes.has('busy'), false,
+    'and the label has to come back on success, or the button reads as busy forever');
+  const refused = await driveImport({ ok: false, resp: { error: 'nope' } });
+  assert.equal(refused.classes.has('busy'), false, 'a refused import must not leave the spinner up');
+  const broken = await driveImport({ fetchFails: true });
+  assert.equal(broken.classes.has('busy'), false, 'nor must a network failure mid-upload');
 });
 
 test('import will not take a second click while the first is still uploading', async () => {
@@ -3596,6 +3624,9 @@ function driveDownloads({ status = 200 } = {}) {
   const seen = [];
   const rawFetch = async (url, init) => {
     seen.push({ url: String(url), headers: new Headers((init && init.headers) || undefined) });
+    // Sampled on the wire: the spinner has to be up WHILE the export is fetching,
+    // which is the only window a stuck-looking button would be observed in.
+    if (els.exportBtn) out.busyOnWire = els.exportBtn.classes.has('busy');
     return {
       ok: status >= 200 && status < 300, status,
       headers: new Headers({ 'Content-Disposition': 'attachment; filename="from-server.txt"' }),
@@ -3611,11 +3642,18 @@ function driveDownloads({ status = 200 } = {}) {
     createElement: () => { const a = { clicked: false, click() { this.clicked = true; }, remove() {} }; anchors.push(a); return a; },
   };
   const els = {}, handlers = {};
-  const $ = id => els[id] || (els[id] = {
-    textContent: '',
-    addEventListener: (ev, fn) => { handlers[id + ':' + ev] = fn; },
-  });
-  const out = { seen, anchors, handlers, els, flashed: [], loginShown: 0 };
+  const out = { busyOnWire: null };
+  const $ = id => els[id] || (els[id] = (() => {
+    const classes = new Set();
+    return {
+      textContent: '', classes, disabled: false,
+      addEventListener: (ev, fn) => { handlers[id + ':' + ev] = fn; },
+      classList: { toggle: (c, on) => { on ? classes.add(c) : classes.delete(c); },
+        add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) },
+      setAttribute() {}, removeAttribute() {},
+    };
+  })());
+  Object.assign(out, { seen, anchors, handlers, els, flashed: [], loginShown: 0 });
   const src =
     soleAnchor('const _fetch=window.fetch.bind(window);',
       'the raw pre-wrapper handle the login POST uses is gone, and the page has no unmarked escape hatch') + '\n' +
@@ -3637,6 +3675,7 @@ function driveDownloads({ status = 200 } = {}) {
     'const fetch=window.fetch;\n' +
     script.match(/const downloadCapBytes = [^;]*;/)[0] + '\n' +
     sliceBetween('async function downloadVia(', "$('exportBtn').addEventListener('click'") + '\n' +
+    extract('function btnBusy(') + '\n' +
     extract(soleAnchor("$('exportBtn').addEventListener('click'")) + ');\n' +
     extract(soleAnchor("$('logDownload').addEventListener('click'")) + ');\n' +
     extract(soleAnchor("$('csvDownload').addEventListener('click'")) + ');\n' +
@@ -3651,6 +3690,38 @@ function driveDownloads({ status = 200 } = {}) {
       () => {}, () => ['pings'], m => out.flashed.push(m), () => { out.loginShown++; }, true);
   return out;
 }
+
+// The swap is half JS and half stylesheet: the class the handlers toggle does
+// nothing on its own. These pin the two rules that carry the meaning, and the
+// one that keeps the button from resizing under the operator.
+test('the busy class actually hides the label and shows the spinner', () => {
+  const rule = sel => {
+    const m = html.match(new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\{([^}]*)\\}'));
+    assert.ok(m, `${sel} is not in the stylesheet, so the busy state renders as nothing at all`);
+    return m[1];
+  };
+  assert.match(rule('.btn.busy .btn-lbl'), /visibility:hidden/,
+    'the label has to stay in the layout while it is hidden - display:none would shrink the button ' +
+    'mid-click and shift the row under the pointer');
+  assert.match(rule('.btn.busy .btn-busy'), /display:block/,
+    'the spinner is display:none by default, so without this the busy button shows nothing at all');
+  assert.match(rule('.btn .btn-busy'), /display:none/,
+    'an idle button must not show a spinner beside its label');
+});
+
+// A default export is the whole database and can take a while to build, during
+// which downloadVia shows nothing at all - no progress, no message. Without the
+// swap the button looks untouched and invites a second click that starts the
+// whole export again.
+test('export swaps its label for a spinner while the file is being fetched, and puts it back', async () => {
+  const d = driveDownloads();
+  await d.handlers['exportBtn:click']({ preventDefault() {} });
+  assert.equal(d.busyOnWire, true,
+    'the export button looked idle while the server was building the file, so a second click starts a second export');
+  assert.equal(d.els.exportBtn.classes.has('busy'), false,
+    'and the label has to come back once the file is handed over');
+  assert.equal(d.els.exportBtn.disabled, false, 'a finished export must leave a usable button');
+});
 
 test('requests through the fetch wrapper are marked, or the browser stacks its own password box on top of the login overlay', async () => {
   const d = driveDownloads();
