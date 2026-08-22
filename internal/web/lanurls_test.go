@@ -1,8 +1,12 @@
 package web
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -11,8 +15,9 @@ import (
 
 // A synthetic dual-stack host in the shape hostAddrs() returns: one Wi-Fi interface
 // carrying a private IPv4, a ULA, a stable global IPv6 and a temporary (privacy)
-// one, plus a link-local and a docker bridge. lanEntriesFor takes the address list
-// as an argument so a test can pose a host net.Interface.Addrs() would never report.
+// one, plus a link-local, a docker bridge and a Tailscale address. lanEntriesFor
+// takes the address list as an argument so a test can pose a host
+// net.Interface.Addrs() would never report.
 //
 // docker0 is first on purpose: enumeration order is the kernel's, not "the LAN
 // first", so leading with the default-route address would let the primary-first sort
@@ -20,7 +25,9 @@ import (
 //
 // The literals are documentation ranges (RFC 3849, a fd00::/8 ULA, an EUI-64
 // link-local from the QEMU MAC range, RFC 1918), because a public repo must not
-// carry a real home network's routable /64. Only how they classify matters here.
+// carry a real home network's routable /64. tailscale0 is the exception and is
+// carrier-grade NAT space, which is not routable from the internet either. Only how
+// they classify matters here.
 var testHost = []hostAddr{
 	{iface: "docker0", ip: net.ParseIP("172.17.0.1")},
 	{iface: "en0", ip: net.ParseIP("192.168.1.24")},
@@ -28,6 +35,7 @@ var testHost = []hostAddr{
 	{iface: "en0", ip: net.ParseIP("fd00:db8:1::24")},
 	{iface: "en0", ip: net.ParseIP("2001:db8:1:2::1")},
 	{iface: "en0", ip: net.ParseIP("2001:db8:1:2::a7c9")},
+	{iface: "tailscale0", ip: net.ParseIP("100.101.102.103")},
 }
 
 func urlsOf(entries []lanEntry) []string {
@@ -59,13 +67,15 @@ func TestLanEntriesFollowTheBindAndCoverBothFamilies(t *testing.T) {
 		v4       = "http://192.168.1.24:9000"
 		ula      = "http://[fd00:db8:1::24]:9000"
 		gua      = "http://[2001:db8:1:2::1]:9000"
-		guaTemp  = "http://[2001:db8:1:2::a7c9]:9000"
 		docker   = "http://172.17.0.1:9000"
+		tailnet  = "http://100.101.102.103:9000"
 		routeSrc = "192.168.1.24" // what defaultRouteIP() reports on this synthetic host
 	)
 	// Primary first, then enumeration order - and testHost enumerates docker0 ahead
-	// of en0, so this order is a claim about the sort, not about the fixture.
-	all := []string{v4, docker, ula, gua, guaTemp}
+	// of en0, so this order is a claim about the sort, not about the fixture. en0's
+	// second global IPv6 is absent because it shares a /64 with the first; see the
+	// dedupe test below.
+	all := []string{v4, docker, ula, gua, tailnet}
 
 	cases := []struct {
 		name   string
@@ -142,6 +152,185 @@ func TestLanEntriesExcludeLinkLocalAndLeadWithTheDefaultRoute(t *testing.T) {
 	}
 }
 
+// Several IPv6 addresses from one /64 on one interface are the same host on the
+// same network (RFC 8981 privacy addressing produces them by the handful), so the
+// list advertises the first and drops the rest - they are duplicate answers to "what
+// do I type", not extra ones. What must survive: a second /64, the same /64 on
+// another interface, and every IPv4 address, including aliases on one interface.
+func TestLanEntriesKeepOneIPv6PerPrefixPerInterface(t *testing.T) {
+	_, got := lanEntriesFor(":9000", testHost, "192.168.1.24")
+	var fromGUA []string
+	for _, e := range got {
+		if strings.HasPrefix(e.IP, "2001:db8:1:2:") {
+			fromGUA = append(fromGUA, e.IP)
+		}
+	}
+	if len(fromGUA) != 1 || fromGUA[0] != "2001:db8:1:2::1" {
+		t.Errorf("en0's 2001:db8:1:2::/64 advertised %v, want only 2001:db8:1:2::1: two addresses in one /64 on one interface reach the same dashboard over the same network, and ::1 enumerates first", fromGUA)
+	}
+
+	// A host whose duplicates and non-duplicates are all on one fixture, so a dedupe
+	// that reaches too far shows up as a missing row rather than a passing test. Two
+	// of the addresses sit right on the boundary and pin it from either side: the
+	// pair that differs only in the FOURTH hextet is the last thing a shorter prefix
+	// (a /48, say) would wrongly collapse, and the one that differs only past bit 64
+	// is the first thing a longer one (a /80) would wrongly keep.
+	host := []hostAddr{
+		{iface: "en0", ip: net.ParseIP("192.168.1.24")},
+		{iface: "en0", ip: net.ParseIP("192.168.1.25")},
+		{iface: "en0", ip: net.ParseIP("2001:db8:1:2::1")},
+		{iface: "en0", ip: net.ParseIP("2001:db8:1:2::a7c9")},
+		{iface: "en0", ip: net.ParseIP("2001:db8:1:2:8000::1")},
+		{iface: "en0", ip: net.ParseIP("2001:db8:1:3::1")},
+		{iface: "en0", ip: net.ParseIP("2001:db8:9:9::5")},
+		{iface: "eth1", ip: net.ParseIP("2001:db8:1:2::2")},
+	}
+	_, got = lanEntriesFor(":9000", host, "")
+	want := []string{
+		"http://192.168.1.24:9000",
+		"http://192.168.1.25:9000",
+		"http://[2001:db8:1:2::1]:9000",
+		"http://[2001:db8:1:3::1]:9000",
+		"http://[2001:db8:9:9::5]:9000",
+		"http://[2001:db8:1:2::2]:9000",
+	}
+	if !sameURLs(got, want) {
+		t.Errorf("advertised\n  %v\nwant\n  %v\nOnly a repeated (interface, /64) may collapse: two IPv4 addresses on one interface are separate answers, a second /64 is a second network, and the same /64 on another interface is a second path to reach it. 2001:db8:1:3::1 differs from 2001:db8:1:2::1 only in the fourth hextet, so a prefix shorter than /64 swallows a whole separate network; 2001:db8:1:2:8000::1 differs only past the 64th bit, so a prefix longer than /64 re-admits the privacy addresses this collapse exists to fold away.",
+			urlsOf(got), want)
+	}
+}
+
+// Public on a row means globally routable, which is the part this machine can know.
+// It does not mean anything outside can connect: that is the router's inbound
+// policy, and nothing here can observe it.
+func TestLanEntriesFlagGloballyRoutableAddresses(t *testing.T) {
+	want := map[string]bool{
+		"192.168.1.24":    false, // RFC 1918
+		"172.17.0.1":      false, // RFC 1918 as well, the docker bridge
+		"fd00:db8:1::24":  false, // ULA, fc00::/7
+		"2001:db8:1:2::1": true,  // global unicast, the case the flag exists for
+		"100.101.102.103": false, // CGNAT: a tailnet peer can reach it, the internet cannot
+	}
+	_, got := lanEntriesFor(":9000", testHost, "192.168.1.24")
+	if len(got) != len(want) {
+		t.Fatalf("advertised\n  %v\nwant one row for each of the %d addresses classified above: the per-row check below only ever sees rows that ARE advertised, so a fixture that grew or a filter that swallowed a row would let an address ship with its public flag never looked at",
+			urlsOf(got), len(want))
+	}
+	for _, e := range got {
+		w, ok := want[e.IP]
+		if !ok {
+			t.Errorf("advertised %s, which this test has no expectation for: every address the panel lists needs a stated public/not-public verdict, or the flag that drives the exposure warning goes untested for it", e.IP)
+			continue
+		}
+		if e.Public != w {
+			t.Errorf("%s on %s: public = %v, want %v. This flag decides whether the Access tab tells the operator their dashboard may be reachable from outside, so calling a private or CGNAT address public spends that warning on a network nobody outside can enter, and missing a globally routable one leaves a plain-HTTP dashboard unannounced.",
+				e.IP, e.Iface, e.Public, w)
+		}
+	}
+
+	// A pinned bind returns from its own branch before the enumeration runs, so it
+	// classifies separately and has to agree - one address, one answer.
+	for _, c := range []struct {
+		listen string
+		want   bool
+	}{
+		{"[2001:db8:1:2::1]:9000", true},
+		{"192.168.1.24:9000", false},
+		{"100.101.102.103:9000", false},
+	} {
+		_, got := lanEntriesFor(c.listen, testHost, "192.168.1.24")
+		if len(got) != 1 || got[0].Public != c.want {
+			t.Errorf("-listen %s advertised %+v, want a single row with public = %v: a pinned socket takes the branch above the enumeration, and the same address must not be described one way there and another way here", c.listen, got, c.want)
+		}
+	}
+}
+
+// The two binds that fall through to the full enumeration - a hostname other than
+// localhost, and a zoned literal - serve ONE of the listed addresses without saying
+// which, so a row there is a candidate rather than a confirmed answer. The public tag
+// still follows the address: the row already advertises that URL, and a globally
+// routable plain-HTTP address listed with no tag is described exactly like the LAN
+// ones beside it, which is the case the flag was added for. Private and CGNAT rows
+// stay untagged on both, so the fall-through does not tag the whole list either.
+func TestLanEntriesFlagPublicOnTheFallThroughBinds(t *testing.T) {
+	want := map[string]bool{
+		"2001:db8:1:2::1": true,  // the candidate that would go unannounced
+		"192.168.1.24":    false, // RFC 1918
+		"172.17.0.1":      false, // the docker bridge
+		"fd00:db8:1::24":  false, // ULA
+		"100.101.102.103": false, // CGNAT
+	}
+	for _, listen := range []string{"myhost.example:9000", "[fe80::1%en0]:9000"} {
+		_, got := lanEntriesFor(listen, testHost, "192.168.1.24")
+		if len(got) != len(want) {
+			t.Fatalf("-listen %s advertised\n  %v\nwant the full enumeration of %d addresses: these two binds deliberately fall back to it, and a shorter list means this case stopped being a fall-through and no longer tests one",
+				listen, urlsOf(got), len(want))
+		}
+		for _, e := range got {
+			w, ok := want[e.IP]
+			if !ok {
+				t.Errorf("-listen %s advertised %s, which this test has no expectation for: every row the panel lists needs a stated verdict, or the flag that drives the exposure warning goes untested for it", listen, e.IP)
+				continue
+			}
+			if e.Public != w {
+				t.Errorf("-listen %s: %s public = %v, want %v. A hostname or a zoned literal cannot be narrowed to one address here, so every row stays a candidate - dropping the tag hides a routable plain-HTTP address among the LAN ones, and tagging a private or CGNAT row spends the warning on a network nobody outside can enter",
+					listen, e.IP, e.Public, w)
+			}
+		}
+	}
+}
+
+// The Access tab reads these rows straight off the JSON, so the field names are an
+// interface rather than an implementation detail. Renaming one blanks the part of
+// the row it drives instead of failing anywhere a reader would notice.
+func TestLanEntryJSONKeepsTheNamesTheAccessTabReads(t *testing.T) {
+	b, err := json.Marshal(lanEntry{URL: "http://192.0.2.1:9000", IP: "192.0.2.1", Iface: "en0", Primary: true, Public: true})
+	if err != nil {
+		t.Fatalf("lanEntry does not marshal: %v. /api/access carries these rows to the Access tab as JSON, so a row that cannot be encoded is a panel with no addresses in it at all", err)
+	}
+	for _, k := range []string{`"url"`, `"ip"`, `"iface"`, `"primary"`, `"public"`} {
+		if !strings.Contains(string(b), k) {
+			t.Errorf("lanEntry marshalled as %s, which has no %s key: the Access tab reads that exact name, so renaming the field silently blanks whatever it drives - the link, the accent on the row to hand to another device, or the public tag - instead of failing anywhere a reader would notice", b, k)
+		}
+	}
+}
+
+// Where isPublicIP's line falls. The stdlib gets every case here right except one:
+// 100.64.0.0/10 is global unicast and not private, so a predicate built on those two
+// calls alone reports every Tailscale host as reachable from the internet.
+func TestIsPublicIPExcludesCGNATAndPrivateSpace(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+		why  string
+	}{
+		{"2001:db8:1:2::1", true, "a global unicast IPv6 address is what the flag is for"},
+		{"8.8.8.8", true, "so is a routable IPv4 address, as a VPS has"},
+		{"172.67.1.1", true, "172.16.0.0/12 is private but the rest of 172/8 is not, and this one's second octet also falls inside the CGNAT block's, so it fails if that block is matched without its first octet"},
+		{"192.168.1.24", false, "RFC 1918"},
+		{"10.0.0.5", false, "RFC 1918"},
+		{"172.17.0.1", false, "RFC 1918, the shape a docker bridge takes"},
+		{"fd00:db8:1::24", false, "ULA, fc00::/7"},
+		{"fd7a:115c:a1e0::1", false, "Tailscale's IPv6 range is a ULA, so the stdlib already answers this one"},
+		{"fe80::1", false, "link-local is not global unicast"},
+		{"127.0.0.1", false, "neither is loopback"},
+		{"100.64.0.0", false, "first address of the CGNAT block"},
+		{"100.101.102.103", false, "a Tailscale address, the case the carve-out exists for"},
+		{"100.127.255.255", false, "last address of the CGNAT block"},
+		{"100.63.255.255", true, "one below the block - 100.0.0.0/8 is otherwise ordinary public space"},
+		{"100.128.0.0", true, "one above it, same reason"},
+	}
+	for _, c := range cases {
+		ip := net.ParseIP(c.ip)
+		if ip == nil {
+			t.Fatalf("test fixture %q does not parse, so isPublicIP is never asked about it: a typo in one of these literals retires the boundary it was added to hold without failing anything", c.ip)
+		}
+		if got := isPublicIP(ip); got != c.want {
+			t.Errorf("isPublicIP(%s) = %v, want %v: %s", c.ip, got, c.want, c.why)
+		}
+	}
+}
+
 // familyMix counts advertised addresses by family - "1 IPv4, 1 ULA, 2 global IPv6"
 // - for the one test here that runs against the real host. Counts, not addresses,
 // because that log line goes wherever the suite runs, CI included, and it used to
@@ -202,6 +391,62 @@ func TestLanURLsAreParseableOnThisHost(t *testing.T) {
 			t.Errorf("advertised URL %q parses as host %q port %q, want %q and %q: an IPv6 literal must be bracketed or the port is read out of the address",
 				e.URL, u.Hostname(), u.Port(), e.IP, port)
 		}
+	}
+}
+
+// The reverse-proxy caveat describes a CHANGE of posture, so it rides the transition
+// into local-only and nothing else. The Settings drawer echoes local_only on every
+// Save, so without that gate an unrelated change on an install that is already
+// local-only answers "Access is now limited to this machine, but ..." - a sentence
+// that says "now" about nothing, on save after save, until the operator stops reading
+// the one save where it matters.
+func TestLocalOnlyProxyCaveatRidesTheTransitionOnly(t *testing.T) {
+	const caveat = "CANNOT block"             // the wording the response carries
+	const logged = "declares a reverse proxy" // the wording the server log carries
+
+	post := func(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/api/access", strings.NewReader(body))
+		r.Host = "127.0.0.1:9000"
+		r.RemoteAddr = "127.0.0.1:54321"
+		r.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(rr, r)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST /api/access %s: HTTP %d: %s. The Settings drawer aborts the whole Save when this call fails, so an access POST has to succeed before anything can be said about what it warned",
+				body, rr.Code, strings.TrimSpace(rr.Body.String()))
+		}
+		return rr
+	}
+
+	// Turning it on with a proxy declared: the change does less than its name says,
+	// and the operator making it is the person who needs to hear so.
+	var onLog bytes.Buffer
+	on := newTestServerLog(t, &onLog)
+	on.AllowedHosts = []string{"ping.example.com"}
+	rr := post(t, on, `{"local_only":true}`)
+	if w := strings.Join(warningsOf(t, rr), " "); !strings.Contains(w, caveat) {
+		t.Errorf("switching to local-only with -allow-host declared answered warnings %q, want the %q caveat: proxied visitors arrive as loopback connections, so this save did NOT make the dashboard private and the person who just made it believes it did",
+			w, caveat)
+	}
+	if !strings.Contains(onLog.String(), logged) {
+		t.Errorf("switching to local-only with -allow-host declared logged nothing containing %q; the response reaches whoever was at the keyboard, the log is what anyone reading back the box's history has", logged)
+	}
+
+	// Already local-only, and the save is about something else entirely: the posture
+	// did not move, so neither the response nor the log may claim it did.
+	var keepLog bytes.Buffer
+	keep := newTestServerLog(t, &keepLog)
+	keep.AllowedHosts = []string{"ping.example.com"}
+	if err := keep.settings.SetAccessLocalOnly(context.Background(), true); err != nil {
+		t.Fatalf("seed local-only: %v. The case under test is a save made on a box that was ALREADY local-only, so the seed has to land before the POST", err)
+	}
+	rr = post(t, keep, `{"local_only":true,"auth_enabled":true}`)
+	if w := strings.Join(warningsOf(t, rr), " "); w != "" {
+		t.Errorf("a save that only turned the login switch on answered warnings %q; local-only was already on, so nothing about network reach changed and a caveat saying access is \"now\" limited is a warning the operator learns to dismiss before the save that means it", w)
+	}
+	if strings.Contains(keepLog.String(), logged) {
+		t.Errorf("a save that changed no network reach still logged the %q caveat; repeating it on every save buries the one line that recorded the actual change", logged)
 	}
 }
 

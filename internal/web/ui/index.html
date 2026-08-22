@@ -1292,7 +1292,11 @@
     font-size:12.5px;color:var(--fg);background:color-mix(in srgb,var(--down) 16%,var(--panel));
     border-top:1px solid color-mix(in srgb,var(--down) 55%,transparent);}
   /* Brief undo toast after a tile is hidden by edge-drag (easy to do by accident). */
+  /* Sized on its text and then capped: anchored at left:50%, shrink-to-fit sizes a
+     sentence-long message against the half viewport to its right - a narrow column
+     on a phone. */
   .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:54px;z-index:96;
+    width:max-content;max-width:calc(100vw - 24px);box-sizing:border-box;
     background:var(--panel2);border:1px solid var(--line2);border-radius:999px;padding:8px 16px;
     font-size:12.5px;box-shadow:0 10px 30px rgba(0,0,0,.45);}
   .toast a{color:var(--accent);font-weight:600;}
@@ -1432,15 +1436,30 @@
   .url-head{display:flex;align-items:center;gap:7px;font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:8px;}
   .url-list{display:flex;align-items:center;flex-wrap:wrap;gap:9px;}
   .url-row{display:flex;align-items:center;gap:6px;}
-  .url-a{display:inline-flex;align-items:center;height:30px;padding:0 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg2);
+  /* min-height, not a fixed height: a long IPv6 URL wraps to two lines in this pill
+     at phone width, and a fixed height paints the second line below the border,
+     over the row beneath. */
+  .url-a{display:inline-flex;align-items:center;min-height:30px;padding:4px 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg2);
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--accent);text-decoration:none;overflow-wrap:anywhere;}
   .url-a:hover{border-color:var(--accent);}
   .url-row.alt .url-a{color:var(--muted);}                       /* not the default-route address */
+  /* Two axes, so two levels: the accent marks the address to hand another device,
+     full contrast marks the row with a security consequence - .alt alone would
+     rank a public address below a LAN one. */
+  .url-row.alt.pub .url-a{color:var(--fg);}
   .url-copy{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
     border:1px solid var(--line2);border-radius:8px;background:var(--bg2);color:var(--muted);font-size:12px;cursor:pointer;transition:color .12s,border-color .12s;}
   .url-copy:hover{border-color:var(--accent);color:var(--accent);}
   .url-copy.done{border-color:var(--up);color:var(--up);}
+  /* --warn, not --accent: the accent already marks the row to copy, and scope is a
+     separate axis from which address to use. */
+  .url-tag{flex:none;font-size:10px;letter-spacing:.5px;text-transform:uppercase;line-height:1.4;padding:2px 6px;
+    border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);border-radius:6px;background:color-mix(in srgb,var(--warn) 12%,transparent);color:var(--warn);}
   .url-if{font-size:11.5px;color:var(--muted);}
+  /* Above the shared .warn-bubble cap: these two are the longest of them, and the
+     bubble hides its overflow, so at that cap the sentence naming the remedy is
+     the part that is clipped. */
+  #netNoAuthWarn.show,#qsNoAuthWarn.show{max-height:300px;}
   /* FLAT-CORNERS: in Flat mode (default, no .round) square every rounded corner
      across the whole UI - buttons, toggle pills, fields, selects, dropdowns,
      tooltips, chips, badges, swatches, status marks - to a hair of softening
@@ -1483,6 +1502,7 @@
   html:not(.round) .log-ic,
   html:not(.round) .url-a,
   html:not(.round) .url-copy,
+  html:not(.round) .url-tag,
   html:not(.round) .ctl,
   html:not(.round) .ctl:has(>input),
   html:not(.round) input:not([type=range]),
@@ -2040,6 +2060,11 @@
           <button class="btn ghost url-logout" id="logoutBtn" type="button">Log out</button>
         </div>
         <div class="warn-bubble" id="localOnlyWarn"><span class="wi">⚠&#xFE0E;</span><span>Turning off <b>Network access</b> from another device will <b>cut your own access</b> once you Save - do it from the machine running Pingularity.</span></div>
+        <!-- The daemon says this once at boot, on stderr, where a detached
+             container scrolls it away - and says nothing at all when the toggle
+             above is flipped later. Said here it lands beside the remedy.
+             Filled by updateNetNoAuthWarn. -->
+        <div class="warn-bubble" id="netNoAuthWarn"><span class="wi">⚠&#xFE0E;</span><span id="netNoAuthText"></span></div>
         <p class="muted access-note">Restrict who can reach the dashboard, API, and metrics. <b>Pingularity serves plain HTTP</b> - on untrusted networks, put a TLS reverse proxy in front. <span class="info" tabindex="0" data-tip="A login keeps people out, but over plain HTTP the password crosses the network unencrypted, so anyone snooping could read it. Put a TLS reverse proxy in front (caddy, nginx, cloudflared) to encrypt it.">i</span></p>
       </section>
       </div><!-- /access pane -->
@@ -2268,6 +2293,11 @@ Applies live and persists.">i</span></span>
       <input type="text" id="qsUser" placeholder="Username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="120">
       <input type="password" id="qsPass" placeholder="Password" maxlength="72">
     </div>
+    <!-- Network access with both fields left blank is the choice that installs a
+         passwordless, network-reachable daemon, and this dialog is where it is
+         made. Filled by updateQsNoAuthWarn; it warns, it never blocks Start
+         monitoring. -->
+    <div class="warn-bubble" id="qsNoAuthWarn"><span class="wi">⚠&#xFE0E;</span><span id="qsNoAuthText"></span></div>
   </div>
   <div class="qs-row qs-two">
     <div>
@@ -3714,6 +3744,27 @@ function qsMachineOnlyNote(){
     ? 'The safe default. Nothing is reachable from other devices.'
     : 'You are reaching this over the network - choosing this will lock you out. Keep "Anyone on my network" and set a login below.';
 }
+// The wizard warns on the same condition as the Access tab (netOpenNoAuth), in
+// its own voice and against what this dialog will POST: auth is on only when BOTH
+// fields are filled, which is the auth_enabled qsSave sends. hasPassword is false
+// because there is none to inherit - the server refuses a full Quick Setup answer
+// once a login is active (web.go handleQuickSetup). rows is the same address list
+// the Access tab lists, so a loopback bind stays silent here too.
+function qsNoAuthText(network, rows, user, pass){
+  if(!netOpenNoAuth(network, rows, !!(user && pass), false, pass)) return '';
+  const base = 'Leaving both fields blank means <b>no login</b>: anyone who can reach this machine on your network can open the dashboard and change these settings.';
+  return rows.some(e=>e.public)
+    ? base + ' One of these addresses is <b>public</b> - reachable from outside your network too, if your router allows inbound. Fill in a username and password above to require a login.'
+    : base + ' Fill in a username and password above to require a login.';
+}
+function updateQsNoAuthWarn(){
+  // The access choice is read off the pills exactly as qsSave reads it, so what
+  // the bubble judges and what gets posted cannot drift apart.
+  const t = qsNoAuthText($('qsAcc').querySelectorAll('b')[1].classList.contains('on'),
+    accessLanUrls, $('qsUser').value.trim(), $('qsPass').value);
+  $('qsNoAuthText').innerHTML = t;   // innerHTML for the <b>; qsNoAuthText returns literals
+  $('qsNoAuthWarn').classList.toggle('show', !!t);
+}
 function showQuickSetup(){
   if(qsShown) return; qsShown=true;
   // Default the access choice to how the install actually booted: a container
@@ -3776,7 +3827,12 @@ wireSeg('qsAcc', i=>{
   $('qsAccNote').textContent = i===1
     ? 'Reachable from your LAN. Authentication and static IP are recommended.'
     : qsMachineOnlyNote();
+  updateQsNoAuthWarn();
 });
+// Every keystroke, so the bubble goes away as the fields right above it are filled
+// in, rather than at the POST that would already have opened the port.
+$('qsUser').addEventListener('input', updateQsNoAuthWarn);
+$('qsPass').addEventListener('input', updateQsNoAuthWarn);
 // Focus trap: while Quick Setup is open, Tab must cycle within the dialog, not
 // escape to the (inert) page behind it. Roving tabindex means only the checked
 // radio of each group is in the tab order, so arrows still move within a group.
@@ -7986,6 +8042,12 @@ async function loadAccess(){
   // current password, so surface the field exactly when it is required.
   $('curPassField').style.display = a.auth_active ? '' : 'none';
   updateAuthFields();
+  // After the auth fields, not beside renderAccessUrls above: the warning reads
+  // the login toggle and the saved-password flag, which are only set by the lines
+  // in between. Quick Setup reads the same address list, and on a first run this
+  // fetch can land after its dialog is already up.
+  updateNetNoAuthWarn();
+  updateQsNoAuthWarn();
   // auth_active (not the intent flag) gates the overlay - an enabled-but-no-
   // password state isn't enforced, so it must not lock anyone out.
   if(a.auth_active && !a.authed) showLogin(); else hideLogin();
@@ -8041,18 +8103,23 @@ function renderAccessUrls(){
   const rows = (on && accessLanUrls.length) ? accessLanUrls
     : [{ url:'http://localhost:'+accessPort, iface:'', primary:true, local:true }];
   // Each address is a pill + a copy button - the point of an address is to type it
-  // into another device. The default-route row leads (accent) when there is one; a
-  // v6-only host, or a bind pinned elsewhere, leaves every row muted. What each
-  // address is lives in the (i), not in the row - the interface name is only a title.
-  const row = e => `<span class="url-row${e.primary?'':' alt'}" title="${e.iface?esc(e.iface):''}">`
+  // into another device. The default-route row leads (accent) when there is one; on
+  // a v6-only host, or a bind pinned elsewhere, nothing is accented and the rest
+  // recede, except a public row, which keeps full contrast either way. What each
+  // address is lives in the (i), not in the row - the interface name is only a
+  // title. The tag states SCOPE, which the daemon knows; whether anything outside
+  // can actually connect is the inbound policy of the router, which it cannot see,
+  // so that hedge rides in the title rather than in the word.
+  const row = e => `<span class="url-row${e.primary?'':' alt'}${e.public?' pub':''}" title="${e.iface?esc(e.iface):''}">`
     + `<a class="url-a" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)}</a>`
     + `<button class="url-copy" type="button" data-url="${esc(e.url)}" title="Copy address" aria-label="Copy ${esc(e.url)}">⧉</button>`
+    + (e.public ? '<span class="url-tag" title="Globally routable: this address can be dialled from outside your network. Whether anything out there gets through depends on the inbound policy of your router, which Pingularity cannot check.">public</span>' : '')
     + '</span>';
   // Two tips: with the toggle on and a loopback bind the list is empty, and with
   // no tip there the switch looks inert rather than overruled by the bind.
   const tip = !on ? ''
     : accessLanUrls.length
-    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers - the addresses Pingularity is listening on (-listen). The default listens on all of them; a -listen naming one address narrows this to that address, though a -listen naming a hostname, or an IPv6 with a %zone, falls back to listing them all.\n• The highlighted address is the one on your network - use it from another device. Nothing is highlighted when none of these is the address this host routes out through: a v6-only host, or a -listen pinned elsewhere.\n• The other rows are this same host under its other addresses - usually the IPv6 addresses of the same network card, sometimes a second card, Wi-Fi, a docker bridge, a VPN or a VM.\n• Most of those answer only from their own network. The exception is a public address - on a home connection that means an IPv6 starting 2 or 3: it is reachable from outside your network if your router allows inbound, over plain HTTP. Worth a login password, or bind loopback with -listen 127.0.0.1:9000.\n• An IPv4 address usually comes from your router (DHCP) and can change - pin it with a static IP or a DHCP reservation. Some public IPv6 addresses rotate on their own every day or so and nothing here says which, so do not bookmark one.">i</span>'
+    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers - the addresses Pingularity listens on (-listen). The default listens on all of them; naming one narrows this to that address, though a hostname, or an IPv6 with a %zone, falls back to all of them.\n• The highlighted address is the one on your network - use it from another device. Nothing is highlighted when this host has no IPv4 route out (a v6-only host), or -listen is pinned elsewhere.\n• The other rows are this same host under its other addresses - IPv6 on the same card, a second card, Wi-Fi, a docker bridge, a VPN or a VM.\n• Most answer only from their own network. A row tagged public is reachable from outside it if your router allows inbound, over plain HTTP - worth a login password, or bind loopback with -listen 127.0.0.1:9000.\n• Some IPv6 addresses rotate every day or so and nothing here says which, so do not bookmark one.">i</span>'
     : '<span class="info" tabindex="0" data-tip="Network access is on, but there is no address to hand to another device.\n• Pingularity answers only where it is listening. With -listen 127.0.0.1:9000 (or localhost) that is this machine alone, and the toggle cannot widen it - point -listen at a network address instead.\n• The list is also empty when no interface is up with an address worth sharing.">i</span>';
   // The caption follows the addresses, not the toggle: a loopback bind leaves
   // localhost as the only row even with the toggle on, and that is this machine only.
@@ -8060,6 +8127,33 @@ function renderAccessUrls(){
   $('accessUrls').innerHTML = `<div class="url-head">Reachable at ${tip}</div>`
     + `<div class="url-list">${rows.map(row).join('')}` + scope + '</div>';
   labelInfoBubbles(); // the freshly-rendered info bubble gets the shared role/name
+}
+// netOpenNoAuth is the one condition both no-login warnings are judged on - this
+// tab and Quick Setup: reachable on the network, with nothing that will ask for a
+// password. It mirrors the boot warning the daemon prints (nonLoopbackListen, not
+// local-only, no active login - main.go) with two differences: it reads PENDING
+// form state, so a bubble clears as the password is typed rather than a save
+// later, and rows stands in for nonLoopbackListen - a loopback bind advertises no
+// address, so the toggle opens nothing. Family-blind on purpose: a ULA is as
+// reachable from the LAN as a 192.168 address is, and a password is the only
+// thing that stops either, so a public address escalates the wording rather than
+// gating the warning.
+function netOpenNoAuth(netOn, rows, authOn, hasPassword, typedPass){
+  const willHaveAuth = authOn && (hasPassword || typedPass.length>0);
+  return !!netOn && rows.length>0 && !willHaveAuth;
+}
+// netNoAuthWarnText is what the Access tab bubble should say, or empty for silence.
+function netNoAuthWarnText(netOn, rows, authOn, hasPassword, typedPass){
+  if(!netOpenNoAuth(netOn, rows, authOn, hasPassword, typedPass)) return '';
+  const base = '<b>Network access is on and no login is required.</b> Anyone who can reach this machine on your network can open this dashboard and change these settings, including this page.';
+  return rows.some(e=>e.public)
+    ? base + ' One of these addresses is <b>public</b> - reachable from outside your network too, if your router allows inbound connections, which Pingularity cannot check. Set a password above, or bind loopback with -listen 127.0.0.1:9000.'
+    : base + ' Set a password above.';
+}
+function updateNetNoAuthWarn(){
+  const t = netNoAuthWarnText($('setNetAccess').checked, accessLanUrls, $('setAuthEnabled').checked, accessHasPassword, $('authPass').value);
+  $('netNoAuthText').innerHTML = t;   // innerHTML for the <b>; netNoAuthWarnText returns literals
+  $('netNoAuthWarn').classList.toggle('show', !!t);
 }
 // Copy a listed address (delegated - the rows are re-rendered on every toggle).
 $('accessUrls').addEventListener('click', async e=>{
@@ -8374,6 +8468,12 @@ setInterval(()=>{ if(!document.hidden
 async function postAccess(body){
   try{ const r=await fetch('api/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok){ $('settingsMsg').textContent=await r.text(); return false; }
+    // A save can succeed and still not do what it looks like it does - today:
+    // local-only cannot keep out visitors a declared reverse proxy delivers as
+    // local connections. The server says so in the response warnings; show it in
+    // the toast, not #settingsMsg, which Save clears as it closes the drawer.
+    let warn=[]; try{ warn=(await r.json()).warnings||[]; }catch(_){ }
+    if(warn.length) flashStatus(warn.join(' '));
   }catch(_){ return false; }
   return true;
 }
@@ -8383,8 +8483,12 @@ $('setNetAccess').addEventListener('change', ()=>{
   // saved state is already local-only (nothing pending to warn about).
   $('localOnlyWarn').classList.toggle('show', !$('setNetAccess').checked && !accessSavedLocalOnly);
   renderAccessUrls();
+  updateNetNoAuthWarn();
 });
-$('setAuthEnabled').addEventListener('change', updateAuthFields);
+$('setAuthEnabled').addEventListener('change', ()=>{ updateAuthFields(); updateNetNoAuthWarn(); });
+// Every keystroke, so the bubble goes away as the password is typed - in the same
+// pane, inches from the remedy - instead of on the next Save.
+$('authPass').addEventListener('input', updateNetNoAuthWarn);
 $('logoutBtn').addEventListener('click', async ()=>{ await fetch('api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}}); showLogin(); }); // header = the body-less-POST CSRF guard (see requireJSONCT)
 
 function tick(){ refreshStatus(); refreshChart(); refreshSpeedChart(); refreshHeatmap(); refreshNetinfo();
