@@ -135,6 +135,10 @@ func TestSendAndHeartbeatCounters(t *testing.T) {
 	var status atomic.Int32
 	status.Store(200)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Take longer than the clock can miss. A loopback round trip is quick
+		// enough that Windows timed it as exactly zero, so the latency sum below
+		// stayed at zero and failed a release that had nothing wrong with it.
+		time.Sleep(20 * time.Millisecond)
 		w.WriteHeader(int(status.Load()))
 	}))
 	defer srv.Close()
