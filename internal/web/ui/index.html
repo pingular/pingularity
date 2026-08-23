@@ -790,6 +790,10 @@
   @media (max-width:600px){ .info::after{width:min(250px,86vw);left:auto;right:0;} .lbl .info::after,.ie-lbl .info::after,.netinfo .info:not(.conn-off)::after{position:fixed;left:8px !important;right:auto !important;top:auto;bottom:12px;width:min(250px,86vw);} }
   .drawer-actions{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;
     border-top:1px solid var(--line);padding-top:16px;margin-top:4px;}
+  /* The message takes whatever space the buttons leave and wraps inside it, which
+     also keeps the buttons pinned right when it is empty. Sized to its own text it
+     overflowed the row instead, pushing Reset tiles onto a line of its own. */
+  #settingsMsg{flex:1 1 0;min-width:0;}
 
   /* Content brightness: a black overlay above everything dims the whole page
      uniformly. opacity = 1 - brightness; pointer-events:none keeps the UI usable. */
@@ -1150,6 +1154,10 @@
     padding:7px 14px;font:inherit;font-weight:600;font-size:12px;cursor:pointer;
     transition:filter .15s,transform .08s;}
   .btn:hover{filter:brightness(1.09);} .btn:active{transform:translateY(1px);} .btn:disabled{opacity:.55;cursor:default;}
+  /* Save goes red when a click did NOT save. The message beside it says why, but
+     the drawer stays open looking exactly as it did, which otherwise reads as
+     nothing having happened at all. It stays red until a save actually lands. */
+  .btn.err{background:var(--down);}
   /* Busy state for ordinary buttons, same swap the RUN pill uses: the label goes
      visibility:hidden rather than display:none so the button keeps its own width
      and nothing on the row shifts while the work runs. Opacity stays up - a busy
@@ -2247,7 +2255,7 @@ Applies live and persists.">i</span></span>
         <button class="btn" id="saveSettings">Save</button>
         <button class="btn ghost" id="discardSettings" type="button">Discard</button>
         <span class="muted" id="settingsMsg"></span>
-        <button class="btn ghost" id="resetSettings" type="button" style="margin-left:auto">Reset to defaults</button>
+        <button class="btn ghost" id="resetSettings" type="button">Reset to defaults</button>
         <button class="btn ghost" id="resetLayout" type="button">Reset tiles</button>
       </div>
     </div>
@@ -3442,6 +3450,7 @@ if(window.visualViewport && window.matchMedia && window.matchMedia('(pointer:coa
 }
 function openDrawer(){
   dismissCoach(); // opening Settings marks the first-run coachmark seen
+  $('saveSettings').classList.remove('err'); // a discarded failure must not colour a fresh open
   // Baseline the live theme preview + unsaved-changes snapshot on every real
   // open (gear or error-bubble link) - but not if the drawer is already open,
   // so a re-entrant open can't erase in-progress edits from the dirty check.
@@ -7790,11 +7799,17 @@ function settingsBody(){
   return b;
 }
 let saveInFlight=false;
+// Marks the Save button as "this did not save". Text is optional: postAccess
+// has already put its own error on screen, and only the button is missing.
+function saveFailed(text){
+  if(text !== undefined) $('settingsMsg').textContent = text;
+  $('saveSettings').classList.add('err');
+}
       $('saveSettings').addEventListener('click', async () => {
   // Ignore re-entrant clicks while a save is running: the access POST clears the password
   // field mid-flight, so a second overlapping save could submit a blank password.
   if(saveInFlight) return;
-  saveInFlight=true; $('saveSettings').disabled=true;
+  saveInFlight=true; $('saveSettings').disabled=true; $('saveSettings').classList.remove('err');
   try {
   // If the city/ID box still has text, search it first so settingsBody() captures
   // the resulting scope - covers "typed but never clicked Search" and "changed the
@@ -7804,14 +7819,14 @@ let saveInFlight=false;
   // Don't save the old scope under a failed search - but an emptied box means the
   // user gave up on that query (Auto location's programmatic clear included), so it
   // no longer blocks. The failed text is kept in the box, so "fix" is followable.
-  if(serverSearchFailed && $('serverCity').value.trim()){ $('settingsMsg').textContent='Could not find that server/city - fix the search or clear the box before saving.'; return; }
+  if(serverSearchFailed && $('serverCity').value.trim()){ saveFailed('Could not find that server/city - fix the search or clear the box before saving.'); return; }
   // Same rule for a bad iperf3 address: block rather than save around it, otherwise the
   // save reports success while that field silently kept its old value.
   const addrErr=iperfAddrError();
   if(addrErr){
     iperfAddrBad(addrErr);
     activateTab('server'); $('setIperfAddr').focus();
-    $('settingsMsg').textContent='Fix the iperf3 server address before saving.';
+    saveFailed('Fix the iperf3 server address before saving.');
     return;
   }
   // A renamed server whose stored password was never re-entered: the save would
@@ -7826,27 +7841,27 @@ let saveInFlight=false;
   { const orphan=iperfPwOrphan();
     if(orphan){
       activateTab('server');
-      $('settingsMsg').textContent='Re-enter '+(orphan.label||orphan.orig_addr)+"'s password (its address changed), or change the address back, before saving.";
+      saveFailed('Re-enter '+(orphan.label||orphan.orig_addr)+"'s password (its address changed), or change the address back, before saving.");
       return;
     } }
   const body = settingsBody();   // captures the open iperf3 editor (incl. a just-typed address) too
   // iperf3 with no valid server set would fail every run ("no iperf3 server set") - block
   // the save and point the user at the fix rather than persist a broken engine.
   if(body.speed_engine==='iperf3' && !body.iperf_server){
-    $('settingsMsg').textContent='The iperf3 engine needs a server - add one with a host:port and pick it as the test target before saving.';
+    saveFailed('The iperf3 engine needs a server - add one with a host:port and pick it as the test target before saving.');
     return;
   }
   // An enabled schedule whose windows have no active days never runs - block it
   // rather than silently disabling probing/speedtests behind an "on" toggle.
   for(const f of ['lat','speed']){ if($(SCHED_FEATS[f].en).checked && body['sched_'+f+'_windows'].every(w=>!w.days.includes('1'))){
-    $('settingsMsg').textContent='The '+(f==='lat'?'latency':'speedtest')+' schedule has no active days - pick a day or turn it off.'; return; } }
+    saveFailed('The '+(f==='lat'?'latency':'speedtest')+' schedule has no active days - pick a day or turn it off.'); return; } }
   const msg=$('settingsMsg'); msg.textContent='Saving…';
   try {
     // Apply access changes first - setting a password re-issues the session
     // cookie, so the settings POST that follows stays authenticated. Bail if it
     // fails: postAccess has already shown the error, and we must not clear the
     // typed password, POST the settings, or close the drawer as if it saved.
-    if(!await postAccess(accessBody())) return;
+    if(!await postAccess(accessBody())){ saveFailed(); return; }
     $('authPass').value=''; $('authCurPass').value=''; // access (incl. any password) applied - safe to clear
     const r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(r.ok){ applySettings(await r.json());
@@ -7871,8 +7886,8 @@ let saveInFlight=false;
         if(lb) flashStatus('Saved - but '+(lb.label||lb.addr)+' points at localhost, which inside this bridged container is the container itself, not the machine running your iperf3 server. Use the host\'s LAN IP or host.docker.internal.'); } }
     // Access was POSTed first (and applied); if the settings POST fails, say so -
     // so Discard isn't mistaken for "nothing was saved".
-    else msg.textContent=(await r.text())+' (access/security settings, if changed, were already applied)';
-  } catch(e){ msg.textContent='failed'; }
+    else saveFailed((await r.text())+' (access/security settings, if changed, were already applied)');
+  } catch(e){ saveFailed('failed'); }
   } finally { saveInFlight=false; $('saveSettings').disabled=false; }
 });
 
