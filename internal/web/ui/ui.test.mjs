@@ -4948,3 +4948,36 @@ test('the heartbeat tip says Test is a real check-in', () => {
   assert.match(tip, /\n• Blank = off\./, 'both of them');
   assert.doesNotMatch(tip, /simulat/, 'nothing here may read as a rehearsal');
 });
+
+test('a long settings message wraps inside its own column instead of moving the buttons', () => {
+  // Sized to its own text the message overflowed the action row, and the iperf3
+  // no-server warning pushed Reset tiles onto a line of its own.
+  const rule = html.match(/\n\s*#settingsMsg\s*\{[^}]*\}/);
+  assert.ok(rule, 'the message needs its own rule, or it sizes to its text and overflows the row');
+  assert.match(rule[0], /flex:\s*1 1 0/, 'it has to take the leftover space rather than demand its own');
+  assert.match(rule[0], /min-width:\s*0/,
+    'without this a long unbroken message refuses to shrink below its content width');
+  const foot = html.match(/id="resetSettings"[^>]*>/)[0];
+  assert.doesNotMatch(foot, /margin-left:auto/,
+    'the message column does the spacing now; two mechanisms for it drift apart');
+});
+
+test('every save that does not save turns the button red', () => {
+  const rule = html.match(/\n\s*\.btn\.err\s*\{[^}]*\}/);
+  assert.ok(rule, 'the failed-save state needs its own rule');
+  assert.match(rule[0], /var\(--down\)/,
+    'it has to use the palette down colour, so every theme gets its own red');
+
+  const at = html.indexOf("$('saveSettings').addEventListener('click'");
+  const end = html.indexOf('saveInFlight=false', at);
+  const handler = html.slice(at, end);
+  assert.ok(at > 0 && end > at, 'could not find the save handler');
+  // Every bail-out routes through saveFailed. A path that writes the message
+  // directly would explain itself and still leave the button looking normal.
+  assert.doesNotMatch(handler, /\$\('settingsMsg'\)\.textContent\s*=/,
+    'a blocked save wrote the message without marking the button');
+  assert.match(handler, /classList\.remove\('err'\)/,
+    'each attempt has to start clean, or a retry that works still looks failed');
+  assert.match(html.slice(html.indexOf('function openDrawer(')), /classList\.remove\('err'\)/,
+    'a failure that was discarded must not colour a freshly opened drawer');
+});
