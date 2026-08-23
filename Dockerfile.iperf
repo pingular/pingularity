@@ -80,9 +80,10 @@ COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
 # Belt and braces: some BuildKit versions apply COPY --chmod to the files but
 # not the directory itself (observed: buildx honors it, ubuntu-latest's plain
 # docker build does not), and this image HAS a shell to correct it. The
-# distroless default image cannot RUN anything; its published buildx output is
-# verified 0700, and the daemon tightens its own container data dir at boot
-# either way (store.go's container carve-out).
+# distroless default image cannot RUN anything, so it seeds the directory one
+# level down and copies it as an entry instead - see the COPY in Dockerfile.
+# The daemon also tightens its own container data dir at boot either way
+# (store.go's container carve-out).
 RUN chmod 0700 /var/lib/pingularity
 EXPOSE 9000
 VOLUME /var/lib/pingularity

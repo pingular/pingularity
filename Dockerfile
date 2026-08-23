@@ -31,14 +31,18 @@ RUN apt-get update \
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/pingularity /pingularity
 # +ep: effective+permitted, so the cap is raised automatically on exec even for
-# a non-root user. `mkdir /data` seeds the data dir the final stage chowns.
+# a non-root user. `mkdir /seed/pingularity` seeds the data dir the final stage
+# copies; it is made 0700 here so the copy carries that mode across.
 # The .pingularity-image-dir marker is a volume-lineage HEURISTIC (not a proof
 # of volume type): Docker's copy-up carries it into a fresh named volume, so the
 # daemon's container carve-out (store.go) can tell content that came from OUR
 # image from an empty PVC or a plain bind-mounted host directory, which never
 # carry it. A bind mount restored FROM a marked volume would carry it too - an
 # accepted edge, since the content is genuinely ours.
-RUN setcap cap_net_raw+ep /pingularity && mkdir -p /data && touch /data/.pingularity-image-dir
+RUN setcap cap_net_raw+ep /pingularity \
+    && mkdir -p /seed/pingularity \
+    && touch /seed/pingularity/.pingularity-image-dir \
+    && chmod 0700 /seed/pingularity
 
 # --- final image: distroless nonroot, carrying the capped binary ---
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
@@ -51,15 +55,16 @@ LABEL org.opencontainers.image.title="pingularity" \
 COPY --from=setcap /pingularity /pingularity
 # The data dir must exist owned by nonroot (65532) so a freshly created named
 # volume inherits that ownership and the unprivileged process can write to it.
-# --chmod=0700 matches the mode pingularity gives a data directory it creates
-# itself. Without it COPY makes the destination directory 0755 (the source mode is
-# not carried across), and the image shipped a group/world-readable data directory
-# - which tripped pingularity's own start-up check on every container start,
-# telling the operator the directory was too open and to "consider a dedicated -db
-# directory" when this IS the dedicated directory and the image had made it that
-# way. The check rightly refuses to re-permission a directory it did not create,
-# so the mode has to be correct as shipped.
-COPY --from=setcap --chown=65532:65532 --chmod=0700 /data /var/lib/pingularity
+# It is copied as an entry INSIDE /seed rather than being the destination itself:
+# a destination directory COPY creates implicitly is 0755 and --chmod does not
+# reach it, so the image shipped a group/world-readable data directory. As a
+# copied entry it carries its own mode, set in the builder stage and again here.
+# 0700 is the mode pingularity gives a data directory it creates itself; its
+# start-up check refuses to re-permission a directory it did not create, so the
+# mode has to be right as shipped or every container start warns that the
+# directory is too open. This stage is distroless, so unlike Dockerfile.iperf
+# there is no shell to correct the mode afterwards.
+COPY --from=setcap --chown=65532:65532 --chmod=0700 /seed/ /var/lib/
 EXPOSE 9000
 VOLUME /var/lib/pingularity
 USER nonroot
