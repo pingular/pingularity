@@ -4604,9 +4604,9 @@ test('advice to copy the database by hand always says to stop the service first'
 // this predicate is the whole warning for anyone who opens access from this tab.
 // It is judged on PENDING form state so it clears as the password is typed.
 test('the no-login warning fires exactly when network access is open and unprotected', () => {
-  const rows = [{ url: 'http://192.168.1.24:9000', public: false }];
+  const rows = [{ url: 'http://192.168.1.24:9000' }];
   const w = (netOn, r, authOn, hasPw, typed) => F.netNoAuthWarnText(netOn, r, authOn, hasPw, typed);
-  assert.match(w(true, rows, false, false, ''), /no login is required/,
+  assert.match(w(true, rows, false, false, ''), /no login is required/i,
     'open and unprotected is the state the warning exists for');
   assert.equal(w(false, rows, false, false, ''), '',
     'network access off: this machine only, nothing to warn about');
@@ -4615,27 +4615,10 @@ test('the no-login warning fires exactly when network access is open and unprote
   assert.equal(w(true, rows, true, true, ''), '', 'login on with a stored password is protected');
   assert.equal(w(true, rows, true, false, 'hunter2'), '',
     'the bubble clears as the password is typed, not on the next Save');
-  assert.match(w(true, rows, true, false, ''), /no login is required/,
+  assert.match(w(true, rows, true, false, ''), /no login is required/i,
     'the login toggle alone does not activate auth - the server needs a password too');
-  assert.match(w(true, rows, false, true, ''), /no login is required/,
+  assert.match(w(true, rows, false, true, ''), /no login is required/i,
     'a stored password with the login toggle off protects nothing');
-});
-
-// The base condition is deliberately family- and scope-blind. The adversary that
-// actually reaches self-hosters is a compromised device already on the LAN, and a
-// ULA, a GUA and a 192.168 address are all equally reachable from there.
-test('a public address escalates the warning and its absence never silences it', () => {
-  const lan = [{ url: 'http://192.168.1.24:9000', public: false }];
-  const pub = lan.concat([{ url: 'http://[2001:db8::1]:9000', public: true }]);
-  const lanText = F.netNoAuthWarnText(true, lan, false, false, '');
-  const pubText = F.netNoAuthWarnText(true, pub, false, false, '');
-  assert.ok(lanText.length > 0,
-    'gating on public would leave the whole IPv4-only-LAN majority unwarned');
-  assert.doesNotMatch(lanText, /public/, 'an all-private list must not claim a public address');
-  assert.match(pubText, /public/);
-  assert.match(pubText, /router/,
-    'the word states scope; the reachability hedge has to be in the prose, since inbound policy is unobservable from here');
-  assert.match(pubText, /-listen 127\.0\.0\.1:9000/, 'the escalated copy names the bind that closes it');
 });
 
 test('the no-login warning is recomputed from every input that can change it', () => {
@@ -4652,39 +4635,6 @@ test('the no-login warning is recomputed from every input that can change it', (
     'the login toggle changes the answer');
   assert.match(script, /\$\('authPass'\)\.addEventListener\('input',\s*updateNetNoAuthWarn\)/,
     'per keystroke: the bubble has to go away as the remedy is typed, inches from it');
-});
-
-// renderAccessUrls builds the row markup from page globals and writes it into
-// #accessUrls, so the visible half is only pinned by running the real function: a
-// fake $ hands it the toggle and collects what it rendered.
-function accessUrlsHTML(rows, netOn = true) {
-  const out = { innerHTML: '' };
-  const els = { setNetAccess: { checked: netOn }, accessUrls: out };
-  new Function('$', 'esc', 'accessLanUrls', 'accessPort', 'labelInfoBubbles',
-    extract('function renderAccessUrls') + '\nreturn renderAccessUrls;')(
-    id => els[id], esc, rows, '9000', () => {})();
-  return out.innerHTML;
-}
-
-// The tag is the only thing on this list that says a row answers from outside the
-// LAN, and its title carries the whole hedge: the daemon knows the scope of an
-// address, never whether the router lets anything in on it.
-test('a public row is tagged and hedged; a LAN row is neither', () => {
-  const lan = accessUrlsHTML([{ url: 'http://192.168.1.24:9000', iface: 'eth0', primary: true, public: false }]);
-  const pub = accessUrlsHTML([{ url: 'http://[2001:db8::1]:9000', iface: 'eth0', primary: false, public: true }]);
-  assert.match(pub, /<span class="url-tag" title="[^"]*">public<\/span>/, 'the public row carries the tag');
-  const title = pub.match(/<span class="url-tag" title="([^"]*)">/)[1];
-  assert.match(title, /outside your network/, 'the word states scope; the title says what that means');
-  assert.match(title, /router/, 'and hedges it - inbound policy cannot be seen from here');
-  assert.match(pub, /class="url-row alt pub"/, 'pub is what keeps a public row out of the muted level');
-  assert.doesNotMatch(lan, /url-tag/, 'a LAN address must never be labelled public');
-  assert.doesNotMatch(lan, /class="url-row[^"]*pub/);
-  const tagCss = html.match(/\n\s*\.url-tag\{([^}]*)\}/)[1];
-  // The border is the faintest of the three: with only that, the word itself
-  // renders in body colour on no fill, which is how the one row with a security
-  // consequence ends up looking like the interface name beside it.
-  assert.match(tagCss, /(^|;)color:var\(--warn\)/, 'the word itself has to be warn-coloured');
-  assert.match(tagCss, /(^|;)background:[^;]*var\(--warn\)/, 'on a warn fill, not a bare one');
 });
 
 // A max-height off a named rule, or a named failure when the rule has moved -
@@ -4717,11 +4667,11 @@ function netWarnDriver() {
 }
 
 test('the bubble is put on screen for the open state and taken off it for every other', () => {
-  const rows = [{ url: 'http://192.168.1.24:9000', public: false }];
+  const rows = [{ url: 'http://192.168.1.24:9000' }];
   const warn = netWarnDriver();
   const open = warn({ rows });
   assert.deepEqual(open.toggled, { cls: 'show', on: true }, 'the class is the whole show path');
-  assert.match(open.text, /no login is required/);
+  assert.match(open.text, /no login is required/i);
   const shut = warn({ rows, authOn: true, hasPassword: true });
   assert.equal(shut.toggled.on, false,
     'a password closes the gap the warning is about, so the bubble has to come off screen - one that stays up after the fix is one people learn to ignore');
@@ -4729,11 +4679,11 @@ test('the bubble is put on screen for the open state and taken off it for every 
     'a hidden bubble must not keep the copy behind it - this element was showing the warning one call ago');
   // The copy is written with innerHTML for its <b>, so neither what the operator
   // types nor what the daemon lists may reach it.
-  const echo = warn({ rows: [{ url: 'http://<img src=x>:9000', iface: '<em>eth0</em>', public: true }], typed: '<script>' });
+  const echo = warn({ rows: [{ url: 'http://<img src=x>:9000', iface: '<em>eth0</em>' }], typed: '<script>' });
   assert.doesNotMatch(echo.text, /<img|eth0|<script/);
-  // .warn-bubble hides its overflow, and the escalated copy - here and in the
-  // wizard - is the longest of these bubbles, so at the shared cap the sentence
-  // naming the remedy is the part cut off.
+  // .warn-bubble hides its overflow, and this copy - here and in the wizard - is
+  // the longest of these bubbles, so at the shared cap the sentence naming the
+  // remedy is the part cut off.
   const cap = cssPx(/\.warn-bubble\.show\{[^}]*max-height:(\d+)px/, 'the shared .warn-bubble.show cap');
   for (const id of ['netNoAuthWarn', 'qsNoAuthWarn']) {
     const own = cssPx(new RegExp('#' + id + '\\.show[^{]*\\{[^}]*max-height:(\\d+)px'),
@@ -4748,7 +4698,7 @@ test('the bubble is put on screen for the open state and taken off it for every 
 // and the Access tab bubble is in a tab this operator has not opened, so the
 // wizard has to say it where the choice is made.
 test('Quick Setup warns when its own answer would open the network with no login', () => {
-  const rows = [{ url: 'http://192.168.1.24:9000', public: false }];
+  const rows = [{ url: 'http://192.168.1.24:9000' }];
   const w = (net, r, user, pass) => F.qsNoAuthText(net, r, user, pass);
   assert.match(w(true, rows, '', ''), /no login/, 'both fields blank is the install this exists for');
   assert.equal(w(false, rows, '', ''), '', 'this machine only: nothing to warn about');
@@ -4756,8 +4706,6 @@ test('Quick Setup warns when its own answer would open the network with no login
   assert.equal(w(true, rows, 'admin', 'hunter2'), '', 'both fields filled is the auth_enabled qsSave posts');
   assert.match(w(true, rows, 'admin', ''), /no login/, 'a username with no password activates no login');
   assert.match(w(true, rows, '', 'hunter2'), /no login/, 'nor a password with no username');
-  const pub = rows.concat([{ url: 'http://[2001:db8::1]:9000', public: true }]);
-  assert.match(w(true, pub, '', ''), /public/, 'a public address escalates here as it does in the Access tab');
 });
 
 test('the Quick Setup warning is wired to the choice and to both fields, and blocks neither', () => {
@@ -4798,7 +4746,7 @@ function qsWarnDriver() {
 }
 
 test('the Quick Setup bubble is put on screen for the open answer and taken off it for every other', () => {
-  const rows = [{ url: 'http://192.168.1.24:9000', public: false }];
+  const rows = [{ url: 'http://192.168.1.24:9000' }];
   const warn = qsWarnDriver();
   const open = warn({ rows });
   assert.deepEqual(open.toggled, { cls: 'show', on: true }, 'the class is the whole show path');
@@ -4821,7 +4769,7 @@ test('the Quick Setup bubble is put on screen for the open answer and taken off 
   // back. The marker outlives escaping, so escaping it would not rescue this.
   // (Both fields at once cannot warn: that is a login.)
   for (const [user, pass] of [['MARK<script>', ''], ['', 'MARK<script>']]) {
-    const echo = warn({ rows: [{ url: 'http://MARK:9000', iface: 'MARK', public: true }], user, pass });
+    const echo = warn({ rows: [{ url: 'http://MARK:9000', iface: 'MARK' }], user, pass });
     assert.match(echo.text, /no login/, 'the hostile answer is still the open one, so there is copy to inspect');
     assert.doesNotMatch(echo.text, /MARK/,
       'qsNoAuthText interpolates nothing it is handed, which is the whole licence for that innerHTML');
@@ -4836,20 +4784,6 @@ test('the address pill grows for a long IPv6 URL instead of spilling out of it',
   assert.match(rule, /min-height:\s*30px/);
   assert.doesNotMatch(rule, /[^-]height:\s*30px/,
     'a fixed height clips or spills the second line of a wrapped IPv6 URL');
-});
-
-// A public address is the one row on this list with a security consequence.
-// Muting it - which .url-row.alt did, purely because it is not the default route -
-// rendered the security fact as the least prominent thing in the panel.
-test('a public address is never the least prominent row on the list', () => {
-  assert.match(extract('function renderAccessUrls'), /e\.public/,
-    'rows must be tagged from the public flag the server sends');
-  const mute = html.match(/\.url-row\.alt \.url-a\{([^}]*)\}/)[1];
-  const pub = html.match(/\.url-row\.alt\.pub \.url-a\{([^}]*)\}/)[1];
-  assert.match(mute, /var\(--muted\)/, 'non-default-route rows still recede');
-  assert.doesNotMatch(pub, /var\(--muted\)/, 'a public row must not be muted');
-  assert.doesNotMatch(pub, /var\(--accent\)/,
-    'nor take the accent - that marks the address to hand another device, a separate question');
 });
 
 // This tip has to be readable in one hover, so it carries facts about the panel

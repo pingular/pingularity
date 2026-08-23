@@ -25,9 +25,8 @@ import (
 //
 // The literals are documentation ranges (RFC 3849, a fd00::/8 ULA, an EUI-64
 // link-local from the QEMU MAC range, RFC 1918), because a public repo must not
-// carry a real home network's routable /64. tailscale0 is the exception and is
-// carrier-grade NAT space, which is not routable from the internet either. Only how
-// they classify matters here.
+// carry a real home network's routable /64. tailscale0 is the exception: shared
+// carrier-grade NAT space, which is nobody's address in particular either.
 var testHost = []hostAddr{
 	{iface: "docker0", ip: net.ParseIP("172.17.0.1")},
 	{iface: "en0", ip: net.ParseIP("192.168.1.24")},
@@ -200,133 +199,17 @@ func TestLanEntriesKeepOneIPv6PerPrefixPerInterface(t *testing.T) {
 	}
 }
 
-// Public on a row means globally routable, which is the part this machine can know.
-// It does not mean anything outside can connect: that is the router's inbound
-// policy, and nothing here can observe it.
-func TestLanEntriesFlagGloballyRoutableAddresses(t *testing.T) {
-	want := map[string]bool{
-		"192.168.1.24":    false, // RFC 1918
-		"172.17.0.1":      false, // RFC 1918 as well, the docker bridge
-		"fd00:db8:1::24":  false, // ULA, fc00::/7
-		"2001:db8:1:2::1": true,  // global unicast, the case the flag exists for
-		"100.101.102.103": false, // CGNAT: a tailnet peer can reach it, the internet cannot
-	}
-	_, got := lanEntriesFor(":9000", testHost, "192.168.1.24")
-	if len(got) != len(want) {
-		t.Fatalf("advertised\n  %v\nwant one row for each of the %d addresses classified above: the per-row check below only ever sees rows that ARE advertised, so a fixture that grew or a filter that swallowed a row would let an address ship with its public flag never looked at",
-			urlsOf(got), len(want))
-	}
-	for _, e := range got {
-		w, ok := want[e.IP]
-		if !ok {
-			t.Errorf("advertised %s, which this test has no expectation for: every address the panel lists needs a stated public/not-public verdict, or the flag that drives the exposure warning goes untested for it", e.IP)
-			continue
-		}
-		if e.Public != w {
-			t.Errorf("%s on %s: public = %v, want %v. This flag decides whether the Access tab tells the operator their dashboard may be reachable from outside, so calling a private or CGNAT address public spends that warning on a network nobody outside can enter, and missing a globally routable one leaves a plain-HTTP dashboard unannounced.",
-				e.IP, e.Iface, e.Public, w)
-		}
-	}
-
-	// A pinned bind returns from its own branch before the enumeration runs, so it
-	// classifies separately and has to agree - one address, one answer.
-	for _, c := range []struct {
-		listen string
-		want   bool
-	}{
-		{"[2001:db8:1:2::1]:9000", true},
-		{"192.168.1.24:9000", false},
-		{"100.101.102.103:9000", false},
-	} {
-		_, got := lanEntriesFor(c.listen, testHost, "192.168.1.24")
-		if len(got) != 1 || got[0].Public != c.want {
-			t.Errorf("-listen %s advertised %+v, want a single row with public = %v: a pinned socket takes the branch above the enumeration, and the same address must not be described one way there and another way here", c.listen, got, c.want)
-		}
-	}
-}
-
-// The two binds that fall through to the full enumeration - a hostname other than
-// localhost, and a zoned literal - serve ONE of the listed addresses without saying
-// which, so a row there is a candidate rather than a confirmed answer. The public tag
-// still follows the address: the row already advertises that URL, and a globally
-// routable plain-HTTP address listed with no tag is described exactly like the LAN
-// ones beside it, which is the case the flag was added for. Private and CGNAT rows
-// stay untagged on both, so the fall-through does not tag the whole list either.
-func TestLanEntriesFlagPublicOnTheFallThroughBinds(t *testing.T) {
-	want := map[string]bool{
-		"2001:db8:1:2::1": true,  // the candidate that would go unannounced
-		"192.168.1.24":    false, // RFC 1918
-		"172.17.0.1":      false, // the docker bridge
-		"fd00:db8:1::24":  false, // ULA
-		"100.101.102.103": false, // CGNAT
-	}
-	for _, listen := range []string{"myhost.example:9000", "[fe80::1%en0]:9000"} {
-		_, got := lanEntriesFor(listen, testHost, "192.168.1.24")
-		if len(got) != len(want) {
-			t.Fatalf("-listen %s advertised\n  %v\nwant the full enumeration of %d addresses: these two binds deliberately fall back to it, and a shorter list means this case stopped being a fall-through and no longer tests one",
-				listen, urlsOf(got), len(want))
-		}
-		for _, e := range got {
-			w, ok := want[e.IP]
-			if !ok {
-				t.Errorf("-listen %s advertised %s, which this test has no expectation for: every row the panel lists needs a stated verdict, or the flag that drives the exposure warning goes untested for it", listen, e.IP)
-				continue
-			}
-			if e.Public != w {
-				t.Errorf("-listen %s: %s public = %v, want %v. A hostname or a zoned literal cannot be narrowed to one address here, so every row stays a candidate - dropping the tag hides a routable plain-HTTP address among the LAN ones, and tagging a private or CGNAT row spends the warning on a network nobody outside can enter",
-					listen, e.IP, e.Public, w)
-			}
-		}
-	}
-}
-
 // The Access tab reads these rows straight off the JSON, so the field names are an
 // interface rather than an implementation detail. Renaming one blanks the part of
 // the row it drives instead of failing anywhere a reader would notice.
 func TestLanEntryJSONKeepsTheNamesTheAccessTabReads(t *testing.T) {
-	b, err := json.Marshal(lanEntry{URL: "http://192.0.2.1:9000", IP: "192.0.2.1", Iface: "en0", Primary: true, Public: true})
+	b, err := json.Marshal(lanEntry{URL: "http://192.0.2.1:9000", IP: "192.0.2.1", Iface: "en0", Primary: true})
 	if err != nil {
 		t.Fatalf("lanEntry does not marshal: %v. /api/access carries these rows to the Access tab as JSON, so a row that cannot be encoded is a panel with no addresses in it at all", err)
 	}
-	for _, k := range []string{`"url"`, `"ip"`, `"iface"`, `"primary"`, `"public"`} {
+	for _, k := range []string{`"url"`, `"ip"`, `"iface"`, `"primary"`} {
 		if !strings.Contains(string(b), k) {
-			t.Errorf("lanEntry marshalled as %s, which has no %s key: the Access tab reads that exact name, so renaming the field silently blanks whatever it drives - the link, the accent on the row to hand to another device, or the public tag - instead of failing anywhere a reader would notice", b, k)
-		}
-	}
-}
-
-// Where isPublicIP's line falls. The stdlib gets every case here right except one:
-// 100.64.0.0/10 is global unicast and not private, so a predicate built on those two
-// calls alone reports every Tailscale host as reachable from the internet.
-func TestIsPublicIPExcludesCGNATAndPrivateSpace(t *testing.T) {
-	cases := []struct {
-		ip   string
-		want bool
-		why  string
-	}{
-		{"2001:db8:1:2::1", true, "a global unicast IPv6 address is what the flag is for"},
-		{"8.8.8.8", true, "so is a routable IPv4 address, as a VPS has"},
-		{"172.67.1.1", true, "172.16.0.0/12 is private but the rest of 172/8 is not, and this one's second octet also falls inside the CGNAT block's, so it fails if that block is matched without its first octet"},
-		{"192.168.1.24", false, "RFC 1918"},
-		{"10.0.0.5", false, "RFC 1918"},
-		{"172.17.0.1", false, "RFC 1918, the shape a docker bridge takes"},
-		{"fd00:db8:1::24", false, "ULA, fc00::/7"},
-		{"fd7a:115c:a1e0::1", false, "Tailscale's IPv6 range is a ULA, so the stdlib already answers this one"},
-		{"fe80::1", false, "link-local is not global unicast"},
-		{"127.0.0.1", false, "neither is loopback"},
-		{"100.64.0.0", false, "first address of the CGNAT block"},
-		{"100.101.102.103", false, "a Tailscale address, the case the carve-out exists for"},
-		{"100.127.255.255", false, "last address of the CGNAT block"},
-		{"100.63.255.255", true, "one below the block - 100.0.0.0/8 is otherwise ordinary public space"},
-		{"100.128.0.0", true, "one above it, same reason"},
-	}
-	for _, c := range cases {
-		ip := net.ParseIP(c.ip)
-		if ip == nil {
-			t.Fatalf("test fixture %q does not parse, so isPublicIP is never asked about it: a typo in one of these literals retires the boundary it was added to hold without failing anything", c.ip)
-		}
-		if got := isPublicIP(ip); got != c.want {
-			t.Errorf("isPublicIP(%s) = %v, want %v: %s", c.ip, got, c.want, c.why)
+			t.Errorf("lanEntry marshalled as %s, which has no %s key: the Access tab reads that exact name, so renaming the field silently blanks whatever it drives - the link, or the accent on the row to hand to another device - instead of failing anywhere a reader would notice", b, k)
 		}
 	}
 }
