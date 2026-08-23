@@ -1927,6 +1927,7 @@ and `-d '{…}'` where a body is listed below.
   settings; a hand-built or third-party file is applied in *its* key order, so put
   `config` last yourself)
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
+- `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
 
 > All endpoints are **unauthenticated** by default; what protects a fresh
 > install - native or container - is the **Network access** filter starting

@@ -356,6 +356,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/speed/runs.csv", s.handleSpeedRunsCSV)
 	mux.HandleFunc("/api/speed/usage", s.handleSpeedUsage)
 	mux.HandleFunc("/api/notify/test", s.handleNotifyTest)
+	mux.HandleFunc("/api/notify/heartbeat/test", s.handleNotifyHeartbeatTest)
 	mux.HandleFunc("/api/speedtest", s.handleSpeedtest)
 	mux.HandleFunc("/api/speedtest/abort", s.handleSpeedtestAbort)
 	mux.HandleFunc("/api/speedtest/servers", s.handleSpeedtestServers)
@@ -494,7 +495,7 @@ func selfPacedPath(p string) bool {
 	switch p {
 	case "/api/speedtest", "/api/speedtest/abort", "/api/speedtest/servers", "/api/netinfo",
 		"/api/iperf/check", "/api/export", "/api/import",
-		"/api/speed/runs.csv", "/api/update", "/api/notify/test":
+		"/api/speed/runs.csv", "/api/update", "/api/notify/test", "/api/notify/heartbeat/test":
 		return true
 	}
 	return false
@@ -1598,6 +1599,36 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 	if err := n.Send(r.Context(), "🔔 Pingularity test alert - your webhook is working.",
 		map[string]any{"event": "test"}); err != nil {
 		http.Error(w, "delivery failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]bool{"sent": true})
+}
+
+// handleNotifyHeartbeatTest pings the heartbeat URL in the request body (POST
+// {url}) so users can check a dead-man's-switch before saving it. Push watchdogs
+// count any request as "I am alive", so this is a real check-in and resets the
+// countdown - there is no way to test one without doing so.
+func (s *Server) handleNotifyHeartbeatTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var in struct {
+		URL string `json:"url"` // the field's current value, saved or not
+	}
+	if err := decodeJSONBody(w, r, &in); err != nil {
+		return // response already written (415/400)
+	}
+	if strings.TrimSpace(in.URL) == "" {
+		http.Error(w, "no heartbeat URL set", http.StatusBadRequest)
+		return
+	}
+	// The heartbeat client, not the webhook one: it follows redirects, and
+	// hc-ping.com redirects - the webhook client would report a working URL as
+	// broken. Heartbeat scrubs the URL out of its error (it is a credential), so
+	// the reason is safe to return; 502 so the UI's r.ok check catches it.
+	if err := notify.Heartbeat(r.Context(), notify.NewHeartbeatClient(), in.URL, s.log); err != nil {
+		http.Error(w, "ping failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, map[string]bool{"sent": true})

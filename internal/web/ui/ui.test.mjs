@@ -4828,3 +4828,123 @@ test('a caveat the server returns with a successful access save reaches the oper
   assert.match(readSource(here, '..', 'auth.go'), /status\["warnings"\]/,
     'the server half of this must still be there');
 });
+
+// --- the heartbeat Test button ----------------------------------------------
+//
+// Healthchecks.io, Uptime Kuma push and every other push-style watchdog count ANY
+// request as a check-in, so this button is not a rehearsal: one click really does
+// reset the countdown. That makes two things load-bearing. The URL sent has to be
+// the one visible in the field (testing a saved value while the operator edits a
+// different one reports on the wrong watchdog), and the path has to stay relative
+// so a dashboard served under a subpath still reaches its own API. Both are driven
+// through the REAL click handler lifted out of index.html.
+function driveHeartbeatTest({ url = 'https://hc-ping.com/uuid', ok = true, body = '', fetchFails = false } = {}) {
+  let handler = null;
+  const btn = { disabled: false, innerHTML: 'Test', addEventListener: (_ev, fn) => { handler = fn; } };
+  const msg = { textContent: '' };
+  const els = { testHeartbeat: btn, setHeartbeat: { value: url }, settingsMsg: msg };
+  const calls = [], timers = [];
+  const fetchStub = async (u, opt) => {
+    // Snapshot the button as the request leaves: after the await it is restored,
+    // so this is the only place the in-flight state can be seen.
+    calls.push({ url: u, opt, disabledInFlight: btn.disabled, labelInFlight: btn.innerHTML });
+    if (fetchFails) throw new Error('network went away');
+    return { ok, status: ok ? 200 : 502, text: async () => body };
+  };
+  const register = new Function('$', 'fetch', 'setTimeout',
+    extract("$('testHeartbeat').addEventListener('click'") + ');');
+  register(id => els[id], fetchStub, (fn, ms) => { timers.push({ fn, ms }); });
+  return handler().then(() => ({ btn, msg, calls, timers }));
+}
+
+test('the heartbeat Test button refuses an empty field instead of checking in with nothing', async () => {
+  const { calls, msg, btn } = await driveHeartbeatTest({ url: '   ' });
+  assert.equal(calls.length, 0,
+    'a blank or whitespace-only field must never reach the server: it would be a 400 dressed up as a test');
+  assert.match(msg.textContent, /heartbeat URL/,
+    'and the operator has to be told which field is empty');
+  assert.equal(btn.disabled, false, 'a refusal is instant, so the button must stay usable');
+});
+
+test('the heartbeat Test button posts the typed URL to the heartbeat endpoint', async () => {
+  const { calls, msg } = await driveHeartbeatTest({ url: '  https://hc-ping.com/typed  ' });
+  assert.equal(calls.length, 1, 'one click, one check-in');
+  assert.equal(calls[0].url, 'api/notify/heartbeat/test',
+    'relative with no leading slash - a leading slash escapes a subpath deployment and 404s');
+  assert.equal(calls[0].opt.method, 'POST', 'the endpoint answers 405 to anything else');
+  assert.equal(calls[0].opt.headers['Content-Type'], 'application/json');
+  assert.deepEqual(JSON.parse(calls[0].opt.body), { url: 'https://hc-ping.com/typed' },
+    'the value currently in the field wins over whatever is saved, trimmed the same way the refusal trims');
+  assert.match(msg.textContent, /checked in/,
+    'the reply has to say a real check-in was recorded - the watchdog countdown just restarted');
+});
+
+test('a refused heartbeat test shows what the server said, not a generic failure', async () => {
+  // Wire format copied from the real 502 body: notify formats a bad status as
+  // "status %d", and the handler prefixes it.
+  const { msg } = await driveHeartbeatTest({ ok: false, body: 'ping failed: status 404' });
+  assert.equal(msg.textContent, 'Test failed: ping failed: status 404',
+    'the server text names the actual fault, and it is already scrubbed of the URL');
+  const dead = await driveHeartbeatTest({ fetchFails: true });
+  assert.equal(dead.msg.textContent, 'Test failed.',
+    'a dead connection has no server text to show, and must not read as a success');
+});
+
+test('the heartbeat Test button spins while the check-in is in flight, and comes back', async () => {
+  const done = await driveHeartbeatTest();
+  assert.equal(done.calls[0].disabledInFlight, true,
+    'a live button takes a second click, and each click is another real check-in');
+  assert.match(done.calls[0].labelInFlight, /btn-spin/,
+    'a watchdog that is slow to answer looks identical to a hang without the spinner');
+  assert.equal(done.btn.disabled, false, 'and it has to be usable again afterwards');
+  assert.equal(done.btn.innerHTML, 'Test', 'with its own label back, not a spinner left up forever');
+  for (const broken of [await driveHeartbeatTest({ ok: false, body: 'nope' }),
+                        await driveHeartbeatTest({ fetchFails: true })]) {
+    assert.equal(broken.btn.disabled, false, 'a failed test must not leave the button stuck');
+    assert.equal(broken.btn.innerHTML, 'Test', 'nor leave the spinner up');
+  }
+});
+
+test('the heartbeat result clears itself, without wiping a newer message', async () => {
+  const done = await driveHeartbeatTest();
+  assert.equal(done.timers.length, 1);
+  assert.equal(done.timers[0].ms, 4000, 'same dwell as the webhook test result');
+  done.timers[0].fn();
+  assert.equal(done.msg.textContent, '', 'the success line goes away on its own');
+  const raced = await driveHeartbeatTest();
+  raced.msg.textContent = 'Saved.';
+  raced.timers[0].fn();
+  assert.equal(raced.msg.textContent, 'Saved.',
+    'settingsMsg is shared, so a late timer must not blank whatever replaced its own line');
+});
+
+// The two rows sit one above the other with a fixed label column, so any
+// difference in how the field is wrapped shows up as misaligned inputs.
+test('the heartbeat field is wrapped and sized exactly like the webhook one', () => {
+  const lines = html.split('\n');
+  const at = lines.findIndex(l => l.includes('id="setHeartbeat"'));
+  const row = lines.slice(at - 1, at + 4).join('\n');
+  assert.match(row, /<div class="server-search">\s*<input type="text" id="setHeartbeat"/,
+    'the input needs the flex wrapper, or it stretches full width and the two rows stop lining up');
+  assert.match(row, /<button class="btn" id="testHeartbeat" type="button">Test<\/button>/,
+    'the Test button belongs inside that wrapper, beside its own field');
+  assert.match(row, /<\/button>\s*<\/div>\s*<\/div>/, 'and the wrapper has to be closed');
+  const size = html.match(/\n\s*#testWebhook[^{]*\{[^}]*width:90px[^}]*\}/)[0];
+  assert.match(size, /#testHeartbeat/, 'without this the two Test buttons are different widths');
+  const hold = html.match(/\n\s*#testWebhook[^{]*\{min-width:54px;\}/)[0];
+  assert.match(hold, /#testHeartbeat/, 'without this the button shrinks when the spinner replaces its label');
+  assert.doesNotMatch(html, /[^,]#testHeartbeat\s*\{/,
+    'extend the webhook selectors instead of copying the declarations, which drift apart');
+});
+
+// The dangerous misreading is that Test is a rehearsal. It is not: the watchdog
+// records the check-in and starts its countdown over, which can mask a real
+// outage for a full period.
+test('the heartbeat tip says Test is a real check-in', () => {
+  const tip = html.match(/data-tip="Pingularity pings this URL[^"]*"/)[0];
+  assert.match(tip, /\n• Test sends a real check-in/, 'a bullet, shaped like the ones already there');
+  assert.match(tip, /resets the watchdog/, 'saying it is real is only half of it - name the consequence');
+  assert.match(tip, /\n• Pausing monitoring stops the pings/, 'the existing bullets stay');
+  assert.match(tip, /\n• Blank = off\./, 'both of them');
+  assert.doesNotMatch(tip, /simulat/, 'nothing here may read as a rehearsal');
+});
