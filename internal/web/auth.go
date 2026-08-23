@@ -1202,10 +1202,6 @@ type lanEntry struct {
 	IP      string `json:"ip"`
 	Iface   string `json:"iface"`
 	Primary bool   `json:"primary"` // the IPv4 default-route source - the one to hand to another device; no entry has it on a host with no IPv4 route out, or a bind pinned elsewhere
-	// Public means globally routable, not confirmed reachable from outside: whether
-	// anything on the internet can open a connection is the router's inbound policy,
-	// which this machine cannot see. The UI carries that hedge in its wording.
-	Public bool `json:"public"`
 }
 
 // hostAddr is one address this host holds and the interface carrying it. Passing a
@@ -1269,13 +1265,6 @@ func (s *Server) lanURLs() (port string, entries []lanEntry) {
 // localhost (resolving it would cost a DNS round-trip inside a UI request) and a
 // zoned literal like `[fe80::1%en0]:9000` (pinning it would echo the address without
 // the zone its reader has to supply).
-//
-// Public keeps following the address on those two rather than being withheld: the
-// socket does answer on one of the listed addresses, the panel already tells the
-// reader that both forms fall back to the whole list, and so the tag reads there as
-// "one of these candidates is routable" - which is established. Withholding it would
-// leave a globally routable plain-HTTP URL listed and described like a LAN address,
-// which is the exposure the flag exists to announce.
 func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port string, entries []lanEntry) {
 	host, p, err := net.SplitHostPort(listenAddr)
 	if err != nil || p == "" {
@@ -1308,7 +1297,7 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 		// Pinned to one address: that address is the answer, listed even if the
 		// enumeration no longer carries it, because the socket is bound there. The
 		// interface name is only a label, so an address that has moved just loses it.
-		e := lanEntry{IP: bind.String(), Primary: bind.String() == primary, Public: isPublicIP(bind)}
+		e := lanEntry{IP: bind.String(), Primary: bind.String() == primary}
 		e.URL = "http://" + net.JoinHostPort(e.IP, port)
 		for _, a := range addrs {
 			if a.ip.Equal(bind) {
@@ -1345,29 +1334,11 @@ func lanEntriesFor(listenAddr string, addrs []hostAddr, primary string) (port st
 			// JoinHostPort brackets an IPv6 literal; unbracketed, the trailing :9000
 			// reads as part of the address and the result is not a URL.
 			URL: "http://" + net.JoinHostPort(ip, port), IP: ip,
-			Iface: a.iface, Primary: ip == primary, Public: isPublicIP(a.ip),
+			Iface: a.iface, Primary: ip == primary,
 		})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Primary && !entries[j].Primary })
 	return port, entries
-}
-
-// isPublicIP reports whether an address is globally routable - reachable from off
-// the network in principle. It cannot say whether anything outside actually gets
-// through: that is the router's inbound policy, which is not visible from here.
-func isPublicIP(ip net.IP) bool {
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
-		return false
-	}
-	// 100.64.0.0/10 is carrier-grade NAT, and it is also where Tailscale hands out
-	// its IPv4 addresses. Go calls it global unicast and not private, so without this
-	// clause a tailnet address - very common in this audience - would be reported as
-	// reachable from the internet. Tailscale's IPv6 range is a ULA, so IsPrivate
-	// already covers it.
-	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-		return false
-	}
-	return true
 }
 
 // defaultRouteIP reports the IPv4 source address the host would use to reach the

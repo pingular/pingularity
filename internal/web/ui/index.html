@@ -1452,18 +1452,10 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--accent);text-decoration:none;overflow-wrap:anywhere;}
   .url-a:hover{border-color:var(--accent);}
   .url-row.alt .url-a{color:var(--muted);}                       /* not the default-route address */
-  /* Two axes, so two levels: the accent marks the address to hand another device,
-     full contrast marks the row with a security consequence - .alt alone would
-     rank a public address below a LAN one. */
-  .url-row.alt.pub .url-a{color:var(--fg);}
   .url-copy{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
     border:1px solid var(--line2);border-radius:8px;background:var(--bg2);color:var(--muted);font-size:12px;cursor:pointer;transition:color .12s,border-color .12s;}
   .url-copy:hover{border-color:var(--accent);color:var(--accent);}
   .url-copy.done{border-color:var(--up);color:var(--up);}
-  /* --warn, not --accent: the accent already marks the row to copy, and scope is a
-     separate axis from which address to use. */
-  .url-tag{flex:none;font-size:10px;letter-spacing:.5px;text-transform:uppercase;line-height:1.4;padding:2px 6px;
-    border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);border-radius:6px;background:color-mix(in srgb,var(--warn) 12%,transparent);color:var(--warn);}
   .url-if{font-size:11.5px;color:var(--muted);}
   /* Above the shared .warn-bubble cap: these two are the longest of them, and the
      bubble hides its overflow, so at that cap the sentence naming the remedy is
@@ -1511,7 +1503,6 @@
   html:not(.round) .log-ic,
   html:not(.round) .url-a,
   html:not(.round) .url-copy,
-  html:not(.round) .url-tag,
   html:not(.round) .ctl,
   html:not(.round) .ctl:has(>input),
   html:not(.round) input:not([type=range]),
@@ -3761,10 +3752,7 @@ function qsMachineOnlyNote(){
 // the Access tab lists, so a loopback bind stays silent here too.
 function qsNoAuthText(network, rows, user, pass){
   if(!netOpenNoAuth(network, rows, !!(user && pass), false, pass)) return '';
-  const base = 'Leaving both fields blank means <b>no login</b>: anyone who can reach this machine on your network can open the dashboard and change these settings.';
-  return rows.some(e=>e.public)
-    ? base + ' One of these addresses is <b>public</b> - reachable from outside your network too, if your router allows inbound. Fill in a username and password above to require a login.'
-    : base + ' Fill in a username and password above to require a login.';
+  return 'Leaving both fields blank means <b>no login</b>: anyone who can reach this machine on your network can open the dashboard and change these settings. Fill in a username and password above to require a login.';
 }
 function updateQsNoAuthWarn(){
   // The access choice is read off the pills exactly as qsSave reads it, so what
@@ -8118,9 +8106,9 @@ function copyText(t){
 // renderAccessUrls lists where the dashboard answers, reflecting the (pending)
 // Network-access toggle. The list follows the listen address, not the addresses
 // this host holds: a wildcard bind advertises every usable address in both
-// families (a global IPv6 among them, which can answer from outside the LAN), a
-// loopback bind advertises none, a pinned -listen only its own. So the localhost
-// fallback below also fires with the toggle on, whenever the bind is loopback.
+// families, a loopback bind advertises none, a pinned -listen only its own. So
+// the localhost fallback below also fires with the toggle on, whenever the bind
+// is loopback.
 // The rule, with the two binds that over-list (a hostname other than localhost,
 // a zoned literal), is lanEntriesFor in internal/web/auth.go.
 function renderAccessUrls(){
@@ -8130,21 +8118,17 @@ function renderAccessUrls(){
   // Each address is a pill + a copy button - the point of an address is to type it
   // into another device. The default-route row leads (accent) when there is one; on
   // a v6-only host, or a bind pinned elsewhere, nothing is accented and the rest
-  // recede, except a public row, which keeps full contrast either way. What each
-  // address is lives in the (i), not in the row - the interface name is only a
-  // title. The tag states SCOPE, which the daemon knows; whether anything outside
-  // can actually connect is the inbound policy of the router, which it cannot see,
-  // so that hedge rides in the title rather than in the word.
-  const row = e => `<span class="url-row${e.primary?'':' alt'}${e.public?' pub':''}" title="${e.iface?esc(e.iface):''}">`
+  // recede. What each address is lives in the (i), not in the row - the interface
+  // name is only a title.
+  const row = e => `<span class="url-row${e.primary?'':' alt'}" title="${e.iface?esc(e.iface):''}">`
     + `<a class="url-a" href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)}</a>`
     + `<button class="url-copy" type="button" data-url="${esc(e.url)}" title="Copy address" aria-label="Copy ${esc(e.url)}">⧉</button>`
-    + (e.public ? '<span class="url-tag" title="Globally routable: this address can be dialled from outside your network. Whether anything out there gets through depends on the inbound policy of your router, which Pingularity cannot check.">public</span>' : '')
     + '</span>';
   // Two tips: with the toggle on and a loopback bind the list is empty, and with
   // no tip there the switch looks inert rather than overruled by the bind.
   const tip = !on ? ''
     : accessLanUrls.length
-    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers - the addresses Pingularity listens on (-listen). The default listens on all of them; naming one narrows this to that address, though a hostname, or an IPv6 with a %zone, falls back to all of them.\n• The highlighted address is the one on your network - use it from another device. Nothing is highlighted when this host has no IPv4 route out (a v6-only host), or -listen is pinned elsewhere.\n• The other rows are this same host under its other addresses - IPv6 on the same card, a second card, Wi-Fi, a docker bridge, a VPN or a VM.\n• Most answer only from their own network. A row tagged public is reachable from outside it if your router allows inbound, over plain HTTP - worth a login password, or bind loopback with -listen 127.0.0.1:9000.\n• Some IPv6 addresses rotate every day or so and nothing here says which, so do not bookmark one.">i</span>'
+    ? '<span class="info" tabindex="0" data-tip="Where the dashboard answers - the addresses Pingularity listens on (-listen). The default listens on all of them; naming one narrows this to that address, though a hostname, or an IPv6 with a %zone, falls back to all of them.\n• The highlighted address is the one on your network - use it from another device. Nothing is highlighted when this host has no IPv4 route out (a v6-only host), or -listen is pinned elsewhere.\n• The other rows are this same host under its other addresses - IPv6 on the same card, a second card, Wi-Fi, a docker bridge, a VPN or a VM.\n• Some IPv6 addresses rotate every day or so and nothing here says which, so do not bookmark one.">i</span>'
     : '<span class="info" tabindex="0" data-tip="Network access is on, but there is no address to hand to another device.\n• Pingularity answers only where it is listening. With -listen 127.0.0.1:9000 (or localhost) that is this machine alone, and the toggle cannot widen it - point -listen at a network address instead.\n• The list is also empty when no interface is up with an address worth sharing.">i</span>';
   // The caption follows the addresses, not the toggle: a loopback bind leaves
   // localhost as the only row even with the toggle on, and that is this machine only.
@@ -8161,8 +8145,7 @@ function renderAccessUrls(){
 // later, and rows stands in for nonLoopbackListen - a loopback bind advertises no
 // address, so the toggle opens nothing. Family-blind on purpose: a ULA is as
 // reachable from the LAN as a 192.168 address is, and a password is the only
-// thing that stops either, so a public address escalates the wording rather than
-// gating the warning.
+// thing that stops either.
 function netOpenNoAuth(netOn, rows, authOn, hasPassword, typedPass){
   const willHaveAuth = authOn && (hasPassword || typedPass.length>0);
   return !!netOn && rows.length>0 && !willHaveAuth;
@@ -8170,10 +8153,7 @@ function netOpenNoAuth(netOn, rows, authOn, hasPassword, typedPass){
 // netNoAuthWarnText is what the Access tab bubble should say, or empty for silence.
 function netNoAuthWarnText(netOn, rows, authOn, hasPassword, typedPass){
   if(!netOpenNoAuth(netOn, rows, authOn, hasPassword, typedPass)) return '';
-  const base = '<b>Network access is on and no login is required.</b> Anyone who can reach this machine on your network can open this dashboard and change these settings, including this page.';
-  return rows.some(e=>e.public)
-    ? base + ' One of these addresses is <b>public</b> - reachable from outside your network too, if your router allows inbound connections, which Pingularity cannot check. Set a password above, or bind loopback with -listen 127.0.0.1:9000.'
-    : base + ' Set a password above.';
+  return '<b>No login is required:</b> anyone on your network can open this dashboard and change its settings.';
 }
 function updateNetNoAuthWarn(){
   const t = netNoAuthWarnText($('setNetAccess').checked, accessLanUrls, $('setAuthEnabled').checked, accessHasPassword, $('authPass').value);
