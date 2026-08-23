@@ -2121,11 +2121,12 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	if id != "" && want > 1 {
 		// Resolve the pin first so the list can be centred on it. Passed into
 		// pickServers afterwards so this fetch is not repeated.
-		p, err := newOoklaClient(uc).FetchServerByIDContext(ctx, id)
+		p, err := fetchServerByID(ctx, uc, id)
 		if err != nil {
 			return Result{}, fmt.Errorf("fetch server %s: %w", id, err)
 		}
-		currentEndpoint(p) // a pinned server needs the same rewrite as a listed one
+		currentEndpoint(p)    // a pinned server needs the same rewrite as a listed one
+		o.recentrePin(ctx, p) // the by-ID position can be OURS, not the server's
 		pinned = p
 	}
 	if lat, lon, label, ok := listCentre(id, want, pinned, searchedCity); ok {
@@ -2403,6 +2404,111 @@ func serverCoord(s *ookla.Server) (lat, lon float64, ok bool) {
 		return 0, 0, false
 	}
 	return la, lo, true
+}
+
+// fetchServersByKeyword fetches the catalogue rows Ookla's search matches. A
+// package var for the same reason fetchOriginServers is one: it is the only
+// seam through which a test can put a catalogue in front of the recovery
+// without a network.
+var fetchServersByKeyword = func(ctx context.Context, keyword string) (ookla.Servers, error) {
+	return newOoklaClient(keywordConfig(keyword)).FetchServerListContext(ctx)
+}
+
+// keywordConfig carries the search keyword to the catalogue fetch. Split out so
+// a test can hold the search string to the byte without a network: the seam
+// above is stubbed in every test, so nothing else exercises this line.
+func keywordConfig(keyword string) *ookla.UserConfig {
+	return &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent, Keyword: keyword}
+}
+
+// pinCoordBudget bounds the one recovery fetch below, which runs inside the run
+// deadline and before anything is measured. Measured round trips: 0.4s for a
+// small ISP's catalogue, ~4.5s for the largest (the library echoes every row it
+// returns, and Rogers returns 90).
+const pinCoordBudget = 15 * time.Second
+
+// recentrePin replaces a by-ID coordinate we cannot trust with the catalogue's
+// own, and clears it when there is none to be had.
+//
+// api/ios-config.php splices the CALLER'S own ISP server into its reply wearing
+// the CALLER'S coordinates, so a pin that IS our ISP's server comes back
+// positioned where we are - measured, Montreal server 1993 reported Toronto.
+// listCentre would then draw best-of's companions from our city, where they
+// out-score the pin on ping-discounted throughput and get recorded in its
+// place. The same reply's identity fields (ID, sponsor, name) stay trustworthy.
+//
+// The tell costs no request: the library derives Distance from that reply's OWN
+// client coordinate, so the spliced row reads exactly 0 while a server 5 km
+// away reads 5. A reply carrying no client element reads 0 too, and so does a
+// server genuinely at our address - which is why 0 means "this coordinate is
+// not trustworthy", never "this coordinate is a lie". Both benign cases cost
+// one extra fetch and land on the same coordinate anyway.
+//
+// A cleared coordinate is the pin-with-no-coordinate case listCentre and
+// shouldRaceCities already handle: the searched city, else a raced city.
+func (o *Ookla) recentrePin(ctx context.Context, p *ookla.Server) {
+	if p.Distance != 0 {
+		return
+	}
+	lat, lon, err := sponsorCoord(ctx, p.Sponsor, p.ID)
+	if err != nil {
+		// Warn with a counter: the companions now come from a raced city rather
+		// than from beside the pin, and one of them can be recorded in its place.
+		stats.Inc("speed.pin_coord_unrecovered")
+		o.warnf("could not place the pinned speedtest server; its companions will be drawn "+
+			"from elsewhere and one of them may be recorded instead",
+			"server", serverLabel(p), "server_id", p.ID, "err", err)
+	}
+	// Cleared on failure as well as set on success. A zero distance means this
+	// coordinate is the caller's own, so keeping it is keeping the fault; an
+	// empty one makes listCentre decline and the run races cities, which at
+	// least measures where it centres.
+	p.Lat, p.Lon = lat, lon
+}
+
+// sponsorCoord looks one server's registered coordinate up in the ordinary
+// catalogue, searched by its sponsor and matched by ID.
+//
+// The keyword is the sponsor VERBATIM. Ookla's search is a literal substring
+// match, so trimming, case-folding or stripping accents turns a hit into
+// "no server available or found" (measured: "Telefonica" and "China Telecom"
+// both find nothing, where the registered strings do).
+func sponsorCoord(ctx context.Context, sponsor, id string) (lat, lon string, err error) {
+	if sponsor == "" {
+		return "", "", errors.New("no sponsor to search the catalogue by")
+	}
+	ctx, cancel := context.WithTimeout(ctx, pinCoordBudget)
+	defer cancel()
+	// Abandoned, not awaited, when the context dies: the library one-shot-pings
+	// every row it fetched on a context of its own (speedtest-go server.go:305),
+	// so waiting for the call to return holds the run - and the scheduler's
+	// single-flight flag - open past an abort. raceOrigins abandons its fetches
+	// for the same reason.
+	type res struct {
+		rows ookla.Servers
+		err  error
+	}
+	done := make(chan res, 1)
+	go func() {
+		r, e := fetchServersByKeyword(ctx, sponsor)
+		done <- res{r, e}
+	}()
+	var rows ookla.Servers
+	select {
+	case r := <-done:
+		rows, err = r.rows, r.err
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	}
+	if err != nil {
+		return "", "", err
+	}
+	for _, s := range rows {
+		if s.ID == id {
+			return s.Lat, s.Lon, nil
+		}
+	}
+	return "", "", fmt.Errorf("server %s absent from sponsor %q's catalogue", id, sponsor)
 }
 
 // listCentre decides what the fetched server list is centred on, which is the
@@ -2955,6 +3061,13 @@ var fetchServerList = func(ctx context.Context, client *ookla.Speedtest) (ookla.
 	// guardedServers before anything pings or measures them: with a proxy
 	// configured the dial guard never sees these third-party destinations.
 	return guardedServers(ctx, currentEndpoints(servers)), err
+}
+
+// fetchServerByID indirects the pin's early resolve for the same reason, and it
+// carries more than identity: what this returns decides where a pinned best-of
+// run draws its companions from (see recentrePin).
+var fetchServerByID = func(ctx context.Context, uc *ookla.UserConfig, id string) (*ookla.Server, error) {
+	return newOoklaClient(uc).FetchServerByIDContext(ctx, id)
 }
 
 // connFamilies records which IP families one measurement's transfer
