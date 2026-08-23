@@ -341,6 +341,13 @@
 
   .tabpane{grid-row:2;grid-column:1;display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 48px;align-content:start;}
   .tabpane.active{display:grid;} .sgroup{display:contents;} .sgroup h3{grid-column:1/-1;} .tabpane .sgroup:first-child h3{margin-top:2px;} #serverRow{grid-column:1/-1;} .sgroup p{grid-column:1/-1;margin:6px 0 0;} @media (max-width:600px){ .tabpane{grid-template-columns:1fr;} }
+  /* Latency runs three across, like the iperf test parameters: nine rows of short
+     labels and small controls, which read better as three tight rows than five
+     wide ones. Narrower screens step back down. */
+  .tabpane[data-tab="latency"]{grid-template-columns:repeat(3,minmax(0,1fr));column-gap:24px;}
+  .tabpane[data-tab="latency"] .lbl{white-space:nowrap;}
+  @media (max-width:900px){ .tabpane[data-tab="latency"]{grid-template-columns:repeat(2,minmax(0,1fr));column-gap:48px;} }
+  @media (max-width:600px){ .tabpane[data-tab="latency"]{grid-template-columns:1fr;} }
   /* Theme picker (Appearance tab). */
   .theme-opts{grid-column:1/-1;display:flex;gap:12px;flex-wrap:wrap;margin-top:2px;}
   .theme-opt{display:flex;align-items:center;gap:9px;background:var(--bg2);color:var(--fg);
@@ -559,11 +566,13 @@
   .srow-wide{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;margin:6px 0 4px;justify-content:flex-start;font-size:13px;} /* same 13px .srow pins - these rows are not .srow, so without it they inherit the drawer base and read larger */
   /* Webhook/Heartbeat: label and its field on ONE line - label hugs the left, the field
      (input, or input+Test) fills the rest. Fixed label column so both rows' fields align. */
-  .srow-wide.srow-inline{display:grid;grid-template-columns:120px minmax(0,1fr);align-items:center;gap:12px;min-height:33px;}
+  /* No margin: the pane's row-gap alone spaces these, so they sit the same
+     distance apart as the .srow rows they share the pane with. */
+  .srow-wide.srow-inline{display:grid;grid-template-columns:120px minmax(0,1fr);align-items:center;gap:12px;min-height:33px;margin:0;}
   /* Alert on outage / Alert after / Periodic summary on one line - compact inline field
      groups. The controls hug their labels (no tab-uniform stretching) and the gaps stay
      tight so the trio survives on one line well below laptop-half-screen widths. */
-  .notif-inline{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;margin:4px 0;}
+  .notif-inline{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;margin:0;}
   .notif-inline .srow{display:flex;width:auto;min-height:33px;gap:8px;}
   /* First group ("Alert on outage") mirrors the srow-inline geometry above it
      (120px label column + 12px gap), so its toggle's left edge lines up with
@@ -2206,7 +2215,6 @@
             <span class="rel-ver" id="ver">-</span>
             <a class="badge upd" id="updState" target="_blank" rel="noopener">-</a>
           </span></div>
-        <div class="srow-div"></div>
         <label class="srow"><span class="lbl">Logging
           <span class="info" tabindex="0" data-tip="Record activity for the console, journald, and the viewer below.
 • On - full detail (debug).
