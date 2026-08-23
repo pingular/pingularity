@@ -121,3 +121,25 @@ func TestDockerfilesHealthcheckAndAttribution(t *testing.T) {
 		t.Error("Dockerfile.iperf: missing WORKDIR /var/lib/pingularity (process would start in unwritable /)")
 	}
 }
+
+// The data directory has to ship at 0700, and the only way to get that in a
+// distroless stage is to seed it one level down and copy it as an ENTRY: a
+// directory COPY creates as its own destination is 0755 and --chmod never
+// reaches it. The image shipped world-readable for a release because nothing
+// static checked this - the only guard was a Docker-dependent CI leg.
+func TestDockerfileShipsTheDataDirAt0700(t *testing.T) {
+	b, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	d := string(b)
+	if !strings.Contains(d, "chmod 0700 /seed/pingularity") {
+		t.Error("Dockerfile: the seeded data dir is not made 0700 in the builder stage")
+	}
+	if !strings.Contains(d, "COPY --from=setcap --chown=65532:65532 --chmod=0700 /seed/ /var/lib/") {
+		t.Error("Dockerfile: data dir must be copied as an entry inside /seed, not as the COPY destination")
+	}
+	if strings.Contains(d, "/data /var/lib/pingularity") {
+		t.Error("Dockerfile: copying onto /var/lib/pingularity makes it the destination, which ships 0755")
+	}
+}
