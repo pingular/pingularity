@@ -717,7 +717,7 @@
   #serverCity.field-error{border-color:var(--down);}
   #serverCity.field-error::placeholder{color:var(--down);opacity:1;}
   .server-search .btn{margin:0;}
-  #testWebhook{width:90px;height:36px;padding:0;} /* same footprint as the tab's dropdown pills (Periodic summary) */
+  #testWebhook,#testHeartbeat{width:90px;height:36px;padding:0;} /* same footprint as the tab's dropdown pills (Periodic summary) */
   /* The (i) glyph is text, so pin EVERY inherited metric (family, weight, size,
      line-height, tracking) - otherwise icons inside panel h2s pick up bold-700 +
      letter-spacing and render bigger/off-centre than the ones in body text. */
@@ -957,7 +957,7 @@
   @keyframes spin{to{transform:rotate(360deg);}}
   .btn-spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:-2px;}
   #serverSearchBtn{min-width:62px;}  /* hold width while the spinner replaces the label */
-  #testWebhook{min-width:54px;}      /* same: hold width for the busy spinner */
+  #testWebhook,#testHeartbeat{min-width:54px;}  /* same: hold width for the busy spinner */
   .drag-handle:active,.panel[draggable="true"]{cursor:grabbing;}
   .panel.dragging{opacity:.45;}
   .panel.dragging *{pointer-events:none;}
@@ -1980,6 +1980,17 @@
         <h3>Notifications</h3>
         <div class="warn-bubble" id="notifyWarn"><span class="wi">⚠&#xFE0E;</span><span>A monitoring <b>schedule</b> is enabled: the link isn’t probed outside the scheduled windows, so outages there <b>won’t be detected or alerted</b>. Check the <b>Schedule</b> tab if you expect round-the-clock alerts.</span></div>
         <div class="srow-wide srow-inline">
+          <span class="lbl">Heartbeat URL
+            <span class="info" tabindex="0" data-tip="Pingularity pings this URL every minute while monitoring is on. A watchdog like Healthchecks.io alerts you if Pingularity or the whole host goes silent.
+• Pausing monitoring stops the pings, so the watchdog will report you down.
+• Test sends a real check-in - there is no dry run, so it resets the watchdog's countdown.
+• Blank = off.">i</span></span>
+          <div class="server-search">
+            <input type="text" id="setHeartbeat" placeholder="https://hc-ping.com/your-uuid" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done">
+            <button class="btn" id="testHeartbeat" type="button">Test</button>
+          </div>
+        </div>
+        <div class="srow-wide srow-inline">
           <span class="lbl">Webhook URL
             <span class="info" tabindex="0" data-tip="Where alerts are POSTed as JSON. Works with Discord, Slack, ntfy, Apprise, or any receiver. Leave blank to disable.">i</span></span>
           <div class="server-search">
@@ -2008,16 +2019,6 @@
               <option value="daily">Daily</option>
               <option value="weekly">Weekly</option>
             </select></span></label>
-        </div>
-        <!-- Dead-man's-switch: a distinct concern (Pingularity's own liveness, not
-             a network alert), so it sits below a divider, on its own. -->
-        <div class="srow-div" role="separator"></div>
-        <div class="srow-wide srow-inline">
-          <span class="lbl">Heartbeat URL
-            <span class="info" tabindex="0" data-tip="Pingularity pings this URL every minute while monitoring is on. A watchdog like Healthchecks.io alerts you if Pingularity or the whole host goes silent.
-• Pausing monitoring stops the pings, so the watchdog will report you down.
-• Blank = off.">i</span></span>
-          <input type="text" id="setHeartbeat" placeholder="https://hc-ping.com/your-uuid" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done">
         </div>
       </div>
       </div><!-- /alerts pane -->
@@ -7934,7 +7935,28 @@ $('testWebhook').addEventListener('click', async () => {
     const r=await fetch('api/notify/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url, format:$('setWebhookFormat').value})});
     msg.textContent = r.ok ? 'Test alert sent - check your channel.' : ('Test failed: '+await r.text());
   }catch(e){ msg.textContent='Test failed.'; }
-  b.disabled=false; b.innerHTML=t; setTimeout(()=>{ if(msg.textContent.startsWith('Test')) msg.textContent=''; },4000);
+  b.disabled=false; b.innerHTML=t;
+  // Clear only what this click wrote. A prefix match also caught the heartbeat
+  // button's messages, wiping them seconds early when both were pressed.
+  const shown=msg.textContent; setTimeout(()=>{ if(msg.textContent===shown) msg.textContent=''; },4000);
+});
+
+// Test heartbeat: POST the URL currently typed in the field. A push watchdog counts any
+// request as a check-in, so this one is real - it resets the countdown, same as the
+// per-minute ping.
+$('testHeartbeat').addEventListener('click', async () => {
+  const url=$('setHeartbeat').value.trim();
+  const msg=$('settingsMsg');
+  if(!url){ msg.textContent='Enter a heartbeat URL first.'; return; }
+  const b=$('testHeartbeat'); b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
+  try{
+    const r=await fetch('api/notify/heartbeat/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    msg.textContent = r.ok ? 'Heartbeat sent - your watchdog just checked in.' : ('Test failed: '+await r.text());
+  }catch(e){ msg.textContent='Test failed.'; }
+  b.disabled=false; b.innerHTML=t;
+  // Clear only the line this click wrote - a Save or the webhook test may have replaced
+  // it by now, and the success line does not start with "Test" to match on.
+  const shown=msg.textContent; setTimeout(()=>{ if(msg.textContent===shown) msg.textContent=''; },4000);
 });
 
 // --- Access / authentication --------------------------------------------

@@ -103,6 +103,11 @@ func NewHeartbeatClient() *http.Client {
 			if ssrfBlocked(req.URL.String()) {
 				return fmt.Errorf("blocked redirect to link-local/metadata destination")
 			}
+			// Go puts the previous URL in Referer on each hop, and a heartbeat URL
+			// is a credential - the check UUID is the whole path. The next host is
+			// named by the previous one, not by the user, so it must not be handed
+			// the token just for being redirected to.
+			req.Header.Del("Referer")
 			return nil
 		},
 	}
@@ -366,13 +371,16 @@ func (n *Notifier) Send(ctx context.Context, message string, fields map[string]a
 	return nil
 }
 
-// scrubURLErr strips the URL from a *url.Error before it hits a log line:
-// webhook URLs are bearer secrets (Discord/Slack put the token in the path),
-// and url.Error.Error() prints the full URL. The underlying cause is kept.
+// scrubURLErr strips the URL from a *url.Error before it reaches a log line or
+// the browser: webhook and heartbeat URLs are both bearer secrets (Discord and
+// Slack put the token in the path, Healthchecks the check UUID), and
+// url.Error.Error() prints the whole URL. The operation and the underlying cause
+// are kept. It does not name which kind of URL failed - each caller already
+// says that, and guessing here told heartbeat users their webhook was broken.
 func scrubURLErr(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		return fmt.Errorf("%s webhook: %w", ue.Op, ue.Err)
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
 	}
 	return err
 }
@@ -483,22 +491,24 @@ func hostOf(rawurl string) string {
 
 // Heartbeat pings a dead-man's-switch URL (Healthchecks.io, Uptime Kuma push,
 // …) so the external service can alert if Pingularity or the host goes silent.
-// Errors are ignored - a missed ping is itself the signal the watchdog wants.
-func Heartbeat(ctx context.Context, client *http.Client, url string, log *slog.Logger) {
+// A missed ping is itself the signal the watchdog wants, so it is the caller
+// that decides whether a failure matters: the per-minute loop drops the error,
+// the Test button shows it. Returned errors carry no URL - it is a credential.
+func Heartbeat(ctx context.Context, client *http.Client, url string, log *slog.Logger) error {
 	url = strings.TrimSpace(url)
 	if url == "" {
-		return
+		return nil
 	}
 	if ssrfBlocked(url) {
 		stats.Inc("notify.heartbeat.blocked")
 		// A misconfiguration: the watchdog will never be pinged. Worth surfacing.
 		log.Warn("heartbeat blocked", "reason", "link-local/metadata destination")
-		return
+		return errors.New("link-local or metadata destination refused")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		log.Debug("heartbeat build request", "err", scrubURLErr(err))
-		return
+		return scrubURLErr(err)
 	}
 	req.Header.Set("User-Agent", "pingularity")
 	// Same accounting as Send, under a fixed "heartbeat" class regardless of host.
@@ -512,11 +522,13 @@ func Heartbeat(ctx context.Context, client *http.Client, url string, log *slog.L
 	if err != nil {
 		stats.Inc("notify.heartbeat.fail")
 		log.Debug("heartbeat fail", "err", scrubURLErr(err))
-		return
+		return scrubURLErr(err)
 	}
+	var failed error
 	if resp.StatusCode >= 300 {
 		stats.Inc("notify.heartbeat.fail")
 		log.Debug("heartbeat fail", "status", resp.StatusCode)
+		failed = fmt.Errorf("status %d", resp.StatusCode)
 	} else {
 		stats.Inc("notify.heartbeat.ok")
 		log.Debug("heartbeat ok")
@@ -524,4 +536,5 @@ func Heartbeat(ctx context.Context, client *http.Client, url string, log *slog.L
 	// Drain (bounded) so the connection can be pooled for keep-alive reuse.
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
+	return failed
 }

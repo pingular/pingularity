@@ -1666,7 +1666,10 @@ func (p *program) runHeartbeat(ctx context.Context, set *settings.Controller) {
 			return
 		case <-t.C:
 			if set.Monitoring() {
-				notify.Heartbeat(ctx, client, set.HeartbeatURL(), p.log)
+				// Dropped on purpose: the watchdog on the other end already treats a
+				// missed ping as the alert, so there is nothing for this loop to do
+				// about a failure. Heartbeat has logged it.
+				_ = notify.Heartbeat(ctx, client, set.HeartbeatURL(), p.log)
 			}
 		}
 	}
