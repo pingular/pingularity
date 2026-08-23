@@ -1036,6 +1036,7 @@ func seedKnownCounters() {
 		// a coordinate at all (a climbing rate means auto is running blind, e.g.
 		// connection-info lookups switched off).
 		"speed.cityrace_decided", "speed.cityrace_silent", "speed.cityrace_unanchored",
+		"speed.pin_coord_unrecovered",
 		// A pause span that crossed a clock correction and was refused rather than
 		// recorded: expected once on an RTC-less boot, never in steady state.
 		"monitor.pause_clock_corrections",
