@@ -36,6 +36,7 @@ const (
 	keyDownAfter         = "down_after"
 	keyUpAfter           = "up_after"
 	keySpeedServer       = "speed_server_id"
+	keySpeedServers      = "speed_servers"    // JSON array of SavedServer (the Ookla picker list)
 	keySpeedAutoLoc      = "speed_auto_loc"   // "lat,lon" the auto picker centres on ("" = your IP)
 	keySpeedAutoLabel    = "speed_auto_label" // human label for the auto location
 	keySpeedEnabled      = "speedtest_enabled"
@@ -174,6 +175,31 @@ type Window struct {
 	End   int    `json:"end"`
 }
 
+// maxSpeedServers bounds the saved Ookla server list (storage + UI sanity).
+const maxSpeedServers = 12
+
+// SavedServer is one Ookla server on the user's picker list: the ID a test runs
+// against, plus the sponsor and name the list shows.
+//
+// Lat/Lon are the server's registered position, kept so a later run never has to
+// ask Ookla where the server is. Its by-ID endpoint answers with the CALLER'S
+// own position whenever the server belongs to the caller's ISP, which drags a
+// pinned server's companions to the wrong city (see recentrePin in
+// internal/speedtest); the catalogue listing the picker read reports the real
+// one. 0,0 means no coordinate - the sentinel serverCoord already uses.
+//
+// float64 rather than the Ookla API's strings: serverCoord parses them at the
+// boundary and is the one place that decides a pair is usable, so a list saved
+// downstream of it would otherwise re-parse, and re-decide that rule, on every
+// read.
+type SavedServer struct {
+	ID      string  `json:"id"`
+	Sponsor string  `json:"sponsor,omitempty"`
+	Name    string  `json:"name,omitempty"`
+	Lat     float64 `json:"lat,omitempty"`
+	Lon     float64 `json:"lon,omitempty"`
+}
+
 // maxIperfServers bounds the saved iperf3 server list (storage + UI sanity).
 const maxIperfServers = 12
 
@@ -242,9 +268,10 @@ type Values struct {
 	Timeout              time.Duration
 	DownAfter            int
 	UpAfter              int
-	SpeedServerID        string // Ookla server ID ("" = auto)
-	SpeedAutoLoc         string // "lat,lon" the auto picker centres on ("" = your IP)
-	SpeedAutoLabel       string // human label for SpeedAutoLoc
+	SpeedServerID        string        // Ookla server ID ("" = auto)
+	SpeedServers         []SavedServer // the saved Ookla picker list; SpeedServerID is the selected one
+	SpeedAutoLoc         string        // "lat,lon" the auto picker centres on ("" = your IP)
+	SpeedAutoLabel       string        // human label for SpeedAutoLoc
 	SpeedtestEnabled     bool
 	SpeedtestOnReconnect bool
 	IPv6Mode             string // "auto" | "on" | "off"
@@ -776,6 +803,17 @@ func overlay(v Values, m map[string]string) Values {
 	if val, ok := m[keySpeedServer]; ok {
 		v.SpeedServerID = val
 	}
+	// An absent key is a database written before this key existed: the list stays
+	// at its empty default and the read persists nothing. A blob that fails to
+	// decode is discarded whole rather than kept in part - the decoder zeroes only
+	// the offending field and hands back the rest, which would silently rewrite a
+	// server's coordinate to 0,0 and then save it back that way.
+	if raw, ok := m[keySpeedServers]; ok {
+		var ss []SavedServer
+		if json.Unmarshal([]byte(raw), &ss) == nil {
+			v.SpeedServers = ss
+		}
+	}
 	if val, ok := m[keySpeedAutoLoc]; ok {
 		v.SpeedAutoLoc = val
 	}
@@ -1039,6 +1077,11 @@ func (c *Controller) UpAfter() int                     { return c.get().UpAfter 
 func (c *Controller) SpeedServerID() string            { return c.get().SpeedServerID }
 func (c *Controller) SpeedAutoLabel() string           { return c.get().SpeedAutoLabel }
 
+// SpeedServers returns the saved Ookla picker list. Copied, not shared, by the
+// same rule as Snapshot: the controller keeps serving this slice after the call
+// returns, so a caller that edited what it got back would edit live settings.
+func (c *Controller) SpeedServers() []SavedServer { return slices.Clone(c.get().SpeedServers) }
+
 // AutoLocation parses the stored "lat,lon" the auto picker centres on. ok is
 // false when unset, meaning use the caller's own IP location.
 func (c *Controller) AutoLocation() (lat, lon float64, ok bool) {
@@ -1158,12 +1201,13 @@ func (c *Controller) LatencyAllowed(t time.Time) bool {
 func (c *Controller) Snapshot() Values { return cloneValues(c.get()) }
 func (c *Controller) Defaults() Values { return cloneValues(c.defaults) }
 
-// cloneValues deep-copies v's slice fields. Window and IperfTarget hold only
-// value types, so a per-element copy is a full clone.
+// cloneValues deep-copies v's slice fields. Window, IperfTarget and SavedServer
+// hold only value types, so a per-element copy is a full clone.
 func cloneValues(v Values) Values {
 	v.SchedLatWindows = slices.Clone(v.SchedLatWindows)
 	v.SchedSpeedWindows = slices.Clone(v.SchedSpeedWindows)
 	v.IperfServers = slices.Clone(v.IperfServers)
+	v.SpeedServers = slices.Clone(v.SpeedServers)
 	return v
 }
 
@@ -1302,6 +1346,7 @@ type Patch struct {
 	DownAfter            *int
 	UpAfter              *int
 	SpeedServerID        *string
+	SpeedServers         []SavedServer
 	SpeedAutoLoc         *string
 	SpeedAutoLabel       *string
 	SpeedtestEnabled     *bool
@@ -1366,6 +1411,9 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.DownAfter, p.DownAfter)
 	setIf(&v.UpAfter, p.UpAfter)
 	setIf(&v.SpeedServerID, p.SpeedServerID)
+	if p.SpeedServers != nil {
+		v.SpeedServers = p.SpeedServers
+	}
 	setIf(&v.SpeedAutoLoc, p.SpeedAutoLoc)
 	setIf(&v.SpeedAutoLabel, p.SpeedAutoLabel)
 	setIf(&v.SpeedtestEnabled, p.SpeedtestEnabled)
@@ -1453,6 +1501,7 @@ func (p Patch) keys() map[string]bool {
 	mark(p.DownAfter != nil, keyDownAfter)
 	mark(p.UpAfter != nil, keyUpAfter)
 	mark(p.SpeedServerID != nil, keySpeedServer)
+	mark(p.SpeedServers != nil, keySpeedServers)
 	mark(p.SpeedAutoLoc != nil, keySpeedAutoLoc)
 	mark(p.SpeedAutoLabel != nil, keySpeedAutoLabel)
 	mark(p.SpeedtestEnabled != nil, keySpeedEnabled)
@@ -1608,6 +1657,7 @@ func formKeys(v Values) map[string]string {
 		keyDownAfter:         strconv.Itoa(v.DownAfter),
 		keyUpAfter:           strconv.Itoa(v.UpAfter),
 		keySpeedServer:       v.SpeedServerID,
+		keySpeedServers:      speedServersJSON(v.SpeedServers),
 		keySpeedAutoLoc:      v.SpeedAutoLoc,
 		keySpeedAutoLabel:    v.SpeedAutoLabel,
 		keySpeedEnabled:      b2s(v.SpeedtestEnabled),
@@ -2391,6 +2441,7 @@ func normalize(v Values) Values {
 	}
 	v.SpeedAutoLabel = capLen(v.SpeedAutoLabel, maxLabelLen)
 	v.SpeedServerID = capLen(strings.TrimSpace(v.SpeedServerID), maxServerID)
+	v.SpeedServers = sanitizeSpeedServers(v.SpeedServers)
 	// Exit-path target: trim and drop anything that can't be a host/IP (empty,
 	// flag-shaped, whitespaced); "" means the runtime default (1.1.1.1). netinfo
 	// resolves it and falls back if it can't, so this is just storage hygiene.
@@ -2503,7 +2554,15 @@ func validAutoLoc(s string) bool {
 	}
 	lat, e1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
 	lon, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-	return e1 == nil && e2 == nil && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
+	return e1 == nil && e2 == nil && validCoord(lat, lon)
+}
+
+// validCoord reports whether a coordinate pair can centre a server search:
+// within [-90,90] / [-180,180]. NaN and ±Inf reach here from a crafted import or
+// a corrupt row and fail these comparisons - NaN is false against every bound,
+// an infinity is outside both.
+func validCoord(lat, lon float64) bool {
+	return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
 }
 
 // normDays returns a valid 7-char weekday mask, defaulting to all days when
@@ -2579,6 +2638,59 @@ func sanitizeIperfToken(s string) string {
 		return ""
 	}
 	return s
+}
+
+// speedServersJSON serializes the saved Ookla server list ("[]" when empty).
+// Marshal can only fail on a non-finite coordinate, which sanitizeSpeedServers
+// rules out; "[]" keeps the stored value parseable if one ever slips past.
+func speedServersJSON(ss []SavedServer) string {
+	if len(ss) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(ss)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// sanitizeSpeedServers trims and bounds the saved Ookla list: trim and
+// length-cap each field, drop entries with no ID, dedupe by ID (first wins),
+// clear a coordinate that cannot centre anything, and cap the list. Whether the
+// ID still names a live server is not checked here - only the picker can know
+// that, and a server can be retired after it is saved.
+func sanitizeSpeedServers(ss []SavedServer) []SavedServer {
+	out := make([]SavedServer, 0, len(ss))
+	seen := make(map[string]bool)
+	for _, s := range ss {
+		// Cap before the duplicate check: two IDs that differ only past the cap
+		// store the same value, so checking first would keep both.
+		id := capLen(strings.TrimSpace(s.ID), maxServerID) // rune-safe (see capLen)
+		if id == "" || seen[id] {
+			continue
+		}
+		lat, lon := s.Lat, s.Lon
+		if !validCoord(lat, lon) {
+			// 0,0 is the "no coordinate" case the picker already handles. Keeping an
+			// out-of-range pair would centre a later run on nowhere, and json.Marshal
+			// refuses NaN/Inf outright - which would store the whole list as "[]".
+			lat, lon = 0, 0
+		}
+		seen[id] = true
+		out = append(out, SavedServer{
+			ID:      id,
+			Sponsor: capLen(strings.TrimSpace(s.Sponsor), maxLabelLen), // rune-safe: free-form text
+			Name:    capLen(strings.TrimSpace(s.Name), maxLabelLen),
+			Lat:     lat, Lon: lon,
+		})
+		if len(out) >= maxSpeedServers {
+			break
+		}
+	}
+	// Clipped: the slice was sized for the stored list, so a crafted backup with
+	// thousands of entries would keep its whole backing array alive behind the
+	// twelve that survive, for as long as the process runs.
+	return slices.Clip(out)
 }
 
 // iperfServersJSON serializes the saved iperf3 server list ("[]" when empty).
