@@ -22,6 +22,9 @@ func sentinel(f reflect.Value) bool {
 	case reflect.TypeOf([]Window(nil)):
 		f.Set(reflect.ValueOf([]Window{{Days: AllDays, Start: 540, End: 1020}}))
 		return true
+	case reflect.TypeOf([]SavedServer(nil)):
+		f.Set(reflect.ValueOf([]SavedServer{{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5}}))
+		return true
 	}
 	switch f.Kind() {
 	case reflect.Bool:

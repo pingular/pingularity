@@ -503,6 +503,10 @@ func TestFormKeysOverlayRoundTrip(t *testing.T) {
 		Timeout:           5 * time.Second,
 		DownAfter:         3, UpAfter: 2,
 		SpeedServerID: "1234", SpeedAutoLoc: "45.5,-73.5", SpeedAutoLabel: "Montreal",
+		SpeedServers: []SavedServer{
+			{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
+			{ID: "5678", Sponsor: "Rogers", Name: "Toronto, ON"}, // no coordinate: the 0,0 case must round-trip too
+		},
 		SpeedtestEnabled: true, SpeedtestOnReconnect: true, IPv6Mode: "on", ExitTarget: "8.8.8.8", DNSProbe: true, NetinfoEnabled: true,
 		SpeedEngine: "iperf3", IperfServer: "10.0.0.5:5201",
 		IperfServers: []IperfTarget{
