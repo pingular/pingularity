@@ -162,7 +162,7 @@ homebrew_casks:
     # brew refuses up front with a version message. goreleaser has no first-class
     # field for a cask's depends_on, so the raw cask DSL rides custom_block.
     custom_block: |
-      depends_on macos: ">= :ventura"
+      depends_on macos: :ventura
     # The binary is unsigned/un-notarized, so Homebrew's cask download carries the
     # com.apple.quarantine xattr and Gatekeeper blocks the first run. The old
     # formula never hit this (formulae are not quarantined); strip the xattr on
