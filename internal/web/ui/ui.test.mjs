@@ -3179,8 +3179,9 @@ function driveApplyPendingServer({ pendingServer, seen = [] }) {
   const calls = [];
   const fetchStub = (url, opts) => { calls.push({ url, opts }); return Promise.resolve({ ok: true, json: async () => ({ servers: [] }) }); };
   const make = new Function('$', 'document', 'pendingServer', 'serverHealth', 'serverProbes', 'annotateOption', 'rememberServerHealth', 'fetch',
+    'fpKnown', 'fpNote', 'fpDraw', 'serverOptionText',
     body + '\nreturn applyPendingServer;');
-  make($, document, pendingServer, serverHealth, new Map(), () => {}, () => {}, fetchStub)();
+  make($, document, pendingServer, serverHealth, new Map(), () => {}, () => {}, fetchStub, new Map(), () => {}, () => {}, () => '')();
   return calls;
 }
 
@@ -3196,7 +3197,8 @@ test('applyPendingServer asks about an unknown pin at most twice per page load, 
   const calls = [];
   const fetchStub = url => { calls.push(url); return Promise.resolve({ ok: true, json: async () => ({ servers: [] }) }); }; // no verdict
   const apply = new Function('$', 'document', 'pendingServer', 'serverHealth', 'serverProbes', 'annotateOption', 'rememberServerHealth', 'fetch',
-    body + '\nreturn applyPendingServer;')($, document, '54321', new Map(), new Map(), () => {}, () => {}, fetchStub);
+    'fpKnown', 'fpNote', 'fpDraw', 'serverOptionText',
+    body + '\nreturn applyPendingServer;')($, document, '54321', new Map(), new Map(), () => {}, () => {}, fetchStub, new Map(), () => {}, () => {}, () => '');
   // A repopulate rebuilds the select, which is what used to re-fire the
   // probe every time; the harness mimics it by emptying the options first.
   const repopulate = () => { options.length = 0; apply(); };
@@ -3266,10 +3268,12 @@ function drivePicker({ chosen = '', health = [] } = {}) {
     + script.match(/const STAR_OFF=[^;]*;/)[0] + '\n'
     + script.match(/const fpUnsupported = [^;]*;/)[0] + '\n'
     + script.match(/const fpKept = [^;]*;/)[0] + '\n'
-    + 'let speedServers=[], fpBrowse=[], pendingServer="", fpListLabel="Server", fpPinging=false;\n'
+    + 'let speedServers=[], fpBrowse=[], pendingServer="", fpListLabel="Server", fpPinging=false, fpPingedAt=0, fpPingsStale=false;\n'
+    + script.match(/const FP_AUTO_FRESH_MS=[^;]*;/)[0] + '\n'
     // The saved pane's two ping sources are network calls; the pure half (what
     // the rows show for a ping and where it came from) is what these tests pin.
-    + 'function fpLoadStoredPings(){} function fpRefreshPings(){ fpPinging=true; }\n'
+    + 'function fpLoadStoredPings(){} let refreshes=0; function fpRefreshPings(){ refreshes++; fpPinging=true; }\n'
+    + extract('function fpRefreshPingsIfStale') + '\n'
     // applyPendingServer reduced to the one thing the picker leans on - it puts
     // the pin on #setServer. Its option synthesis and by-ID probe are pinned by
     // their own tests above.
@@ -3280,11 +3284,13 @@ function drivePicker({ chosen = '', health = [] } = {}) {
     + 'let serverSearchFailed=false, serverErrShown=""; function clearServerFieldError(){}\n'
     + extract('function fpRefuse') + '\n'
     + script.match(/const FP_UNSUPPORTED_TIP=[^;]*;/)[0] + '\n'
-    + ['function fpPanes', 'function fpHeldServer', 'function fpHeader', 'function fpPingText', 'function fpKmText', 'function fpRow',
+    + script.match(/const fpKnown=new Map\(\);/)[0] + '\nlet fpCentre=null;\n'
+    + ['function fpNote', 'function fpKmFrom', 'function fpPanes', 'function fpHeldServer', 'function fpHeader', 'function fpPingText', 'function fpKmText', 'function fpRow',
       'function fpAutoRow', 'function fpCue', 'function fpFill', 'function fpDraw',
       'function fpAdopt', 'function fpAdoptSaved', 'function fpToggleStar', 'function fpChoose',
       'function fpClick'].map(extract).join('\n')
-    + '\nreturn { FP_MAX, fpPanes, fpHeldServer, fpHeader, fpDraw, fpAdopt, fpAdoptSaved, setLabel: l => { fpListLabel = l; },'
+    + '\nreturn { FP_MAX, fpPanes, fpHeldServer, fpHeader, fpDraw, fpAdopt, fpAdoptSaved, setLabel: l => { fpListLabel = l; }, setCentre: c => { fpCentre = c; }, known: () => fpKnown,'
+    + ' fpRefreshPingsIfStale, refreshes: () => refreshes, pinged: (at, stale) => { fpPingedAt = at; fpPingsStale = !!stale; fpPinging = false; },'
     + ' fpToggleStar, fpChoose, fpClick, saved: () => speedServers, pin: () => pendingServer };';
   const api = new Function('$', 'document', 'esc', 'serverHealth', 'window', src)(
     id => els[id], { createElement: fpEl }, esc,
@@ -3573,20 +3579,20 @@ test('a server at the city\u2019s own point is near, not unknown', () => {
   assert.equal(km('1'), '&lt;1 km', 'a fraction of a kilometre is a distance, not a blank');
   assert.equal(km('2'), '12 km');
   assert.equal(km('3'), '', 'a literal 0 is the catalogue saying it does not know');
+  // A kept server sitting on the list's own centre point reads near, not blank.
+  p.setCentre({ lat: 45.5017, lon: -73.5673 });
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal', lat: 45.5017, lon: -73.5673 }]);
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML, /<span class="fp-km">&lt;1 km<\/span>/, 'a saved server at the centre itself is "<1 km", never "unknown"');
   assert.equal(km('4'), '');
 });
 
-test('the Ookla tab leads with Best of 3, and the challenger knobs sit beside it', () => {
+test('the Ookla tab leads with Best of 3, and the challenger has no knobs', () => {
   const ookla = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
   const at = id => ookla.indexOf('id="' + id + '"');
   assert.ok(at('setSpeedBestOf') < at('setSpeedRetries') && at('setSpeedRetries') < at('setOoklaConnections'),
     'Best of 3 takes the first cell; Parallel connections moved to where it was');
-  assert.ok(at('setOoklaLoss') < at('setSpeedChallengeEvery') && at('setSpeedChallengeEvery') < at('setSpeedChallengeMargin') && at('setSpeedChallengeMargin') < at('setOoklaConnections'),
-    'the two challenge rows follow the packet-loss probe');
-  assert.match(ookla, /id="setSpeedChallengeEvery" min="0" max="1000"/);
-  assert.match(ookla, /id="setSpeedChallengeMargin" min="0" max="100"/);
-  assert.match(script, /\['setSpeedChallengeEvery','speed_challenge_every','int',12\]/, 'blank falls back to the shipping default, not zero (0 means never)');
-  assert.match(script, /\['setSpeedChallengeMargin','speed_challenge_margin','int',15\]/);
+  assert.doesNotMatch(html, /setSpeedChallengeEvery|setSpeedChallengeMargin|speed_challenge/,
+    'the challenger just works: its cadence is an API-only setting and its bar is derived from the incumbent\u2019s own record');
 });
 
 test('the runs table says why each run\u2019s server was the one measured', () => {
@@ -3599,6 +3605,148 @@ test('the runs table says why each run\u2019s server was the one measured', () =
   for (const reason of ['fastest_ranked', 'incumbent', 'on_net', 'challenger', 'challenger_won', 'challenger_failed', 'score', 'ping_bootstrap', 'pinned', 'pinned_bestof', 'pinned_companion'])
     assert.ok(new RegExp('\\b' + reason + ':\\[').test(script), reason + ' (a win reason the daemon writes) has a label');
   assert.match(script, /\$\{esc\(r\.server\)\}\$\{winTag\(r\)\}/, 'the tag sits right after the server name');
+});
+
+test('a chosen server keeps its name, ping and distance when the list moves away from it', () => {
+  const p = drivePicker();
+  p.setCentre({ lat: 43.65, lon: -79.38 });   // Toronto
+  p.fpAdopt([SRV('47343', { sponsor: 'Rogers', name: 'Toronto, ON', ping_ms: 15.2, distance_km: 1, lat: 43.65, lon: -79.38 })]);
+  p.fpChoose('47343');
+  // Auto lands in Montréal: the chosen server is in neither pane now.
+  p.setCentre({ lat: 45.5017, lon: -73.5673 });
+  p.fpAdopt([SRV('1993', { sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 1 })]);
+  const held = fpRowOf(p.els.fpAll, '47343');
+  assert.ok(held, 'the chosen server still has a row');
+  const html = fpBtn(held).innerHTML;
+  assert.match(html, /Rogers<span class="fp-sub"> · Toronto, ON<\/span>/, 'its name is what the picker learned, not "Server 47343"');
+  assert.match(html, /15 ms/, 'its last ping stays');
+  assert.match(html, /<span class="fp-km">(50[0-9]|51[0-9]) km<\/span>/, 'its distance is re-measured from the new centre (~505 km), not the old list\u2019s 1 km');
+  // Without a centre the distance is honestly blank, and a server never seen falls back to the id.
+  p.setCentre(null); p.fpDraw();
+  assert.match(fpBtn(fpRowOf(p.els.fpAll, '47343')).innerHTML, /<span class="fp-km"><\/span>/);
+  p.els.setServer.value = '999'; p.fpDraw();
+  assert.match(fpBtn(fpRowOf(p.els.fpAll, '999')).innerHTML, /Server 999/);
+});
+
+// A typed ID the daemon reports as unsupported is listed, not pinned - and a
+// Save straight after must not slip past on the old pin: 3c8fd65 pinned the
+// typed ID, so the user's intent was never silently ignored there either.
+test('server list: an unsupported ID typed in Find is listed, refused, and blocks Save until acted on', async () => {
+  const { api, els, fetches, log } = driveServers();
+  els.serverCity.value = '14236';
+  const search = api.searchServers();
+  await tick();
+  fetches[0].ok({ servers: [{ id: '14236', sponsor: 'Frontier', name: 'Los Angeles, CA', fallback_ok: false }] });
+  await search; await tick();
+  const st = api.state();
+  assert.equal(st.pendingServer, '', 'an unsupported server is never pinned by typing its ID');
+  assert.equal(st.pinRefused, '14236', 'the refusal is held for Save to answer');
+  assert.deepEqual(log.populated, [[{ id: '14236', sponsor: 'Frontier', name: 'Los Angeles, CA', fallback_ok: false }]], 'but it is listed, with its badge');
+  assert.match(els.settingsMsg.textContent, /Server 14236 has no speedtest endpoint/, 'and the footer says why');
+  const save = script.slice(script.indexOf("const unverified=serverPinUnverified; serverPinUnverified='';"), script.indexOf('const addrErr=iperfAddrError();'));
+  assert.match(save, /if\(serverPinRefused\)\{ const id=serverPinRefused; serverPinRefused=''; *\n?\s*saveFailed\(/, 'Save blocks on a held refusal with the reason, like a failed search');
+  assert.match(extract('function fpChoose'), /serverPinRefused='';/, 'picking a row on purpose supersedes the refused ID');
+  assert.match(extract('async function searchServers'), /serverSearchFailed=false; serverPinRefused='';/, 'and so does the next search');
+});
+
+// The list you were looking at is the drawer's to keep: a reopen fetches the
+// same place again with today's pings, Save leaves it alone, and only Reset to
+// defaults puts the default list back.
+test('server list: a reopen re-runs the last Find on the same place', async () => {
+  const { api, fetches } = driveServers();
+  api.fetchServers({ city: 'Toronto' });
+  await tick();
+  fetches[0].ok({ lat: 43.7, lon: -79.4, location: 'Toronto, ON, Canada', servers: [{ id: 't' }] });
+  await tick();
+  assert.equal(api.state().browseLabel, 'Toronto');
+  // What applySettings does on a reopen: the same coordinates, fetched again.
+  api.fetchServers({ lat: '43.7', lon: '-79.4' });
+  await tick();
+  assert.match(fetches[1].url, /lat=43\.7&lon=-79\.4/, 'the refetch goes back to the searched place, not the default centre');
+  fetches[1].ok({ lat: 43.7, lon: -79.4, location: '', centre: '', servers: [{ id: 't', ping_ms: 12 }] });
+  await tick();
+  const st = api.state();
+  assert.equal(st.browseLabel, 'Toronto', 'the place name survives a coordinate refetch (the daemon names none for one)');
+  assert.equal(st.browseLoc, '43.7,-79.4');
+  const apply = extract('function applySettings');
+  assert.match(apply, /if\(drawerReopening && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/,
+    'a reopen refetches the list showing - the same place, or the same race - unless a race is already in flight for it (a fetch then would supersede the race and show the default list); any other settings load keeps it');
+  assert.doesNotMatch(apply, /browseLoc='';/, 'a settings load must not throw the search away');
+  assert.match(script, /drawerReopening=true; try\{ await loadSettings\(\); \} finally\{ drawerReopening=false; \}/, 'only the drawer\u2019s own reopen refetch counts as a reopen');
+  assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\); serversLoaded=false; loadServers\(\);\s*\/\/ back to the default list/, 'Reset to defaults is the act that starts over');
+});
+
+// The last Find outlives a reload: the browser remembers the place (never the
+// daemon), the page starts on it, and an Auto or a Reset forgets it.
+test('server list: the last listing is remembered - a Find by its place, an Auto by its result, shown again while fresh', async () => {
+  const { api, fetches, log } = driveServers();
+  api.fetchServers({ city: 'Ottawa' });
+  await tick();
+  fetches[0].ok({ lat: 45.42, lon: -75.69, location: 'Ottawa, Ontario, Canada', servers: [{ id: 'o' }] });
+  await tick();
+  assert.deepEqual(api.state().remembered, ['{"loc":"45.42,-75.69","label":"Ottawa"}'], 'a successful Find is remembered, place and label');
+  const race = { winner: { kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 },
+    origins: [{ kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 }, { kind: 'isp', label: 'Toronto, CA', lat: 43.65, lon: -79.38 }],
+    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
+  api.fetchServers({ candidates: true });
+  await tick();
+  fetches[1].ok(race);
+  await tick();
+  const kept = JSON.parse(api.state().remembered[1]);
+  assert.equal(kept.auto, true, 'an Auto is remembered by its RESULT, not as an act');
+  assert.deepEqual(kept.servers, race.servers, 'the rows the daemon sent, pings and all');
+  assert.ok(Date.now() - kept.at < 5000, 'stamped with when it was raced');
+  // A page load (or reopen) with a fresh remembered Auto shows it again without a request.
+  const before = fetches.length, shown = log.populated.length;
+  api.state().setStartOnAuto(true);
+  api.loadServers();
+  await tick();
+  assert.equal(fetches.length, before, 'fresh: no race, no fetch');
+  assert.deepEqual(log.populated[shown], race.servers, 'the remembered rows are what shows');
+  assert.deepEqual(api.state().autoCities, ['Montréal', 'Toronto'], 'with the cities the box names');
+  assert.equal(api.state().startOnAuto, false, 'and the memory is spent once shown');
+  // Older than ten minutes: the tab races again instead.
+  api.state().ageAuto(11 * 60 * 1000);
+  api.state().setStartOnAuto(true);
+  api.loadServers();
+  await tick();
+  assert.equal(fetches[before].url, 'api/speedtest/candidates', 'stale: raced again, not shown as it was');
+  fetches[before].status(409);   // a speedtest is in flight: the page-started race cannot run
+  await tick(); await tick();
+  assert.deepEqual(log.populated[log.populated.length - 1], race.servers, 'a page-started race that cannot run shows the remembered result rather than an empty pane');
+  // A speedtest completing marks the memory stale: the next showing races.
+  api.state().stale();
+  assert.equal(api.state().autoCache.at, 0, 'a run spends the remembered Auto');
+  assert.equal(JSON.parse(api.state().remembered[api.state().remembered.length - 1]).at, 0, 'and says so in the browser\u2019s memory');
+  assert.match(script, /if \(hadRun\)\{ autoCentreLastRun=false; serversLoaded=false; fpAutoStale\(\); \}/, 'wired to the status poll\u2019s new-run detection');
+  assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\);/, 'Reset to defaults forgets both');
+  assert.match(script, /if\(drawerReopening && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/, 'a reopen shows or re-races an Auto the same way');
+  assert.doesNotMatch(extract('function fpShowAutoCache'), /as of|ago/i, 'no "as of" note: the list is either fresh enough to stand or raced again');
+});
+
+// The favourites' pings are measured again on a reopen and on the tab's first
+// visit - unless measured within the last ten minutes with no speedtest since,
+// the same rule the Auto candidates follow.
+test('the saved servers are re-measured on reopen when their pings are stale', () => {
+  const p = drivePicker();
+  p.fpRefreshPingsIfStale();
+  assert.equal(p.refreshes(), 0, 'nothing kept, nothing to measure');
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpRefreshPingsIfStale();
+  assert.equal(p.refreshes(), 1, 'never measured this page: measure');
+  p.pinged(Date.now() - 60 * 1000, false);
+  p.fpRefreshPingsIfStale();
+  assert.equal(p.refreshes(), 1, 'measured a minute ago: stands');
+  p.pinged(Date.now() - 11 * 60 * 1000, false);
+  p.fpRefreshPingsIfStale();
+  assert.equal(p.refreshes(), 2, 'older than ten minutes: measure again');
+  p.pinged(Date.now() - 60 * 1000, true);
+  p.fpRefreshPingsIfStale();
+  assert.equal(p.refreshes(), 3, 'a speedtest since: measure again, however recent');
+  assert.match(extract('async function loadServers'), /fpRefreshPingsIfStale\(\{quiet:true\}\);/, 'wired to the tab\u2019s first visit and every reopen (loadServers runs on both)');
+  assert.match(extract('function fpAutoStale'), /fpPingsStale=true;/, 'a completed run marks them stale, like the Auto memory');
+  assert.match(extract('async function fpRefreshPings'), /fpPingedAt=Date\.now\(\); fpPingsStale=false;/, 'a successful measurement resets the clock');
+  assert.match(extract('async function fpRefreshPings'), /if\(!\(opts && opts\.quiet\)\)\s*\n\s*\$\('settingsMsg'\)/, 'a page-started measurement that fails does not shout in the footer');
 });
 
 test('only the saved pane offers to re-measure', () => {
@@ -3667,11 +3815,16 @@ test('the search bar is the results header, with Find and Auto matched', () => {
   assert.match(bar, /id="serverCity"[^>]*placeholder="Place or Ookla server ID"/);
   // The placeholder grows a "(Current: ...)" once the list is centred somewhere
   // known, so the box says what "here" is; it is rewritten with the caption.
-  const findBoxText = new Function(script.match(/const findBoxText = [^;]*;/)[0] + '\nreturn findBoxText;')();
+  const findBoxText = new Function(script.match(/const findBoxText = \(cur, autoCities\) => \{[\s\S]*?\n\};/)[0] + '\n' + script.match(/const joinPlaces = [^;]*;/)[0] + '\nreturn findBoxText;')();
   assert.equal(findBoxText(''), 'Place or Ookla server ID');
   assert.equal(findBoxText('Toronto, ON'), 'Place or Ookla server ID (Current: Toronto, ON)');
-  assert.match(extract('function updateScopeNote'), /box\.placeholder = findBoxText\(browseLabel\|\|autoDefaultLoc\)/,
-    'a searched place first, then where Auto last centred');
+  // After Auto the list spans every city that raced, so the box names them all, winner first.
+  assert.equal(findBoxText('Montréal', ['Montréal', 'Toronto']), 'Place or Ookla server ID (Auto: Montréal and Toronto)');
+  assert.equal(findBoxText('Montréal', ['Montréal', 'Toronto', 'Ottawa']), 'Place or Ookla server ID (Auto: Montréal, Toronto and Ottawa)');
+  assert.equal(findBoxText('Montréal', ['Montréal']), 'Place or Ookla server ID (Auto: Montréal)');
+  assert.equal(findBoxText('Toronto', []), 'Place or Ookla server ID (Current: Toronto)', 'a Find after an Auto is a place again');
+  assert.match(extract('function updateScopeNote'), /box\.placeholder = findBoxText\(browseLabel\|\|autoDefaultLoc, fpListLabel==='Candidates' \? fpAutoCities : null\)/,
+    'a searched place first, then where Auto last centred; the raced cities only while the Candidates list is up');
   assert.match(bar, /id="serverSearchBtn"[^>]*><span class="btn-lbl">Find<\/span><span class="btn-busy btn-spin"/,
     'Find uses the shared spinner, so its label does not have to be rebuilt by hand');
   assert.match(bar, /id="serverAuto"[^>]*><span class="btn-lbl">Auto<\/span><span class="btn-busy btn-spin"/);
@@ -3707,7 +3860,7 @@ test('Ookla and iperf3 have their own tabs, and Engine heads the Speedtest tab',
 test('each engine tab shows its whole contents whatever the engine is', () => {
   const ookla = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
   const iperf = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="iperf">'), html.indexOf('<!-- /iperf3 pane -->'));
-  for (const id of ['setOoklaConnections', 'setSpeedRetries', 'setSpeedDirection', 'setOoklaLoss', 'setSpeedBestOf', 'setSpeedChallengeEvery', 'setSpeedChallengeMargin', 'serverRow', 'fpFav', 'fpAll'])
+  for (const id of ['setOoklaConnections', 'setSpeedRetries', 'setSpeedDirection', 'setOoklaLoss', 'setSpeedBestOf', 'serverRow', 'fpFav', 'fpAll'])
     assert.ok(ookla.includes('id="' + id + '"'), `${id} belongs on the Ookla tab`);
   for (const id of ['iperfServerRow', 'iperfEditor', 'setIperfDur', 'setIperfStreams', 'setIperfRetries', 'setIperfDirection', 'setIperfUDP', 'iperfUdpRateRow'])
     assert.ok(iperf.includes('id="' + id + '"'), `${id} belongs on the iperf3 tab`);
@@ -3813,7 +3966,14 @@ function driveServers() {
     // Every page-level name the lifted functions write, or a sloppy-mode
     // assignment creates a global that leaks between drives and a test passes
     // only because an earlier one ran.
-    + 'browseLoc="", browseLabel="", serverPinUnverified="", serverErrShown="", fpListLabel="Server", fpRefusedID="";\n'
+    + 'browseLoc="", browseLabel="", serverPinUnverified="", serverErrShown="", fpListLabel="Server", fpRefusedID="", serverPinRefused="", fpCentre=null, fpAutoCities=[], drawerReopening=false, startOnAuto=false, fpAutoCache=null;\n'
+    // The browser-side memory of the last listing: the REAL rememberFind over a capturing lsSet, so a
+    // test can assert what a search or an Auto remembers.
+    + 'const remembered=[]; function lsSet(k,v){ remembered.push(v); } function lsGet(){ return null; } function fpLoadStoredPings(){} function fpRefreshPingsIfStale(){}\n'
+    + 'const LS_FIND="ooklaFind";\n' + script.match(/const FP_AUTO_FRESH_MS=[^;]*;/)[0] + '\n'
+    + script.match(/const rememberFind = \(\) => lsSet\([\s\S]*?: ''\);/)[0] + '\n'
+    + script.match(/const fpAutoFresh = [^;]*;/)[0] + '\n'
+    + ['function fpAutoStale', 'function fpShowAutoCache', 'function fpAutoCitiesOf'].map(extract).join('\n') + '\n'
     + extract('function fpRefuse') + '\n'
     // The generation counter itself is lifted from the page, so deleting it there
     // fails this drive rather than letting the test supply its own.
@@ -3823,8 +3983,8 @@ function driveServers() {
     + extract('async function loadServers') + '\n'
     + extract('async function searchServers') + '\n'
     + extract('function fpAutoList') + '\n'
-    + 'return { fetchServers, searchServers, fpAutoList, '
-    + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, autoCentreLastRun,'
+    + 'return { fetchServers, searchServers, fpAutoList, loadServers, '
+    + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, autoCentreLastRun, pinRefused: serverPinRefused, autoCities: fpAutoCities, remembered, startOnAuto, setStartOnAuto: v => { startOnAuto = v; }, autoCache: fpAutoCache, ageAuto: ms => { fpAutoCache.at = Date.now() - ms; }, stale: fpAutoStale,'
     + ' searchFailed: serverSearchFailed, pinUnverified: serverPinUnverified, errShown: serverErrShown, listLabel: fpListLabel }) };')(
     id => els[id], fetchStub, on => log.loading.push(on), s => log.populated.push(s),
     () => {}, () => {}, () => {}, m => log.errs.push(m), () => true,
@@ -3931,12 +4091,15 @@ test('server list: Auto shows the candidates a run would race, and says so', asy
   api.fetchServers({ candidates: true });
   await tick();
   assert.equal(fetches[0].url, 'api/speedtest/candidates', 'the race field, not the browse list');
-  fetches[0].ok({ winner: { kind: 'saved', label: 'Montréal, QC, Canada' },
+  fetches[0].ok({ winner: { kind: 'saved', label: 'Montréal, QC, Canada', lat: 45.5, lon: -73.57 },
+    origins: [{ kind: 'exit', label: 'Montreal, CA', lat: 45.5017, lon: -73.5673 }, { kind: 'isp', label: 'Toronto, CA', lat: 43.65, lon: -79.38 },
+      { kind: 'saved', label: 'Montréal, QC, Canada', lat: 45.5, lon: -73.57 }, { kind: 'geo', label: 'your connection' }],
     servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 10.4, origin: 'saved' }] });
   await tick();
   let st = api.state();
   assert.equal(st.listLabel, 'Candidates', 'the results pane is headed as the race field');
   assert.equal(st.autoDefaultLoc, 'Montréal', 'the winner is where a run now would centre');
+  assert.deepEqual(st.autoCities, ['Montréal', 'Toronto'], 'every city that raced, the winner first, each once (the star in Montréal folds into it; the unanchored placement has no place)');
   assert.equal(st.autoCentreLastRun, false, 'and it is not a past-tense claim about the last run');
   assert.equal(st.pendingServer, '', 'listing the field chooses nothing');
   assert.deepEqual(log.populated[0][0].ping_ms, 10.4, 'the ping reaches the rows');

@@ -868,7 +868,7 @@ func (o *Ookla) RaceListing(ctx context.Context) (RaceListing, error) {
 		lat, lon, ok := serverCoord(s)
 		dist := s.Distance
 		if recentre && ok {
-			dist = kmBetween(centreLat, centreLon, lat, lon)
+			dist = measuredKM(centreLat, centreLon, lat, lon)
 		}
 		infos = append(infos, ServerInfo{
 			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name, Country: s.Country,

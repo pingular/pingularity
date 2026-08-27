@@ -1828,17 +1828,6 @@
 • Many networks and servers block the UDP it uses. Loss then stays blank, and the probe (not the speedtest) is skipped for that server for a while.
 • Turn it off to keep every test as short as it can be, at the cost of the loss figure.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setOoklaLoss"><span class="unit"></span></span></label>
-        <label class="srow"><span class="lbl">Challenge every
-          <span class="info" tabindex="0" data-tip="Auto keeps measuring the same server while it pings within a hair of the fastest, so it never learns whether a rival is actually faster. After this many automatic tests, the next scheduled test measures the strongest rival instead.
-• Same data as any other test: one server is measured.
-• The rival takes over only if it beats the incumbent&#39;s recent results by the margin below; otherwise the incumbent keeps its place and the run is just a data point. A server needs three tests of record before it can be challenged.
-• 0 = never challenge. 12 is about twice a day at hourly tests (manual and reconnect tests count too).">i</span></span>
-          <span class="ctl"><input type="number" id="setSpeedChallengeEvery" min="0" max="1000" step="1"><span class="unit">tests</span></span></label>
-        <label class="srow"><span class="lbl">Challenger must beat by
-          <span class="info" tabindex="0" data-tip="How much better than the incumbent&#39;s recent median score a challenger has to be to take its place.
-• Compared across different hours, so set it above your line&#39;s normal run-to-run swing - a lucky hour must not steal the seat.
-• 15% suits a wired line; a wireless one swings more.">i</span></span>
-          <span class="ctl"><input type="number" id="setSpeedChallengeMargin" min="0" max="100" step="1"><span class="unit">%</span></span></label>
         <label class="srow"><span class="lbl">Parallel connections
           <span class="info" tabindex="0" data-tip="Parallel Ookla connections.
 • More connections fill a fast or high-latency link better.
@@ -3627,7 +3616,7 @@ function openDrawer(){
     // unsaved edits, so the refetch can't wipe them.
     const formClean = (savedBody==='' || formSnapshot()===savedBody);
     savedBody = formSnapshot();   // provisional baseline for the unsaved-changes check
-    if(formClean) (async()=>{ await loadSettings(); await loadAccess(); savedBody=formSnapshot(); })();
+    if(formClean) (async()=>{ drawerReopening=true; try{ await loadSettings(); } finally{ drawerReopening=false; } await loadAccess(); savedBody=formSnapshot(); })();
     // Reopen where you left off - the tab, and the expanded Appearance section
     // with it, so a round trip back to (say) Chart customization is one click.
     activateTab(restoreDrawerPlace());
@@ -4523,7 +4512,7 @@ async function refreshStatus() {
     // claim (the fallback wording stays true either way) and refetch on the
     // next tab visit. The initial ''->server transition invalidates nothing -
     // a list fetched before it already had this run in the store.
-    if (hadRun){ autoCentreLastRun=false; serversLoaded=false; }
+    if (hadRun){ autoCentreLastRun=false; serversLoaded=false; fpAutoStale(); }
     if (wasLoaded) updateScopeNote();
   }
   if (!!s.bridged_container !== bridgedContainer){ bridgedContainer=!!s.bridged_container; refreshNetinfo(); }
@@ -6816,7 +6805,55 @@ $('netinfoRefresh').addEventListener('click', async () => {
 // browseLoc is where the LIST is centred (a searched place); a run never reads it.
 // They were one variable, so searching a city committed a scope nobody asked for.
 let browseLoc='', browseLabel='';
+// The last listing survives a reload: remembered in this browser (never on
+// the daemon - it is browsing, not a setting). A searched place is fetched
+// again, with today's pings, the first time the Ookla tab shows - one list
+// fetch, cheap. An Auto is a race (a list fetch per candidate city and a
+// round of pings at every racer, hundreds of requests and several seconds),
+// so its RESULT is remembered instead and shown again as it was while it is
+// under FP_AUTO_FRESH_MS old; older than that, or once a speedtest has run
+// since (the daemon raced again for it), the next showing races afresh.
+const LS_FIND='ooklaFind';
+const FP_AUTO_FRESH_MS=10*60*1000;
+let startOnAuto=false;   // the remembered listing was Auto: show or race it, do not fetch, when the tab first shows
+let fpAutoCache=null;    // {at, servers, winner, origins} - the last Auto result, as the daemon sent it
+try{ const f=JSON.parse(lsGet(LS_FIND)||'null');
+  if(f && f.auto && Array.isArray(f.servers)){ fpAutoCache={at:+f.at||0, servers:f.servers, winner:f.winner||null, origins:f.origins||[]}; startOnAuto=true; }
+  else if(f && /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(String(f.loc||''))){ browseLoc=String(f.loc); browseLabel=String(f.label||''); } }catch(e){}
+const rememberFind = () => lsSet(LS_FIND, fpListLabel==='Candidates' && fpAutoCache ? JSON.stringify({auto:true, at:fpAutoCache.at, servers:fpAutoCache.servers, winner:fpAutoCache.winner, origins:fpAutoCache.origins})
+  : browseLoc ? JSON.stringify({loc:browseLoc, label:browseLabel}) : '');
+const fpAutoFresh = () => !!(fpAutoCache && fpAutoCache.at && Date.now()-fpAutoCache.at < FP_AUTO_FRESH_MS);
+// fpAutoStale marks the remembered Auto as spent - a speedtest has run since,
+// so the daemon has raced again and the list should too, next time it shows.
+function fpAutoStale(){ fpPingsStale=true; if(fpAutoCache && fpAutoCache.at){ fpAutoCache.at=0; rememberFind(); } }
+// fpShowAutoCache puts the remembered Auto result back on the page without a
+// fetch: the same rows, pings, cities and centre the daemon sent.
+function fpShowAutoCache(){
+  const c=fpAutoCache; if(!c) return false;
+  fpListLabel='Candidates'; browseLoc=''; browseLabel='';
+  fpAutoCities=fpAutoCitiesOf(c.winner, c.origins);
+  autoDefaultLoc=shortPlace(c.winner&&c.winner.label||''); autoCentreLastRun=false;
+  const w=c.winner||{}; fpCentre=(typeof w.lat==='number' && typeof w.lon==='number' && (w.lat||w.lon)) ? {lat:w.lat, lon:w.lon} : null;
+  serversLoaded=true; serversScope='';
+  populateServers(c.servers);
+  return true;
+}
+// fpAutoCitiesOf names every city that raced, the winner first, each once (the
+// exit and a star in the same city are one entry to the race too).
+function fpAutoCitiesOf(winner, origins){
+  const seen=new Set(); const cities=[];
+  for(const o of [winner].concat(origins||[])){
+    const c = o && o.label && o.lat!=null ? shortPlace(o.label) : '';
+    const key = c.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+    if(!c || seen.has(key)) continue; seen.add(key); cities.push(c);
+  }
+  const win=shortPlace(winner&&winner.label||'');
+  return cities.length ? cities : (win ? [win] : []);
+}
 let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
+// drawerReopening: the settings refetch under way is a drawer REOPEN, so the
+// list you were looking at is fetched again rather than kept or replaced.
+let drawerReopening=false;
 // shortPlace is the city alone: the geocoder answers with a whole address
 // ("Toronto, Golden Horseshoe, Ontario, Canada"), and the second part is
 // whatever regional label it felt like adding.
@@ -6850,10 +6887,19 @@ const autoText = () => autoOptionText();
 // findBoxText is the Find box's placeholder: the prompt, plus the place the
 // list below is currently centred on when there is one - a searched city, a
 // saved scope, or where Auto last centred - so the box says what "here" is.
-const findBoxText = cur => 'Place or Ookla server ID' + (cur ? ` (Current: ${cur})` : '');
+// After Auto the list spans every city that raced, not one place, so the box
+// names them all - the winner first - rather than the winner alone.
+const findBoxText = (cur, autoCities) => {
+  if(autoCities && autoCities.length) return `Place or Ookla server ID (Auto: ${joinPlaces(autoCities)})`;
+  return 'Place or Ookla server ID' + (cur ? ` (Current: ${cur})` : '');
+};
+const joinPlaces = a => a.length<=1 ? a.join('') : a.slice(0,-1).join(', ')+' and '+a[a.length-1];
+// The cities the last Auto raced, winner first, for the Find box; emptied by
+// any other listing.
+let fpAutoCities=[];
 function updateScopeNote(){
   const el=$('serverLoc'), sel=$('setServer');
-  const box=$('serverCity'); if(box) box.placeholder = findBoxText(browseLabel||autoDefaultLoc);
+  const box=$('serverCity'); if(box) box.placeholder = findBoxText(browseLabel||autoDefaultLoc, fpListLabel==='Candidates' ? fpAutoCities : null);
   // Best of 3 keeps the chosen server and adds two companions. Those come from
   // around whatever the list is centred on - the pinned server when there is
   // one, the auto location otherwise - so say which, because "Using X." alone
@@ -6975,6 +7021,14 @@ async function fetchServers(opts){
     const d=await r.json();
     if(my!==serversGen) return;   // superseded while in flight: this answer is no longer the page's truth
     fpListLabel = opts.candidates ? 'Candidates' : 'Server';
+    fpAutoCities = [];
+    if(opts.candidates){
+      fpAutoCities = fpAutoCitiesOf(d.winner, d.origins);
+      // The result is what is remembered (see fpAutoCache): a reopen or reload
+      // inside FP_AUTO_FRESH_MS shows it again instead of racing.
+      fpAutoCache = {at:Date.now(), servers:d.servers||[], winner:d.winner||null, origins:d.origins||[]};
+      rememberFind();
+    }
     if(opts.id){
       // An ID typed in Find pins that server - unless the daemon's by-ID
       // probe says it has no speedtest endpoint: every transfer against it
@@ -6985,7 +7039,7 @@ async function fetchServers(opts){
       if(s && s.fallback_ok===false) fpRefusedID=String(opts.id);
       else pendingServer=String(opts.id); // pin a specific server
     }
-    else if(opts.city){ browseLoc=`${d.lat},${d.lon}`; browseLabel=shortPlace(d.location); } // a search moves the browse list; it commits nothing
+    else if(opts.city){ browseLoc=`${d.lat},${d.lon}`; browseLabel=shortPlace(d.location); rememberFind(); } // a search moves the browse list; it commits nothing - but it is remembered across a reload
     else if(opts.candidates){
       browseLoc=''; browseLabel=''; autoDefaultLoc=shortPlace(d.winner&&d.winner.label||''); autoCentreLastRun=false; // the race's own field: the winner's city is where a run now would centre
       // This IS the list for the centre now in effect, so a tab revisit or a
@@ -6994,7 +7048,13 @@ async function fetchServers(opts){
       // Distances are the daemon's, measured from the winning city for every
       // row (see RaceListing), so the column means one thing down the list.
     }
+    else if(opts.lat){ /* a refetch of the place last searched (a reopen): browseLoc/browseLabel stay as they are */ }
     else { autoDefaultLoc=shortPlace(d.location||''); autoCentreLastRun = d.centre==='last_run'; } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
+    // The centre the daemon measured this list's distances from: a searched
+    // or default list names its point; the Auto list, the winning city's.
+    // Set BEFORE the rows land, so the held row's distance is from this list.
+    const c = opts.candidates ? (d.winner||{}) : d;
+    fpCentre = (typeof c.lat==='number' && typeof c.lon==='number' && (c.lat||c.lon)) ? {lat:c.lat, lon:c.lon} : null;
     populateServers(d.servers);
     // Scoped to the newest request too: an abandoned one finishing must not clear
     // the spinner the live request is still showing.
@@ -7008,6 +7068,11 @@ async function loadServers(){
   // still reflects the saved server via applyPendingServer meanwhile.
   if(!serverTabSeen && !serverTabActive()){ applyPendingServer(); updateScopeNote(); return; }
   serverTabSeen=true;
+  fpLoadStoredPings();   // the kept rows' history pings, deferred to the first visit like the list
+  fpRefreshPingsIfStale({quiet:true});   // ... and their live pings, measured again when stale (see fpPingedAt)
+  // A remembered or reopened Auto: shown again from its result while that is
+  // fresh, raced again once it is stale - never a plain list fetch.
+  if(startOnAuto){ startOnAuto=false; if(fpAutoFresh() && fpShowAutoCache()) return; serversLoaded=true; serversScope=browseLoc; fpAutoList({fallback:true}); return; }
   // Keyed on the scope, not a bare flag: the list is only reusable if it was
   // fetched for the location currently in effect. Reopening the drawer restores
   // straight onto this tab while the settings refetch is still in flight, and an
@@ -7029,8 +7094,12 @@ let serverSearchInFlight=null, serverSearchFailed=false;
 // searchServers), so a Save that triggered that search can say so after the
 // drawer has closed over the footer.
 let serverPinUnverified='';
-// The ID the last search listed but refused to pin (no speedtest endpoint).
-let fpRefusedID='';
+// The ID the last search listed but refused to pin (no speedtest endpoint):
+// fpRefusedID hands it from fetchServers to the search that started it;
+// serverPinRefused holds it until Save has answered for it or the user moves
+// on, so a Save right after the refusal is blocked with the reason rather
+// than quietly saving whatever was pinned before (3c8fd65 pinned the typed ID).
+let fpRefusedID='', serverPinRefused='';
 // fpRefuse says why a server cannot be chosen, in the footer, owned like a
 // search error (serverErrShown) so typing, the next Find, a row click or
 // closing the drawer retire it. The design's rule: a silent no-op click is
@@ -7045,7 +7114,7 @@ async function searchServers(){
   btnBusy(b, true);
   const opts = /^\d+$/.test(q) ? {id:q} : {city:q};   // all-digits = pin an exact Ookla server ID
   const p=fetchServers(opts), myGen=serversGen;   // fetchServers takes its generation synchronously, so this names THIS request
-  serverSearchInFlight=p; serverSearchFailed=false;
+  serverSearchInFlight=p; serverSearchFailed=false; serverPinRefused='';
   // On success the query is consumed (the scope note carries it now) - clear the
   // box so Save's leftover-text re-search can't wipe a later dropdown pick, and
   // drop any error styling left by an earlier failed attempt.
@@ -7053,7 +7122,7 @@ async function searchServers(){
   // a newer request started) must not touch the box or paint "city not found" over
   // a page that has moved on - fetchServers already dropped its answer.
   try{ await p; if(myGen!==serversGen) return; $('serverCity').value=''; clearServerFieldError();
-    if(fpRefusedID){ fpRefuse(fpRefusedID); fpRefusedID=''; } }   // after the clear, or the clear would eat it
+    if(fpRefusedID){ serverPinRefused=fpRefusedID; fpRefuse(fpRefusedID); fpRefusedID=''; } }   // after the clear, or the clear would eat it
   catch(e){ if(myGen!==serversGen) return;
     if(opts.id && (e.status===502 || e.status===504 || e.status===undefined)){
       // The daemon answers 404 only when Ookla knows no such server; 502/504 -
@@ -7080,7 +7149,9 @@ async function searchServers(){
 function applyPendingServer(){
   const sel=$('setServer');
   if(pendingServer && ![...sel.options].some(o=>o.value===pendingServer)){
-    const o=document.createElement('option'); o.value=pendingServer; o.textContent='Server '+pendingServer;
+    const o=document.createElement('option'); o.value=pendingServer;
+    const k=fpKnown.get(String(pendingServer));
+    o.textContent = k && (k.sponsor||k.name) ? serverOptionText({sponsor:k.sponsor||'', name:k.name||'', country:k.country||''}) : 'Server '+pendingServer;
     annotateOption(o, pendingServer);   // keep a known-bad verdict on the synthesized row
     sel.appendChild(o);
     // Never seen this id: ask the daemon, which probes by ID, and re-annotate.
@@ -7100,7 +7171,7 @@ function applyPendingServer(){
             {method:'POST',headers:{'Content-Type':'application/json'}})
         .then(r=>r.ok?r.json():null)
         .then(d=>{ const s=d&&d.servers&&d.servers[0]; if(!s) return;
-          rememberServerHealth([s]); annotateOption(o, id); })
+          rememberServerHealth([s]); fpNote([s]); annotateOption(o, id); fpDraw(); })
         .catch(()=>{})
         .finally(()=>{ pr.inflight=false; });
     }
@@ -7150,6 +7221,39 @@ const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strok
 // verdict, and serverHealth is the only source for a kept server the current
 // browse page does not list.
 const fpUnsupported = id => serverHealth.get(String(id))===false;
+// fpKnown is what the picker has learned about each server it has seen, by
+// id: identity, the catalogue coordinate, and the last ping a listing carried.
+// The held row (a chosen server neither pane lists any more) is drawn from
+// it, so choosing a server and then searching elsewhere keeps its name, ping
+// and distance instead of degrading to "Server <id>" off the hidden select.
+// Distance is NOT kept: it is relative to whichever list it came from, so it
+// is re-measured from fpCentre, the centre of the list now showing.
+const fpKnown=new Map();
+let fpCentre=null;   // {lat,lon} of the list in the results pane, when the daemon named one
+function fpNote(list){
+  for(const s of (list||[])){
+    if(!s || s.id==null) continue;
+    const id=String(s.id), k=fpKnown.get(id)||{id};
+    // Non-empty wins, field by field: a sparse by-ID record must not blank a
+    // good name, and a listing without a ping must not erase the last one.
+    if(s.sponsor) k.sponsor=s.sponsor;
+    if(s.name) k.name=s.name;
+    if(s.country) k.country=s.country;
+    if(s.lat||s.lon){ k.lat=s.lat; k.lon=s.lon; }
+    if(s.ping>0) k.ping=s.ping;
+    fpKnown.set(id, k);
+  }
+}
+// fpKmFrom is a server's distance from the list's centre, from the coordinate
+// the picker knows for it; undefined when either side is unknown.
+function fpKmFrom(s){
+  if(!fpCentre || !s || !(s.lat||s.lon)) return undefined;
+  const R=6371, r=Math.PI/180, dLat=(s.lat-fpCentre.lat)*r, dLon=(s.lon-fpCentre.lon)*r;
+  const a=Math.sin(dLat/2)**2 + Math.cos(fpCentre.lat*r)*Math.cos(s.lat*r)*Math.sin(dLon/2)**2;
+  // Never exactly 0: that is the "no distance" reading. A server on the
+  // centre's own point is near ("<1 km"), not unknown.
+  return Math.max(2*R*Math.asin(Math.sqrt(a)), 0.01);
+}
 const fpKept = id => speedServers.some(s=>s.id===String(id));
 // fpPanes splits one browse page in two. A kept server appears once, in the
 // saved pane - listing it below as well is the same table printed twice - and it
@@ -7162,7 +7266,8 @@ function fpPanes(browse, saved, held){
   // median of what the daemon's runs measured (fpLoadStoredPings), which
   // pingSrc says so the column can show which.
   const kept=(saved||[]).map(s=>{ const b=seen.get(s.id)||{};
-    return {id:s.id, sponsor:s.sponsor||b.sponsor||'', name:s.name||b.name||'', km:b.km,
+    return {id:s.id, sponsor:s.sponsor||b.sponsor||'', name:s.name||b.name||'',
+      km:(b.km>0?b.km:fpKmFrom(s)),   // the listing's distance when it lists it, else measured from the centre
       ping:(b.ping>0?b.ping:s.ping), pingSrc:(b.ping>0?'':s.pingSrc)}; });
   const keep=new Set(kept.map(s=>s.id));
   const rest=(browse||[]).filter(b=>!keep.has(b.id));
@@ -7180,6 +7285,10 @@ function fpPanes(browse, saved, held){
 function fpHeldServer(){
   const sel=$('setServer'); if(!sel) return null;
   const id=sel.value; if(!id) return null;
+  // What the picker learned when the server was listed or chosen comes first:
+  // its name, its last ping, and its distance from the list now showing.
+  const k=fpKnown.get(String(id));
+  if(k && (k.sponsor||k.name)) return {id:id, sponsor:k.sponsor||'', name:k.name||'', ping:k.ping, km:fpKmFrom(k), held:true};
   const opt=sel.selectedOptions && sel.selectedOptions[0];
   const txt=(opt && opt.textContent || '').trim();
   // serverOptionText renders "Sponsor - City, Country (N km)"; keep the halves it
@@ -7287,6 +7396,7 @@ function fpDraw(){
 function fpAdopt(list){
   fpBrowse=(list||[]).map(s=>({id:String(s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'',
     km:s.distance_km, ping:s.ping_ms, lat:s.lat||0, lon:s.lon||0}));
+  fpNote(fpBrowse);
   fpDraw();
 }
 // fpAdoptSaved takes the kept list from a settings load or from Reset. Both go
@@ -7297,18 +7407,25 @@ function fpAdoptSaved(list){
   speedServers=(Array.isArray(list)?list:[])
     .map(s=>({id:String(s.id==null?'':s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'', lat:s.lat||0, lon:s.lon||0}))
     .filter(s=>s.id).slice(0, FP_MAX);
+  fpNote(speedServers);
   fpDraw();
   fpLoadStoredPings();
 }
 // fpLoadStoredPings fills the kept rows' pings from the daemon's history (the
 // median of each server's recent ranking pings), marked so the column can say
 // so. A row that already has a fresh measurement keeps it.
-let fpStoredGen=0;
+let fpStoredGen=0, fpStoredFor='';
 async function fpLoadStoredPings(){
+  // Deferred like the server list itself: most page loads never open the
+  // Ookla tab, and this is a request per settings load, save, reset and
+  // import otherwise. Skipped when the kept list is the one last answered.
+  if(!serverTabSeen && !serverTabActive()) return;
   const ids=speedServers.map(s=>s.id); if(!ids.length) return;
+  const key=ids.join(','); if(key===fpStoredFor) return;
   const my=++fpStoredGen;
   let d; try{ const r=await fetch('api/speed/server-pings?ids='+encodeURIComponent(ids.join(','))); if(!r.ok) return; d=await r.json(); }catch(e){ return; }
   if(my!==fpStoredGen) return;
+  fpStoredFor=key;
   const p=(d&&d.pings)||{}; let changed=false;
   for(const s of speedServers){ if(s.pingSrc==='live') continue; const ms=p[s.id]; if(ms>0){ s.ping=ms; s.pingSrc='history'; changed=true; } }
   if(changed) fpDraw();
@@ -7317,7 +7434,20 @@ async function fpLoadStoredPings(){
 // refresh): the daemon resolves each by ID and pings it the way the race
 // pings, no transfer. 409 while a test runs - a ping through a transfer
 // measures the transfer.
-async function fpRefreshPings(){
+// fpPingedAt / fpPingsStale: when the kept servers were last measured live,
+// and whether a speedtest has run since (the link may have changed under
+// them). fpRefreshPingsIfStale is what a reopen and the tab's first visit
+// call: measure again unless the last measurement is under FP_AUTO_FRESH_MS
+// old and still current - the same rule the Auto candidates follow.
+let fpPingedAt=0, fpPingsStale=false;
+function fpRefreshPingsIfStale(opts){
+  if(!speedServers.length || fpPinging) return;
+  if(fpPingedAt && !fpPingsStale && Date.now()-fpPingedAt < FP_AUTO_FRESH_MS) return;
+  fpRefreshPings(opts);
+}
+// opts.quiet: started by the page rather than a click - a failure is not the
+// user's news, so the footer stays as it was (the history medians remain).
+async function fpRefreshPings(opts){
   if(fpPinging) return;
   const ids=speedServers.map(s=>s.id); if(!ids.length) return;
   fpPinging=true; fpDraw();
@@ -7336,8 +7466,10 @@ async function fpRefreshPings(){
       // The listing's copy of this server would otherwise outrank the fresh
       // measurement in fpPanes; make it agree, so a later Find/Auto still wins.
       const b=fpBrowse.find(x=>x.id===s.id); if(b) b.ping = ms>0 ? ms : 0; }
+    fpPingedAt=Date.now(); fpPingsStale=false;
   }catch(e){
-    $('settingsMsg').textContent = e&&e.status===409 ? 'A speedtest is running - try again when it finishes.' : 'Could not measure your servers.';
+    if(!(opts && opts.quiet))
+      $('settingsMsg').textContent = e&&e.status===409 ? 'A speedtest is running - try again when it finishes.' : 'Could not measure your servers.';
   }finally{ fpPinging=false; fpDraw(); }
 }
 function fpToggleStar(id){
@@ -7359,6 +7491,7 @@ function fpChoose(id){
   if(id==null) return;
   if(fpUnsupported(id) && $('setServer').value!==id){ fpRefuse(id); return; }
   if(!serverSearchFailed) clearServerFieldError();   // retire an unverified-pin notice; a failed search's error stays until its box is fixed
+  serverPinRefused='';   // a row picked on purpose supersedes the refused typed ID
   pendingServer=id;
   applyPendingServer();   // synthesizes the option for a pin outside this browse page
   updateScopeNote();
@@ -7379,13 +7512,23 @@ $('serverRow').addEventListener('click', fpClick);
 // Auto shows the candidates a run would race right now: every origin's pool,
 // deduplicated and pinged, fastest first. It is a listing button: it does not
 // touch which server is chosen, and it runs no transfer.
-function fpAutoList(){
+// opts.fallback: this race was started by the page (a stale remembered Auto
+// on load or reopen), not by a click - if it cannot run (a speedtest in
+// flight, Ookla unreachable) the remembered result is shown as it was rather
+// than an empty pane: minutes-old candidates beat none.
+function fpAutoList(opts){
   const b=$('serverAuto'); if(b.disabled) return;
   $('serverCity').value=''; clearServerFieldError();
   btnBusy(b, true);
   const p=fetchServers({candidates:true}), myGen=serversGen;   // fetchServers takes its generation synchronously
   return p.catch(e=>{
     if(myGen!==serversGen) return;   // superseded by a Find or a reload: its failure is not the page's news
+    if(opts && opts.fallback){
+      // Started by the page, not a click: the remembered result stands in,
+      // and with none to stand in the default list does - never an empty pane.
+      if(fpAutoCache && fpShowAutoCache()) return;
+      serversLoaded=false; loadServers(); return;
+    }
     // Owned like a search error (serverErrShown), so typing, the next Find, a
     // row click or closing the drawer retire it - but no red outline: the box
     // is empty and there is nothing to fix.
@@ -7415,8 +7558,6 @@ const FIELDS=[
   ['setIperfDur','iperf_duration','int',5],
   ['setIperfStreams','iperf_streams','int',8],  // blank falls back to the shipping default (config.go IperfStreams), not the minimum
   ['setOoklaConnections','ookla_connections','int',0],
-  ['setSpeedChallengeEvery','speed_challenge_every','int',12],
-  ['setSpeedChallengeMargin','speed_challenge_margin','int',15],
   ['setOoklaLoss','ookla_loss','bool'],
   ['setSpeedBestOf','speed_best_of','bool'],
   ['setIperfWindow','iperf_window','int',0],
@@ -7613,7 +7754,17 @@ function applySettings(s){
   if(s.min_speed_seconds){ $('setSpeed').min=Math.max(1,Math.round(s.min_speed_seconds/60)); }
   if(s.max_speed_seconds){ $('setSpeed').max=Math.round(s.max_speed_seconds/60); }
   pendingServer=s.speed_server_id||'';
-  browseLoc=''; browseLabel=''; loadServers();
+  // The list you were looking at survives a settings load - a Find or an Auto
+  // is browsing, not a setting, so a Save must not replace it. On a REOPEN it
+  // is fetched again: the same place with today's pings, or the same race run
+  // again (when the Ookla tab is the one reopening; otherwise the default list
+  // on the next visit). A first load starts on the default list. Reset to
+  // defaults is the one act that puts the default list back on purpose.
+  if(drawerReopening && !$('serverAuto').disabled){   // a race already in flight for this list is the refresh; a fetch now would supersede it
+    serversLoaded=false;
+    if(fpListLabel==='Candidates') startOnAuto=true;   // loadServers shows or races instead of fetching, once the tab shows
+  }
+  loadServers();
   // After loadServers, which restores the pin onto #setServer - the radio is drawn
   // from that. The saved pane draws whether or not the browse fetch ever runs; it
   // is deferred until the tab is first opened.
@@ -8358,6 +8509,10 @@ function saveFailed(text){
   // hide. Taken now, said after the close (below) - only if that ID is still
   // what was saved.
   const unverified=serverPinUnverified; serverPinUnverified='';
+  // A typed ID the search refused to pin (no speedtest endpoint) must not save
+  // around silently: the drawer would close on the old pin and report success.
+  if(serverPinRefused){ const id=serverPinRefused; serverPinRefused='';
+    saveFailed(serverErrShown || ('Server '+id+' has no speedtest endpoint - every test against it would fail, so it cannot be chosen. Pick another server or clear the box before saving.')); return; }
   // Don't save the old scope under a failed search - but an emptied box means the
   // user gave up on that query (Auto location's programmatic clear included), so it
   // no longer blocks. The failed text is kept in the box, so "fix" is followable.
@@ -8469,7 +8624,7 @@ $('resetSettings').addEventListener('click', () => {
   // greying by hand - otherwise the latency/speedtest sub-controls keep the
   // pre-reset disabled/grey state (busyDeferSupported is a host capability, unchanged).
   syncLatencyDeps(); syncSpeedDeps();
-  pendingServer=''; serversLoaded=false; loadServers();
+  pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind(); serversLoaded=false; loadServers();   // back to the default list: a reset starts over
   fpAdoptSaved(d.speed_servers);   // the kept list rides outside FIELDS, like the iperf3 one below
   $('serverCity').value=''; clearServerFieldError(); // else leftover text re-searches on Save and overrides the reset to Auto
   updateAutoLocUI();

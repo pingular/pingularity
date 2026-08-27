@@ -2323,7 +2323,15 @@ func originDTO(o *speedtest.Origin) map[string]any {
 	if o == nil {
 		return nil
 	}
-	return map[string]any{"kind": o.Kind, "label": o.Label}
+	m := map[string]any{"kind": o.Kind, "label": o.Label}
+	// The coordinate rides along for an anchored origin so the picker can
+	// measure a held row's distance from the centre now in effect (the
+	// candidates' own distances are from this point); an unanchored origin has
+	// none and sends none.
+	if o.Anchored {
+		m["lat"], m["lon"] = o.Lat, o.Lon
+	}
+	return m
 }
 
 func originsDTO(in []speedtest.Origin) []map[string]any {
@@ -2523,26 +2531,25 @@ type settingsDTO struct {
 	IperfDur         *int             `json:"iperf_duration"`
 	IperfStreams     *int             `json:"iperf_streams"`
 	OoklaConnections *int             `json:"ookla_connections"`
-	// Ookla auto-select challenger: after every N automatic tests the next
-	// scheduled test measures the strongest rival instead of the incumbent,
-	// which takes the seat only if it beats the incumbent's recent record by
-	// this percent (0 = never).
-	SpeedChallengeEvery  *int    `json:"speed_challenge_every"`
-	SpeedChallengeMargin *int    `json:"speed_challenge_margin"`
-	OoklaLoss            *bool   `json:"ookla_loss"`
-	SpeedBestOf          *bool   `json:"speed_best_of"`
-	IperfOmit            *int    `json:"iperf_omit"`
-	SpeedDirection       *string `json:"speed_direction"`
-	IperfDirection       *string `json:"iperf_direction"`
-	IperfUDP             *bool   `json:"iperf_udp"`
-	IperfUDPRate         *int    `json:"iperf_udp_rate"`
-	IperfWindow          *int    `json:"iperf_window"`
-	SpeedRetries         *int    `json:"speed_retries"`
-	IperfRetries         *int    `json:"iperf_retries"`
-	IperfCongestion      *string `json:"iperf_congestion"`
-	IperfNoDelay         *bool   `json:"iperf_nodelay"`
-	IperfDSCP            *string `json:"iperf_dscp"`
-	IperfMSS             *int    `json:"iperf_mss"`
+	// Ookla auto-select challenger cadence: after every N automatic tests the
+	// next scheduled test measures the strongest rival instead of the
+	// incumbent (0 = never). API-only - no row in the settings drawer; the
+	// bar the rival must clear is derived from the incumbent's own record.
+	SpeedChallengeEvery *int    `json:"speed_challenge_every"`
+	OoklaLoss           *bool   `json:"ookla_loss"`
+	SpeedBestOf         *bool   `json:"speed_best_of"`
+	IperfOmit           *int    `json:"iperf_omit"`
+	SpeedDirection      *string `json:"speed_direction"`
+	IperfDirection      *string `json:"iperf_direction"`
+	IperfUDP            *bool   `json:"iperf_udp"`
+	IperfUDPRate        *int    `json:"iperf_udp_rate"`
+	IperfWindow         *int    `json:"iperf_window"`
+	SpeedRetries        *int    `json:"speed_retries"`
+	IperfRetries        *int    `json:"iperf_retries"`
+	IperfCongestion     *string `json:"iperf_congestion"`
+	IperfNoDelay        *bool   `json:"iperf_nodelay"`
+	IperfDSCP           *string `json:"iperf_dscp"`
+	IperfMSS            *int    `json:"iperf_mss"`
 
 	// The saved Ookla picker list, following the same nil/[] rule as the iperf3
 	// one above. settings.SavedServer holds nothing secret, so it IS the wire
@@ -2635,7 +2642,6 @@ func dtoFrom(v settings.Values) settingsDTO {
 		IperfStreams:             ptr(v.IperfStreams),
 		OoklaConnections:         ptr(v.OoklaConnections),
 		SpeedChallengeEvery:      ptr(v.SpeedChallengeEvery),
-		SpeedChallengeMargin:     ptr(v.SpeedChallengeMargin),
 		OoklaLoss:                ptr(v.OoklaLoss),
 		SpeedBestOf:              ptr(v.SpeedBestOf),
 		IperfOmit:                ptr(v.IperfOmit),
@@ -2955,49 +2961,48 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			// generic settings POST must not be able to flip it back to false and
 			// reopen Quick Setup (or re-freeze defaults through it). The GET
 			// response still reports it for the client's read.
-			ExitTarget:           in.ExitTarget,
-			SpeedtestAdaptive:    in.SpeedtestAdaptive,
-			SpeedtestOnDegraded:  in.SpeedtestOnDegraded,
-			DegradedPingMS:       in.DegradedPingMS,
-			SpeedtestSkipBusy:    in.SpeedtestSkipBusy,
-			SpeedBusyMbps:        in.SpeedBusyMbps,
-			SpeedEngine:          in.SpeedEngine,
-			IperfServer:          in.IperfServer,
-			IperfDur:             in.IperfDur,
-			IperfStreams:         in.IperfStreams,
-			OoklaConnections:     in.OoklaConnections,
-			SpeedChallengeEvery:  in.SpeedChallengeEvery,
-			SpeedChallengeMargin: in.SpeedChallengeMargin,
-			OoklaLoss:            in.OoklaLoss,
-			SpeedBestOf:          in.SpeedBestOf,
-			IperfOmit:            in.IperfOmit,
-			SpeedDirection:       in.SpeedDirection,
-			IperfDirection:       in.IperfDirection,
-			IperfUDP:             in.IperfUDP,
-			IperfUDPRate:         in.IperfUDPRate,
-			IperfWindow:          in.IperfWindow,
-			SpeedRetries:         in.SpeedRetries,
-			IperfRetries:         in.IperfRetries,
-			IperfCongestion:      in.IperfCongestion,
-			IperfNoDelay:         in.IperfNoDelay,
-			IperfDSCP:            in.IperfDSCP,
-			IperfMSS:             in.IperfMSS,
-			ThreshDownMbps:       in.ThreshDownMbps,
-			ThreshUpMbps:         in.ThreshUpMbps,
-			ThreshPingMS:         in.ThreshPingMS,
-			ThreshJitterMS:       in.ThreshJitterMS,
-			ThreshLossPct:        in.ThreshLossPct,
-			ThreshConsec:         in.ThreshConsec,
-			ThreshBloatDownMS:    in.ThreshBloatDownMS,
-			ThreshBloatUpMS:      in.ThreshBloatUpMS,
-			AlertOnOutage:        in.AlertOnOutage,
-			WebhookURL:           in.WebhookURL,
-			HeartbeatURL:         in.HeartbeatURL,
-			DigestFreq:           in.DigestFreq,
-			SchedLatEnabled:      in.SchedLatEnabled,
-			SchedLatWindows:      in.SchedLatWindows,
-			SchedSpeedEnabled:    in.SchedSpeedEnabled,
-			SchedSpeedWindows:    in.SchedSpeedWindows,
+			ExitTarget:          in.ExitTarget,
+			SpeedtestAdaptive:   in.SpeedtestAdaptive,
+			SpeedtestOnDegraded: in.SpeedtestOnDegraded,
+			DegradedPingMS:      in.DegradedPingMS,
+			SpeedtestSkipBusy:   in.SpeedtestSkipBusy,
+			SpeedBusyMbps:       in.SpeedBusyMbps,
+			SpeedEngine:         in.SpeedEngine,
+			IperfServer:         in.IperfServer,
+			IperfDur:            in.IperfDur,
+			IperfStreams:        in.IperfStreams,
+			OoklaConnections:    in.OoklaConnections,
+			SpeedChallengeEvery: in.SpeedChallengeEvery,
+			OoklaLoss:           in.OoklaLoss,
+			SpeedBestOf:         in.SpeedBestOf,
+			IperfOmit:           in.IperfOmit,
+			SpeedDirection:      in.SpeedDirection,
+			IperfDirection:      in.IperfDirection,
+			IperfUDP:            in.IperfUDP,
+			IperfUDPRate:        in.IperfUDPRate,
+			IperfWindow:         in.IperfWindow,
+			SpeedRetries:        in.SpeedRetries,
+			IperfRetries:        in.IperfRetries,
+			IperfCongestion:     in.IperfCongestion,
+			IperfNoDelay:        in.IperfNoDelay,
+			IperfDSCP:           in.IperfDSCP,
+			IperfMSS:            in.IperfMSS,
+			ThreshDownMbps:      in.ThreshDownMbps,
+			ThreshUpMbps:        in.ThreshUpMbps,
+			ThreshPingMS:        in.ThreshPingMS,
+			ThreshJitterMS:      in.ThreshJitterMS,
+			ThreshLossPct:       in.ThreshLossPct,
+			ThreshConsec:        in.ThreshConsec,
+			ThreshBloatDownMS:   in.ThreshBloatDownMS,
+			ThreshBloatUpMS:     in.ThreshBloatUpMS,
+			AlertOnOutage:       in.AlertOnOutage,
+			WebhookURL:          in.WebhookURL,
+			HeartbeatURL:        in.HeartbeatURL,
+			DigestFreq:          in.DigestFreq,
+			SchedLatEnabled:     in.SchedLatEnabled,
+			SchedLatWindows:     in.SchedLatWindows,
+			SchedSpeedEnabled:   in.SchedSpeedEnabled,
+			SchedSpeedWindows:   in.SchedSpeedWindows,
 		}
 		if in.IperfServers != nil { // nil = keep the saved list (and its passwords)
 			pat.IperfServers = iperfServersFromDTO(in.IperfServers) // blank pw kept by Update

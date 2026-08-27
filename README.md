@@ -940,18 +940,22 @@ that has gone bad loses its seat the run it goes bad, because the seat is
 re-pinged every run rather than remembered - and an incumbent the winning
 city's list does not carry is not pinged at all, and loses the seat the same
 way. Ping alone
-never learns whether a rival is *faster* to transfer, so after every N
-automatic tests (**Challenge every**, default 12; 0 = never - any unpinned
-Ookla run counts, and the challenge itself lands on the next *scheduled*
-single-server run; with **Best of 3** on no challenge run ever happens, because
-every round already measures rivals, so both Challenge settings do nothing
-until Best of 3 is off)
-the run measures the incumbent's strongest rival instead - one server, no
-extra data - and the rival takes the seat only if its score beats the median
-of the incumbent's last dozen same-direction runs by **Challenger must beat
-by** (default 15 %; a fresh seat needs three runs of record before it is
-challenged at all, and changing the test direction starts that record
-afresh). If the rival cannot be measured the incumbent is measured as the
+never learns whether a rival is *faster* to transfer, so after every twelve
+automatic tests (any unpinned Ookla run counts; the challenge itself lands on
+the next *scheduled* single-server run, and with **Best of 3** on it never
+does, because every round already measures rivals) the run measures the
+incumbent's strongest rival instead - one server, no extra data - and the
+rival takes the seat only if its one score clears a bar set by the
+incumbent's own last dozen same-direction runs: their median plus 15 %, or
+their second-best hour if that is higher. So on a steady wired line the rival
+needs a clear 15 % win; on a link whose runs swing by a fifth it has to beat
+what the incumbent itself reaches on a good hour, or one lucky hour would
+steal the seat and the next challenge would steal it back - nobody has to
+know their link's noise as a number, the record already says it. A fresh seat
+needs three runs of record before it is challenged at all, and changing the
+test direction starts that record afresh. There is nothing to set: the
+cadence is `speed_challenge_every` on the settings API (default 12; 0 turns
+the challenger off) and is deliberately not in the drawer. If the rival cannot be measured the incumbent is measured as the
 fallback and the attempt still counts. Win reasons `challenger` (tried,
 lost), `challenger_won` and `challenger_failed` record it; the
 `speed.challenge` / `speed.challenge_won` / `speed.challenge_failed` counters
@@ -1208,11 +1212,15 @@ and persist across restarts:
   bound like the data-used figure itself - and it counts neither the extra
   triggers nor this faster cadence.
 - **Ookla** → the Ookla server picker (kept servers, Find by place or ID, Auto
-  to preview what a run would race), test direction, retries, parallel
-  connections, the packet-loss probe; **Challenge every** / **Challenger must
-  beat by** let a rival server take the seat now and then without extra data
-  (single-server Auto runs only - with Best of 3 on they do nothing; see
-  *Choosing an Ookla server*). The engine itself (**Ookla** or
+  to preview what a run would race - the list you were looking at comes back
+  when you reopen the drawer or reload the page: a searched place fetched
+  fresh, the Auto candidates as last raced while that is under ten minutes old
+  and no speedtest has run since, raced again otherwise - and your kept
+  servers' pings are measured again on the same ten-minute rule; Save leaves
+  it all alone and Reset to defaults starts over), test direction, retries, parallel
+  connections, the packet-loss probe. (The automatic challenger that lets a
+  rival server take the seat now and then has no knob here - see *Choosing an
+  Ookla server*.) The engine itself (**Ookla** or
   **iperf3**) is chosen on the Speedtest tab; iperf3's servers and per-test
   options live on their own **iperf3** tab. **Best of 3 servers** (Ookla only, off by default) tests your chosen
   server plus the two fastest by ping *near it* - the search is centred on the

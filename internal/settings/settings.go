@@ -107,10 +107,11 @@ const (
 	keySpeedBestOf      = "speed_best_of"     // Ookla: race 3 servers, keep the best result
 	// Ookla auto-select: after every N automatic (unpinned) tests, the next
 	// scheduled test measures the incumbent's strongest rival instead of the
-	// incumbent (0 = never), and the rival takes the seat only if it beats the
-	// incumbent's recent record by this margin (%).
-	keySpeedChallengeEvery  = "speed_challenge_every"
-	keySpeedChallengeMargin = "speed_challenge_margin"
+	// incumbent (0 = never); the rival takes the seat only by beating a bar
+	// derived from the incumbent's own record. Stored and reachable through
+	// the API, not shown in the UI: the feature is meant to just work, and the
+	// runs table's "challenger" tag is how it shows.
+	keySpeedChallengeEvery = "speed_challenge_every"
 	// Per-server network path + RSA auth (bind, ipver, auth, username, password, rsa
 	// key) live inside each IperfTarget, serialized in keyIperfServers - not as their
 	// own keys - so they're scoped to the server they belong to.
@@ -158,13 +159,12 @@ const (
 
 	MaxOoklaConnections = 16 // ceiling for Ookla parallel connections; 0 = library default
 	// MaxSpeedChallengeEvery bounds the challenge cadence (tests between
-	// challenges); MaxSpeedChallengeMargin the bar a challenger must clear (%).
-	MaxSpeedChallengeEvery  = 1000
-	MaxSpeedChallengeMargin = 100
-	MaxIperfOmit            = 5
-	MaxIperfWindow          = 65536 // KB (64 MB) ceiling for -w; 0 = auto
-	MaxSpeedRetries         = 3     // ceiling for per-direction retries; 0 = no retry
-	MaxIperfMSS             = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
+	// challenges).
+	MaxSpeedChallengeEvery = 1000
+	MaxIperfOmit           = 5
+	MaxIperfWindow         = 65536 // KB (64 MB) ceiling for -w; 0 = auto
+	MaxSpeedRetries        = 3     // ceiling for per-direction retries; 0 = no retry
+	MaxIperfMSS            = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
 )
 
 // AllDays selects every weekday (the schedule default).
@@ -403,12 +403,11 @@ type Values struct {
 	// SpeedChallengeEvery: an automatic Ookla run keeps measuring the same
 	// server while it pings within noise of the fastest (the incumbent), which
 	// never measures a rival's throughput. After this many automatic tests the
-	// next scheduled run measures the strongest rival instead, and the rival takes the seat
-	// only if its score beats the incumbent's recent median by
-	// SpeedChallengeMargin percent. 0 = never challenge. Same data as an
-	// ordinary test: one server is measured either way.
-	SpeedChallengeEvery  int
-	SpeedChallengeMargin int
+	// next scheduled run measures the strongest rival instead, and the rival
+	// takes the seat only if its score beats a bar derived from the
+	// incumbent's recent record (speedtest.challengeWon). 0 = never challenge.
+	// Same data as an ordinary test: one server is measured either way.
+	SpeedChallengeEvery int
 	// OoklaLoss gates Ookla's packet-loss probe - a few extra seconds of UDP after
 	// the transfers. The Ookla analogue of IperfUDP (which also measures jitter;
 	// Ookla gets jitter from its ping phase, so this only adds loss).
@@ -901,9 +900,6 @@ func overlay(v Values, m map[string]string) Values {
 	if n, ok := atoi(m[keySpeedChallengeEvery]); ok {
 		v.SpeedChallengeEvery = n
 	}
-	if n, ok := atoi(m[keySpeedChallengeMargin]); ok {
-		v.SpeedChallengeMargin = n
-	}
 	if b, ok := pbool(m[keyOoklaLoss]); ok {
 		v.OoklaLoss = b
 	}
@@ -1115,7 +1111,6 @@ func (c *Controller) IperfDur() int              { return c.get().IperfDur }
 func (c *Controller) IperfStreams() int          { return c.get().IperfStreams }
 func (c *Controller) OoklaConnections() int      { return c.get().OoklaConnections }
 func (c *Controller) SpeedChallengeEvery() int   { return c.get().SpeedChallengeEvery }
-func (c *Controller) SpeedChallengeMargin() int  { return c.get().SpeedChallengeMargin }
 func (c *Controller) OoklaLoss() bool            { return c.get().OoklaLoss }
 func (c *Controller) SpeedBestOf() bool          { return c.get().SpeedBestOf }
 
@@ -1367,7 +1362,6 @@ type Patch struct {
 	IperfStreams         *int
 	OoklaConnections     *int
 	SpeedChallengeEvery  *int
-	SpeedChallengeMargin *int
 	OoklaLoss            *bool
 	SpeedBestOf          *bool
 	IperfOmit            *int
@@ -1436,7 +1430,6 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.IperfStreams, p.IperfStreams)
 	setIf(&v.OoklaConnections, p.OoklaConnections)
 	setIf(&v.SpeedChallengeEvery, p.SpeedChallengeEvery)
-	setIf(&v.SpeedChallengeMargin, p.SpeedChallengeMargin)
 	setIf(&v.OoklaLoss, p.OoklaLoss)
 	setIf(&v.SpeedBestOf, p.SpeedBestOf)
 	setIf(&v.IperfOmit, p.IperfOmit)
@@ -1522,7 +1515,6 @@ func (p Patch) keys() map[string]bool {
 	mark(p.IperfStreams != nil, keyIperfStreams)
 	mark(p.OoklaConnections != nil, keyOoklaConnections)
 	mark(p.SpeedChallengeEvery != nil, keySpeedChallengeEvery)
-	mark(p.SpeedChallengeMargin != nil, keySpeedChallengeMargin)
 	mark(p.OoklaLoss != nil, keyOoklaLoss)
 	mark(p.SpeedBestOf != nil, keySpeedBestOf)
 	mark(p.IperfOmit != nil, keyIperfOmit)
@@ -1649,68 +1641,67 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 // key/value pairs.
 func formKeys(v Values) map[string]string {
 	return map[string]string{
-		keyLatency:              sec(v.Latency),
-		keyLatencyEnabled:       b2s(v.LatencyEnabled),
-		keyDNSProbe:             b2s(v.DNSProbe),
-		keyNetinfo:              b2s(v.NetinfoEnabled),
-		keySpeed:                sec(v.Speed),
-		keyRetention:            sec(v.Retention),
-		keySpeedRet:             sec(v.SpeedRetention),
-		keyDowntimeRet:          sec(v.DowntimeRetention),
-		keyTimeout:              sec(v.Timeout),
-		keyDownAfter:            strconv.Itoa(v.DownAfter),
-		keyUpAfter:              strconv.Itoa(v.UpAfter),
-		keySpeedServer:          v.SpeedServerID,
-		keySpeedServers:         speedServersJSON(v.SpeedServers),
-		keySpeedEnabled:         b2s(v.SpeedtestEnabled),
-		keySpeedOnRecon:         b2s(v.SpeedtestOnReconnect),
-		keyIPv6Mode:             v.IPv6Mode,
-		keyExitTarget:           v.ExitTarget,
-		keyThreshDown:           f2s(v.ThreshDownMbps),
-		keyThreshUp:             f2s(v.ThreshUpMbps),
-		keyThreshPing:           f2s(v.ThreshPingMS),
-		keyThreshJitter:         f2s(v.ThreshJitterMS),
-		keyThreshLoss:           f2s(v.ThreshLossPct),
-		keyThreshConsec:         strconv.Itoa(v.ThreshConsec),
-		keyThreshBloatDown:      f2s(v.ThreshBloatDownMS),
-		keyThreshBloatUp:        f2s(v.ThreshBloatUpMS),
-		keySpeedAdaptive:        b2s(v.SpeedtestAdaptive),
-		keySpeedOnDegraded:      b2s(v.SpeedtestOnDegraded),
-		keyDegradedPingMS:       f2s(v.DegradedPingMS),
-		keySpeedSkipBusy:        b2s(v.SpeedtestSkipBusy),
-		keySpeedBusyMbps:        f2s(v.SpeedBusyMbps),
-		keySpeedEngine:          v.SpeedEngine,
-		keyIperfServer:          v.IperfServer,
-		keyIperfServers:         iperfServersJSON(v.IperfServers),
-		keyIperfDur:             strconv.Itoa(v.IperfDur),
-		keyIperfStreams:         strconv.Itoa(v.IperfStreams),
-		keyOoklaConnections:     strconv.Itoa(v.OoklaConnections),
-		keySpeedChallengeEvery:  strconv.Itoa(v.SpeedChallengeEvery),
-		keySpeedChallengeMargin: strconv.Itoa(v.SpeedChallengeMargin),
-		keyOoklaLoss:            b2s(v.OoklaLoss),
-		keySpeedBestOf:          b2s(v.SpeedBestOf),
-		keyIperfOmit:            strconv.Itoa(v.IperfOmit),
-		keySpeedDirection:       v.SpeedDirection,
-		keyIperfDirection:       v.IperfDirection,
-		keyIperfUDP:             b2s(v.IperfUDP),
-		keyIperfUDPRate:         strconv.Itoa(v.IperfUDPRate),
-		keyIperfWindow:          strconv.Itoa(v.IperfWindow),
-		keySpeedRetries:         strconv.Itoa(v.SpeedRetries),
-		keyIperfRetries:         strconv.Itoa(v.IperfRetries),
-		keyIperfCongest:         v.IperfCongestion,
-		keyIperfNoDelay:         b2s(v.IperfNoDelay),
-		keyIperfDSCP:            v.IperfDSCP,
-		keyIperfMSS:             strconv.Itoa(v.IperfMSS),
-		keyAlertOnOutage:        b2s(v.AlertOnOutage),
-		keyWebhookURL:           v.WebhookURL,
-		keyWebhookFormat:        v.WebhookFormat,
-		keyHeartbeatURL:         v.HeartbeatURL,
-		keyDigestFreq:           v.DigestFreq,
-		keySchedLatEnabled:      b2s(v.SchedLatEnabled),
-		keySchedLatWindows:      windowsJSON(v.SchedLatWindows),
-		keySchedSpeedEnabled:    b2s(v.SchedSpeedEnabled),
-		keySchedSpeedWindows:    windowsJSON(v.SchedSpeedWindows),
-		keyQuickSetup:           b2s(v.QuickSetupDone),
+		keyLatency:             sec(v.Latency),
+		keyLatencyEnabled:      b2s(v.LatencyEnabled),
+		keyDNSProbe:            b2s(v.DNSProbe),
+		keyNetinfo:             b2s(v.NetinfoEnabled),
+		keySpeed:               sec(v.Speed),
+		keyRetention:           sec(v.Retention),
+		keySpeedRet:            sec(v.SpeedRetention),
+		keyDowntimeRet:         sec(v.DowntimeRetention),
+		keyTimeout:             sec(v.Timeout),
+		keyDownAfter:           strconv.Itoa(v.DownAfter),
+		keyUpAfter:             strconv.Itoa(v.UpAfter),
+		keySpeedServer:         v.SpeedServerID,
+		keySpeedServers:        speedServersJSON(v.SpeedServers),
+		keySpeedEnabled:        b2s(v.SpeedtestEnabled),
+		keySpeedOnRecon:        b2s(v.SpeedtestOnReconnect),
+		keyIPv6Mode:            v.IPv6Mode,
+		keyExitTarget:          v.ExitTarget,
+		keyThreshDown:          f2s(v.ThreshDownMbps),
+		keyThreshUp:            f2s(v.ThreshUpMbps),
+		keyThreshPing:          f2s(v.ThreshPingMS),
+		keyThreshJitter:        f2s(v.ThreshJitterMS),
+		keyThreshLoss:          f2s(v.ThreshLossPct),
+		keyThreshConsec:        strconv.Itoa(v.ThreshConsec),
+		keyThreshBloatDown:     f2s(v.ThreshBloatDownMS),
+		keyThreshBloatUp:       f2s(v.ThreshBloatUpMS),
+		keySpeedAdaptive:       b2s(v.SpeedtestAdaptive),
+		keySpeedOnDegraded:     b2s(v.SpeedtestOnDegraded),
+		keyDegradedPingMS:      f2s(v.DegradedPingMS),
+		keySpeedSkipBusy:       b2s(v.SpeedtestSkipBusy),
+		keySpeedBusyMbps:       f2s(v.SpeedBusyMbps),
+		keySpeedEngine:         v.SpeedEngine,
+		keyIperfServer:         v.IperfServer,
+		keyIperfServers:        iperfServersJSON(v.IperfServers),
+		keyIperfDur:            strconv.Itoa(v.IperfDur),
+		keyIperfStreams:        strconv.Itoa(v.IperfStreams),
+		keyOoklaConnections:    strconv.Itoa(v.OoklaConnections),
+		keySpeedChallengeEvery: strconv.Itoa(v.SpeedChallengeEvery),
+		keyOoklaLoss:           b2s(v.OoklaLoss),
+		keySpeedBestOf:         b2s(v.SpeedBestOf),
+		keyIperfOmit:           strconv.Itoa(v.IperfOmit),
+		keySpeedDirection:      v.SpeedDirection,
+		keyIperfDirection:      v.IperfDirection,
+		keyIperfUDP:            b2s(v.IperfUDP),
+		keyIperfUDPRate:        strconv.Itoa(v.IperfUDPRate),
+		keyIperfWindow:         strconv.Itoa(v.IperfWindow),
+		keySpeedRetries:        strconv.Itoa(v.SpeedRetries),
+		keyIperfRetries:        strconv.Itoa(v.IperfRetries),
+		keyIperfCongest:        v.IperfCongestion,
+		keyIperfNoDelay:        b2s(v.IperfNoDelay),
+		keyIperfDSCP:           v.IperfDSCP,
+		keyIperfMSS:            strconv.Itoa(v.IperfMSS),
+		keyAlertOnOutage:       b2s(v.AlertOnOutage),
+		keyWebhookURL:          v.WebhookURL,
+		keyWebhookFormat:       v.WebhookFormat,
+		keyHeartbeatURL:        v.HeartbeatURL,
+		keyDigestFreq:          v.DigestFreq,
+		keySchedLatEnabled:     b2s(v.SchedLatEnabled),
+		keySchedLatWindows:     windowsJSON(v.SchedLatWindows),
+		keySchedSpeedEnabled:   b2s(v.SchedSpeedEnabled),
+		keySchedSpeedWindows:   windowsJSON(v.SchedSpeedWindows),
+		keyQuickSetup:          b2s(v.QuickSetupDone),
 	}
 }
 
@@ -2497,7 +2488,6 @@ func normalize(v Values) Values {
 	v.IperfStreams = clampI(v.IperfStreams, MinIperfStreams, MaxIperfStreams)
 	v.OoklaConnections = clampI(v.OoklaConnections, 0, MaxOoklaConnections)
 	v.SpeedChallengeEvery = clampI(v.SpeedChallengeEvery, 0, MaxSpeedChallengeEvery)
-	v.SpeedChallengeMargin = clampI(v.SpeedChallengeMargin, 0, MaxSpeedChallengeMargin)
 	v.IperfOmit = clampI(v.IperfOmit, 0, MaxIperfOmit)
 	switch v.SpeedDirection { // Ookla is always sequential - no bidir
 	case "both", "down", "up":

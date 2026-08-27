@@ -701,7 +701,6 @@ func (p *program) run(ctx context.Context) {
 	tester.PriorDataFn = newPriorDataFn(p.store)
 	tester.IncumbentFn = newIncumbentFn(p.store)
 	tester.ChallengeFn = newChallengeFn(p.store, set)
-	tester.ChallengeMarginFn = set.SpeedChallengeMargin
 	tester.IncumbentScoresFn = newIncumbentScoresFn(p.store)
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer    // surface the live server during a run
@@ -2126,10 +2125,9 @@ func defaultSettings(cfg config.Config) settings.Values {
 		OoklaLoss:          true,           // Ookla packet-loss UDP probe on by default
 		SpeedBestOf:        false,          // best-of-3 costs 3x the data - opt in
 		// Auto-select challenger: twice a day at the hourly default, no extra
-		// data; the rival needs a clear win over the incumbent's recent record
-		// (link noise on one run is well under 15% on a wired line).
-		SpeedChallengeEvery:  12,
-		SpeedChallengeMargin: 15,
+		// data; the bar the rival must clear is derived from the incumbent's own
+		// record (see speedtest.challengeWon), so there is no margin to set.
+		SpeedChallengeEvery: 12,
 	}
 }
 
