@@ -682,20 +682,27 @@ func (p *program) run(ctx context.Context) {
 	// Speedtest scheduler - always constructed so it can be toggled live.
 	tester := speedtest.NewOokla()
 	tester.ServerIDFn = set.SpeedServerID // honor the chosen server, live
-	// Auto server selection: a city the user searched overrides everything
-	// (AutoLocFn - a statement of intent, not a hypothesis to measure).
-	// Otherwise the candidate cities the connection itself names - the exit
-	// router's, the ISP geolocation's, and the one the Ookla API places our
-	// address in - each contribute their closest servers to one deduplicated
-	// ping race, and the city whose server answers fastest becomes the centre
-	// (see speedtest.raceCities and autoOrigins).
-	tester.AutoLocFn = set.AutoLocation
-	tester.OriginsFn = func() []speedtest.Origin { return autoOrigins(ni.Get()) }
+	// Auto server selection: the candidate cities the connection itself names
+	// - the exit router's, the ISP geolocation's, the starred servers', the
+	// last race's winner's, and the one the Ookla API places our address in -
+	// each contribute their
+	// closest servers to one deduplicated ping race, and the city whose server
+	// answers fastest becomes the centre (see speedtest.raceCities and
+	// autoOrigins).
+	// A starred server's catalogue coordinate, for a pinned best-of run whose
+	// pin the live catalogue could not place (see speedtest.recentrePin).
+	tester.SavedCoordFn = newSavedCoordFn(set)
+	recentWinner := newRecentWinnerFn(p.store)
+	tester.OriginsFn = func() []speedtest.Origin { return autoOrigins(ni.Get(), set.SpeedServers(), recentWinner()) }
 	// The user's ISP name grants its own server a guaranteed lane in the
 	// auto-select ping race (an on-net server is the most likely winner). A
 	// stale or empty name is harmless - it only adds or skips one racer.
 	tester.ISPFn = func() string { return ni.Get().ISP }
 	tester.PriorDataFn = newPriorDataFn(p.store)
+	tester.IncumbentFn = newIncumbentFn(p.store)
+	tester.ChallengeFn = newChallengeFn(p.store, set)
+	tester.ChallengeMarginFn = set.SpeedChallengeMargin
+	tester.IncumbentScoresFn = newIncumbentScoresFn(p.store)
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer    // surface the live server during a run
 	tester.DirectionFn = set.SpeedDirection     // Ookla direction (per-engine; iperf3 has its own)
@@ -945,7 +952,9 @@ func (p *program) run(ctx context.Context) {
 	// the picker starts from cities the race would consider and then follows
 	// what it actually chose (web.lastAutoRunServerID).
 	srv.AutoOriginsFn = tester.OriginsFn
-	srv.Logs = p.ring // backs the About-tab log viewer (/api/logs)
+	srv.RaceListingFn = tester.RaceListing        // the picker's Auto button: the field a run would race
+	srv.PingServersFn = speedtest.PingServersByID // the saved pane's refresh: re-measure the kept servers
+	srv.Logs = p.ring                             // backs the About-tab log viewer (/api/logs)
 	srv.OnLogClear = func() {
 		// The /api/logs clear already emptied the ring; rewrite the on-disk
 		// snapshot to match so a restart within the snapshot interval can't
@@ -994,6 +1003,9 @@ func seedKnownCounters() {
 		// Reconnect triggers the spacing gates refused (see reconnectGate): a
 		// climbing rate is a flapping link, not a broken feature.
 		"speed.reconnect_suppressed", "netinfo.reconnect_suppressed",
+		// A Team Cymru lookup the host resolver failed and a public resolver
+		// answered: climbing = the host's DNS is timing out on the origin zone.
+		"netinfo.cymru_fallback",
 		// A run that had to start while a previous run's abandoned transfer was still
 		// moving bytes: those numbers read low. Climbing = someone is abort-storming.
 		"speed.overlapped_orphan", "speed.abandoned_resumed",
@@ -1022,8 +1034,9 @@ func seedKnownCounters() {
 		// An upload retried single-stream because no chunk completed in the capture
 		// window - the uplink is slower than the parallel chunk set needs.
 		"speed.upload_starvation_retry", "speed.upload_starvation_rescued",
-		// A server the user was offered for pinning has no HTTP legacy fallback -
-		// they are about to choose one that fails every run.
+		// A by-ID lookup (the picker's Find, its pin probe, or the browse list's
+		// last-run centring) found a server with no HTTP legacy fallback - one
+		// that fails every run. One user action can count more than once.
 		"speed.pinned_server_no_fallback",
 		// A scheduled run dropped because another trigger (manual, reconnect,
 		// degraded) already held the single-flight. The slot is not retried, so a
@@ -1036,6 +1049,13 @@ func seedKnownCounters() {
 		// a coordinate at all (a climbing rate means auto is running blind, e.g.
 		// connection-info lookups switched off).
 		"speed.cityrace_decided", "speed.cityrace_silent", "speed.cityrace_unanchored",
+		// ... and how many runs then ranked the race's own list and pings
+		// instead of fetching and pinging the same servers again (every
+		// decided race should; a gap means the run refetched).
+		"speed.cityrace_field_reused",
+		// The auto-select challenger: runs that measured the incumbent's rival
+		// instead of the incumbent, and how many of those took the seat.
+		"speed.challenge", "speed.challenge_won", "speed.challenge_failed",
 		"speed.pin_coord_unrecovered",
 		// A pause span that crossed a clock correction and was refused rather than
 		// recorded: expected once on an RTC-less boot, never in steady state.
@@ -1435,8 +1455,118 @@ func newPriorDataFn(st *store.Store) func() bool {
 	}
 }
 
+// newIncumbentFn names the server the last AUTOMATIC Ookla run measured, for
+// the run to keep while it stays within noise of the fastest (see
+// speedtest.Ookla.IncumbentFn). Read once per auto run, at selection time. The
+// walk skips pinned runs rather than stopping at one: a week pinned to a
+// server and then un-pinned should resume the auto history, not start a new
+// one on whichever box happens to ping fastest that hour. Bounded, so a
+// longtime-pinned install reads a dozen rows and gives up, the same bound the
+// browse centring uses (see internal/web lastAutoRunServerID). "" on any
+// error: no incumbent is the pre-existing behaviour, and a wrong incumbent
+// would still have to win its seat on this run's ping.
+func newIncumbentFn(st *store.Store) func() string {
+	return func() string {
+		rows, err := st.LastSpeedWinners(context.Background(), 12)
+		if err != nil {
+			return ""
+		}
+		for _, r := range rows {
+			// A challenger that LOST measured a server the seat did not go
+			// to; skipping it is what makes a challenge an experiment rather
+			// than a coin toss (see speedtest.ChallengeLost).
+			if speedtest.PinnedRun(r.WinReason) || speedtest.ChallengeLost(r.WinReason) || r.ServerID == "" {
+				continue
+			}
+			return r.ServerID
+		}
+		return ""
+	}
+}
+
+// newChallengeFn says whether the next scheduled auto run is a CHALLENGE run:
+// one that measures the incumbent's strongest rival instead of the incumbent
+// (see speedtest.Ookla.ChallengeFn). Due when the last N AUTOMATIC winners -
+// every unpinned Ookla run, whatever triggered it - hold no challenge at all,
+// N being the Every setting; the challenge itself lands on the next scheduled
+// run. Pinned runs are excluded in the query, so they neither count toward N
+// nor, however long the pinned stretch, push the auto rows out of the window.
+// Derived from the selection history rather than an in-memory counter, so a
+// daemon restarted every day still challenges on schedule.
+func newChallengeFn(st *store.Store, set *settings.Controller) func() bool {
+	return func() bool {
+		every := set.SpeedChallengeEvery()
+		if every <= 0 {
+			return false
+		}
+		rows, err := st.LastSpeedWinnersExcluding(context.Background(), every,
+			speedtest.WinReasonPinned, speedtest.WinReasonPinnedBestOf, speedtest.WinReasonPinnedCompanion)
+		if err != nil {
+			return false
+		}
+		auto := 0
+		for _, r := range rows {
+			if speedtest.ChallengeRun(r.WinReason) {
+				return false // challenged within the last N auto runs
+			}
+			auto++
+			if auto >= every {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// newRecentWinnerFn names the city that won the newest decided race, as an
+// origin for the next one (see autoOrigins). Read live each run, like the
+// other origins; nil with no decided race in the history or on any error -
+// the pre-existing field, which is the safe reading.
+func newRecentWinnerFn(st *store.Store) func() *speedtest.Origin {
+	return func() *speedtest.Origin {
+		label, lat, lon, ok, err := st.LastDecidedRace(context.Background())
+		if err != nil || !ok {
+			return nil
+		}
+		return &speedtest.Origin{Kind: "recent", Label: label, Lat: lat, Lon: lon, Anchored: true}
+	}
+}
+
+// newIncumbentScoresFn hands the engine a server's recent measured scores
+// under one test direction, newest first, for a challenge verdict (see
+// speedtest.Ookla.IncumbentScoresFn).
+func newIncumbentScoresFn(st *store.Store) func(id, dir string) []float64 {
+	return func(id, dir string) []float64 {
+		scores, err := st.RecentServerScores(context.Background(), id, dir, speedtest.ChallengeHistory)
+		if err != nil {
+			return nil
+		}
+		return scores
+	}
+}
+
+// newSavedCoordFn looks a pinned server up in the saved picker list for the
+// catalogue coordinate stored when it was starred. ok=false for a server that
+// is not on the list or was starred without a coordinate (a by-ID row stores
+// 0,0) - the run then falls back exactly as it did before the list existed.
+//
+// Named, like newFirstRunReadyFn, so a root test can pin it against the real
+// controller: this lookup is the only reader of the saved picker list (the
+// speed_servers SETTING - the speed_servers table of per-run reports has its
+// own readers) outside the picker itself.
+func newSavedCoordFn(set *settings.Controller) func(id string) (lat, lon float64, ok bool) {
+	return func(id string) (float64, float64, bool) {
+		for _, s := range set.SpeedServers() {
+			if s.ID == id {
+				return s.Lat, s.Lon, s.Lat != 0 || s.Lon != 0
+			}
+		}
+		return 0, 0, false
+	}
+}
+
 // newFirstRunReadyFn builds the consent run's selection-readiness predicate
-// (speedtest.Scheduler.ReadyFn): with a server pinned or a city searched the
+// (speedtest.Scheduler.ReadyFn): with a server pinned the
 // race doesn't need netinfo; a working iperf3 engine measures its own
 // configured server (though iperf3-but-unavailable falls back to Ookla, so
 // THAT case still waits); with connection info off nothing is ever coming;
@@ -1446,7 +1576,9 @@ func newPriorDataFn(st *store.Store) func() bool {
 //
 // Known, accepted residual: the first publish carries the FAST fields; the
 // exit-router hop is patched in only after its traceroute finishes, so the
-// consent run can race {isp, geo} while later runs race {exit, isp, geo}.
+// consent run can race {isp, saved..., recent, geo} while later runs race
+// {exit, isp, saved..., recent, geo} (saved = the starred servers' cities,
+// recent = the last race's winner, see autoOrigins).
 // Waiting for the exit would hold the first test up to the trace's own 12s
 // budget on every fresh install - a worse trade than a first selection
 // centred on the ISP city (and the ISP-name lane usually seats the on-net
@@ -1457,9 +1589,6 @@ func newPriorDataFn(st *store.Store) func() bool {
 func newFirstRunReadyFn(set *settings.Controller, ni *netinfo.Manager) func() bool {
 	return func() bool {
 		if set.SpeedServerID() != "" {
-			return true
-		}
-		if _, _, ok := set.AutoLocation(); ok {
 			return true
 		}
 		if set.SpeedEngine() == "iperf3" && speedtest.IperfAvailable() {
@@ -1485,10 +1614,11 @@ func newFirstRunReadyFn(set *settings.Controller, ni *netinfo.Manager) func() bo
 // race falls back to (the exit router, the old cascade's answer); who wins is
 // decided by ping.
 //
-// EVERY ORIGIN HERE IS DERIVED FROM THE CONNECTION. A searched city is not one
-// of them: it is a statement of intent, wired through AutoLocFn, and it
-// bypasses the race. A pinned server (speed_server_id) overrides both.
-func autoOrigins(i netinfo.Info) []speedtest.Origin {
+// The origins are the connection's own cities plus the cities the user has
+// starred a server in - a star is a statement about where good servers are,
+// and it races like any other origin rather than overriding anything. A
+// pinned server (speed_server_id) overrides the race.
+func autoOrigins(i netinfo.Info, saved []settings.SavedServer, recent *speedtest.Origin) []speedtest.Origin {
 	var out []speedtest.Origin
 	// The exit-node city: the last hop still inside the ISP, and the truest
 	// network origin we can name - when RIPE has a coordinate for it, which for
@@ -1509,6 +1639,35 @@ func autoOrigins(i netinfo.Info) []speedtest.Origin {
 			label += ", " + i.Country
 		}
 		out = append(out, speedtest.Origin{Kind: "isp", Label: label, Lat: i.Lat, Lon: i.Lon, Anchored: true})
+	}
+	// The starred servers' cities. The picker stored each one's catalogue
+	// coordinate when it was starred, and a star is the user saying "this is
+	// where my good servers are" - so each city races every run, whatever the
+	// connection-derived origins say. It is also the one origin that survives
+	// exit discovery going dark (a resolver timing out on the ASN zone took the
+	// exit out for an evening, measured, and the race then had only the ISP's
+	// geolocation - a city 500 km from the servers that were faster).
+	// pickOrigins folds stars in one city into one fetch and caps the fan-out;
+	// the ISP lane inside the pool still seats the on-net server. Before geo,
+	// because geo is usually the ISP city's pool again; after exit and isp,
+	// because order names the silent-race fallback and those are measured.
+	for _, s := range saved {
+		if s.Lat == 0 && s.Lon == 0 {
+			continue // starred from a by-ID reply: no coordinate (see speedtest.recentrePin)
+		}
+		out = append(out, speedtest.Origin{Kind: "saved", Label: s.Name, Lat: s.Lat, Lon: s.Lon, Anchored: true})
+	}
+	// The city that won the LAST race (see newRecentWinnerFn): the one
+	// candidate that survives every lookup going dark with nothing starred -
+	// the 2026-08-26 evening, where a resolver timeout took the exit out and
+	// Montréal was never entered. A candidate, not a verdict: it still has to
+	// win on ping, so a city the user has since moved away from costs one
+	// fetch and a few pings and loses. On an ordinary day it is the exit or a
+	// star's city again and pickOrigins folds it into that one. After the
+	// stars, so a star is never displaced by it at the anchored cap; before
+	// geo for the reason the stars are.
+	if recent != nil && recent.Anchored && (recent.Lat != 0 || recent.Lon != 0) {
+		out = append(out, speedtest.Origin{Kind: "recent", Label: recent.Label, Lat: recent.Lat, Lon: recent.Lon, Anchored: true})
 	}
 	// The geo city: no centre of ours at all - the Ookla API geolocates our
 	// source address and returns the pool IT believes we belong to. Usually a
@@ -1966,6 +2125,11 @@ func defaultSettings(cfg config.Config) settings.Values {
 		IperfWindow:        0,              // iperf3 TCP window/socket-buffer KB (0 = OS auto-tune)
 		OoklaLoss:          true,           // Ookla packet-loss UDP probe on by default
 		SpeedBestOf:        false,          // best-of-3 costs 3x the data - opt in
+		// Auto-select challenger: twice a day at the hourly default, no extra
+		// data; the rival needs a clear win over the incumbent's recent record
+		// (link noise on one run is well under 15% on a wired line).
+		SpeedChallengeEvery:  12,
+		SpeedChallengeMargin: 15,
 	}
 }
 

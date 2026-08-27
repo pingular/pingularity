@@ -46,6 +46,8 @@ func (c *originFetchCount) fetches() int {
 // counts how often each candidate was pinged. IDs absent from the table stay
 // unanswered (Latency 0).
 func stubRacePing(t *testing.T, ms map[string]int) *racePingCount {
+	// Replace semantics, like the real racePing: an ID absent from the table
+	// reads as unanswered (Latency 0) even if the fixture carried a fetch echo.
 	t.Helper()
 	c := &racePingCount{pinged: map[string]int{}}
 	old := racePing
@@ -55,6 +57,8 @@ func stubRacePing(t *testing.T, ms map[string]int) *racePingCount {
 		c.mu.Unlock()
 		if m, ok := ms[s.ID]; ok {
 			s.Latency = time.Duration(m) * time.Millisecond
+		} else {
+			s.Latency = 0
 		}
 	}
 	t.Cleanup(func() { racePing = old })
@@ -362,6 +366,221 @@ func TestPickOriginsDropsNoFixFoldsNearDuplicatesAndCaps(t *testing.T) {
 	if got := pickOrigins(many); len(got) != cityOriginMax {
 		t.Errorf("cap: kept %d origins, want %d", len(got), cityOriginMax)
 	}
+
+	// The daemon's real field: exit and ISP distinct, stars in two more cities,
+	// and Ookla's own placement last. All five must be fetched - the fifth lane
+	// is what the cap was widened for - and the unanchored placement is never
+	// the one the cap evicts, even with stars in three or four cities.
+	field := []Origin{
+		{Kind: "exit", Lat: 45.51, Lon: -73.59, Anchored: true},
+		{Kind: "isp", Lat: 43.70, Lon: -79.40, Anchored: true},
+		{Kind: "saved", Lat: 46.81, Lon: -71.21, Anchored: true}, // Quebec City
+		{Kind: "saved", Lat: 45.42, Lon: -75.70, Anchored: true}, // Ottawa
+		{Kind: "geo", Anchored: false},
+	}
+	if got := originKinds(pickOrigins(field)); len(got) != 5 || got[4] != "geo" {
+		t.Errorf("five-origin field kept %v, want all five with geo last", got)
+	}
+	six := append(append([]Origin{}, field[:4]...), Origin{Kind: "saved", Lat: 44.23, Lon: -76.49, Anchored: true}, field[4]) // Kingston
+	if got := originKinds(pickOrigins(six)); len(got) != 6 || got[5] != "geo" {
+		t.Errorf("a fifth anchored origin evicted Ookla's placement: kept %v", got)
+	}
+	seven := append(append([]Origin{}, six[:5]...), Origin{Kind: "saved", Lat: 48.42, Lon: -71.06, Anchored: true}, field[4]) // Saguenay: past the cap
+	if got := originKinds(pickOrigins(seven)); len(got) != 6 || got[5] != "geo" {
+		t.Errorf("stars past the cap must be the ones dropped, never geo: kept %v", got)
+	}
+}
+
+func originKinds(os []Origin) []string {
+	out := make([]string, 0, len(os))
+	for _, o := range os {
+		out = append(out, o.Kind)
+	}
+	return out
+}
+
+// A metro whose servers all sit at the city-centre point is a distance tie, and
+// "the six nearest" of a tie used to be whichever six the sort left first -
+// measured, that dropped the fastest-echoing server and the user's own ISP's
+// from the Montreal pool. The cut now breaks the tie by the fetch's echo,
+// prefers one server per sponsor, and seats the ISP's server, so the race
+// field is the six worth racing rather than six by chance.
+func TestPoolCutBreaksATieByEchoAndSeatsTheISP(t *testing.T) {
+	tied := func(id, sponsor string, echoMS int) *ookla.Server {
+		s := srv(id, 1)
+		s.Sponsor = sponsor
+		s.Latency = time.Duration(echoMS) * time.Millisecond
+		return s
+	}
+	// Listed slowest-first, so an order-of-arrival cut would take the wrong six.
+	pool := ookla.Servers{
+		tied("slow1", "Alpha", 40), tied("slow2", "Bravo", 39), tied("slow3", "Charlie", 38),
+		tied("slow4", "Delta", 37), tied("slow5", "Echo", 36), tied("slow6", "Foxtrot", 35),
+		tied("bell2", "Bell Canada", 16), tied("bell1", "Bell Canada", 15), // one provider, two boxes: one seat, for diversity
+		tied("fast", "Golf", 9),
+		tied("ebox3", "EBOX", 24), tied("ebox2", "EBOX", 23), // the ISP's boxes: cityPoolISPMax lanes, its fastest echoes first...
+		tied("1993", "EBOX", 21),
+	}
+	pool[len(pool)-1].Latency = -1 // ...though 1993's echo failed (the library's PingTimeout), so it yields to its siblings here
+	fetches := stubOriginPools(t, map[string]ookla.Servers{"exit": pool})
+	pings := stubRacePing(t, map[string]int{"fast": 9, "bell1": 15, "bell2": 16, "ebox2": 12, "ebox3": 13, "1993": 11, "slow6": 35, "slow5": 36})
+	o := NewOokla()
+	o.ISPFn = func() string { return "AS1403 EBOX - EBOX" }
+	o.OriginsFn = func() []Origin {
+		return []Origin{{Kind: "exit", Label: "Montréal, CA", Lat: 45.51, Lon: -73.59, Anchored: true}}
+	}
+	win, ok := o.raceCities(context.Background())
+	if !ok || fetches.fetches() != 1 {
+		t.Fatalf("race: ok=%v fetches=%d", ok, fetches.fetches())
+	}
+	for _, id := range []string{"ebox2", "ebox3", "fast", "bell1", "slow6", "slow5"} {
+		if pings.count(id) != 1 {
+			t.Errorf("%s pinged %d times, want 1: %d ISP lanes, then the fastest echoes with one box per sponsor, then the rest by echo", id, pings.count(id), cityPoolISPMax)
+		}
+	}
+	for _, id := range []string{"1993", "slow1", "slow2", "slow3", "slow4", "bell2"} {
+		if pings.count(id) != 0 {
+			t.Errorf("%s pinged %d times, want 0: a third ISP box past its %d lanes, a second box of one sponsor, or cut by echo", id, pings.count(id), cityPoolISPMax)
+		}
+	}
+	if win.Kind != "exit" {
+		t.Errorf("winner = %v", win)
+	}
+}
+
+// A small city's pool is its own servers. Ookla pads every list out to ~25
+// rows from whatever is next, so seeding over the whole list let the
+// one-per-sponsor pass seat another metro's boxes over the city's own
+// duplicates - and a server two cities both listed was then credited to the
+// wrong one. The pool is drawn from the run's distance window, never fewer
+// than the pool size, and its lanes stay in distance order.
+func TestPoolCutStaysWithinTheCitysOwnDistanceWindow(t *testing.T) {
+	at := func(id, sponsor string, km float64, echoMS int) *ookla.Server {
+		s := srv(id, km)
+		s.Sponsor = sponsor
+		s.Latency = time.Duration(echoMS) * time.Millisecond
+		return s
+	}
+	pool := ookla.Servers{
+		at("v1", "Videotron", 1, 12), at("v2", "Videotron", 1, 13), at("v3", "Videotron", 1, 14), at("bell", "Bell Canada", 1, 15),
+		at("tr", "Cogeco", 130, 20), at("m1", "Alpha", 250, 9), at("m2", "Bravo", 250, 10), at("m3", "Charlie", 250, 11), at("m4", "Delta", 250, 12),
+	}
+	stubOriginPools(t, map[string]ookla.Servers{"exit": pool})
+	pings := stubRacePing(t, map[string]int{"v1": 12, "v2": 13, "v3": 14, "bell": 15, "tr": 20, "m1": 9, "m2": 10, "m3": 11, "m4": 12})
+	o := NewOokla()
+	o.OriginsFn = func() []Origin {
+		return []Origin{{Kind: "exit", Label: "Québec, CA", Lat: 46.81, Lon: -71.21, Anchored: true}}
+	}
+	if _, ok := o.raceCities(context.Background()); !ok {
+		t.Fatal("race returned no winner")
+	}
+	for _, id := range []string{"v1", "v2", "v3", "bell", "tr", "m1"} {
+		if pings.count(id) != 1 {
+			t.Errorf("%s pinged %d times, want 1: the city's own four, then the nearest two to fill the pool", id, pings.count(id))
+		}
+	}
+	for _, id := range []string{"m2", "m3", "m4"} {
+		if pings.count(id) != 0 {
+			t.Errorf("%s pinged %d times, want 0: 250 km away and past the pool - a faster echo there must not displace the city's own duplicate sponsors", id, pings.count(id))
+		}
+	}
+}
+
+// The picker's Auto button shows the race's field: every pool fetched, the
+// union deduplicated, every racer pinged, fastest first, each row naming the
+// origin that surfaced it - and the winner is the origin a run started now
+// would centre on. Same seams as the race itself, so what the user sees is
+// what a run would decide over.
+func TestRaceListingIsTheRacesOwnFieldFastestFirst(t *testing.T) {
+	oldProbe := probeFallback
+	probeFallback = func(context.Context, *ookla.Server) endpointState { return endpointOK }
+	t.Cleanup(func() { probeFallback = oldProbe })
+	fetches := stubOriginPools(t, map[string]ookla.Servers{
+		"isp":   {srv("t1", 4), srv("t2", 4), srv("t3", 4)},
+		"saved": {srv("m1", 1), srv("m2", 1), srv("1993", 1), srv("t1", 500)}, // t1 surfaces from two pools: listed once
+		"geo":   {srv("t1", 4)},
+	})
+	stubRacePing(t, map[string]int{"t1": 27, "t2": 28, "m1": 10, "m2": 11, "1993": 12}) // t3 never answers
+	o := NewOokla()
+	o.OriginsFn = func() []Origin {
+		return []Origin{
+			{Kind: "isp", Label: "Toronto, CA", Lat: 43.70, Lon: -79.40, Anchored: true},
+			{Kind: "saved", Label: "Montréal, QC", Lat: 45.5, Lon: -73.5, Anchored: true},
+			{Kind: "geo", Label: "your connection"},
+		}
+	}
+	l, err := o.RaceListing(context.Background())
+	if err != nil {
+		t.Fatalf("listing: %v", err)
+	}
+	if fetches.fetches() != 3 {
+		t.Errorf("fetched %d pools, want one per origin", fetches.fetches())
+	}
+	var ids []string
+	for _, c := range l.Servers {
+		ids = append(ids, c.ID)
+	}
+	want := []string{"m1", "m2", "1993", "t1", "t2", "t3"}
+	if len(ids) != len(want) {
+		t.Fatalf("listing = %v, want %v: deduplicated, fastest first, the unanswered last", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("listing = %v, want %v", ids, want)
+		}
+	}
+	if l.Servers[0].Origin != "saved" || l.Servers[0].OriginLabel != "Montréal, QC" || l.Servers[0].PingMS == nil || *l.Servers[0].PingMS != 10 {
+		t.Errorf("fastest row = %+v, want the starred city's server at 10 ms, credited to that origin", l.Servers[0])
+	}
+	if last := l.Servers[5]; last.ID != "t3" || last.PingMS != nil {
+		t.Errorf("an unanswered racer must carry no ping and sort last: %+v", last)
+	}
+	if l.Winner == nil || l.Winner.Kind != "saved" {
+		t.Errorf("winner = %+v, want the starred city: a run now would centre there", l.Winner)
+	}
+	if len(l.Origins) != 3 {
+		t.Errorf("origins = %v, want the three that raced", l.Origins)
+	}
+}
+
+// A listing has nothing to degrade to: when its caller gives up mid-race it
+// fails, rather than inventing a field from half-written pools. Shaped like
+// TestRaceCitiesDoesNotWaitForUncancellableFetches, and for the same reasons:
+// the abandoned fetch outlives the call, so the seams and t must outlive it,
+// and the orphan must never reach the real probe (see that test's comment).
+func TestRaceListingFailsWhenItsBudgetDies(t *testing.T) {
+	release, entered, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	done := make(chan struct{})
+	old, oldPing := fetchOriginServers, racePing
+	fetchOriginServers = func(ctx context.Context, o Origin) (ookla.Servers, error) {
+		close(entered)
+		<-release
+		close(finished)
+		return ookla.Servers{srv("late", 1)}, nil
+	}
+	racePing = func(context.Context, *ookla.Server) {}
+	t.Cleanup(func() { <-finished; <-done; fetchOriginServers, racePing = old, oldPing })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	o := NewOokla()
+	o.OriginsFn = func() []Origin {
+		return []Origin{{Kind: "isp", Label: "Toronto, CA", Lat: 43.70, Lon: -79.40, Anchored: true}}
+	}
+	go func() {
+		defer close(done)
+		if _, err := o.RaceListing(ctx); err == nil {
+			t.Error("a listing whose caller gave up must fail, not invent a field from half-written pools")
+		}
+	}()
+	<-entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("RaceListing waited on a fetch it cannot cancel")
+	}
+	close(release)
 }
 
 func TestUnionCityCandidatesRoundRobinDedupeAndOwner(t *testing.T) {
@@ -438,6 +657,35 @@ func TestRaceCitiesFastestCityWins(t *testing.T) {
 	}
 	if n := pings.count("e1"); n != 1 {
 		t.Errorf("shared server e1 pinged %d times, want 1 (deduplicated across cities)", n)
+	}
+}
+
+// A starred city is an ordinary racer: its pool is fetched and pinged like any
+// connection-derived one, and it wins on measurement alone. The measured case:
+// the only connection-derived origin left was the ISP geolocation (Toronto,
+// 27 ms to everything there) while the starred server's city (Montreal) had
+// 10 ms servers that never entered the race.
+func TestRaceCitiesAStarredCityCanWin(t *testing.T) {
+	fetches := stubOriginPools(t, map[string]ookla.Servers{
+		"isp":   {srv("t1", 4), srv("t2", 4), srv("t3", 4)},
+		"saved": {srv("m1", 1), srv("m2", 1), srv("1993", 1)},
+		"geo":   {srv("t1", 4)},
+	})
+	pings := stubRacePing(t, map[string]int{"t1": 27, "t2": 28, "t3": 29, "m1": 10, "m2": 11, "1993": 12})
+	o := NewOokla()
+	o.OriginsFn = func() []Origin {
+		return []Origin{
+			{Kind: "isp", Label: "Toronto, CA", Lat: 43.70, Lon: -79.40, Anchored: true},
+			{Kind: "saved", Label: "Montréal, QC", Lat: 45.5, Lon: -73.5, Anchored: true},
+			{Kind: "geo", Label: "your connection"},
+		}
+	}
+	win, ok := o.raceCities(context.Background())
+	if !ok || win.Kind != "saved" {
+		t.Fatalf("winner = %+v ok=%v, want the starred city: its servers answered fastest", win, ok)
+	}
+	if fetches.fetches() != 3 || pings.count("1993") != 1 {
+		t.Errorf("fetches = %d, star's server pinged %d times; want one fetch per origin and the starred server raced once", fetches.fetches(), pings.count("1993"))
 	}
 }
 

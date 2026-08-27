@@ -451,8 +451,10 @@ published.
 > does not already hold those rows - a fresh box, a rebuilt volume - brings them
 > back as permanent 0 Mbps runs. Take the backup with the newer build, before
 > you step down - though that file is your way back *up*, not a rescue while you
-> are down: any run carrying the new columns stamps the export for 0.70+, and an
-> older build refuses a newer stamp outright rather than restoring half of it.
+> are down: any run carrying the new columns stamps the export for the release
+> that introduced them - 0.70 for the failed-run marker, higher again for the
+> city-race verdict every Ookla run has recorded since - and an older build
+> refuses a newer stamp outright rather than restoring half of it.
 
 ## Run in the background (systemd / launchd / Windows service)
 
@@ -657,8 +659,10 @@ outlier, though: one stalled handshake among nine fast ones reports several time
 the real latency (and lands in jitter, which is their standard deviation, as a
 much larger distortion still). So the run also keeps the **fastest** of those
 same samples - no extra probes - and everything that *decides* on latency uses
-that floor instead: which server wins a best-of round, which server the very
-first run picks, and whether your ping threshold breached. A pothole shouldn't
+that floor instead: which city wins the race for the centre, which server every
+automatic run ranks first (and whether last run's server keeps its seat within
+the max(2 ms, 15 %) band), which server wins a best-of round, which server the
+very first run picks, and whether your ping threshold breached. A pothole shouldn't
 pick your server or page you, but a genuinely distant link has a high floor too
 and still breaches. iperf3 exposes no per-sample values of its own, so a run
 measures the latency itself: five bare TCP handshakes to the server before the
@@ -902,28 +906,84 @@ runs consult it; reconnect, degraded and **Run now** go regardless.
 
 ### Choosing an Ookla server
 
-For Ookla, choose a server (search a city) or leave **Auto - fastest near you**
-(it reads **Auto - fastest in \<city\>** once you've searched one). Auto
-isn't just "nearest": every server that's effectively equidistant gets to race
+For Ookla, choose a server (Find by place or Ookla ID, then pick its row) or
+leave **Auto - fastest near you**. A row badged **Unsupported** cannot be
+chosen: that server has no HTTP speedtest endpoint (Ookla's legacy upload
+path), so every test against it would fail - clicking it says so in the
+footer instead of selecting it, and typing its ID into Find lists it with the
+badge rather than pinning it (hover the badge for the reason). Such a server
+can still be starred, and a server that is already chosen keeps its radio
+even if it later earns the badge, so the picker never hides what the next run
+will use. Auto isn't just "nearest": every server that's effectively equidistant gets to race
 (in a big city, a dozen providers all sit "0 km away" - one of each is pinged
-rather than an arbitrary few) and the lowest latency wins. Your own ISP's
+rather than an arbitrary few, and the same rule seeds each candidate city's
+six in the city race that picks the centre, with distance ties broken by the
+echo the server list itself came back with) and the lowest latency wins -
+judged on the **floor** of each server's ten probes, not their mean, because one
+stalled probe among nine fast ones moves a mean by 20 ms and a floor by nothing
+(the city race and the Best-of-3 verdict use the same floor, so the three
+decisions agree). Your own ISP's
 server, when Ookla lists one nearby **and the sponsor name can be matched to
 your ISP**, is guaranteed a place in the race - traffic to it never leaves your
 provider's network, so it's the most likely winner - but it still has to win on
 ping like everyone else. (That match is a name heuristic: if your ISP is unknown
 or trades under a different name than it sponsors servers under, its server
-simply competes on distance like any other.) The **centre** of that search is
+simply competes on distance like any other.) Two ties are broken deliberately
+rather than by jitter: a run **keeps the server the last automatic run
+measured** while it is still among the servers this run pings (the winning
+city's list, seeded as above) and still pings within max(2 ms, 15 %) of the
+fastest (win reason `incumbent` when that kept it ahead of a faster server;
+plain `fastest` when it was the fastest anyway), and failing that prefers your
+ISP's own server inside the same band (`on_net`) - so the history compares
+like with like instead of flipping between equivalent servers, while a server
+that has gone bad loses its seat the run it goes bad, because the seat is
+re-pinged every run rather than remembered - and an incumbent the winning
+city's list does not carry is not pinged at all, and loses the seat the same
+way. Ping alone
+never learns whether a rival is *faster* to transfer, so after every N
+automatic tests (**Challenge every**, default 12; 0 = never - any unpinned
+Ookla run counts, and the challenge itself lands on the next *scheduled*
+single-server run; with **Best of 3** on no challenge run ever happens, because
+every round already measures rivals, so both Challenge settings do nothing
+until Best of 3 is off)
+the run measures the incumbent's strongest rival instead - one server, no
+extra data - and the rival takes the seat only if its score beats the median
+of the incumbent's last dozen same-direction runs by **Challenger must beat
+by** (default 15 %; a fresh seat needs three runs of record before it is
+challenged at all, and changing the test direction starts that record
+afresh). If the rival cannot be measured the incumbent is measured as the
+fallback and the attempt still counts. Win reasons `challenger` (tried,
+lost), `challenger_won` and `challenger_failed` record it; the
+`speed.challenge` / `speed.challenge_won` / `speed.challenge_failed` counters
+count it. The **centre** of that search is
 measured, not guessed: the candidate cities your connection names - your
 **ISP's exit-router city** (found by traceroute), the city your **IP's
-geolocation** puts you in, and the one **speedtest.net itself** places you in -
-each enter their six closest servers into one deduplicated ping race, and the
+geolocation** puts you in, the cities of any servers you have **starred**, the
+city that **won the last race** (so a lookup going dark cannot make Auto
+forget where its servers are - it is a candidate like the others, and still
+has to win), and the one **speedtest.net itself** places you in -
+each enter six of their nearest servers (at most five of the cities with a
+coordinate of their own are fetched, in the order listed - with the exit and
+ISP cities both known that leaves room for stars in three cities, and past it
+the last race's city is dropped first, then further starred cities;
+speedtest.net's own placement is never displaced) - seeded the way a run's own ranking
+is, so a metro whose servers all sit "0 km" apart contributes one per provider
+and your ISP's box rather than six by chance - into one deduplicated ping race, and the
 city whose server answers fastest becomes the centre. (Ookla returns the
 servers *around* a coordinate, so a different centre yields a genuinely
 different list rather than the same one reordered - picking the wrong city can
 hide the fast servers entirely, which is why it's raced. The lists usually
 overlap, and where two candidate cities are close enough to be
-interchangeable they collapse, so a server never gets to race twice.) A
-**city you searched** overrides the race and becomes the centre directly.
+interchangeable they collapse, so a server never gets to race twice.) The race
+does the run's homework as it goes: the winning city's list and the pings the
+race already took are what the run ranks, so it fetches nothing twice and only
+pings the servers the race did not reach. Its verdict - which cities raced,
+each one's fastest answer, which won and why - is recorded on the run (the
+**Centre** column of the runs table; hover it for every city) so a surprising
+city is explainable afterwards - and the muted tag after the server name
+(`incumbent`, `challenger won`, `pinned`, …) says why that server was the one
+measured; hover it for the rule. Searching a place in the picker only moves
+the list you are looking at; nothing but a pinned server overrides the race.
 
 ## Dashboard
 
@@ -1057,11 +1117,12 @@ Below that:
 > | **whoami.akamai.net** (DNS) | a fixed lookup whose answer is your *resolver's* egress address, not yours | connection refresh |
 > | every router on the way to the **exit target** (`1.1.1.1` unless you change it) | one ICMP echo per hop, carrying nothing about you | exit discovery |
 > | **Team Cymru** (DNS) | your public IPv4/IPv6, your resolver's egress address, the resolver addresses your host is configured with, and every traceroute hop in public address space - to name the network each one belongs to; hops that are private, carrier-NAT (`100.64/10`), link-local or loopback are skipped | connection refresh + exit discovery |
+> | **`1.1.1.1:53`, then `9.9.9.9:53`** (direct DNS, the fallback for the row above) | the same Team Cymru query names, sent to that resolver directly rather than through yours | only after your own resolver fails one of those lookups (any error - a timeout, SERVFAIL, refused, unreachable - but not a "no such name" answer, which counts as answered) - then first for the following minute, your resolver last, until it answers again. The `netinfo.cymru_fallback` counter climbs once per lookup a public resolver answers, including every lookup during that minute |
 > | **RIPE IPmap** | the two boundary router IPs the traceroute settles on, and your resolver's egress address, for geolocation | connection refresh + exit discovery |
 > | **ipwho.is**, then **geojs.io** | your public IP, for the ISP/geo line | connection refresh |
 > | **Cloudflare** (`/cdn-cgi/trace`) | a plain fetch, to learn the serving PoP | connection refresh |
 > | reverse DNS | router/host IPs, for names | connection refresh |
-> | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup | when a speedtest runs, and when the Server settings tab is opened or a city is searched |
+> | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup and a small probe of each listed server's upload endpoint (remembered, so a repeat does not send it again); opening the Ookla tab can also cost one by-ID lookup and one name search first, to centre the list on the server your last automatic run used; for the picker's Auto button, the same selection a run performs - one list fetch per candidate city, a round of pings at every racer, then a round at the rest of the winning city's field (up to twelve), no transfer; for a server ID typed in Find, and for a saved pin the drawer has not yet checked this page load (at most twice per server), one by-ID lookup plus one small POST at that server's upload endpoint to learn whether it can still run a test, no transfer; and for the saved list's refresh button, one by-ID lookup, one endpoint probe and a round of pings at each kept server (up to twelve), no transfer | when a speedtest runs, when the Ookla settings tab is opened or a city is searched, when a server ID is typed in Find or a saved pin is first shown, on every Auto click, and on every refresh click in the saved list |
 > | your own **iperf3 server** (opt-in) | the test traffic itself - the TCP transfers, plus a short UDP pass for loss and jitter; or, for the status light in the settings drawer, one bare TCP handshake and nothing else | when an iperf3 speedtest runs, and when the drawer checks a saved server's status light - once per address while the drawer is open with iperf3 selected, plus whenever you click a server's dot or change its address |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
 > | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on (until the first check succeeds: retried at 1m/5m/15m, then hourly) |
@@ -1074,7 +1135,8 @@ Below that:
 > you and the answer describes the resolver. Rows marked (DNS) are questions
 > handed to that resolver rather than connections the daemon makes itself, so
 > what the service at the far end sees is your resolver arriving with an address
-> in the query. "Connection refresh" means: once an hour on its own (every 5
+> in the query - except the direct fallback row, where the daemon asks the named
+> public resolver itself and that resolver sees your address asking. "Connection refresh" means: once an hour on its own (every 5
 > minutes while a lookup is failing, or while exit discovery has yet to
 > succeed), once after a reconnect at most every 5 minutes, and once after
 > every speedtest - so turning speedtests on multiplies these too. Exit
@@ -1145,12 +1207,18 @@ and persist across restarts:
   will use, based on what your recent runs recorded - so it is a measured lower
   bound like the data-used figure itself - and it counts neither the extra
   triggers nor this faster cadence.
-- **Server** → engine (**Ookla** or **iperf3**, each with its own servers and
-  per-test options), server selection (with city search), test direction, and
-  retries. **Best of 3 servers** (Ookla only, off by default) tests your chosen
+- **Ookla** → the Ookla server picker (kept servers, Find by place or ID, Auto
+  to preview what a run would race), test direction, retries, parallel
+  connections, the packet-loss probe; **Challenge every** / **Challenger must
+  beat by** let a rival server take the seat now and then without extra data
+  (single-server Auto runs only - with Best of 3 on they do nothing; see
+  *Choosing an Ookla server*). The engine itself (**Ookla** or
+  **iperf3**) is chosen on the Speedtest tab; iperf3's servers and per-test
+  options live on their own **iperf3** tab. **Best of 3 servers** (Ookla only, off by default) tests your chosen
   server plus the two fastest by ping *near it* - the search is centred on the
   server you picked, not on your exit, so the round stays in the area you asked
-  for (with nothing pinned, they come from the auto location instead). It keeps
+  for (with nothing pinned, the round is drawn from the city the race chose - the
+  server the incumbent rule would lead with, plus the two fastest of the rest). It keeps
   only the best result - handy when one server has a bad day and you'd rather
   it didn't define your history. The best result is the highest *score*: a
   capacity figure weighting download 70% and upload 30% **relative to each
@@ -1192,7 +1260,7 @@ and persist across restarts:
   history (the heatmap, default **365** days); `0` = keep forever - plus
   per-kind "delete data" buttons, each clearing everything its category exports:
   **latency** takes the DNS-resolution series with the ping samples, **speed**
-  takes the best-of selection reports with the runs, and **downtime** takes the
+  takes the server-selection reports with the runs, and **downtime** takes the
   pause/unobserved spans with the outage events, so clearing downtime also resets
   observation coverage. And **Export** / **Import** on the same tab: pick any of
   config / latency / speed / downtime, export them to a JSON file, and import one
@@ -1606,7 +1674,17 @@ self-describing):
   speedtest **runs by trigger** (`speed.run.<trigger>`) and **failures by
   stage** (`speed.fail.<stage>` - server_fetch/ping/download/…), exit-discovery
   traces and geo lookups (`netinfo.trace_ok` / `netinfo.trace_fail` /
-  `netinfo.ipmap_*`), webhook delivery (`.ok` / `.fail` / `.blocked` per
+  `netinfo.ipmap_*`, and `netinfo.cymru_fallback` - a Team Cymru lookup answered
+  by a public resolver rather than your own; it climbs for every lookup during
+  the minute your resolver is being bypassed after one failure, not once per
+  failure), the auto city race
+  (`speed.cityrace_decided` / `_silent` / `_unanchored`, and
+  `speed.cityrace_field_reused` - runs that ranked the race's own list and
+  pings instead of fetching again; every decided race should), the auto-select
+  challenger (`speed.challenge` - every challenge attempt, whether or not the
+  rival could be measured; `speed.challenge_won` - attempts where the rival
+  took the seat; `speed.challenge_failed` - attempts where the rival could not
+  be measured and the incumbent was measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
   destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
 restore refused rather than silently dropped), the /metrics self-disclosures
 (`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's
@@ -1842,14 +1920,43 @@ and `-d '{…}'` where a body is listed below.
   unrecorded
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
-  best-of run (`ts` = the run's unix seconds): every candidate that was ranked,
-  raced, measured, or failed - each with its own numbers, the capacity the
-  round believed, any direction it refused to believe, and the rule that made
-  the winner win
+  Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge
+  run, and pinned run writes one, not only Best-of rounds: every candidate that
+  was ranked, raced, measured, or failed - each with its own numbers, the
+  capacity the round believed, any direction it refused to believe, and the
+  rule that made the winner win (`win_reason` on the winner row:
+  `fastest_ranked`, `incumbent`, `on_net`, `challenger`, `challenger_won`,
+  `challenger_failed`, `pinned`, and for Best-of rounds `score`,
+  `ping_bootstrap`, `pinned_bestof`, `pinned_companion` - the same value the
+  runs table shows as the muted tag). `404` only when no such run exists; a run
+  with no report (an iperf3 run, history from before the report existed, an
+  old backup) answers `200` with an empty `servers` array
 - `GET /api/speed/usage` - cumulative data used per window
+- `POST /api/speedtest/candidates` - the field an automatic Ookla run would race
+  right now: every origin's pool (exit router, ISP city, starred servers' cities,
+  the last race's winning city, Ookla's placement), deduplicated and pinged, fastest first, plus the rest of
+  the winning city's field pinged the same way; `in_field` marks the rows a run
+  would actually choose from, and `distance_km` is re-measured from the winning
+  city for every row that has a coordinate; when Ookla's own placement wins
+  (it has no coordinate to measure from) each row keeps the distance from the
+  origin that listed it, so distances are then not comparable across origins;
+  `409` while a speedtest is running
+- `POST /api/speedtest/ping` - `{ids:[...]}` measure the ping to up to twelve
+  Ookla servers by ID, the way the race pings (no transfer), probing each
+  one's upload endpoint on the way - the picker's saved-pane refresh; answers
+  `{pings:{id: ms|null}, health:{id: bool}}` (`health` only where the probe
+  could tell, so a starred server outside every listing can earn its
+  Unsupported mark); `409` while a speedtest is running
+- `GET /api/speed/server-pings?ids=` - the median of each server's recent
+  ranking pings from this daemon's own runs (no network); a server never
+  ranked is absent
 - `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; `?id=<ookla
-  id>` resolves one server by its Ookla ID instead, `404` if there is no such
-  server; by default the list is centred where auto last tested, else near you)
+  id>` resolves one server by its Ookla ID instead - identity plus `fallback_ok`
+  when its upload endpoint could be probed, no coordinate, and a `distance_km`
+  of `0` that means *unknown*, because that endpoint reports the *caller's*
+  position as the server's: `404` when Ookla answers and knows no such server, `502`/`504` when
+  Ookla could not be asked; by default the list is centred where auto last
+  tested, else near you)
 - `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable
 - `GET /api/heatmap?days=365[&tz=Europe/Berlin]` - daily downtime, plus
   `window_s`/`observed_s` on every day it returns (how much of it was in range
@@ -2043,6 +2150,10 @@ erDiagram
     real packet_loss
     int  healthy
     text server
+    text race_outcome "how the centre was chosen: decided | silent | unanchored | failed | skipped | bypassed_pin"
+    text race_origins "every city that raced, with its fastest answer"
+    text race_winner_label
+    real race_winner_ms
   }
   speed_servers {
     int  run_ts "joins speed.ts: each run's server-selection report"
@@ -2067,7 +2178,7 @@ the default `1.1.1.1` path (flagged in the UI).
 ```mermaid
 flowchart TB
   refresh["netinfo refresh"] --> trace["ICMP traceroute → 1.1.1.1<br/>(native per OS: raw/ping socket on Linux,<br/>ICMP socket on macOS, IcmpSendEcho on Windows)"]
-  trace --> asn["per-hop ASN<br/>(Team Cymru DNS)"]
+  trace --> asn["per-hop ASN<br/>(Team Cymru DNS, via your resolver;<br/>1.1.1.1 / 9.9.9.9 directly when it fails)"]
   asn --> boundary{"walk to the AS boundary"}
   boundary --> exit["exit router<br/>(last hop in the ISP)"]
   boundary --> handoff["handoff<br/>(first hop beyond)"]

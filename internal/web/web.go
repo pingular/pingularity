@@ -94,16 +94,26 @@ type NetInfo interface {
 
 // Server wires the store and live status into HTTP handlers.
 type Server struct {
-	store      *store.Store
-	status     StatusFunc
-	speed      SpeedTrigger
-	settings   *settings.Controller
-	netinfo    NetInfo
-	version    string
-	started    time.Time // process start (for the runtime pill)
-	listenAddr string    // bound address (for showing reachable URLs)
-	log        *slog.Logger
-	logins     *failLimiter // per-IP throttle on password failures
+	store  *store.Store
+	status StatusFunc
+	speed  SpeedTrigger
+	// RaceListingFn answers the picker's Auto button: the field an automatic
+	// Ookla run would race right now (see speedtest.Ookla.RaceListing). Nil
+	// when no Ookla tester is wired (tests), in which case the endpoint says so.
+	RaceListingFn func(ctx context.Context) (speedtest.RaceListing, error)
+	// PingServersFn re-measures the picker's kept servers on demand (the
+	// saved pane's refresh): each ID resolved, its endpoint probed for the
+	// health verdict, and pinged the way the race pings, no transfer (see
+	// speedtest.PingServersByID). Nil when no Ookla tester is wired, in which
+	// case the endpoint says so.
+	PingServersFn func(ctx context.Context, ids []string) map[string]speedtest.ServerPing
+	settings      *settings.Controller
+	netinfo       NetInfo
+	version       string
+	started       time.Time // process start (for the runtime pill)
+	listenAddr    string    // bound address (for showing reachable URLs)
+	log           *slog.Logger
+	logins        *failLimiter // per-IP throttle on password failures
 
 	// serveCtx is the run context, captured when Serve starts; background work
 	// spawned from a handler (the exit-target re-trace) derives from it so a
@@ -360,6 +370,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/speedtest", s.handleSpeedtest)
 	mux.HandleFunc("/api/speedtest/abort", s.handleSpeedtestAbort)
 	mux.HandleFunc("/api/speedtest/servers", s.handleSpeedtestServers)
+	mux.HandleFunc("/api/speedtest/candidates", s.handleSpeedtestCandidates)
+	mux.HandleFunc("/api/speedtest/ping", s.handleSpeedtestPing)
+	mux.HandleFunc("/api/speed/server-pings", s.handleSpeedServerPings)
 	mux.HandleFunc("/api/iperf/check", s.handleIperfCheck)
 	mux.HandleFunc("/api/heatmap", s.handleHeatmap)
 	mux.HandleFunc("/api/events", s.handleEvents)
@@ -493,7 +506,7 @@ const baselineWriteWindow = 3 * time.Minute
 // exempt from baselineWriteWindow.
 func selfPacedPath(p string) bool {
 	switch p {
-	case "/api/speedtest", "/api/speedtest/abort", "/api/speedtest/servers", "/api/netinfo",
+	case "/api/speedtest", "/api/speedtest/abort", "/api/speedtest/servers", "/api/speedtest/candidates", "/api/speedtest/ping", "/api/netinfo",
 		"/api/iperf/check", "/api/export", "/api/import",
 		"/api/speed/runs.csv", "/api/update", "/api/notify/test", "/api/notify/heartbeat/test":
 		return true
@@ -1079,7 +1092,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// Ookla runs after all, and then selection IS happening.
 		"speedtest_auto": s.settings.SpeedServerID() == "" &&
 			!(s.settings.SpeedEngine() == "iperf3" && speedtest.IperfAvailable()),
-		"speedtest_auto_label": s.settings.SpeedAutoLabel(), // the city the USER searched, which overrides the race; empty when auto races for its own centre (speedtest.raceCities) - a centre decided per run, which this snapshot cannot name in advance
 		"speedtest_enabled":    s.settings.SpeedtestEnabled(),
 		"speed_interval_s":     int(s.settings.SpeedInterval().Seconds()),
 		"data_used_bytes":      dataBytes,                  // cumulative speedtest data (down+up)
@@ -1330,6 +1342,21 @@ func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	if runs == nil {
 		runs = []store.SpeedSample{}
+	}
+	// Why each run's server was the one measured, from its selection report,
+	// so the table can say "incumbent" or "challenger" beside a server name
+	// that differs from the rows around it. A lookup failure loses the tags,
+	// not the listing.
+	tss := make([]int64, 0, len(runs))
+	for _, run := range runs {
+		tss = append(tss, run.TS)
+	}
+	if reasons, err := s.store.WinReasonsFor(r.Context(), tss); err == nil {
+		for i := range runs {
+			runs[i].WinReason = reasons[runs[i].TS]
+		}
+	} else {
+		s.log.Warn("runs listing: could not read win reasons", "err", err)
 	}
 	writeJSON(w, map[string]any{"runs": runs, "total": total})
 }
@@ -1931,11 +1958,30 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 	// Pin an exact server by Ookla ID: the "City or server ID" box resolves a
 	// numeric entry here so the UI can confirm its name before saving.
 	if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
-		srv, err := speedtest.GetOoklaServer(ctx, id)
+		srv, err := getOoklaServer(ctx, id)
 		if err != nil {
-			http.Error(w, "server not found", http.StatusNotFound)
+			// Only "no such server" is the user's to fix. A transport failure or
+			// this handler's own deadline says nothing about the ID, and the page
+			// must not paint "not found" over a real server - or refuse to save
+			// it - because Ookla was unreachable for a moment. Known residual: the
+			// library never inspects the HTTP status, so an Ookla error page
+			// arrives as a decode error (malformed HTML, the usual case) and
+			// reads as unreachable - but a well-formed one decodes to an empty
+			// list and still reads as not found.
+			switch {
+			case errors.Is(err, speedtest.ErrServerNotFound):
+				http.Error(w, "server not found", http.StatusNotFound)
+			case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+				http.Error(w, "server lookup timed out", http.StatusGatewayTimeout)
+			default:
+				http.Error(w, "could not reach the server catalogue", http.StatusBadGateway)
+			}
 			return
 		}
+		// NOT through browseServers: this reply must never carry a coordinate. The
+		// by-ID endpoint backfills the CALLER'S own position on a sparse record
+		// (see recentrePin), so the plain type - which withholds Lat/Lon - is what
+		// keeps a starred by-ID server from being saved at our address.
 		writeJSON(w, map[string]any{"servers": []speedtest.ServerInfo{srv}})
 		return
 	}
@@ -1990,7 +2036,8 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 		// longtime pin, or the ID lookup failing), fall back to the first
 		// candidate city auto-select would race that carries a coordinate: the
 		// exit router when RIPE placed it, else the ISP geolocation of our
-		// public IP (main.autoOrigins, via speedtest.FirstAnchoredOrigin).
+		// public IP, else a starred server's city, else the last race's winning
+		// city (main.autoOrigins, via speedtest.FirstAnchoredOrigin).
 		// Nothing anchored leaves the fetch uncentred, which is not a gap but
 		// the remaining candidate itself - the Ookla API then places our source
 		// address and returns the pool IT puts us in.
@@ -2047,6 +2094,9 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 			}
+			// The first anchored origin: the exit router, else the ISP city, else
+			// the first city the user has starred a server in, else the city that
+			// won the last race (main.autoOrigins).
 			if centre == "" && s.AutoOriginsFn != nil {
 				if org, ok := speedtest.FirstAnchoredOrigin(s.AutoOriginsFn()); ok {
 					lat, lon, locName = org.Lat, org.Lon, org.Label
@@ -2069,9 +2119,219 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 	if centreSrv != nil && !slices.ContainsFunc(list, func(si speedtest.ServerInfo) bool { return si.ID == centreSrv.ID }) {
 		pre := *centreSrv
 		pre.DistanceKM = 0 // distance to the centre, which is this server
+		// The by-ID record it was resolved from carries no coordinate (that
+		// endpoint reports the caller's), but lat/lon here ARE this server's
+		// catalogue position - the metro fetch was centred on them - so the row
+		// goes out with them like every other listed server. Without this a star
+		// on the one row the caption names saved it at 0,0.
+		pre.Lat, pre.Lon = lat, lon
 		list = append([]speedtest.ServerInfo{pre}, list...)
 	}
-	writeJSON(w, map[string]any{"servers": list, "location": locName, "lat": lat, "lon": lon, "centre": centre})
+	writeJSON(w, map[string]any{"servers": browseServers(list), "location": locName, "lat": lat, "lon": lon, "centre": centre})
+}
+
+// browseServer is one row of the picker's browse listing: a ServerInfo plus the
+// catalogue coordinate ServerInfo itself withholds from JSON. The picker saves
+// that coordinate when a server is starred: the listing is the only reply whose
+// position is the server's own - the by-ID endpoint reports the CALLER'S
+// position for a server on the caller's ISP (see recentrePin in
+// internal/speedtest) - and a pinned best-of run reads the saved pair back when
+// the live catalogue cannot place the pin. The by-ID reply itself never comes
+// through here (ServerInfo's json:"-" tags keep it bare); omitempty is for a
+// listed row whose catalogue pair failed to parse, and the tested guard should
+// a by-ID-shaped record ever be routed through this wrapper without the
+// override the prepended last-run row gets.
+type browseServer struct {
+	speedtest.ServerInfo
+	Lat float64 `json:"lat,omitempty"`
+	Lon float64 `json:"lon,omitempty"`
+}
+
+func browseServers(list []speedtest.ServerInfo) []browseServer {
+	out := make([]browseServer, len(list))
+	for i, s := range list {
+		out[i] = browseServer{ServerInfo: s, Lat: s.Lat, Lon: s.Lon}
+	}
+	return out
+}
+
+// handleSpeedtestCandidates answers the picker's Auto button with the field an
+// automatic run would race right now: every origin's pool (exit router, ISP
+// city, the starred servers' cities, the last race's winning city, Ookla's
+// own placement), deduplicated,
+// pinged, fastest first - the candidates the RUN button would choose between,
+// with the pings the race ranks on. Pings only, no transfer. POST + JSON for
+// the same reason handleSpeedtestServers demands them: this reaches out.
+func (s *Server) handleSpeedtestCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireJSONCT(w, r) {
+		return
+	}
+	if s.RaceListingFn == nil {
+		http.Error(w, "auto selection is not available", http.StatusServiceUnavailable)
+		return
+	}
+	// A race pinged through a running transfer measures the transfer, not the
+	// servers; and the run's own selection is what the list claims to preview.
+	if s.speed != nil && s.speed.RunID() != 0 {
+		http.Error(w, "a speedtest is running", http.StatusConflict)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	l, err := s.RaceListingFn(ctx)
+	if err != nil {
+		s.log.Debug("candidate race failed", "err", err)
+		http.Error(w, "could not race the candidate cities", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"origins": originsDTO(l.Origins),
+		"winner":  originDTO(l.Winner),
+		"servers": raceCandidatesDTO(l.Servers),
+	})
+}
+
+// raceCandidate is one row of the Auto listing on the wire: a browse row (the
+// catalogue coordinate rides along, so a star saves it) plus the origin whose
+// pool surfaced the server.
+type raceCandidate struct {
+	browseServer
+	Origin      string `json:"origin"`
+	OriginLabel string `json:"origin_label,omitempty"`
+	InField     bool   `json:"in_field"` // a run centred where this race centres would choose from this row
+}
+
+func raceCandidatesDTO(in []speedtest.RaceCandidate) []raceCandidate {
+	out := make([]raceCandidate, len(in))
+	for i, c := range in {
+		out[i] = raceCandidate{browseServer: browseServer{ServerInfo: c.ServerInfo, Lat: c.Lat, Lon: c.Lon},
+			Origin: c.Origin, OriginLabel: c.OriginLabel, InField: c.InField}
+	}
+	return out
+}
+
+// maxPingIDs bounds one refresh: the kept list is capped at twelve (see
+// settings.maxSpeedServers), and each ID costs a by-ID fetch plus a probe set
+// at a third party.
+const maxPingIDs = 12
+
+// handleSpeedtestPing re-measures a handful of servers by ID on demand -
+// POST {"ids":[...]} -> {"pings":{id: ms|null}, "health":{id: bool}} - for the
+// picker's saved pane, whose servers are mostly outside whatever list was
+// last fetched. health carries only determined verdicts (the three-state rule
+// browse rows follow), so a kept server's Unsupported mark can come from the
+// refresh. POST + JSON for the reason handleSpeedtestServers gives: it reaches
+// out. 409 while a run is in flight, as the candidate race is: a ping through
+// a transfer measures the transfer.
+func (s *Server) handleSpeedtestPing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireJSONCT(w, r) {
+		return
+	}
+	if s.PingServersFn == nil {
+		http.Error(w, "server pings are not available", http.StatusServiceUnavailable)
+		return
+	}
+	if s.speed != nil && s.speed.RunID() != 0 {
+		http.Error(w, "a speedtest is running", http.StatusConflict)
+		return
+	}
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil {
+		http.Error(w, "bad JSON body", http.StatusBadRequest)
+		return
+	}
+	ids := cleanServerIDs(body.IDs)
+	if len(ids) == 0 {
+		http.Error(w, "no server ids", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	res := s.PingServersFn(ctx, ids)
+	pings := make(map[string]*float64, len(res))
+	health := make(map[string]bool)
+	for id, p := range res {
+		pings[id] = p.PingMS
+		if p.FallbackOK != nil {
+			health[id] = *p.FallbackOK
+		}
+	}
+	writeJSON(w, map[string]any{"pings": pings, "health": health})
+}
+
+// handleSpeedServerPings answers with what the daemon's own runs measured:
+// GET ?ids=a,b,c -> {"pings":{id: median ms}} of each server's recent ranking
+// pings (see store.RecentRankPings). No network - it is what the saved pane
+// shows before anyone asks for a fresh measurement, and a server the runs
+// never ranked is simply absent.
+func (s *Server) handleSpeedServerPings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "use GET", http.StatusMethodNotAllowed)
+		return
+	}
+	ids := cleanServerIDs(strings.Split(r.URL.Query().Get("ids"), ","))
+	if len(ids) == 0 {
+		writeJSON(w, map[string]any{"pings": map[string]float64{}})
+		return
+	}
+	pings, err := s.store.RecentRankPings(r.Context(), ids, recentRankPingRuns)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"pings": pings})
+}
+
+// recentRankPingRuns is how many of a server's ranking pings the saved pane's
+// median is taken over: enough to sit on the typical value rather than the last
+// hour's, few enough to follow a server that has genuinely changed.
+const recentRankPingRuns = 20
+
+// cleanServerIDs keeps the plausible Ookla IDs (digits, as the catalogue
+// issues them), deduplicated, in order, at most maxPingIDs of them.
+func cleanServerIDs(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, id := range in {
+		id = strings.TrimSpace(id)
+		if id == "" || len(id) > 12 || seen[id] || strings.Trim(id, "0123456789") != "" {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) == maxPingIDs {
+			break
+		}
+	}
+	return out
+}
+
+func originDTO(o *speedtest.Origin) map[string]any {
+	if o == nil {
+		return nil
+	}
+	return map[string]any{"kind": o.Kind, "label": o.Label}
+}
+
+func originsDTO(in []speedtest.Origin) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for i := range in {
+		out = append(out, originDTO(&in[i]))
+	}
+	return out
 }
 
 // lastAutoRunServerID finds the server the most recent AUTO-selected Ookla run
@@ -2103,8 +2363,8 @@ func (s *Server) lastAutoRunServerID(ctx context.Context) (string, bool) {
 			if !row.Winner {
 				continue
 			}
-			if row.WinReason == speedtest.WinReasonPinned {
-				break // a pinned run: keep looking for the last AUTO one
+			if speedtest.PinnedRun(row.WinReason) {
+				break // a pinned run, single-target or best-of: keep looking for the last AUTO one
 			}
 			if row.ServerID == "" {
 				break // an imported report missing the ID can centre nothing
@@ -2124,8 +2384,9 @@ func (s *Server) lastAutoRunServerID(ctx context.Context) (string, bool) {
 // Ookla, and that coordinate is the whole defect this handler was fixed for.
 var listOoklaServers = speedtest.ListOoklaServers
 
-// getOoklaServer resolves the last auto run's server for the browse centring
-// above; a seam for the same reason listOoklaServers is.
+// getOoklaServer resolves a server by ID - both the picker's by-ID search and
+// the last auto run's server for the browse centring above; a seam for the same
+// reason listOoklaServers is.
 var getOoklaServer = speedtest.GetOoklaServer
 
 // searchOoklaServers fetches the browse list by city-name keyword for the
@@ -2242,8 +2503,6 @@ type settingsDTO struct {
 	DownAfter                *int    `json:"down_after"`
 	UpAfter                  *int    `json:"up_after"`
 	SpeedServerID            *string `json:"speed_server_id"`
-	SpeedAutoLoc             *string `json:"speed_auto_loc"`
-	SpeedAutoLabel           *string `json:"speed_auto_label"`
 	SpeedtestEnabled         *bool   `json:"speedtest_enabled"`
 	SpeedtestOnReconnect     *bool   `json:"speedtest_on_reconnect"`
 	IPv6Mode                 *string `json:"ipv6_mode"`
@@ -2264,20 +2523,32 @@ type settingsDTO struct {
 	IperfDur         *int             `json:"iperf_duration"`
 	IperfStreams     *int             `json:"iperf_streams"`
 	OoklaConnections *int             `json:"ookla_connections"`
-	OoklaLoss        *bool            `json:"ookla_loss"`
-	SpeedBestOf      *bool            `json:"speed_best_of"`
-	IperfOmit        *int             `json:"iperf_omit"`
-	SpeedDirection   *string          `json:"speed_direction"`
-	IperfDirection   *string          `json:"iperf_direction"`
-	IperfUDP         *bool            `json:"iperf_udp"`
-	IperfUDPRate     *int             `json:"iperf_udp_rate"`
-	IperfWindow      *int             `json:"iperf_window"`
-	SpeedRetries     *int             `json:"speed_retries"`
-	IperfRetries     *int             `json:"iperf_retries"`
-	IperfCongestion  *string          `json:"iperf_congestion"`
-	IperfNoDelay     *bool            `json:"iperf_nodelay"`
-	IperfDSCP        *string          `json:"iperf_dscp"`
-	IperfMSS         *int             `json:"iperf_mss"`
+	// Ookla auto-select challenger: after every N automatic tests the next
+	// scheduled test measures the strongest rival instead of the incumbent,
+	// which takes the seat only if it beats the incumbent's recent record by
+	// this percent (0 = never).
+	SpeedChallengeEvery  *int    `json:"speed_challenge_every"`
+	SpeedChallengeMargin *int    `json:"speed_challenge_margin"`
+	OoklaLoss            *bool   `json:"ookla_loss"`
+	SpeedBestOf          *bool   `json:"speed_best_of"`
+	IperfOmit            *int    `json:"iperf_omit"`
+	SpeedDirection       *string `json:"speed_direction"`
+	IperfDirection       *string `json:"iperf_direction"`
+	IperfUDP             *bool   `json:"iperf_udp"`
+	IperfUDPRate         *int    `json:"iperf_udp_rate"`
+	IperfWindow          *int    `json:"iperf_window"`
+	SpeedRetries         *int    `json:"speed_retries"`
+	IperfRetries         *int    `json:"iperf_retries"`
+	IperfCongestion      *string `json:"iperf_congestion"`
+	IperfNoDelay         *bool   `json:"iperf_nodelay"`
+	IperfDSCP            *string `json:"iperf_dscp"`
+	IperfMSS             *int    `json:"iperf_mss"`
+
+	// The saved Ookla picker list, following the same nil/[] rule as the iperf3
+	// one above. settings.SavedServer holds nothing secret, so it IS the wire
+	// shape - a parallel DTO would only be a place to drift.
+	SpeedServers []settings.SavedServer `json:"speed_servers"`
+
 	// Alerting.
 	ThreshDownMbps    *float64 `json:"thresh_down_mbps"`
 	ThreshUpMbps      *float64 `json:"thresh_up_mbps"`
@@ -2345,8 +2616,6 @@ func dtoFrom(v settings.Values) settingsDTO {
 		DownAfter:                ptr(v.DownAfter),
 		UpAfter:                  ptr(v.UpAfter),
 		SpeedServerID:            ptr(v.SpeedServerID),
-		SpeedAutoLoc:             ptr(v.SpeedAutoLoc),
-		SpeedAutoLabel:           ptr(v.SpeedAutoLabel),
 		SpeedtestEnabled:         ptr(v.SpeedtestEnabled),
 		SpeedtestOnReconnect:     ptr(v.SpeedtestOnReconnect),
 		IPv6Mode:                 ptr(v.IPv6Mode),
@@ -2361,9 +2630,12 @@ func dtoFrom(v settings.Values) settingsDTO {
 		SpeedEngine:              ptr(v.SpeedEngine),
 		IperfServer:              ptr(v.IperfServer),
 		IperfServers:             iperfServersToDTO(v.IperfServers),
+		SpeedServers:             v.SpeedServers,
 		IperfDur:                 ptr(v.IperfDur),
 		IperfStreams:             ptr(v.IperfStreams),
 		OoklaConnections:         ptr(v.OoklaConnections),
+		SpeedChallengeEvery:      ptr(v.SpeedChallengeEvery),
+		SpeedChallengeMargin:     ptr(v.SpeedChallengeMargin),
 		OoklaLoss:                ptr(v.OoklaLoss),
 		SpeedBestOf:              ptr(v.SpeedBestOf),
 		IperfOmit:                ptr(v.IperfOmit),
@@ -2666,8 +2938,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			DNSProbe:             in.DNSProbe,
 			NetinfoEnabled:       in.NetinfoEnabled,
 			SpeedServerID:        in.SpeedServerID,
-			SpeedAutoLoc:         in.SpeedAutoLoc,
-			SpeedAutoLabel:       in.SpeedAutoLabel,
 			Speed:                durp(in.SpeedSeconds),
 			Retention:            durp(in.RetentionSeconds),
 			SpeedRetention:       durp(in.SpeedRetentionSeconds),
@@ -2685,50 +2955,55 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			// generic settings POST must not be able to flip it back to false and
 			// reopen Quick Setup (or re-freeze defaults through it). The GET
 			// response still reports it for the client's read.
-			ExitTarget:          in.ExitTarget,
-			SpeedtestAdaptive:   in.SpeedtestAdaptive,
-			SpeedtestOnDegraded: in.SpeedtestOnDegraded,
-			DegradedPingMS:      in.DegradedPingMS,
-			SpeedtestSkipBusy:   in.SpeedtestSkipBusy,
-			SpeedBusyMbps:       in.SpeedBusyMbps,
-			SpeedEngine:         in.SpeedEngine,
-			IperfServer:         in.IperfServer,
-			IperfDur:            in.IperfDur,
-			IperfStreams:        in.IperfStreams,
-			OoklaConnections:    in.OoklaConnections,
-			OoklaLoss:           in.OoklaLoss,
-			SpeedBestOf:         in.SpeedBestOf,
-			IperfOmit:           in.IperfOmit,
-			SpeedDirection:      in.SpeedDirection,
-			IperfDirection:      in.IperfDirection,
-			IperfUDP:            in.IperfUDP,
-			IperfUDPRate:        in.IperfUDPRate,
-			IperfWindow:         in.IperfWindow,
-			SpeedRetries:        in.SpeedRetries,
-			IperfRetries:        in.IperfRetries,
-			IperfCongestion:     in.IperfCongestion,
-			IperfNoDelay:        in.IperfNoDelay,
-			IperfDSCP:           in.IperfDSCP,
-			IperfMSS:            in.IperfMSS,
-			ThreshDownMbps:      in.ThreshDownMbps,
-			ThreshUpMbps:        in.ThreshUpMbps,
-			ThreshPingMS:        in.ThreshPingMS,
-			ThreshJitterMS:      in.ThreshJitterMS,
-			ThreshLossPct:       in.ThreshLossPct,
-			ThreshConsec:        in.ThreshConsec,
-			ThreshBloatDownMS:   in.ThreshBloatDownMS,
-			ThreshBloatUpMS:     in.ThreshBloatUpMS,
-			AlertOnOutage:       in.AlertOnOutage,
-			WebhookURL:          in.WebhookURL,
-			HeartbeatURL:        in.HeartbeatURL,
-			DigestFreq:          in.DigestFreq,
-			SchedLatEnabled:     in.SchedLatEnabled,
-			SchedLatWindows:     in.SchedLatWindows,
-			SchedSpeedEnabled:   in.SchedSpeedEnabled,
-			SchedSpeedWindows:   in.SchedSpeedWindows,
+			ExitTarget:           in.ExitTarget,
+			SpeedtestAdaptive:    in.SpeedtestAdaptive,
+			SpeedtestOnDegraded:  in.SpeedtestOnDegraded,
+			DegradedPingMS:       in.DegradedPingMS,
+			SpeedtestSkipBusy:    in.SpeedtestSkipBusy,
+			SpeedBusyMbps:        in.SpeedBusyMbps,
+			SpeedEngine:          in.SpeedEngine,
+			IperfServer:          in.IperfServer,
+			IperfDur:             in.IperfDur,
+			IperfStreams:         in.IperfStreams,
+			OoklaConnections:     in.OoklaConnections,
+			SpeedChallengeEvery:  in.SpeedChallengeEvery,
+			SpeedChallengeMargin: in.SpeedChallengeMargin,
+			OoklaLoss:            in.OoklaLoss,
+			SpeedBestOf:          in.SpeedBestOf,
+			IperfOmit:            in.IperfOmit,
+			SpeedDirection:       in.SpeedDirection,
+			IperfDirection:       in.IperfDirection,
+			IperfUDP:             in.IperfUDP,
+			IperfUDPRate:         in.IperfUDPRate,
+			IperfWindow:          in.IperfWindow,
+			SpeedRetries:         in.SpeedRetries,
+			IperfRetries:         in.IperfRetries,
+			IperfCongestion:      in.IperfCongestion,
+			IperfNoDelay:         in.IperfNoDelay,
+			IperfDSCP:            in.IperfDSCP,
+			IperfMSS:             in.IperfMSS,
+			ThreshDownMbps:       in.ThreshDownMbps,
+			ThreshUpMbps:         in.ThreshUpMbps,
+			ThreshPingMS:         in.ThreshPingMS,
+			ThreshJitterMS:       in.ThreshJitterMS,
+			ThreshLossPct:        in.ThreshLossPct,
+			ThreshConsec:         in.ThreshConsec,
+			ThreshBloatDownMS:    in.ThreshBloatDownMS,
+			ThreshBloatUpMS:      in.ThreshBloatUpMS,
+			AlertOnOutage:        in.AlertOnOutage,
+			WebhookURL:           in.WebhookURL,
+			HeartbeatURL:         in.HeartbeatURL,
+			DigestFreq:           in.DigestFreq,
+			SchedLatEnabled:      in.SchedLatEnabled,
+			SchedLatWindows:      in.SchedLatWindows,
+			SchedSpeedEnabled:    in.SchedSpeedEnabled,
+			SchedSpeedWindows:    in.SchedSpeedWindows,
 		}
 		if in.IperfServers != nil { // nil = keep the saved list (and its passwords)
 			pat.IperfServers = iperfServersFromDTO(in.IperfServers) // blank pw kept by Update
+		}
+		if in.SpeedServers != nil { // nil = keep the saved list; [] = the user unstarred every one
+			pat.SpeedServers = in.SpeedServers
 		}
 		v, err := s.settings.Update(r.Context(), pat)
 		if err != nil {
@@ -2965,8 +3240,16 @@ var importReconcileHook func()
 //
 // minExportSchema is the oldest we still read: bumping the writer must not orphan
 // the backups already on disk.
+//
+// It went to 6 when the speed table gained the race verdict columns (race_*,
+// see store.SpeedSample.RaceOutcome): the same shape as 5, columns rather
+// than keys, decided the same content-dependent way - a file carries them
+// only when some row uses them, and stamps 6 only then. The builds that read
+// 5 abort on them exactly as the builds that read 4 abort on `failed`.
+// store.SpeedColumnSchema is where each column's version lives, so a column
+// added later is one map entry rather than one more paragraph here.
 const (
-	exportSchema    = 5
+	exportSchema    = 6
 	minExportSchema = 1
 )
 
@@ -2975,11 +3258,12 @@ const (
 // rejects anything above 1 before reading a byte, so stamping the file's own
 // requirement rather than exportSchema is what keeps a pauses-less backup
 // restorable on the builds that predate pauses (the roll-back path).
-// newSpeedColumns says the speed rows being exported still carry at least one
-// column added after schema 4, which no category key can express (see
-// exportSchema's v5 paragraph). The caller has already dropped the ones no row
-// uses, so this is about the bytes actually being written, not the table shape.
-func exportSchemaFor(keys []string, newSpeedColumns bool) int {
+// speedCols says which speed columns added after schema 4 the rows being
+// exported still carry (true = in use), which no category key can express (see
+// exportSchema's v5 and v6 paragraphs). The caller has already dropped the ones
+// no row uses, so this is about the bytes actually being written, not the
+// table shape; each column's own version comes from store.SpeedColumnSchema.
+func exportSchemaFor(keys []string, speedCols map[string]bool) int {
 	v := 1
 	for _, k := range keys {
 		switch k {
@@ -2991,8 +3275,10 @@ func exportSchemaFor(keys []string, newSpeedColumns bool) int {
 			v = max(v, 2)
 		}
 	}
-	if newSpeedColumns {
-		v = max(v, 5) // ... and to 5 for the post-schema-4 speed columns, which are columns rather than keys
+	for c, inUse := range speedCols {
+		if inUse {
+			v = max(v, store.SpeedColumnSchema(c)) // ... 5 and 6 for the speed columns, which are columns rather than keys
+		}
 	}
 	return v
 }
@@ -3069,13 +3355,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		newSpeedCols = inUse
 		break
 	}
-	carriesNewSpeedCols := false
-	for _, inUse := range newSpeedCols {
-		if inUse {
-			carriesNewSpeedCols = true
-			break
-		}
-	}
 	// Progress-refreshed write deadline: rearm as rows flush, so a client that stops
 	// reading is reaped within one window instead of holding the cursor for minutes.
 	bump := exportDeadlineBumper(w, s.log)
@@ -3100,7 +3379,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	catsJSON, _ := json.Marshal(cats)
 	fmt.Fprintf(bw, `{"pingularity_export":%d,"producer_version":%q,"exported_at":%d,"categories":%s`,
-		exportSchemaFor(cats, carriesNewSpeedCols), s.version, time.Now().Unix(), catsJSON)
+		exportSchemaFor(cats, newSpeedCols), s.version, time.Now().Unix(), catsJSON)
 	for _, dc := range sel {
 		fmt.Fprintf(bw, ",%q:[", dc.key)
 		first := true
@@ -3108,7 +3387,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			// Drop the post-schema-4 columns no row uses, so the low stamp this
 			// file is about to carry is TRUE: an older build would abort the
 			// whole category on any one of them, not skip it. A column that IS
-			// in use stays, and carriesNewSpeedCols has already pushed the stamp
+			// in use stays, and exportSchemaFor has already pushed the stamp
 			// out of that build's range - the two decisions read the same map.
 			if dc.table == "speed" {
 				for _, c := range store.SpeedColumnsPastSchema4() {

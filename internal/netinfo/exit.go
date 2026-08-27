@@ -747,6 +747,107 @@ func (m *Manager) cfColo(ctx context.Context) string {
 	return ""
 }
 
+// Team Cymru answers over DNS, so every exit discovery leans on a resolver -
+// and the host's own is the one thing here that can be slow or filtered for
+// minutes at a time (measured: NextDNS timing out on the origin zone for a
+// whole evening, which took the Exit row, and the race origin it feeds, down
+// with it). A public resolver reached directly is the fallback; after the
+// host resolver fails, the fallbacks go first for a while, so the trace and the
+// serial lookups after it (AS name, resolver label, country) do not each pay
+// the dead resolver's timeout. The fallbacks get a shorter budget than the host
+// resolver: they answer the zone in tens of milliseconds, and on a network that
+// drops public port 53 outright the whole chain must still cost less than the
+// refresh that runs it. Package-level so tests can swap the lookups and the
+// clock; the host lookup reads net.DefaultResolver at call time so tests that
+// swap the resolver stay off the network.
+var (
+	cymruSystemTXT = func(ctx context.Context, q string) ([]string, error) {
+		return net.DefaultResolver.LookupTXT(ctx, q)
+	}
+	cymruFallbackTXT = []func(context.Context, string) ([]string, error){
+		fixedResolver("1.1.1.1:53").LookupTXT,
+		fixedResolver("9.9.9.9:53").LookupTXT,
+	}
+	cymruLookupTimeout   = 2 * time.Second
+	cymruFallbackTimeout = time.Second
+	cymruSuspectFor      = time.Minute
+	cymruNow             = time.Now
+
+	cymruMu           sync.Mutex
+	cymruSuspectUntil time.Time // the host resolver failed; prefer the fallbacks until then
+)
+
+// fixedResolver is a resolver that asks one server directly, bypassing the
+// host's resolver configuration.
+func fixedResolver(addr string) *net.Resolver {
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}}
+}
+
+// cymruTXT answers one Team Cymru TXT query. NXDOMAIN is an answer (no origin
+// ASN for that prefix) and is returned as the resolver reported it; any other
+// failure moves on to the next resolver. The error returned when all fail is
+// the last one seen. A failure while the caller's own context is already dead
+// says nothing about any resolver: it is returned at once, marks nothing
+// suspect, and asks nobody else.
+func cymruTXT(ctx context.Context, q string) ([]string, error) {
+	try := func(fn func(context.Context, string) ([]string, error), budget time.Duration) ([]string, error, bool) {
+		c, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		txts, err := fn(c, q)
+		return txts, err, err == nil || isNXDomain(err)
+	}
+	cymruMu.Lock()
+	systemFirst := !cymruNow().Before(cymruSuspectUntil)
+	cymruMu.Unlock()
+	var last error
+	if systemFirst {
+		txts, err, answered := try(cymruSystemTXT, cymruLookupTimeout)
+		if answered {
+			return txts, err
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		last = err
+		cymruMu.Lock()
+		cymruSuspectUntil = cymruNow().Add(cymruSuspectFor)
+		cymruMu.Unlock()
+	}
+	for _, fb := range cymruFallbackTXT {
+		txts, err, answered := try(fb, cymruFallbackTimeout)
+		if answered {
+			stats.Inc("netinfo.cymru_fallback")
+			return txts, err
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		last = err
+	}
+	if !systemFirst {
+		// The suspect resolver still gets its turn, last: a fallback that is
+		// blocked (port 53 intercepted) must not make a recovered host resolver
+		// unreachable for the whole suspect window.
+		txts, err, answered := try(cymruSystemTXT, cymruLookupTimeout)
+		if answered {
+			cymruMu.Lock()
+			cymruSuspectUntil = time.Time{}
+			cymruMu.Unlock()
+			return txts, err
+		}
+		last = err
+	}
+	return nil, last
+}
+
+func isNXDomain(err error) bool {
+	var de *net.DNSError
+	return errors.As(err, &de) && de.IsNotFound
+}
+
 // cymruASN resolves an IP to its origin ASN (bare digits) via Team Cymru's DNS
 // zone - origin.asn.cymru.com for IPv4, origin6.asn.cymru.com for IPv6; "" when
 // unknown or the lookup fails.
@@ -763,12 +864,9 @@ func cymruASNLookup(ctx context.Context, ip string) (string, error) {
 	if q == "" {
 		return "", nil
 	}
-	c, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	txts, err := net.DefaultResolver.LookupTXT(c, q)
+	txts, err := cymruTXT(ctx, q)
 	if err != nil {
-		var de *net.DNSError
-		if errors.As(err, &de) && de.IsNotFound {
+		if isNXDomain(err) {
 			return "", nil // NXDOMAIN: genuinely no origin ASN announced for this prefix
 		}
 		return "", err
@@ -788,9 +886,7 @@ func cymruCountry(ctx context.Context, ip string) string {
 	if q == "" {
 		return ""
 	}
-	c, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	txts, err := net.DefaultResolver.LookupTXT(c, q)
+	txts, err := cymruTXT(ctx, q)
 	if err != nil || len(txts) == 0 {
 		return ""
 	}
@@ -873,9 +969,7 @@ func cymruASNName(ctx context.Context, asn string) string {
 	if asn == "" {
 		return ""
 	}
-	c, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	txts, err := net.DefaultResolver.LookupTXT(c, "AS"+asn+".asn.cymru.com")
+	txts, err := cymruTXT(ctx, "AS"+asn+".asn.cymru.com")
 	if err != nil || len(txts) == 0 {
 		return ""
 	}

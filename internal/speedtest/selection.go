@@ -27,7 +27,7 @@ type CandidateReport struct {
 	ServerID   string
 	Server     string // "Sponsor, Name" (serverLabel)
 	DistanceKM float64
-	RankPingMS *float64 // ranking ping, the library MEAN of ~10 samples; nil = the ranking ping went unanswered
+	RankPingMS *float64 // ranking ping: the FLOOR of ~10 samples, the statistic the city race and the winner decision also use; nil = the ranking ping went unanswered
 	RankOrder  int      // 1-based position in rankedServers output; 0 = never ranked (a pin resolved outside the list)
 	Selected   bool     // became a measurement target
 	Measured   bool     // produced a Result
@@ -54,7 +54,7 @@ type CandidateReport struct {
 	CappedDirection      string  // direction(s) the implausibility guard held to the middle for THIS row: "down", "up", "down,up", or ""
 	Score                float64 // roundScore(res, dir, round) - what bestIndex compared
 	Winner               bool
-	WinReason            string // score | ping_bootstrap | fastest_ranked | pinned
+	WinReason            string // score | ping_bootstrap | fastest_ranked | incumbent | on_net | challenger | challenger_won | challenger_failed | pinned | pinned_bestof | pinned_companion
 }
 
 // Win reasons. "fastest_ranked", not "only candidate": a want=1 auto run ranks
@@ -64,11 +64,45 @@ const (
 	winReasonScore       = "score"          // best-of: highest roundScore (with tie-breaks)
 	winReasonPingBoot    = "ping_bootstrap" // best-of with no speed history: lowest ping decided
 	winReasonFastestRank = "fastest_ranked" // want=1 auto: head of the ping-ranked list
+	// want=1 auto with the head PROMOTED there (see promoteIncumbent): the
+	// last auto run's server, still within noise of the fastest, or failing
+	// that the ISP's own server within the same band.
+	winReasonIncumbent = "incumbent"
+	winReasonOnNet     = "on_net"
+	// Exported: main's incumbent lookup must skip a challenger that LOST, and
+	// its challenge cadence counts runs since either of these.
+	WinReasonChallenger    = "challenger"     // scheduled auto: the incumbent's rival was measured; the incumbent kept the seat
+	WinReasonChallengerWon = "challenger_won" // ... and the rival beat the incumbent's recent record: it holds the seat now
+	// ... and the rival could not be measured, so the incumbent was, as the
+	// fallback: the attempt counts toward the cadence, the seat stays.
+	WinReasonChallengerFailed = "challenger_failed"
 	// Exported: the web browse-centring reads this back out of persisted
 	// speed_servers rows to skip pinned runs, and a compile-time tie beats two
 	// copies of the literal drifting apart.
 	WinReasonPinned = "pinned" // user-pinned single target: no contest ran
+	// A pin under best-of is still a pinned run: the companions are the pin's
+	// neighbours and the round says nothing about where auto would have gone.
+	// Its winner carries one of these instead of score/ping_bootstrap so the
+	// browse centring can skip it; which one says whether the pin itself won.
+	WinReasonPinnedBestOf    = "pinned_bestof"    // pinned + best-of: the pin won its round
+	WinReasonPinnedCompanion = "pinned_companion" // pinned + best-of: a companion beat the pin
 )
+
+// ChallengeRun reports whether a persisted win reason names a challenge run,
+// won or lost; ChallengeLost the lost ones alone - the runs whose measured
+// server must NOT become the incumbent.
+func ChallengeRun(reason string) bool {
+	return reason == WinReasonChallenger || reason == WinReasonChallengerWon || reason == WinReasonChallengerFailed
+}
+
+func ChallengeLost(reason string) bool { return reason == WinReasonChallenger }
+
+// PinnedRun reports whether a persisted win reason names a run with a pin in
+// effect, single-target or best-of, so a reader after "where auto last landed"
+// can skip it without knowing every literal.
+func PinnedRun(reason string) bool {
+	return reason == WinReasonPinned || reason == WinReasonPinnedBestOf || reason == WinReasonPinnedCompanion
+}
 
 // candidateRows snapshots the ranked list into report rows, in rank order.
 // rankPings carries the EXPLICIT ranking outcome per server ID - the Latency

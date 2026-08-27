@@ -21,6 +21,36 @@ import (
 // PoP while every city auto races was domestic; the two pools are disjoint, so
 // the server auto actually tests from could not be found in the picker at any
 // scroll position, and the panel captioned it "near your ISP's exit".
+// A starred server's city is an origin like any other, so with no exit and a
+// coordinateless ISP line the browse list centres there rather than nowhere -
+// the same reason it races (see main.autoOrigins).
+func TestBrowseFallbackCentresOnAStarredCityWhenNothingElseIsPlaced(t *testing.T) {
+	var gotLat, gotLon float64
+	old := listOoklaServers
+	listOoklaServers = func(_ context.Context, lat, lon float64) ([]speedtest.ServerInfo, error) {
+		gotLat, gotLon = lat, lon
+		return []speedtest.ServerInfo{}, nil
+	}
+	t.Cleanup(func() { listOoklaServers = old })
+	s := &Server{netinfo: stubNetInfo{}, AutoOriginsFn: func() []speedtest.Origin {
+		return []speedtest.Origin{
+			{Kind: "isp", Label: "Toronto, CA"}, // geolocated by name only: no coordinate
+			{Kind: "saved", Label: "Montréal, QC", Lat: 45.5, Lon: -73.5, Anchored: true},
+			{Kind: "geo", Label: "your connection"},
+		}
+	}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers", nil)
+	req.Header.Set("Content-Type", "application/json")
+	s.handleSpeedtestServers(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if gotLat != 45.5 || gotLon != -73.5 {
+		t.Errorf("centred on %v,%v; want the starred city, the first origin with a position", gotLat, gotLon)
+	}
+}
+
 func TestBrowseFallbackCentresOnACityAutoWouldRace(t *testing.T) {
 	var gotLat, gotLon float64
 	old := listOoklaServers

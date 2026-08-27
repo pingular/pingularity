@@ -13,7 +13,7 @@ import (
 )
 
 // rankPingLatency is the gate that fixes the zero-ping mis-rank: a successful
-// ping whose mean rounds to 0 on a coarse clock (Windows sub-ms) must count as
+// ping whose floor rounds to 0 on a coarse clock (Windows sub-ms) must count as
 // answered and clamp to the smallest positive duration, so the fastest server
 // ranks first instead of dropping to "unanswered" below every slower one. A
 // failed or unsampled ping must NOT be answered - its Latency field holds a
@@ -28,7 +28,7 @@ func TestRankPingLatency(t *testing.T) {
 		wantAns bool
 	}{
 		{"success, real latency", nil, true, 12 * time.Millisecond, 12 * time.Millisecond, true},
-		{"success, zero mean (coarse clock)", nil, true, 0, time.Nanosecond, true},
+		{"success, zero floor (coarse clock)", nil, true, 0, time.Nanosecond, true},
 		{"failed ping keeps stale echo out", errors.New("x"), true, 5 * time.Millisecond, 0, false},
 		{"nil error but no sample collected", nil, false, 9 * time.Millisecond, 0, false},
 		{"failed ping with zero latency", errors.New("x"), false, 0, 0, false},
@@ -49,7 +49,7 @@ func TestRankPingLatency(t *testing.T) {
 func TestApplyRankPingAndRanking(t *testing.T) {
 	// A failed ranking ping zeros the stale field and reports no measurement.
 	failed := &ookla.Server{ID: "stale", Latency: 1 * time.Millisecond} // stale discovery echo
-	if ms := applyRankPing(failed, errors.New("unreachable"), false); ms != nil {
+	if ms := applyRankPing(failed, errors.New("unreachable"), false, 0); ms != nil {
 		t.Errorf("failed ping reported a measurement %v, want nil", *ms)
 	}
 	if failed.Latency != 0 {
@@ -58,7 +58,7 @@ func TestApplyRankPingAndRanking(t *testing.T) {
 
 	// A successful ping records the measured value (positive, so it sorts first).
 	ok := &ookla.Server{ID: "good", Latency: 1 * time.Millisecond}
-	ms := applyRankPing(ok, nil, true)
+	ms := applyRankPing(ok, nil, true, 1*time.Millisecond)
 	if ms == nil || ok.Latency <= 0 {
 		t.Fatalf("successful ping: ms=%v Latency=%v, want a measurement and Latency>0", ms, ok.Latency)
 	}

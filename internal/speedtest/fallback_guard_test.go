@@ -110,7 +110,7 @@ func TestPinnedServerBypassesTheGuard(t *testing.T) {
 	o := &Ookla{}
 
 	t.Run("single server run", func(t *testing.T) {
-		targets, sel, err := o.pickServers(context.Background(), nil, servers, "dead", 1, nil)
+		targets, sel, _, err := o.pickServers(context.Background(), nil, servers, "dead", 1, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,7 +123,7 @@ func TestPinnedServerBypassesTheGuard(t *testing.T) {
 	})
 
 	t.Run("best-of round", func(t *testing.T) {
-		targets, _, err := o.pickServers(context.Background(), nil, servers, "dead", 3, nil)
+		targets, _, _, err := o.pickServers(context.Background(), nil, servers, "dead", 3, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

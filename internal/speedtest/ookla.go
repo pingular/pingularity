@@ -40,11 +40,12 @@ type Ookla struct {
 	// means auto-select the fastest server.
 	ServerIDFn func() string
 
-	// AutoLocFn, if set, supplies a coordinate the USER chose to centre
-	// auto-select on (a searched city). It overrides the city race below:
-	// a typed city is a statement of intent, not a hypothesis to be measured.
-	// ok=false means no city is set, which the race answers.
-	AutoLocFn func() (lat, lon float64, ok bool)
+	// SavedCoordFn, if set, looks a server ID up in the user's saved picker list
+	// and returns the catalogue coordinate the picker stored when the server was
+	// starred. Consulted only when a pinned best-of run cannot recover the pin's
+	// position from the live catalogue (see recentrePin); ok=false, or 0,0,
+	// means the list has nothing usable and the run falls back as before.
+	SavedCoordFn func(id string) (lat, lon float64, ok bool)
 
 	// OriginsFn, if set, enumerates the candidate cities auto-select races when
 	// nothing is pinned and no city is searched: each origin's closest servers
@@ -88,6 +89,56 @@ type Ookla struct {
 	// server AND the next two by ping, then keep the best result (see bestResult).
 	// Nil -> off. Only scheduled and manual runs honour it - see RunReason.
 	BestOfFn func() bool
+
+	// IncumbentFn, if set, names the server the last AUTOMATIC run measured
+	// (its selection report's winner; "" when there is none, or every recent
+	// run was pinned). Read once per auto run by pickServers: the run keeps
+	// measuring that server while it still ranks within noise of the fastest
+	// (see promoteIncumbent), so the history compares like with like instead
+	// of flipping between equivalent servers on a millisecond of jitter. It is
+	// still measured, every run - an incumbent that drops out of the field or
+	// out of the margin loses its seat that run. Nil -> no incumbent.
+	IncumbentFn func() string
+
+	// ChallengeFn, if set, says whether THIS scheduled auto run is a challenge
+	// run (read once per run). The incumbent rule above never measures a
+	// rival's throughput - it ranks on ping alone - so on a challenge run the
+	// incumbent's strongest rival (the fastest-pinging other server) is
+	// measured instead, and takes the seat only if its score beats the
+	// incumbent's recent record (IncumbentScoresFn) by ChallengeMarginFn
+	// percent (see challengeWon). Same data as an ordinary run: one server.
+	// Scheduled runs only, never under a pin or Best-of (which is its own
+	// explorer). Nil -> never.
+	ChallengeFn func() bool
+	// ChallengeMarginFn is the bar a challenger must clear, in percent over
+	// the incumbent's median score. Nil -> challengeDefaultMargin.
+	ChallengeMarginFn func() int
+	// IncumbentScoresFn hands back a server's recent measured scores, newest
+	// first, at most ChallengeHistory of them, judged under the given test
+	// direction ("both"|"down"|"up"): a score is download-only, upload-only or
+	// a weighted mean of both depending on how the run was configured, so only
+	// same-direction scores compare. Nil -> no history, so no challenger can
+	// ever win (the seat stays put, which is the safe reading).
+	IncumbentScoresFn func(id, dir string) []float64
+
+	// dir is the run's direction, kept for pickServers' challenge gate (the
+	// record it consults is per direction). Set by RunReason; a plain field
+	// for the same single-flight reason as upRec.
+	dir string
+
+	// challenge / challenged: this run is a challenge run, and the incumbent
+	// it is challenging (set by pickServers when the challenge actually
+	// happened - the incumbent had to be in the field and answering). Per-run
+	// fields for the same single-flight reason as upRec.
+	challenge  bool
+	challenged string
+
+	// raced carries the city race's own pings into the ranking of the run in
+	// flight (server ID -> the race's floor; 0 = raced and unanswered), so the
+	// servers the race measured seconds ago are not pinged twice. Set by
+	// RunReason before selection - nil when no race decided - and a plain
+	// field for the same single-flight reason as upRec.
+	raced map[string]time.Duration
 
 	// Log, if set, records which servers a best-of-N run tried and which won.
 	// Nil is fine - the losing runs are discarded either way.
@@ -2077,31 +2128,23 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// finish the run short - measured, a raced best-of-3 gave its third server
 	// 80s of the 90s it is designed to get. The allowance is added here rather
 	// than inside runBudget because only this scope knows whether a race can
-	// happen at all: runBudget cannot see the pin or the searched city, and its
-	// result is clamped by bestOfTotalCap, which would swallow the allowance.
+	// happen at all: runBudget cannot see the pin, and its result is clamped by
+	// bestOfTotalCap, which would swallow the allowance.
 	id := o.serverID()
 	origins := o.candidateOrigins()
-	// The searched city is snapshotted for the same reason the origins are: it
-	// is a LIVE settings read, it decides both the deadline below and the centre
-	// later on, and a pinned best-of run does a network fetch between those two
-	// points. Read twice, a city cleared in that window sizes the deadline as
-	// "no race" and then races anyway - paying for the race out of the exact
-	// base budget, the defect this allowance exists to prevent.
-	searchedCity := snapshotAutoLoc(o.AutoLocFn)
 	perServer, total := runBudget(retries, want)
-	if o.mayRaceCities(id, want, origins, searchedCity) {
+	if o.mayRaceCities(id, want, origins) {
 		total += cityRaceBudget
 	}
 	ctx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
 
-	// Auto with a configured location (a searched city) fetches servers near that
-	// coordinate; otherwise near the city that wins the race (see raceCities),
+	// Auto fetches servers near the city that wins the race (see raceCities),
 	// else near the caller's own IP. Fresh client per run: the
 	// library's client.Context accumulates per-chunk DataChunk snapshots for the
 	// client's life, so reusing one leaks a run's memory every test.
 	// One UserConfig carries the parallel-connection count (0 -> the library's
-	// NumCPU default) and, for auto-select with a searched city, the location.
+	// NumCPU default) and the location the run is centred on.
 	uc := &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent}
 	if o.ConnectionsFn != nil {
 		uc.MaxConnections = o.ConnectionsFn()
@@ -2110,7 +2153,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// companion servers from. A pinned server is resolved by ID and doesn't care
 	// about the centring itself, so what matters here is only where its COMPANIONS
 	// come from:
-	//   - nothing pinned: the searched city, else the raced city (see raceCities).
+	//   - nothing pinned: the raced city (see raceCities).
 	//   - pinned + best-of: the PINNED server, so the extras are its neighbours.
 	//     Centring those on the exit instead made a pin nearly pointless - the
 	//     winner is chosen on ping-weighted throughput (see bestIndex), so
@@ -2129,17 +2172,32 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		o.recentrePin(ctx, p) // the by-ID position can be OURS, not the server's
 		pinned = p
 	}
-	if lat, lon, label, ok := listCentre(id, want, pinned, searchedCity); ok {
+	// Every run records how its centre was chosen, raced or not (see
+	// RaceVerdict): a pin bypasses the race, and the row should say so rather
+	// than leave the column blank as if nothing decided.
+	var race raceResult
+	o.raced = nil
+	// A challenge is a scheduled, unpinned, single-server run's business: a
+	// manual run is the user asking about their line now, and Best-of already
+	// explores. Decided here, once, so pickServers and the verdict agree.
+	o.challenge = reason == "scheduled" && id == "" && want <= 1 && o.ChallengeFn != nil && o.ChallengeFn()
+	o.challenged = ""
+	o.dir = dir
+	if lat, lon, label, ok := listCentre(id, want, pinned); ok {
 		uc.Location = newAnchoredLocation(label, lat, lon)
+		race.Verdict.Outcome = RaceBypassedPin
 	} else if shouldRaceCities(id, want) {
 		// An unanchored winner is a real answer, not a failure - it means the
 		// pool the Ookla API picks for our source address held the fastest
 		// server, so Location stays nil and that same pool is what gets fetched
 		// below. A failed race leaves Location nil too, which is the pre-race
 		// behaviour.
-		if win, ok := o.raceOrigins(ctx, origins); ok && win.Anchored {
-			uc.Location = newAnchoredLocation("auto", win.Lat, win.Lon)
+		race = o.runRace(ctx, origins)
+		if race.OK && race.Origin.Anchored {
+			uc.Location = newAnchoredLocation("auto", race.Origin.Lat, race.Origin.Lon)
 		}
+	} else {
+		race.Verdict.Outcome = RaceBypassedPin
 	}
 	client, rec := newOoklaClientRec(uc)
 	o.upRec = rec
@@ -2166,9 +2224,23 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		}
 	}
 
-	servers, err := fetchServerList(ctx, client)
-	if err != nil {
-		return Result{}, fmt.Errorf("fetch server list: %w", err)
+	// A decided race already fetched the list this run would fetch - the
+	// winner's own coordinate is the centre, and the race read the API around
+	// it seconds ago - and already pinged part of it with the ranking's own
+	// statistic. Reuse both (see raceResult) rather than spend ~25 echo GETs
+	// and a round of pings re-learning them; the servers only need re-homing
+	// onto this run's client, the way the pin above is.
+	var servers ookla.Servers
+	if len(race.Field) > 0 {
+		servers = adoptRaceField(ctx, client, race.Field)
+		o.raced = race.Raced
+		stats.Inc("speed.cityrace_field_reused")
+	} else {
+		var err error
+		servers, err = fetchServerList(ctx, client)
+		if err != nil {
+			return Result{}, fmt.Errorf("fetch server list: %w", err)
+		}
 	}
 
 	// Bound just the candidate selection - the by-ID resolve and, above all, the
@@ -2182,7 +2254,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// stalled one just finishes unpinged and loses the race. The measurement below
 	// runs on the original ctx (the full run budget), not selCtx.
 	selCtx, selCancel := context.WithTimeout(ctx, bestOfSelectionBudget)
-	targets, sel, err := o.pickServers(selCtx, client, servers, id, want, pinned)
+	targets, sel, lead, err := o.pickServers(selCtx, client, servers, id, want, pinned)
 	selCancel()
 	if err != nil {
 		return Result{}, err
@@ -2289,6 +2361,9 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 				"capacity_mbps", util.Round2(resultCapacity(res, dir)))
 		}
 		results = append(results, res)
+		if want <= 1 {
+			break // a single-server run: the targets past the first are fallbacks, measured only when it failed
+		}
 	}
 	if len(results) == 0 {
 		// Even a total failure carries its usage out: every candidate's failed
@@ -2375,12 +2450,52 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	switch {
 	case id != "" && want <= 1:
 		winReason = WinReasonPinned
+	// A pinned best-of names the pin before it names the tie-break: the browse
+	// centring reads the reason back to skip runs a pin steered, and a
+	// "ping_bootstrap" on such a run would pass for an auto landing (see
+	// lastAutoRunServerID in internal/web).
+	case id != "" && best.ServerID == id:
+		winReason = WinReasonPinnedBestOf
+	case id != "":
+		winReason = WinReasonPinnedCompanion
+	case want <= 1 && lead == WinReasonChallenger && best.ServerID == o.challenged:
+		// The rival failed and the fallback - the incumbent - was measured. The
+		// attempt still counts toward the cadence (ChallengeRun), or a dead
+		// rival would be challenged on every scheduled run; the seat stays.
+		winReason = WinReasonChallengerFailed
+		stats.Inc("speed.challenge")
+		stats.Inc("speed.challenge_failed")
+		o.warnf("auto-select challenger could not be measured; the incumbent was measured instead",
+			"incumbent_id", o.challenged, "rival_err", firstRivalErr(targetIDs, errByID, o.challenged))
+	case want <= 1 && lead == WinReasonChallenger:
+		// The verdict: the rival keeps the seat only by beating the incumbent's
+		// recent record. Decided on the same score Best-of decides on, against
+		// a median so one lucky or unlucky hour of the incumbent's cannot
+		// settle it, with a margin so link noise cannot either.
+		winReason = WinReasonChallenger
+		stats.Inc("speed.challenge")
+		scores := o.incumbentScores(o.challenged, dir)
+		score := resultScore(best, dir)
+		if won, med := challengeWon(score, scores, o.challengeMargin()); won {
+			winReason = WinReasonChallengerWon
+			stats.Inc("speed.challenge_won")
+			o.warnf("auto-select challenger took the seat", "server", best.Server, "server_id", best.ServerID,
+				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
+				"history", len(scores), "margin_pct", o.challengeMargin())
+		} else {
+			o.logf("auto-select challenger lost", "server", best.Server, "server_id", best.ServerID,
+				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
+				"history", len(scores), "margin_pct", o.challengeMargin())
+		}
+	case want <= 1 && lead != "":
+		winReason = lead // the head of the list was promoted there (see promoteIncumbent)
 	case want <= 1:
 		winReason = winReasonFastestRank
 	case bootstrap:
 		winReason = winReasonPingBoot
 	}
 	best.Selection = finishSelection(sel, results, errByID, dir, best.ServerID, winReason)
+	best.Race = &race.Verdict
 	foldRoundBytes(&best, results, spentDown, spentUp)
 	// Always name the server whose numbers are being returned. Without this a run
 	// whose last target failed would leave the mid-run label - a server that
@@ -2428,7 +2543,8 @@ func keywordConfig(keyword string) *ookla.UserConfig {
 const pinCoordBudget = 15 * time.Second
 
 // recentrePin replaces a by-ID coordinate we cannot trust with the catalogue's
-// own, and clears it when there is none to be had.
+// own - else with the pair the picker saved when the server was starred - and
+// clears it when neither has one.
 //
 // api/ios-config.php splices the CALLER'S own ISP server into its reply wearing
 // the CALLER'S coordinates, so a pin that IS our ISP's server comes back
@@ -2452,18 +2568,43 @@ func (o *Ookla) recentrePin(ctx context.Context, p *ookla.Server) {
 	}
 	lat, lon, err := sponsorCoord(ctx, p.Sponsor, p.ID)
 	if err != nil {
-		// Warn with a counter: the companions now come from a raced city rather
-		// than from beside the pin, and one of them can be recorded in its place.
-		stats.Inc("speed.pin_coord_unrecovered")
-		o.warnf("could not place the pinned speedtest server; its companions will be drawn "+
-			"from elsewhere and one of them may be recorded instead",
-			"server", serverLabel(p), "server_id", p.ID, "err", err)
+		if la, lo, ok := o.savedCoord(p.ID); ok {
+			// The picker stored the catalogue's own coordinate when this server
+			// was starred, so the companions can still come from beside the pin.
+			// A snapshot, not a live answer: wrong only if the server has moved
+			// since it was starred, which the lookup that just failed could not
+			// have said either.
+			lat, lon = strconv.FormatFloat(la, 'f', -1, 64), strconv.FormatFloat(lo, 'f', -1, 64)
+			o.logf("placed the pinned speedtest server from the saved list; the catalogue lookup failed",
+				"server", serverLabel(p), "server_id", p.ID, "err", err)
+		} else {
+			// Warn with a counter: the companions now come from a raced city rather
+			// than from beside the pin, and one of them can be recorded in its place.
+			stats.Inc("speed.pin_coord_unrecovered")
+			o.warnf("could not place the pinned speedtest server; its companions will be drawn "+
+				"from elsewhere and one of them may be recorded instead",
+				"server", serverLabel(p), "server_id", p.ID, "err", err)
+		}
 	}
-	// Cleared on failure as well as set on success. A zero distance means this
-	// coordinate is the caller's own, so keeping it is keeping the fault; an
+	// Cleared when neither source has one, as well as set on success. A zero
+	// distance means this coordinate is the caller's own, so keeping it is keeping the fault; an
 	// empty one makes listCentre decline and the run races cities, which at
 	// least measures where it centres.
 	p.Lat, p.Lon = lat, lon
+}
+
+// savedCoord is SavedCoordFn with the nil and no-coordinate cases folded in:
+// 0,0 is the sentinel the settings layer stores for "starred without a
+// coordinate" (a by-ID row), and serverCoord already refuses it.
+func (o *Ookla) savedCoord(id string) (lat, lon float64, ok bool) {
+	if o.SavedCoordFn == nil {
+		return 0, 0, false
+	}
+	lat, lon, ok = o.SavedCoordFn(id)
+	if !ok || (lat == 0 && lon == 0) {
+		return 0, 0, false
+	}
+	return lat, lon, true
 }
 
 // sponsorCoord looks one server's registered coordinate up in the ordinary
@@ -2517,23 +2658,16 @@ func sponsorCoord(ctx context.Context, sponsor, id string) (lat, lon string, err
 //
 //	pinned + best-of  -> the pinned server, so the extras are ITS neighbours
 //	pinned, no best-of -> nothing; the pin is the only target and centring is moot
-//	nothing pinned    -> the searched city; with none, ok=false and the caller
-//	                     races the candidate cities instead (see raceCities)
+//	nothing pinned    -> ok=false: the caller races the candidate cities
+//	                     instead (see raceCities)
 //
-// A pin whose coordinate Ookla did not supply falls back to the searched city;
-// with no city the caller races instead, so the companions still come from a
-// measured place rather than the public-IP guess the library would make.
-func listCentre(id string, want int, pinned *ookla.Server, autoFn func() (float64, float64, bool)) (lat, lon float64, label string, ok bool) {
+// A pin whose coordinate Ookla did not supply is centred by the race too, so
+// the companions still come from a measured place rather than the public-IP
+// guess the library would make.
+func listCentre(id string, want int, pinned *ookla.Server) (lat, lon float64, label string, ok bool) {
 	if id != "" && want > 1 {
 		if la, lo, good := serverCoord(pinned); good {
 			return la, lo, "pinned", true
-		}
-	} else if id != "" {
-		return 0, 0, "", false
-	}
-	if autoFn != nil {
-		if la, lo, good := autoFn(); good {
-			return la, lo, "auto", true
 		}
 	}
 	return 0, 0, "", false
@@ -2616,27 +2750,8 @@ func shouldRaceCities(id string, want int) bool { return id == "" || want > 1 }
 // budget whether or not it ends up racing. The cost of the over-allowance is a
 // rare run permitted to take 30s longer than it needs; the cost of guessing the
 // other way is a run cut off mid-transfer.
-func (o *Ookla) mayRaceCities(id string, want int, origins []Origin, searchedCity func() (float64, float64, bool)) bool {
-	if !anyAnchored(origins) || !shouldRaceCities(id, want) {
-		return false
-	}
-	// A searched city centres the run without measuring anything, so there is
-	// no race to pay for. Asked with no resolved pin, which is what makes this
-	// an upper bound (see above), and against the run's SNAPSHOT of the city so
-	// the answer cannot differ from the one the centring decision gets.
-	_, _, _, searched := listCentre(id, want, nil, searchedCity)
-	return !searched
-}
-
-// snapshotAutoLoc reads the searched city once and hands back a function that
-// keeps answering with that reading. Every deadline-sensitive branch in a run
-// must see one immutable set of inputs; see RunReason.
-func snapshotAutoLoc(fn func() (float64, float64, bool)) func() (float64, float64, bool) {
-	if fn == nil {
-		return nil
-	}
-	lat, lon, ok := fn()
-	return func() (float64, float64, bool) { return lat, lon, ok }
+func (o *Ookla) mayRaceCities(id string, want int, origins []Origin) bool {
+	return anyAnchored(origins) && shouldRaceCities(id, want)
 }
 
 // pickServers chooses what a run measures. pre is the already-resolved pinned
@@ -2644,7 +2759,11 @@ func snapshotAutoLoc(fn func() (float64, float64, bool)) func() (float64, float6
 // means resolve it here. The second return is the selection report skeleton:
 // one row per considered candidate, identity and ranking snapshotted NOW
 // (the returned servers are pointers the measurement phase mutates).
-func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, servers ookla.Servers, id string, want int, pre *ookla.Server) (ookla.Servers, []CandidateReport, error) {
+//
+// The third return is the win reason for the head of an auto list when it was
+// PROMOTED there rather than ranked there (see promoteIncumbent); "" when the
+// fastest-ranked server leads, or when a pin is in effect.
+func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, servers ookla.Servers, id string, want int, pre *ookla.Server) (ookla.Servers, []CandidateReport, string, error) {
 	pinned := pre
 	if id != "" && pinned == nil {
 		for _, s := range servers {
@@ -2656,7 +2775,7 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		if pinned == nil { // not in the nearby list; fetch it directly
 			s, err := client.FetchServerByIDContext(ctx, id)
 			if err != nil {
-				return nil, nil, fmt.Errorf("fetch server %s: %w", id, err)
+				return nil, nil, "", fmt.Errorf("fetch server %s: %w", id, err)
 			}
 			// This endpoint (api/ios-config.php) returns Host="" - measured - so
 			// currentEndpoint cannot help and a migrated pin would 307 on every
@@ -2674,7 +2793,7 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 			pinned = s
 		}
 		if want <= 1 {
-			return ookla.Servers{pinned}, []CandidateReport{pinnedRow(pinned, true)}, nil
+			return ookla.Servers{pinned}, []CandidateReport{pinnedRow(pinned, true)}, "", nil
 		}
 	}
 
@@ -2682,7 +2801,7 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	if o.ISPFn != nil {
 		isp = o.ISPFn()
 	}
-	ranked, rankPings, noFallback, allNoFallback := rankedServers(ctx, servers, isp)
+	ranked, rankPings, noFallback, allNoFallback := rankedServersRaced(ctx, servers, isp, o.raced)
 	if allNoFallback {
 		// Every nearby server lacks the fallback, so none was excluded - the run
 		// goes ahead and will probably fail. Silence here would make the worst
@@ -2705,14 +2824,73 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		o.logf("speedtest candidate ranked", "server", serverLabel(s), "server_id", s.ID,
 			"rank", i+1, "distance_km", util.Round1(s.Distance), "ping_ms", util.Round1(f64v(rankPings[s.ID])))
 	}
+	// The report's rank order is the PING order, snapshotted here before any
+	// promotion: a report that read "#1 EBOX 8.3ms, #2 Fibrenoire 7.5ms"
+	// looked like a sorting bug, and a reader asking "how often was the
+	// measured server not the fastest?" needs the ranks to mean ping. Which
+	// row was measured, and why (win_reason), says the rest.
 	sel := candidateRows(ranked, rankPings)
+	// An auto run keeps its incumbent while it stays within noise of the
+	// fastest. Not under a pin: the pin is the target and its companions are
+	// a ranking, not a choice. Logged so a promoted head is explainable at
+	// the same level the ranking is.
+	lead := ""
+	if pinned == nil {
+		var from int
+		incumbent := o.incumbentID()
+		if o.challenge {
+			// A seat with too short a record cannot be lost (challengeWon), so
+			// measuring a rival against it would be a run whose verdict is fixed
+			// in advance, spending the challenge slot for nothing. Deferred: no
+			// challenger row is written, so the cadence stays due and tries
+			// again next run, until the seat has ChallengeHistory's minimum.
+			if n := len(o.incumbentScores(incumbent, o.dir)); incumbent != "" && n < challengeMinHistory {
+				o.logf("speedtest challenge deferred: the incumbent's record is too short to judge against",
+					"incumbent_id", incumbent, "history", n, "needed", challengeMinHistory)
+			} else {
+				ranked, from, lead = challengeIncumbent(ranked, incumbent)
+			}
+			if lead != "" {
+				o.challenged = incumbent
+				o.logf("speedtest challenge: measuring the incumbent's rival", "server", serverLabel(ranked[0]),
+					"server_id", ranked[0].ID, "from_rank", from+1, "incumbent_id", incumbent,
+					"ping_ms", util.Round1(f64v(rankPings[ranked[0].ID])))
+			}
+		}
+		if lead == "" {
+			if ranked, from, lead = promoteIncumbent(ranked, incumbent, isp); lead != "" {
+				o.logf("speedtest candidate promoted", "server", serverLabel(ranked[0]), "server_id", ranked[0].ID,
+					"from_rank", from+1, "reason", lead, "ping_ms", util.Round1(f64v(rankPings[ranked[0].ID])))
+			}
+		}
+	}
 
 	if want <= 1 {
 		if len(ranked) == 0 {
-			return nil, nil, fmt.Errorf("no speedtest servers available")
+			return nil, nil, "", fmt.Errorf("no speedtest servers available")
 		}
-		sel[0].Selected = true
-		return ookla.Servers{ranked[0]}, sel, nil
+		targets := ookla.Servers{ranked[0]}
+		if lead == WinReasonChallenger {
+			// The incumbent rides along as the FALLBACK target, measured only if
+			// the rival fails (RunReason stops after the first measurement at
+			// want=1): a dead rival must cost one failed attempt, not the whole
+			// run - a run with no winner row leaves the cadence still due, so
+			// every following scheduled run would challenge the same dead rival.
+			for _, s := range ranked[1:] {
+				if s.ID == o.challenged {
+					targets = append(targets, s)
+					break
+				}
+			}
+		}
+		chosen := make(map[string]bool, len(targets))
+		for _, s := range targets {
+			chosen[s.ID] = true
+		}
+		for i := range sel {
+			sel[i].Selected = chosen[sel[i].ServerID]
+		}
+		return targets, sel, lead, nil
 	}
 
 	out := make(ookla.Servers, 0, want)
@@ -2729,7 +2907,7 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		out = append(out, s)
 	}
 	if len(out) == 0 {
-		return nil, nil, fmt.Errorf("no speedtest servers available")
+		return nil, nil, "", fmt.Errorf("no speedtest servers available")
 	}
 	// Mark the targets in the report; a pin that was never in the ranked list
 	// gets its own unranked row at the front (RankOrder 0).
@@ -2747,7 +2925,193 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	if pinned != nil && !inRanked {
 		sel = append([]CandidateReport{pinnedRow(pinned, true)}, sel...)
 	}
-	return out, sel, nil
+	return out, sel, lead, nil
+}
+
+// incumbentID is IncumbentFn with the nil case folded in.
+func (o *Ookla) incumbentID() string {
+	if o.IncumbentFn == nil {
+		return ""
+	}
+	return o.IncumbentFn()
+}
+
+func (o *Ookla) incumbentScores(id, dir string) []float64 {
+	if o.IncumbentScoresFn == nil || id == "" {
+		return nil
+	}
+	return o.IncumbentScoresFn(id, dir)
+}
+
+// firstRivalErr is the failure text of the first target that is not the
+// incumbent, for the log line when a challenge fell back to the incumbent.
+func firstRivalErr(targetIDs []string, errByID map[string]string, incumbent string) string {
+	for _, id := range targetIDs {
+		if id != incumbent {
+			if e := errByID[id]; e != "" {
+				return e
+			}
+			return "no result"
+		}
+	}
+	return ""
+}
+
+func (o *Ookla) challengeMargin() int {
+	if o.ChallengeMarginFn == nil {
+		return challengeDefaultMargin
+	}
+	return o.ChallengeMarginFn()
+}
+
+// Challenge constants. ChallengeHistory is how many of the incumbent's recent
+// scores the verdict's median is over; challengeMinHistory is how many it
+// needs before a rival can win at all - below that the record is one or two
+// hours of one server, which is not a record.
+const (
+	ChallengeHistory       = 12
+	challengeMinHistory    = 3
+	challengeDefaultMargin = 15 // percent
+)
+
+// challengeIncumbent picks the run's target on a challenge run: the fastest
+// answered server that is NOT the incumbent. A challenge only makes sense
+// against a seated incumbent - one that is in this run's field, answered, and
+// within rankMargin of the fastest, the seat promoteIncumbent would keep -
+// otherwise the seat is open and the ordinary rules apply (returns "" and the
+// list untouched). Returns the reordered list, the rival's ping rank, and the
+// challenger win reason.
+func challengeIncumbent(ranked ookla.Servers, incumbent string) (ookla.Servers, int, string) {
+	if incumbent == "" || len(ranked) < 2 || ranked[0].Latency <= 0 {
+		return ranked, 0, ""
+	}
+	// "Seated" is the seat promoteIncumbent would actually keep: in the
+	// field, answered, AND within the band of the fastest. An incumbent
+	// outside the band has already lost its seat this run; measuring the
+	// fastest server as its "challenger" would mislabel an ordinary
+	// fastest_ranked run and keep a seat the ordinary rule vacates.
+	limit := ranked[0].Latency + rankMargin(ranked[0].Latency)
+	seated := false
+	for _, s := range ranked {
+		if s.Latency <= 0 || s.Latency > limit {
+			break // rankLess order: nothing past here is inside the band
+		}
+		if s.ID == incumbent {
+			seated = true
+			break
+		}
+	}
+	if !seated {
+		return ranked, 0, ""
+	}
+	for i, s := range ranked {
+		if s.Latency <= 0 {
+			break // answered servers first (rankLess); nothing past here is a rival worth measuring
+		}
+		if s.ID == incumbent {
+			continue
+		}
+		if i == 0 {
+			return ranked, 0, WinReasonChallenger
+		}
+		out := make(ookla.Servers, 0, len(ranked))
+		out = append(out, s)
+		out = append(out, ranked[:i]...)
+		out = append(out, ranked[i+1:]...)
+		return out, i, WinReasonChallenger
+	}
+	return ranked, 0, ""
+}
+
+// challengeWon is the challenge verdict: the rival's score against the median
+// of the incumbent's recent scores, which it must beat by margin percent. No
+// history, or too little (challengeMinHistory), and the incumbent keeps the
+// seat: an unverifiable win is not a win. Returns the median it judged
+// against (0 when there was none).
+func challengeWon(score float64, history []float64, marginPct int) (bool, float64) {
+	if len(history) < challengeMinHistory || !(score > 0) {
+		return false, 0
+	}
+	h := append([]float64(nil), history...)
+	sort.Float64s(h)
+	med := h[len(h)/2]
+	if len(h)%2 == 0 {
+		med = (h[len(h)/2-1] + h[len(h)/2]) / 2
+	}
+	if marginPct < 0 {
+		marginPct = 0
+	}
+	// Integer-scaled so "exactly the bar" is a tie, not a win: 100*1.15 is
+	// 114.999... in binary and 115 beat it.
+	return score*100 > med*float64(100+marginPct), med
+}
+
+// rankMargin is the band within which two ranking pings are the same answer:
+// max(2 ms, 15%) of the faster one. Between equivalent servers in one metro
+// (Montréal lists 25 at "1 km", 8-17 ms) the fastest-this-run flips on 1-2 ms
+// of jitter, and roundScore's ping discount makes 9 vs 12 ms a 2.7% swing -
+// inside run-to-run throughput noise, so a difference this size cannot be
+// what decides which server the history is built on.
+func rankMargin(fastest time.Duration) time.Duration {
+	m := fastest * 15 / 100
+	if m < 2*time.Millisecond {
+		m = 2 * time.Millisecond
+	}
+	return m
+}
+
+// promoteIncumbent moves the server the last auto run measured to the head of
+// the ranked list when its ranking ping THIS run is within rankMargin of the
+// fastest; failing that, the ISP's own server within the same band (the path
+// never leaves the network, and it is the box the user can complain about).
+// Otherwise the ranking stands. Returns the (possibly reordered) list, the
+// rank the promoted server came from, and the win reason - "" when nothing
+// moved, which includes the incumbent already ranking first: that run is
+// honestly "fastest_ranked".
+//
+// This is a tie-break inside measured noise, not a memory: the incumbent has
+// to be in this run's fetched field and answer this run's ping within the
+// band, so a server that has gone bad loses its seat the run it goes bad, and
+// the stale-centre trap the race exists to remove (see raceCities) cannot
+// return through here. ranked is rankLess order: answered ascending, then the
+// unanswered, so the scan stops at the first server outside the band.
+func promoteIncumbent(ranked ookla.Servers, incumbent, isp string) (ookla.Servers, int, string) {
+	if len(ranked) < 2 || ranked[0].Latency <= 0 {
+		return ranked, 0, ""
+	}
+	limit := ranked[0].Latency + rankMargin(ranked[0].Latency)
+	within := func(s *ookla.Server) bool { return s.Latency > 0 && s.Latency <= limit }
+	pick, reason := -1, ""
+	if incumbent != "" {
+		for i, s := range ranked {
+			if !within(s) {
+				break
+			}
+			if s.ID == incumbent {
+				pick, reason = i, winReasonIncumbent
+				break
+			}
+		}
+	}
+	if pick < 0 && isp != "" && !sponsorMatchesISP(ranked[0].Sponsor, isp) {
+		for i, s := range ranked {
+			if !within(s) {
+				break
+			}
+			if sponsorMatchesISP(s.Sponsor, isp) {
+				pick, reason = i, winReasonOnNet
+				break
+			}
+		}
+	}
+	if pick <= 0 {
+		return ranked, 0, ""
+	}
+	out := make(ookla.Servers, 0, len(ranked))
+	out = append(out, ranked[pick])
+	out = append(out, ranked[:pick]...)
+	out = append(out, ranked[pick+1:]...)
+	return out, pick, reason
 }
 
 // freshManager gives the NEXT attempt its own DataManager instead of resetting
@@ -3061,6 +3425,18 @@ var fetchServerList = func(ctx context.Context, client *ookla.Speedtest) (ookla.
 	// guardedServers before anything pings or measures them: with a proxy
 	// configured the dial guard never sees these third-party destinations.
 	return guardedServers(ctx, currentEndpoints(servers)), err
+}
+
+// adoptRaceField makes the city race's fetched list this run's list: the same
+// endpoint rewrite and proxy guard fetchServerList applies, and every server
+// re-homed onto the run's client - the race fetched them on throwaway clients
+// whose upload recorder nobody reads, the hole the pin's re-homing above
+// closes for the same reason.
+func adoptRaceField(ctx context.Context, client *ookla.Speedtest, field ookla.Servers) ookla.Servers {
+	for _, s := range field {
+		s.Context = client
+	}
+	return guardedServers(ctx, currentEndpoints(field))
 }
 
 // fetchServerByID indirects the pin's early resolve for the same reason, and it
@@ -3642,26 +4018,33 @@ const (
 // most likely winner (the path never leaves its network), so when Ookla lists
 // one it is guaranteed a lane even when the distance margin or the diversity
 // trim would have cut it - it still has to WIN the race on ping like everyone
-// else.
+// else. The trim itself is trimToCap, shared with the city race's pools.
 func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
 	n := 0
 	for n < len(sorted) && (n < autoPingMin || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
 		n++
 	}
 	pool := sorted[:n]
+	return trimToCap(pool, sorted, isp, autoPingMax, autoISPMax)
+}
+
+// trimToCap cuts a distance-ordered pool down to max servers the way a race
+// should be seeded, and is shared by the run's ranking (autoCandidates) and the
+// city race's per-origin pools (fetchOriginPools): the user's own ISP's servers
+// first (up to ispMax - each on-net box is a likely winner), then the first
+// server of every other sponsor (in the caller's order, so one provider's
+// equidistant entries can't crowd others out), then the remaining nearest. The
+// ISP guarantee at the end reaches past pool into the whole sorted list.
+func trimToCap(pool, sorted ookla.Servers, isp string, max, ispMax int) ookla.Servers {
 	cand := pool
-	if len(pool) > autoPingMax {
-		// Over the cap, in priority order: the user's own ISP's servers first (up
-		// to autoISPMax - each on-net box is a likely winner), then the first
-		// server of every other sponsor (distance order, so one provider's
-		// equidistant entries can't crowd others out), then remaining nearest.
-		cand = make(ookla.Servers, 0, autoPingMax)
+	if len(pool) > max {
+		cand = make(ookla.Servers, 0, max)
 		seen := map[string]bool{}
 		taken := map[*ookla.Server]bool{}
 		if isp != "" {
 			ispLanes := 0
 			for _, s := range pool {
-				if ispLanes == autoISPMax || len(cand) == autoPingMax {
+				if ispLanes == ispMax || len(cand) == max {
 					break
 				}
 				if sponsorMatchesISP(s.Sponsor, isp) {
@@ -3674,7 +4057,7 @@ func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
 		}
 		var dupes ookla.Servers
 		for _, s := range pool {
-			if len(cand) == autoPingMax {
+			if len(cand) == max {
 				break
 			}
 			if taken[s] {
@@ -3692,7 +4075,7 @@ func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
 			cand = append(cand, s)
 		}
 		for _, s := range dupes {
-			if len(cand) == autoPingMax {
+			if len(cand) == max {
 				break
 			}
 			cand = append(cand, s)
@@ -3716,7 +4099,7 @@ func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
 	}
 	for _, s := range sorted {
 		if sponsorMatchesISP(s.Sponsor, isp) {
-			if len(cand) < autoPingMax {
+			if len(cand) < max {
 				cand = append(cand, s)
 			} else {
 				cand[len(cand)-1] = s
@@ -3771,12 +4154,13 @@ func sponsorMatchesISP(sponsor, isp string) bool {
 // Best-of-N reads ranks 2 and 3 straight off this list: the pings already
 // happened to choose rank 1, so the extra servers cost nothing to identify.
 // rankPingLatency decides what a ranking ping recorded and whether it counts as
-// answered. A SUCCESSFUL ping (nil error, at least one sample) whose mean rounds
-// to zero on a coarse clock - the sub-millisecond Windows case - is clamped to
-// the smallest positive duration, so the fastest server still ranks first and
-// its selection-report row reads answered (~0ms) rather than unanswered below
-// every slower server. A failed or unsampled ping is not answered: its Latency
-// holds a stale list-fetch echo that must never enter the ranking.
+// answered. A SUCCESSFUL ping (nil error, at least one sample) whose floor
+// rounds to zero on a coarse clock - the sub-millisecond Windows case - is
+// clamped to the smallest positive duration, so the fastest server still ranks
+// first and its selection-report row reads answered (~0ms) rather than
+// unanswered below every slower server. A failed or unsampled ping is not
+// answered: the server's Latency holds a stale list-fetch echo that must never
+// enter the ranking.
 func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Duration, bool) {
 	if err != nil || !sampled {
 		return 0, false
@@ -3791,12 +4175,26 @@ func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Durat
 // dropped for having no HTTP Legacy Fallback (see fallbackHealth) so the caller
 // can say so in the log.
 func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64, []string, bool) {
+	return rankedServersRaced(ctx, servers, isp, nil)
+}
+
+// rankedServersRaced is rankedServers with the city race's pings carried in:
+// a server in raced was pinged by the race seconds ago, with the same probe
+// set and the same statistic (the floor), so its entry is the ranking ping and
+// it is not pinged again - including a racer that never answered (0), which
+// ranks unanswered rather than getting a second chance nobody else gets. The
+// fallback health probe still runs for it: the race judges nothing about the
+// legacy bundle.
+func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, raced map[string]time.Duration) (ookla.Servers, map[string]*float64, []string, bool) {
 	if len(servers) == 0 {
 		return nil, nil, nil, false
 	}
 	// Sort a copy so the caller's slice order is untouched.
 	sorted := append(ookla.Servers(nil), servers...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Distance < sorted[j].Distance })
+	// Distance, with a tie broken by the fetch's own echo: within one metro every
+	// server can report the same distance, and an unstable sort made the
+	// one-per-sponsor trim below pick the first of each sponsor by chance.
+	sort.SliceStable(sorted, byDistanceThenEcho(sorted))
 	cand := autoCandidates(sorted, isp)
 
 	// Reserves: the next servers past the candidate cap, so health filtering can
@@ -3830,8 +4228,8 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 	// library assigns the ~10-sample mean only on success, and a failed ranking
 	// ping leaves whatever the list fetch wrote there, often a stale positive
 	// echo sample. applyRankPing both records the honest outcome AND fixes the
-	// field (measured on success, ZERO on failure) so the sort below can't rank
-	// a stale value first. Only contacted servers get an entry.
+	// field (the measured floor on success, ZERO on failure) so the sort below
+	// can't rank a stale value first. Only contacted servers get an entry.
 	rankPings := make(map[string]*float64, len(cand))
 	probe := func(set ookla.Servers) []endpointState {
 		pings := make([]*float64, len(set))
@@ -3847,9 +4245,22 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 				// warm-up), leaving Latency untouched at its stale fetch-echo
 				// value - so "err == nil && Latency > 0" would record a one-shot
 				// echo as an answered ten-sample ranking ping.
+				if floor, ok := raced[s.ID]; ok {
+					pings[i] = applyRankPing(s, nil, floor > 0, floor)
+					health[i] = fallbackHealth(ctx, s)
+					return
+				}
 				sampled := false
-				err := ooklaPing(ctx, s, func(time.Duration) { sampled = true }) // sets s.Latency on success
-				pings[i] = applyRankPing(s, err, sampled)
+				// The FLOOR of the samples, kept by the same callback the city
+				// race uses (keepFastestPing), not the library's mean: the race
+				// chose the city on the floor and the run's own decision judges
+				// the winner on the floor (decisionPingMS), so ranking on the
+				// mean made the server the one choice judged on a statistic one
+				// stalled probe can move by 20ms.
+				var floor time.Duration
+				keep := keepFastestPing(&floor)
+				err := ooklaPing(ctx, s, func(d time.Duration) { sampled = true; keep(d) })
+				pings[i] = applyRankPing(s, err, sampled, floor)
 				// Same fan-out, so this costs the phase nothing it was not already
 				// spending: judge the fallback by STATUS, which the library's ping
 				// does not do (see fallbackHealth).
@@ -3911,12 +4322,15 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 }
 
 // applyRankPing records a ranking-ping outcome on the server and returns the
-// measured latency (ms) for the selection report, or nil on failure. On success
-// it writes the measured value (a clamped near-zero, never 0, so the fastest
-// server still sorts first); on FAILURE it zeros Latency, so a stale discovery
-// echo can't rank an unreachable server ahead of a reachable one measured slower.
-func applyRankPing(s *ookla.Server, err error, sampled bool) *float64 {
-	if lat, answered := rankPingLatency(err, sampled, s.Latency); answered {
+// measured latency (ms) for the selection report, or nil on failure. floor is
+// the fastest sample the ping collected (see rankedServers), which is what a
+// server CHOICE ranks on; the library's own s.Latency, its mean, is overwritten.
+// On success it writes the measured value (a clamped near-zero, never 0, so
+// the fastest server still sorts first); on FAILURE it zeros Latency, so a
+// stale discovery echo can't rank an unreachable server ahead of a reachable
+// one measured slower.
+func applyRankPing(s *ookla.Server, err error, sampled bool, floor time.Duration) *float64 {
+	if lat, answered := rankPingLatency(err, sampled, floor); answered {
 		s.Latency = lat
 		ms := pingMSOf(lat)
 		return &ms
@@ -4389,6 +4803,46 @@ type ServerInfo struct {
 	// should mark it rather than pretend it is a normal choice. Users can still
 	// pin one by ID on purpose; nothing here blocks that.
 	FallbackOK *bool `json:"fallback_ok,omitempty"`
+
+	// PingMS is the ping the row was listed with. For a browse listing it is
+	// the library's one timed GET of latency.txt per server during the fetch,
+	// after an untimed warm-up GET on the same kept-alive connection (so
+	// connection setup is excluded in the normal case), fired for every listed
+	// server concurrently under the library's fixed 4 s cap - one sample,
+	// already paid for. For the race listing it is the race's own
+	// fastest-of-ten. nil = the server did not answer. Listings are sorted on
+	// it, answered first.
+	PingMS *float64 `json:"ping_ms,omitempty"`
+}
+
+// pingMS converts a library latency to the wire's ping: nil for the library's
+// PingTimeout sentinel (-1) and for 0, which means "nothing measured"
+// everywhere in this package; a measured near-zero stays positive (see
+// msIfPositive) so the fastest row cannot print as unanswered.
+func pingMS(d time.Duration) *float64 { return msIfPositive(d) }
+
+// lessByPing orders answered servers by ping and puts the unanswered after
+// them; two servers it cannot separate keep their existing order.
+func lessByPing(a, b *ServerInfo) bool {
+	if (a.PingMS != nil) != (b.PingMS != nil) {
+		return a.PingMS != nil
+	}
+	return a.PingMS != nil && *a.PingMS < *b.PingMS
+}
+
+// sortByPing orders a listing the way a user reads it: answered servers by
+// ping, then the unanswered ones by distance. Stable, so equal pings keep the
+// catalogue's distance order.
+func sortByPing(out []ServerInfo) {
+	sort.SliceStable(out, func(i, j int) bool {
+		if lessByPing(&out[i], &out[j]) {
+			return true
+		}
+		if lessByPing(&out[j], &out[i]) {
+			return false
+		}
+		return out[i].DistanceKM < out[j].DistanceKM
+	})
 }
 
 // annotateFallback fills FallbackOK for a browse/search list, probing verdicts
@@ -4459,12 +4913,13 @@ func annotateFallback(ctx context.Context, servers ookla.Servers, out []ServerIn
 }
 
 // ListOoklaServers returns the Ookla servers the API reports for a location,
-// nearest first. Non-zero lat/lon returns servers near that coordinate (a city
+// fastest first: answered servers by the fetch's own ping, then the unanswered
+// by distance. Non-zero lat/lon returns servers near that coordinate (a city
 // search, like speedtest.net's "change server"); otherwise near the caller's
 // IP. Rows carry real registered coordinates and distances - but note Ookla
 // registers many metro servers at their city's canonical centre point, so a
 // fetch centred exactly there reads 0 km for that whole cohort (the UI
-// suppresses the label; the stable sort keeps Ookla's order for the ties)
+// suppresses the label)
 // while differently-registered neighbours keep real distances. An earlier
 // comment here claimed the API rewrites positions to the query point - wrong:
 // the identical coordinates were the canonical registrations themselves.
@@ -4485,24 +4940,43 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 		return nil, err
 	}
 	currentEndpoints(servers)
-	out := make([]ServerInfo, 0, len(servers))
-	for _, s := range servers {
-		lat, lon, _ := serverCoord(s)
-		out = append(out, ServerInfo{
-			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
-			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
-		})
-	}
+	out := listInfos(servers, lat, lon)
 	// Before the sort: annotateFallback pairs by index with `servers`, and the
 	// sort reorders `out` only.
 	annotateFallback(ctx, servers, out)
-	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
+	sortByPing(out)
 	return out, nil
 }
 
+// listInfos converts a fetched list to picker rows, pairing by index with
+// servers. With a centre (lat/lon not both zero) each row's distance is
+// measured from it here, not taken from the catalogue: Ookla's API reports
+// distance in WHOLE kilometres, so every server within half a kilometre of a
+// geocoded city point reads 0 - eighteen of Montréal's twenty-five did - and a
+// 0 is what "unknown" looks like downstream. Uncentred (the API's own
+// placement, whose coordinate we never learn) and coordinate-less rows keep
+// the catalogue's figure.
+func listInfos(servers ookla.Servers, lat, lon float64) []ServerInfo {
+	centred := lat != 0 || lon != 0
+	out := make([]ServerInfo, 0, len(servers))
+	for _, s := range servers {
+		la, lo, ok := serverCoord(s)
+		dist := s.Distance
+		if centred && ok {
+			dist = kmBetween(lat, lon, la, lo)
+		}
+		out = append(out, ServerInfo{
+			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
+			Country: s.Country, DistanceKM: dist, Lat: la, Lon: lo,
+			PingMS: pingMS(s.Latency),
+		})
+	}
+	return out
+}
+
 // SearchOoklaServers returns the servers whose catalog entry matches a keyword
-// (Ookla matches name and sponsor substrings, worldwide), nearest first, with
-// real registered coordinates on every row. The browse handler uses it as a
+// (Ookla matches name and sponsor substrings, worldwide), fastest first as
+// ListOoklaServers orders them, with real registered coordinates on every row. The browse handler uses it as a
 // COORDINATE ORACLE: it finds the last-run server's own row by ID and centres
 // the ordinary metro fetch on that row's coordinates - never as the list
 // itself, because a city-name cohort collapses to a single row whenever the
@@ -4521,14 +4995,21 @@ func SearchOoklaServers(ctx context.Context, keyword string) ([]ServerInfo, erro
 		out = append(out, ServerInfo{
 			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
 			Country: s.Country, DistanceKM: s.Distance, Lat: lat, Lon: lon,
+			PingMS: pingMS(s.Latency),
 		})
 	}
 	// Before the sort: annotateFallback pairs by index with `servers`, and the
 	// sort reorders `out` only.
 	annotateFallback(ctx, servers, out)
-	sort.SliceStable(out, func(i, j int) bool { return out[i].DistanceKM < out[j].DistanceKM })
+	sortByPing(out)
 	return out, nil
 }
+
+// ErrServerNotFound is the catalogue's answer when no server carries the asked
+// ID. Re-exported so the web layer can tell "no such server" from "Ookla could
+// not be asked" without importing the library itself - the by-ID lookup fails
+// for both reasons and only the first is the user's to fix.
+var ErrServerNotFound = ookla.ErrServerNotFound
 
 // GetOoklaServer fetches one Ookla server by numeric ID so the UI can pin (and
 // confirm the name of) an exact server without a city search.
@@ -4542,8 +5023,12 @@ func GetOoklaServer(ctx context.Context, id string) (ServerInfo, error) {
 	// returned an empty country and - worse - the CALLER'S own geolocated
 	// coordinates in the server's lat/lon attributes, so nothing here may
 	// treat its position or distance as the server's. The browse handler
-	// centres by the Name label through SearchOoklaServers instead.
-	info := ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country, DistanceKM: srv.Distance}
+	// centres by the Name label through SearchOoklaServers instead. The
+	// distance is left at 0 - "unknown" to every reader - on purpose: the one
+	// the endpoint computes is from its guess at OUR position (a Los Angeles
+	// server read 3498 km from Montréal, which is not even the right figure),
+	// and showing it presented a guess as a measurement.
+	info := ServerInfo{ID: srv.ID, Sponsor: srv.Sponsor, Name: srv.Name, Country: srv.Country}
 
 	// Pinning is a deliberate act and nothing here blocks it - but the user
 	// deserves to know BEFORE they pin that this server will fail every run.

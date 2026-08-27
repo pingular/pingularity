@@ -1649,13 +1649,13 @@ test('the RUN button does not offer to stop a run whose id it does not know', ()
   const set = new Function('$', 'esc', 'speedtestPending',
     'let speedtestRunningNow=false, speedtestRunId=0;\n' + defs + '\nreturn setSpeedtestRunning;')(
     id => els[id], s => String(s), false);
-  set(true, '', false, '', 0);      // the optimistic paint: running, id unknown
+  set(true, '', false, 0);          // the optimistic paint: running, id unknown
   assert.ok(!/click to stop/.test(btn.title),
     'the button offers a stop it cannot deliver: with no id the click would send an id-less abort');
   assert.match(btn.title, /starting/i, 'the id-less window should read as a starting state');
-  set(true, 'srv', false, '', 42);  // the poll delivered the id
+  set(true, 'srv', false, 42);      // the poll delivered the id
   assert.match(btn.title, /click to stop/);
-  set(false, '', false, '', 0);
+  set(false, '', false, 0);
   assert.match(btn.title, /Run a speedtest now/);
 });
 
@@ -2219,7 +2219,6 @@ test('isReconcile503: matches the reconcile 503 by Retry-After or body, nothing 
 // country from every city auto races. With no searched city there is no place
 // to name at all: the centre is raced fresh on every test.
 test('autoOptionText names a searched city, never the browse centre', () => {
-  assert.equal(F.autoOptionText('Montreal'), 'Auto - fastest in Montreal');
   assert.equal(F.autoOptionText(''), 'Auto - fastest near you');
   // "near you" describes the candidates - every city the race considers is an
   // attempt to locate US - so it stays true whichever one wins. What must never
@@ -2228,7 +2227,7 @@ test('autoOptionText names a searched city, never the browse centre', () => {
 });
 
 test('a fallback browse centre is never credited to auto', () => {
-  const t = F.autoScopeText('the fastest server', '', 'Miami', '');
+  const t = F.autoScopeText('the fastest server', 'Miami', '');
   assert.ok(/races the cities/.test(t), t);
   assert.ok(/for browsing/.test(t), t);
   // The two claims the old string made, both false: that auto picks near this
@@ -2237,13 +2236,8 @@ test('a fallback browse centre is never credited to auto', () => {
   assert.ok(!/exit/.test(t), t);
 });
 
-test('a searched city wins outright and the browse centre goes unmentioned', () => {
-  assert.equal(F.autoScopeText('the 3 fastest servers', 'Montreal', 'Miami', 'Example ISP, Oldtown'),
-    'Auto picks the 3 fastest servers in <b>Montreal</b>.');
-});
-
 test('with no browse centre the sentence is still true', () => {
-  const t = F.autoScopeText('the fastest server', '', '', '');
+  const t = F.autoScopeText('the fastest server', '', '');
   assert.ok(/for browsing/.test(t), t);
   assert.ok(!/<b>/.test(t), t);
 });
@@ -2254,18 +2248,18 @@ test('with no browse centre the sentence is still true', () => {
 // from a different city" wording: before any auto run there is nothing to
 // remember, and crediting a candidate city to auto is the old defect back.
 test('last-run centring is named in the past tense, fallback centring is not', () => {
-  const t = F.autoScopeText('the fastest server', '', 'Newtown, QC', 'Example ISP, Newtown', true);
+  const t = F.autoScopeText('the fastest server', 'Newtown, QC', 'Example ISP, Newtown', true);
   assert.ok(/centred on <b>Newtown, QC<\/b> where your last auto test ran - not where the next one will/.test(t), t);
   // The disclaimer is the point: toggling auto on shows the LAST run's city for
   // browsing, but the note must not read as where the NEXT test will go (it is
   // raced fresh each run, so no city is known until the test runs).
   assert.ok(/chosen fresh when the next test runs/.test(t), t);
   assert.ok(!/different city/.test(t), t);
-  const f = F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Newtown', false);
+  const f = F.autoScopeText('the fastest server', 'Oldtown', 'Example ISP, Newtown', false);
   assert.ok(/auto may test from a different city/.test(f), f);
   assert.ok(!/last auto test ran/.test(f), f);
   // The flag without a centre has nothing to name; the sentence must not dangle.
-  assert.ok(!/last auto test ran/.test(F.autoScopeText('the fastest server', '', '', '', true)));
+  assert.ok(!/last auto test ran/.test(F.autoScopeText('the fastest server', '', '', true)));
 });
 
 // Reports what the last run MEASURED, in the past tense, so it stays true
@@ -2273,8 +2267,8 @@ test('last-run centring is named in the past tense, fallback centring is not', (
 // did auto use?" without the daemon remembering a race.
 test('the last measured server is reported, and only when there is one', () => {
   assert.ok(/last test measured <b>Example ISP, Oldtown<\/b>/.test(
-    F.autoScopeText('the fastest server', '', 'Oldtown', 'Example ISP, Oldtown')));
-  assert.ok(!/last test measured/.test(F.autoScopeText('the fastest server', '', 'Oldtown', '')));
+    F.autoScopeText('the fastest server', 'Oldtown', 'Example ISP, Oldtown')));
+  assert.ok(!/last test measured/.test(F.autoScopeText('the fastest server', 'Oldtown', '')));
 });
 
 // A dropdown row survives the fields the daemon cannot promise: the by-ID
@@ -2317,10 +2311,9 @@ test('the saved speed image carries the on-screen averages', () => {
 });
 
 test('the panel escapes place names the daemon supplies', () => {
-  assert.ok(F.autoScopeText('x', '', '<img src=x>', '').includes('&lt;img'));
-  assert.ok(F.autoScopeText('x', '<img src=y>', '', '').includes('&lt;img'));
+  assert.ok(F.autoScopeText('x', '<img src=x>', '').includes('&lt;img'));
   // The past-tense branch interpolates a server-derived place of its own.
-  assert.ok(F.autoScopeText('x', '', '<img src=z>', '', true).includes('&lt;img'));
+  assert.ok(F.autoScopeText('x', '<img src=z>', '', true).includes('&lt;img'));
 });
 
 // A 30-day window returns hundreds of runs into ~900px. Below one bar per ~2px
@@ -3117,8 +3110,8 @@ function driveServerPicker(responseSeq) {
   const rows = [];
   const sel = { set innerHTML(v) { rows.length = 0; }, appendChild(o) { rows.push(o); } };
   const doc = { createElement: () => ({ dataset: {}, textContent: '' }) };
-  const populate = new Function('$', 'document', 'serverHealth', 'autoText', 'applyPendingServer', 'updateScopeNote',
-    defs + '\nreturn populateServers;')(() => sel, doc, new Map(), () => 'Auto', () => {}, () => {});
+  const populate = new Function('$', 'document', 'serverHealth', 'autoText', 'applyPendingServer', 'updateScopeNote', 'fpAdopt',
+    defs + '\nreturn populateServers;')(() => sel, doc, new Map(), () => 'Auto', () => {}, () => {}, () => {});
   for (const list of responseSeq) populate(list);
   return rows; // rows[0] is the Auto option
 }
@@ -3185,11 +3178,37 @@ function driveApplyPendingServer({ pendingServer, seen = [] }) {
   const serverHealth = new Map(seen.map(id => [String(id), false]));
   const calls = [];
   const fetchStub = (url, opts) => { calls.push({ url, opts }); return Promise.resolve({ ok: true, json: async () => ({ servers: [] }) }); };
-  const make = new Function('$', 'document', 'pendingServer', 'serverHealth', 'annotateOption', 'rememberServerHealth', 'fetch',
+  const make = new Function('$', 'document', 'pendingServer', 'serverHealth', 'serverProbes', 'annotateOption', 'rememberServerHealth', 'fetch',
     body + '\nreturn applyPendingServer;');
-  make($, document, pendingServer, serverHealth, () => {}, () => {}, fetchStub)();
+  make($, document, pendingServer, serverHealth, new Map(), () => {}, () => {}, fetchStub)();
   return calls;
 }
+
+// The probe is bounded: one in flight at a time, two tries per page load. An
+// inconclusive answer (the daemon could not tell) must not re-fire the lookup
+// on every repopulate - that was a fan-out at a third party with no ceiling.
+test('applyPendingServer asks about an unknown pin at most twice per page load, never twice at once', async () => {
+  const body = extract('function applyPendingServer');
+  const options = [];
+  const sel = { options, appendChild(o) { options.push(o); }, value: '' };
+  const $ = id => (id === 'setServer' ? sel : { value: '' });
+  const document = { createElement: () => ({ dataset: {} }) };
+  const calls = [];
+  const fetchStub = url => { calls.push(url); return Promise.resolve({ ok: true, json: async () => ({ servers: [] }) }); }; // no verdict
+  const apply = new Function('$', 'document', 'pendingServer', 'serverHealth', 'serverProbes', 'annotateOption', 'rememberServerHealth', 'fetch',
+    body + '\nreturn applyPendingServer;')($, document, '54321', new Map(), new Map(), () => {}, () => {}, fetchStub);
+  // A repopulate rebuilds the select, which is what used to re-fire the
+  // probe every time; the harness mimics it by emptying the options first.
+  const repopulate = () => { options.length = 0; apply(); };
+  repopulate(); repopulate();
+  assert.equal(calls.length, 1, 'a repopulate while the first probe is in flight must not ask again');
+  await tick(); await tick();
+  repopulate();
+  assert.equal(calls.length, 2, 'the answer was inconclusive, so one retry is allowed');
+  await tick(); await tick();
+  repopulate(); repopulate(); repopulate();
+  assert.equal(calls.length, 2, 'and after two tries the picker stops asking until the next page load');
+});
 
 test('applyPendingServer resolves an unseen pin with POST+JSON, not a bare GET', () => {
   const calls = driveApplyPendingServer({ pendingServer: '54321', seen: [] });
@@ -3206,71 +3225,614 @@ test('applyPendingServer does not re-fetch a pin whose health is already known',
   assert.equal(calls.length, 0, 'a known verdict must not re-issue the by-ID lookup');
 });
 
+// --- the two-pane Ookla picker ----------------------------------------------
+// A star KEEPS a server (settings speed_servers, capped at 12); the radio CHOOSES
+// the one a run uses (speed_server_id, still carried by the hidden #setServer).
+// Everything below drives the REAL fp* functions out of index.html against a
+// stub DOM small enough to assert on: elements remember their class, dataset,
+// attributes, children and parent, which is all the picker touches.
+const fpMatches = (n, sel) => String(n.className || '').split(/\s+/).includes(sel.slice(1));
+function fpEl(tag) {
+  const e = {
+    tag, className: '', dataset: {}, attrs: {}, children: [], parent: null,
+    innerHTML: '', title: '', type: '', scrollTop: 0, clientHeight: 0, scrollHeight: 0,
+    listeners: {},
+    appendChild(c) { c.parent = e; e.children.push(c); return c; },
+    setAttribute(k, v) { e.attrs[k] = String(v); },
+    getAttribute(k) { return e.attrs[k]; },
+    addEventListener(type, fn) { (e.listeners[type] = e.listeners[type] || []).push(fn); },
+    fire(type) { for (const fn of e.listeners[type] || []) fn(); },
+    get textContent() { return ''; },
+    set textContent(v) { if (v === '') e.children.length = 0; },
+    classList: {
+      add(c) { if (!e.classList.contains(c)) e.className = (e.className + ' ' + c).trim(); },
+      remove(c) { e.className = e.className.split(/\s+/).filter(x => x && x !== c).join(' '); },
+      contains(c) { return e.className.split(/\s+/).includes(c); },
+      toggle(c, on) { if (on) e.classList.add(c); else e.classList.remove(c); },
+    },
+    // Only ever asked for a single class, and only for descendants of this node.
+    querySelector(sel) {
+      const walk = n => { for (const c of n.children) { if (fpMatches(c, sel)) return c; const d = walk(c); if (d) return d; } return null; };
+      return walk(e);
+    },
+    closest(sel) { let n = e; while (n) { if (fpMatches(n, sel)) return n; n = n.parent; } return null; },
+  };
+  return e;
+}
+function drivePicker({ chosen = '', health = [] } = {}) {
+  const els = { fpFav: fpEl('div'), fpAll: fpEl('div'), setServer: { value: chosen }, settingsMsg: { textContent: '' } };
+  const src = script.match(/const FP_MAX=[^;]*;/)[0] + '\n'
+    + script.match(/const STAR_ON=[^;]*;/)[0] + '\n'
+    + script.match(/const STAR_OFF=[^;]*;/)[0] + '\n'
+    + script.match(/const fpUnsupported = [^;]*;/)[0] + '\n'
+    + script.match(/const fpKept = [^;]*;/)[0] + '\n'
+    + 'let speedServers=[], fpBrowse=[], pendingServer="", fpListLabel="Server", fpPinging=false;\n'
+    // The saved pane's two ping sources are network calls; the pure half (what
+    // the rows show for a ping and where it came from) is what these tests pin.
+    + 'function fpLoadStoredPings(){} function fpRefreshPings(){ fpPinging=true; }\n'
+    // applyPendingServer reduced to the one thing the picker leans on - it puts
+    // the pin on #setServer. Its option synthesis and by-ID probe are pinned by
+    // their own tests above.
+    + 'function applyPendingServer(){ $("setServer").value=pendingServer; }\n'
+    + 'function updateScopeNote(){}\n'
+    // fpChoose retires an unverified-pin footer notice on a pick; the search
+    // error machinery it consults is pinned by the driveServers tests.
+    + 'let serverSearchFailed=false, serverErrShown=""; function clearServerFieldError(){}\n'
+    + extract('function fpRefuse') + '\n'
+    + script.match(/const FP_UNSUPPORTED_TIP=[^;]*;/)[0] + '\n'
+    + ['function fpPanes', 'function fpHeldServer', 'function fpHeader', 'function fpPingText', 'function fpKmText', 'function fpRow',
+      'function fpAutoRow', 'function fpCue', 'function fpFill', 'function fpDraw',
+      'function fpAdopt', 'function fpAdoptSaved', 'function fpToggleStar', 'function fpChoose',
+      'function fpClick'].map(extract).join('\n')
+    + '\nreturn { FP_MAX, fpPanes, fpHeldServer, fpHeader, fpDraw, fpAdopt, fpAdoptSaved, setLabel: l => { fpListLabel = l; },'
+    + ' fpToggleStar, fpChoose, fpClick, saved: () => speedServers, pin: () => pendingServer };';
+  const api = new Function('$', 'document', 'esc', 'serverHealth', 'window', src)(
+    id => els[id], { createElement: fpEl }, esc,
+    new Map(health.map(id => [String(id), false])), {});
+  return { ...api, els, click: n => api.fpClick({ target: n, preventDefault() {} }) };
+}
+// children[0] of a pane is the header; children[1] is the scroller holding the rows.
+const fpRows = host => host.children[1].children;
+const fpIds = host => fpRows(host).map(r => r.dataset.pick);
+const fpRowOf = (host, id) => fpRows(host).find(r => r.dataset.pick === id);
+const fpBtn = r => r.children[0];
+const fpStar = r => r.children[1];
+const SRV = (id, extra) => Object.assign({ id, sponsor: 'Sponsor ' + id, name: 'City', distance_km: 10 }, extra);
+
+test('the picker cap is the one the settings layer enforces', () => {
+  const p = drivePicker();
+  const go = readSource(here, '..', '..', 'settings', 'settings.go');
+  const n = go.match(/const maxSpeedServers = (\d+)/)[1];
+  assert.equal(String(p.FP_MAX), n,
+    'the star would go on refusing at a different count than the store keeps, or the store would silently drop rows the picker showed as kept');
+});
+
+test('the thirteenth star is refused, and says why instead of vanishing', () => {
+  const p = drivePicker();
+  p.fpAdopt(Array.from({ length: 15 }, (_, i) => SRV('S' + i)));
+  for (let i = 0; i < 15; i++) p.fpToggleStar('S' + i);
+  assert.equal(p.saved().length, 12, 'the kept list is capped at twelve');
+  assert.deepEqual(p.saved().map(s => s.id), Array.from({ length: 12 }, (_, i) => 'S' + i),
+    'the first twelve stars are the ones that took');
+  const star = fpStar(fpRowOf(p.els.fpAll, 'S12'));
+  assert.ok(star.classList.contains('full'),
+    'a star that cannot take must look inert, not identical to one that can');
+  assert.match(star.title, /12/, 'and say what the limit is');
+  assert.equal(star.getAttribute('aria-pressed'), 'false');
+  assert.equal(fpStar(fpRowOf(p.els.fpFav, 'S0')).getAttribute('aria-pressed'), 'true',
+    'a kept star has to report itself as pressed, or the three states sound like one');
+  // Unstarring is never capped - it is the only way back under the limit.
+  p.fpToggleStar('S0');
+  assert.equal(p.saved().length, 11);
+  p.fpToggleStar('S12');
+  assert.deepEqual(p.saved().map(s => s.id).slice(-1), ['S12'], 'room freed is room usable');
+});
+
+test('a kept server is listed once, in the saved pane', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1'), SRV('2')]);
+  p.fpToggleStar('1');
+  assert.deepEqual(fpIds(p.els.fpFav), ['', '1'], 'the saved pane leads with the Auto row, then what you kept');
+  assert.deepEqual(fpIds(p.els.fpAll), ['2'],
+    'a kept server printed in the results as well is the same table twice');
+});
+
+test('a kept server the current search does not cover is still shown', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1'), SRV('2')]);
+  p.fpToggleStar('1');
+  p.fpAdopt([SRV('7'), SRV('8')]);   // a Find in another city
+  assert.deepEqual(fpIds(p.els.fpFav), ['', '1'],
+    'the saved pane is the saved list, not a filter over whatever was last searched');
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1')).innerHTML, /Sponsor 1/,
+    'and it still names the server, from what was stored when it was kept');
+  assert.deepEqual(fpIds(p.els.fpAll), ['7', '8']);
+});
+
+test('a row names the server well enough to act on', () => {
+  const p = drivePicker();
+  p.fpAdopt([{ id: 1993, sponsor: 'EBOX', name: 'Montréal, QC', distance_km: 356.4 }]);
+  assert.deepEqual(fpIds(p.els.fpAll), ['1993'],
+    'ids arrive as whatever JSON held them and are compared against a string everywhere else');
+  const btn = fpBtn(fpRowOf(p.els.fpAll, '1993'));
+  assert.match(btn.innerHTML, /#1993/, 'the ID is what gets typed into the search box and shows in the runs table');
+  assert.match(btn.innerHTML, /356 km/, 'distance is most of why one server is picked over another');
+  assert.match(btn.innerHTML, /EBOX/);
+  assert.match(btn.innerHTML, /Montréal, QC/);
+  p.fpToggleStar('1993');
+  assert.equal(p.saved()[0].sponsor, 'EBOX',
+    'a numeric id must still find its own row, or the server is kept with no name at all');
+});
+
+test('an unsupported server cannot be chosen, but can still be kept', () => {
+  const p = drivePicker({ health: ['9'] });
+  p.fpAdopt([SRV('1'), SRV('9')]);
+  p.fpChoose('9');
+  assert.equal(p.els.setServer.value, '',
+    'every transfer against it fails, so choosing it would schedule a run that cannot work');
+  assert.match(p.els.settingsMsg.textContent, /Server 9 has no speedtest endpoint/,
+    'a refused click says why - a silent no-op is how the row click and the ID search came to disagree');
+  const row = fpRowOf(p.els.fpAll, '9');
+  assert.ok(fpBtn(row).classList.contains('bad'), 'the row has to say it is unusable');
+  assert.match(fpBtn(row).innerHTML, /<span class="fp-badge bad" title="This server has no HTTP speedtest endpoint[^"]*cannot be chosen[^"]*">Unsupported<\/span>/,
+    'hovering the badge says why');
+  p.fpToggleStar('9');
+  assert.deepEqual(p.saved().map(s => s.id), ['9'],
+    'keeping is not choosing - a server can be watched while it is broken');
+});
+
+test('a server chosen before it went unsupported keeps its radio and its name', () => {
+  const p = drivePicker({ chosen: '9', health: ['9'] });
+  p.fpAdopt([SRV('9')]);
+  const btn = fpBtn(fpRowOf(p.els.fpAll, '9'));
+  assert.ok(btn.classList.contains('on'),
+    'hiding the mark would misreport which server the next run uses');
+  assert.doesNotMatch(btn.innerHTML, /fp-radio off/, 'the radio it still owns is not the faded one');
+  p.fpChoose('9');
+  assert.equal(p.els.setServer.value, '9', 're-clicking the row it already holds must not clear it');
+  assert.equal(p.pin(), '9',
+    'and the pin has to agree with the select: the next repopulate re-applies the pin, '
+    + 'so a refusal that left them disagreeing would quietly un-choose the server');
+});
+
+test('the whole row chooses, and the star owns only its own button', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1')]);
+  // The row is a grid of [button | star] with a gap between: the gap belongs to
+  // neither child, so a click there arrives on the row itself.
+  p.click(fpRowOf(p.els.fpAll, '1'));
+  assert.equal(p.els.setServer.value, '1', 'the gap beside the star still chooses the row');
+  assert.deepEqual(p.saved(), [], 'and must not keep it - that is the star’s job');
+  const star = fpStar(fpRowOf(p.els.fpAll, '1'));
+  p.click(star);
+  assert.deepEqual(p.saved().map(s => s.id), ['1'], 'the star wins inside its own button');
+  assert.equal(p.els.setServer.value, '1', 'and keeping a server must not re-choose anything');
+  // The row rebuilds on every change, so the button inside it is the live one.
+  p.click(fpBtn(fpRowOf(p.els.fpFav, '1')));
+  assert.equal(p.els.setServer.value, '1');
+});
+
+test('the Auto row is a choice, not a server', () => {
+  const p = drivePicker({ chosen: '1' });
+  p.fpAdopt([SRV('1')]);
+  const auto = fpRowOf(p.els.fpFav, '');
+  assert.ok(auto, 'Auto is always offered, whatever is kept');
+  assert.equal(fpStar(auto).tag, 'span',
+    'the star column is filled but empty: a button there would be a focusable control that keeps nothing');
+  p.click(auto);
+  assert.equal(p.els.setServer.value, '', 'choosing Auto clears the pin, which is what empty means');
+});
+
+test('starring captures the coordinate the browse listing reported', () => {
+  const p = drivePicker();
+  p.fpAdopt([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', distance_km: 356, lat: 45.5, lon: -73.5 }]);
+  p.fpToggleStar('1993');
+  assert.deepEqual(p.saved(), [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }],
+    'the catalogue position and country are stored with the server: the row draws from this record alone, and a pinned run can place it when the catalogue cannot');
+  // The by-ID reply carries no coordinate on purpose (handleSpeedtestServers
+  // omits it): that endpoint reports OUR position for a server on our own ISP.
+  const q = drivePicker();
+  q.fpAdopt([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC' }]);
+  q.fpToggleStar('1993');
+  assert.equal(q.saved()[0].lat, 0, 'no coordinate is kept as none, never as a borrowed one');
+  assert.equal(q.saved()[0].lon, 0);
+});
+
+test('a redraw keeps the results where the reader left them', () => {
+  const p = drivePicker();
+  p.fpAdopt(Array.from({ length: 20 }, (_, i) => SRV('S' + i)));
+  p.els.fpAll.children[1].scrollTop = 190;
+  p.fpToggleStar('S15');   // any change redraws, which replaces the scroller
+  assert.equal(p.els.fpAll.children[1].scrollTop, 190,
+    'the list jumped back to the top, so a quick second click lands on whichever row slid under the cursor');
+});
+
+test('the fade shows only while there is more to scroll', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1')]);
+  const list = p.els.fpAll, rows = list.children[1];
+  assert.ok(!list.classList.contains('more-below'), 'nothing overflowing, nothing to cue');
+  rows.clientHeight = 100; rows.scrollHeight = 400;
+  rows.fire('scroll');
+  assert.ok(list.classList.contains('more-below'));
+  assert.ok(!list.classList.contains('more-above'), 'at the top there is nothing above');
+  rows.scrollTop = 300;
+  rows.fire('scroll');
+  assert.ok(list.classList.contains('more-above'));
+  assert.ok(!list.classList.contains('more-below'), 'at the bottom the lower fade has to go');
+});
+
+test('the saved list arrives from settings normalised and capped', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved(Array.from({ length: 20 }, (_, i) => ({ id: i, sponsor: 'S', name: 'N', lat: 1, lon: 2 })));
+  assert.equal(p.saved().length, 12, 'a stored list longer than the cap is trimmed on the way in too');
+  assert.equal(p.saved()[0].id, '0', 'speed_server_id is a string, so the kept ids are compared as strings');
+  p.fpAdoptSaved([{ sponsor: 'nameless' }]);
+  assert.deepEqual(p.saved(), [], 'an entry with no id names no server');
+  p.fpAdoptSaved(undefined);
+  assert.deepEqual(p.saved(), [], 'a settings response with no list at all is an empty list');
+});
+
+// The daemon sends each row's ping; the row shows it the way the connection
+// panel does, and a row without one shows a dash rather than a zero.
+test('rows show the ping the daemon listed them with', () => {
+  const p = drivePicker();
+  p.fpAdopt([{ id: '1', sponsor: 'A', name: 'X', ping_ms: 27.7 }, { id: '2', sponsor: 'B', name: 'Y', ping_ms: 3.26 }, { id: '3', sponsor: 'C', name: 'Z' }]);
+  assert.match(fpBtn(fpRowOf(p.els.fpAll, '1')).innerHTML, /<span class="fp-ping">28 ms<\/span>/, 'whole milliseconds above 10');
+  assert.match(fpBtn(fpRowOf(p.els.fpAll, '2')).innerHTML, /<span class="fp-ping">3.3 ms<\/span>/, 'one decimal under 10');
+  assert.match(fpBtn(fpRowOf(p.els.fpAll, '3')).innerHTML, /<span class="fp-ping none">/, 'no ping is a dash, not 0 ms');
+  assert.equal(p.fpHeader(false).innerHTML.includes('Server'), true, 'a browse list is headed Server');
+  p.setLabel('Candidates');
+  const hdr = p.fpHeader(false).innerHTML;
+  assert.match(hdr, /Candidates/, 'after Auto the results pane is headed as the race field');
+  assert.doesNotMatch(hdr, /fp-refresh/, 'and it is still not a list to re-measure');
+});
+
+test('a kept server shows the median of past runs until the listing or a refresh measures it', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  const kept = p.saved()[0];
+  kept.ping = 8.4; kept.pingSrc = 'history';   // what fpLoadStoredPings writes
+  p.fpDraw();
+  let cell = fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML;
+  assert.match(cell, /class="fp-ping hist" title="Median[^"]*">8\.4 ms/, 'a history ping is shown, and marked as history');
+  p.fpAdopt([SRV('1993', { ping_ms: 6 })]);
+  cell = fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML;
+  assert.match(cell, /class="fp-ping">6\.0 ms/, 'a listing that measured it wins over the history');
+  assert.doesNotMatch(cell, /hist/);
+  kept.ping = 0; kept.pingSrc = 'none'; p.fpAdopt([]); p.fpDraw();
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML, /fp-ping none/, 'a refresh that got no answer shows none, not the stale median');
+  assert.match(extract('function fpAdoptSaved'), /fpLoadStoredPings\(\)/, 'loading the kept list asks the daemon for their history');
+  assert.match(extract('async function fpLoadStoredPings'), /api\/speed\/server-pings\?ids=/);
+});
+
+test('the saved pane refresh measures the kept servers and shows itself busy', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  let hdr = p.fpHeader(true).innerHTML;
+  assert.match(hdr, /<button class="fp-refresh" id="fpRefreshPings" type="button" title="Measure/, 'the refresh is live, not disabled');
+  assert.doesNotMatch(hdr, /not wired up/);
+  const btn = fpEl('button'); btn.className = 'fp-refresh';
+  p.els.fpFav.children[0].appendChild(btn);
+  p.click(btn);                                  // the harness stub flips fpPinging
+  hdr = p.fpHeader(true).innerHTML;
+  assert.match(hdr, /class="fp-refresh spin" id="fpRefreshPings" type="button" disabled/, 'while measuring, the button spins and refuses a second click');
+  const src = extract('async function fpRefreshPings');
+  assert.match(src, /api\/speedtest\/ping/, 'it asks the daemon to ping by ID');
+  assert.match(src, /method:'POST'/, 'as a POST with a JSON content type - the daemon reaches out for it');
+  assert.match(src, /status===409/, 'and says so when a speedtest is running');
+  assert.match(src, /pingSrc='live'/, 'a fresh measurement replaces the history median');
+  assert.match(src, /for\(const id in h\) serverHealth\.set\(String\(id\), !!h\[id\]\);/,
+    'the refresh carries the endpoint verdict, so a starred server outside every listing can earn its Unsupported mark');
+  assert.match(src, /fpBrowse\.find\(x=>x\.id===s\.id\); if\(b\) b\.ping = ms>0 \? ms : 0;/,
+    'the listing\u2019s copy of a kept server must agree with the refresh, or fpPanes shows the stale listing ping over it');
+});
+
+test('a refresh result is shown even when the listing also carries the server', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdopt([SRV('1993', { ping_ms: 31 })]);
+  // What fpRefreshPings writes (the harness stubs the fetch): onto the kept row AND the listing's copy.
+  const kept = p.saved()[0]; kept.ping = 6.2; kept.pingSrc = 'live';
+  const cell = () => fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML;
+  p.fpDraw();
+  assert.match(cell(), /31 ms/, 'without the browse copy updated, the listing wins - which is the defect the refresh has to write around');
+  const src = extract('async function fpRefreshPings');
+  assert.match(src, /const b=fpBrowse\.find/, 'so the refresh updates the browse copy too');
+});
+
+test('the runs table says how each run chose its centre', () => {
+  const raceCell = new Function('esc', 'num1', extract('function raceCell') + '\nreturn raceCell;')(esc, v => (typeof v === 'number' ? v : 0).toFixed(1));
+  assert.equal(raceCell({}), '<span class="muted">-</span>', 'a row from before the verdict existed says nothing');
+  const decided = raceCell({ race_outcome: 'decided', race_winner_kind: 'exit', race_winner_label: 'Montréal, QC', race_winner_ms: 8.4,
+    race_origins: 'exit:Montréal, QC(8.4ms) | isp:Toronto(15.1ms) | geo(-)' });
+  assert.match(decided, /^<span title="exit:Montréal, QC\(8\.4ms\) · isp:Toronto\(15\.1ms\) · geo\(-\)">Montréal, QC <span class="muted">· 8\.4 ms<\/span><\/span>$/,
+    'a decided race names the winning city and its fastest answer, every city in the title');
+  assert.match(raceCell({ race_outcome: 'silent', race_winner_label: 'Montréal' }), /Montréal.*race unanswered/);
+  assert.equal(raceCell({ race_outcome: 'bypassed_pin' }), '<span class="muted">pinned</span>');
+  assert.equal(raceCell({ race_outcome: 'unanchored' }), '<span class="muted">no city to race</span>');
+  assert.equal(raceCell({ race_outcome: '<b>' }), '&lt;b&gt;', 'an outcome the page does not know is shown escaped, not hidden');
+  assert.match(raceCell({ race_outcome: 'decided', race_winner_label: '<img>' }), /&lt;img&gt;/);
+  assert.match(html, /<th title="How the run chose where to test from[^"]*">Centre<\/th>/, 'the column is headed and explained');
+  assert.match(script, /<td>\$\{raceCell\(r\)\}<\/td>/, 'and rendered per run');
+  assert.match(script, /colspan="24"/, 'the empty-table row spans the new column');
+});
+
+test('the picker explains itself on the buttons, not in a paragraph under the list', () => {
+  assert.match(html, /id="serverSearchBtn" type="button" title="List the Ookla servers near a place[^"]*Ookla ID[^"]*"/, 'Find says what it does on hover');
+  assert.match(html, /id="serverAuto" type="button" title="Show what Auto would pick right now[^"]*no speedtest runs[^"]*"/, 'Auto says it lists and pings, never runs or chooses');
+  assert.match(html, /<span class="muted hidden" id="serverLoc"/, 'the caption under the list stays hidden');
+  assert.doesNotMatch(extract('function updateScopeNote'), /nearest responsive/, 'and what it would say is at least not the old lie');
+  assert.doesNotMatch(script, /setAutoLoc/, 'nothing reads the deleted Auto-location checkbox');
+});
+
+test('a server at the city\u2019s own point is near, not unknown', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1', { distance_km: 0.3 }), SRV('2', { distance_km: 12.4 }), SRV('3', { distance_km: 0 }), SRV('4', { distance_km: undefined })]);
+  const km = id => fpBtn(fpRowOf(p.els.fpAll, id)).innerHTML.match(/<span class="fp-km">([^<]*)<\/span>/)[1];
+  assert.equal(km('1'), '&lt;1 km', 'a fraction of a kilometre is a distance, not a blank');
+  assert.equal(km('2'), '12 km');
+  assert.equal(km('3'), '', 'a literal 0 is the catalogue saying it does not know');
+  assert.equal(km('4'), '');
+});
+
+test('the Ookla tab leads with Best of 3, and the challenger knobs sit beside it', () => {
+  const ookla = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
+  const at = id => ookla.indexOf('id="' + id + '"');
+  assert.ok(at('setSpeedBestOf') < at('setSpeedRetries') && at('setSpeedRetries') < at('setOoklaConnections'),
+    'Best of 3 takes the first cell; Parallel connections moved to where it was');
+  assert.ok(at('setOoklaLoss') < at('setSpeedChallengeEvery') && at('setSpeedChallengeEvery') < at('setSpeedChallengeMargin') && at('setSpeedChallengeMargin') < at('setOoklaConnections'),
+    'the two challenge rows follow the packet-loss probe');
+  assert.match(ookla, /id="setSpeedChallengeEvery" min="0" max="1000"/);
+  assert.match(ookla, /id="setSpeedChallengeMargin" min="0" max="100"/);
+  assert.match(script, /\['setSpeedChallengeEvery','speed_challenge_every','int',12\]/, 'blank falls back to the shipping default, not zero (0 means never)');
+  assert.match(script, /\['setSpeedChallengeMargin','speed_challenge_margin','int',15\]/);
+});
+
+test('the runs table says why each run\u2019s server was the one measured', () => {
+  const winTag = new Function('esc', script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0] + '\n' + extract('function winTag') + '\nreturn winTag;')(esc);
+  assert.equal(winTag({}), '', 'a run without a selection report carries no tag');
+  assert.equal(winTag({ win_reason: 'incumbent' }), ' <span class="muted" title="The server the previous test measured, kept because it still pinged within a hair of the fastest">· incumbent</span>');
+  assert.match(winTag({ win_reason: 'challenger_won' }), /· challenger won</, 'a seat change reads as one');
+  assert.match(winTag({ win_reason: 'pinned_companion' }), /· companion</);
+  assert.equal(winTag({ win_reason: '<b>' }), ' <span class="muted">· &lt;b&gt;</span>', 'an unknown reason is shown escaped, not hidden');
+  for (const reason of ['fastest_ranked', 'incumbent', 'on_net', 'challenger', 'challenger_won', 'challenger_failed', 'score', 'ping_bootstrap', 'pinned', 'pinned_bestof', 'pinned_companion'])
+    assert.ok(new RegExp('\\b' + reason + ':\\[').test(script), reason + ' (a win reason the daemon writes) has a label');
+  assert.match(script, /\$\{esc\(r\.server\)\}\$\{winTag\(r\)\}/, 'the tag sits right after the server name');
+});
+
+test('only the saved pane offers to re-measure', () => {
+  const p = drivePicker();
+  const kept = p.fpHeader(true).innerHTML, results = p.fpHeader(false).innerHTML;
+  assert.match(kept, /Saved/);
+  assert.match(kept, /id="fpRefreshPings"/, 'the refresh belongs to the servers you keep');
+  assert.match(kept, /fp-hdr-ping"><span>Ping<\/span><button class="fp-refresh"/,
+    'it sits immediately right of the PING label, inside the same cell');
+  assert.match(results, /Server/);
+  assert.doesNotMatch(results, /fp-refresh/, 'a search result is not a list to re-measure');
+});
+
+test('a server name from Ookla cannot inject markup into the row', () => {
+  const p = drivePicker();
+  p.fpAdopt([{ id: '1', sponsor: '<img src=x onerror=alert(1)>', name: 'a"b', distance_km: 1 }]);
+  const btn = fpBtn(fpRowOf(p.els.fpAll, '1'));
+  assert.doesNotMatch(btn.innerHTML, /<img/, 'the list is third-party text built with innerHTML');
+  assert.match(btn.innerHTML, /&lt;img/);
+});
+
+// The picker writes through the ordinary save path: settingsBody is what Save
+// posts AND what formSnapshot compares for the unsaved-changes check, so being
+// in it is what makes a star a real, discardable edit.
+function driveSettingsBody(speedServers) {
+  const els = { setServer: { value: '55' } };
+  return new Function('$', 'captureIperfEditor', 'activeIperfServer', 'iperfServers', 'iperfAddrValid',
+    'iperfWanted', 'FIELDS', 'getField', 'collectWindows', 'speedServers',
+    extract('function settingsBody') + '\nreturn settingsBody();')(
+    id => els[id] || { value: '', checked: false }, () => {}, () => null, [], () => false,
+    false, [], () => '', () => [], speedServers);
+}
+
+test('starring a server reaches what Save posts, and the dirty check with it', () => {
+  const kept = [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }];
+  const body = driveSettingsBody(kept);
+  assert.deepEqual(body.speed_servers, kept,
+    'without this the star changes nothing: Save posts a body that never mentions it');
+  assert.equal(body.speed_server_id, '55',
+    'the chosen server still travels as speed_server_id, exactly as before');
+  assert.notEqual(JSON.stringify(driveSettingsBody([]).speed_servers), JSON.stringify(body.speed_servers),
+    'two different kept lists must serialize differently, or the dirty check cannot see a star');
+  assert.match(extract('function formSnapshot'), /settingsBody\(\)/,
+    'the unsaved-changes check is built on settingsBody, which is why the star reaches it');
+});
+
+test('the picker is drawn from every path a list can arrive by', () => {
+  // populateServers is the single arrival point: the deferred first load, Find
+  // and Auto all end there, so hooking it is what keeps one code path.
+  assert.match(extract('function populateServers'), /fpAdopt\(list\)/);
+  assert.match(extract('function applySettings'), /fpAdoptSaved\(s\.speed_servers\)/);
+  const reset = html.slice(html.indexOf("$('resetSettings').addEventListener"));
+  assert.match(reset.slice(0, reset.indexOf('});')), /fpAdoptSaved\(d\.speed_servers\)/,
+    'Reset to defaults has to clear the kept list too, or it survives a reset unmentioned');
+});
+
+test('the old dropdown is kept as hidden state, not left on screen', () => {
+  assert.match(html, /<div class="server-select hidden" id="serverSelectWrap">/,
+    '#setServer still carries speed_server_id for settingsBody and applyPendingServer');
+  assert.match(html, /<select id="setServer">/);
+  assert.match(extract('function settingsBody'), /speed_server_id: \$\('setServer'\)\.value/);
+});
+
+test('the search bar is the results header, with Find and Auto matched', () => {
+  const bar = html.slice(html.indexOf('<div class="server-search fp-find">'), html.indexOf('id="fpAll"'));
+  assert.match(bar, /id="serverCity"[^>]*placeholder="Place or Ookla server ID"/);
+  // The placeholder grows a "(Current: ...)" once the list is centred somewhere
+  // known, so the box says what "here" is; it is rewritten with the caption.
+  const findBoxText = new Function(script.match(/const findBoxText = [^;]*;/)[0] + '\nreturn findBoxText;')();
+  assert.equal(findBoxText(''), 'Place or Ookla server ID');
+  assert.equal(findBoxText('Toronto, ON'), 'Place or Ookla server ID (Current: Toronto, ON)');
+  assert.match(extract('function updateScopeNote'), /box\.placeholder = findBoxText\(browseLabel\|\|autoDefaultLoc\)/,
+    'a searched place first, then where Auto last centred');
+  assert.match(bar, /id="serverSearchBtn"[^>]*><span class="btn-lbl">Find<\/span><span class="btn-busy btn-spin"/,
+    'Find uses the shared spinner, so its label does not have to be rebuilt by hand');
+  assert.match(bar, /id="serverAuto"[^>]*><span class="btn-lbl">Auto<\/span><span class="btn-busy btn-spin"/);
+  assert.match(html, /#serverRow \.fp-find \.btn\{min-width:72px;\}/,
+    'two ways of filling the same list, so the two buttons are one size');
+  assert.match(extract('async function searchServers'), /btnBusy\(b, true\)/);
+  assert.doesNotMatch(extract('function updateAutoLocUI'), /checked \? 'none'/,
+    'the box is the pane header now; hiding it would take the results pane header with it');
+});
+
+// The Server tab is two tabs now, one per engine, and both are always on the bar:
+// an Ookla user can see what iperf3 offers, and switching Engine moves nothing.
+// Engine itself sits at the top of Speedtest, because it decides what the two
+// tabs mean rather than being one of their settings.
+test('Ookla and iperf3 have their own tabs, and Engine heads the Speedtest tab', () => {
+  const bar = html.slice(html.indexOf('<div class="tabbar"'), html.indexOf('</div>', html.indexOf('<div class="tabbar"')));
+  assert.match(bar, /data-tab="speedtest">Speedtest<\/button>\s*<button[^>]*data-tab="ookla">Ookla<\/button>\s*<button[^>]*data-tab="iperf">iperf3<\/button>/,
+    'the two engine tabs follow Speedtest, in engine order');
+  assert.doesNotMatch(bar, /data-tab="server"/, 'the combined Server tab is gone');
+  const speed = html.slice(html.indexOf('<div class="tabpane tab-uniform active" data-tab="speedtest">'),
+    html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'));
+  const firstRow = speed.slice(speed.indexOf('<label class="srow'), speed.indexOf('</label>'));
+  assert.match(firstRow, /class="srow eng-row"/, 'Engine is the first row of the Speedtest pane, on a line of its own');
+  assert.match(firstRow, /id="setSpeedEngine"/);
+  assert.equal((html.match(/id="setSpeedEngine"/g) || []).length, 1, 'one engine toggle, not one per tab');
+  assert.match(html, /\.srow\.eng-row\{grid-column:1\/-1;/, 'the engine row spans the pane');
+  assert.match(html, /@media \(max-width:600px\)\{ \.srow\.eng-row\{grid-template-columns:1fr 150px;\} \}/,
+    'in the one-column pane the engine row is a plain row again, or its toggle sits mid-line while every other control is at the edge');
+  assert.doesNotMatch(html, /data-tab="server"/, 'no button, pane or selector still names the removed tab');
+  assert.match(speed, /id="iperfMissingNote"/, 'the "iperf3 is not installed" note explains the Engine toggle, so it sits beside it');
+});
+
+test('each engine tab shows its whole contents whatever the engine is', () => {
+  const ookla = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
+  const iperf = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="iperf">'), html.indexOf('<!-- /iperf3 pane -->'));
+  for (const id of ['setOoklaConnections', 'setSpeedRetries', 'setSpeedDirection', 'setOoklaLoss', 'setSpeedBestOf', 'setSpeedChallengeEvery', 'setSpeedChallengeMargin', 'serverRow', 'fpFav', 'fpAll'])
+    assert.ok(ookla.includes('id="' + id + '"'), `${id} belongs on the Ookla tab`);
+  for (const id of ['iperfServerRow', 'iperfEditor', 'setIperfDur', 'setIperfStreams', 'setIperfRetries', 'setIperfDirection', 'setIperfUDP', 'iperfUdpRateRow'])
+    assert.ok(iperf.includes('id="' + id + '"'), `${id} belongs on the iperf3 tab`);
+  assert.match(iperf, /<div class="srow-wide" id="iperfServerRow">/, 'the iperf3 list is not hidden behind the engine any more');
+  assert.match(iperf, /<label class="srow" id="iperfUdpRateRow">/,
+    'the UDP rate row must not start hidden: the engine toggle that used to un-hide it is gone');
+  assert.match(html, /\.tp-grid\{[^}]*grid-template-columns:repeat\(3,1fr\)/, 'the iperf3 options are three columns by default');
+  assert.match(html, /@media \(max-width:600px\)\{ \.tp-grid\{grid-template-columns:1fr;\} \}/, 'and one column on a phone');
+  for (const fn of ['function renderIperfEditor', 'function updateIperfAuthRows', 'function updateCongestionHint'])
+    assert.doesNotMatch(extract(fn), /setSpeedEngine/, `${fn} must not gate on the engine: the tab is the gate, and under Ookla Add/Edit would otherwise click into nothing`);
+  assert.doesNotMatch(script, /\$\('(iperfServerRow|autoLocRow|serverRow)'\)\.classList\.(toggle|add|remove)\('hidden'/,
+    'nothing anywhere hides a tab\u2019s rows by engine');
+  assert.doesNotMatch(script, /classList\.toggle\('iperf-mode'/);
+  assert.doesNotMatch(html, /iperf-opt|ookla-opt/, 'no row is classed for engine gating any more');
+  const eng = extract('function updateEngineUI');
+  assert.doesNotMatch(eng, /iperfServerRow|serverRow|autoLocRow|tp-grid/,
+    'updateEngineUI must not hide either tab\u2019s rows by engine - the tabs are the split');
+  assert.match(eng, /speedDataEst/, 'the Ookla data estimate on the Speedtest tab is the one thing still gated');
+  assert.match(html, /\.tabpane\[data-tab="ookla"\]\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\);/,
+    'the Ookla settings use the three-column layout the Latency tab does');
+  assert.match(html, /max-width:900px\)\{ \.tabpane\[data-tab="latency"\],\s*\.tabpane\[data-tab="ookla"\]\{grid-template-columns:repeat\(2/,
+    'and step down with it at 900px');
+  assert.match(html, /max-width:600px\)\{ \.tabpane\[data-tab="latency"\],\s*\.tabpane\[data-tab="ookla"\]\{grid-template-columns:1fr/,
+    'and to one column at 600px');
+  assert.doesNotMatch(html, /\.tabpane\[data-tab="ookla"\] \.lbl\{white-space:nowrap/,
+    'Ookla labels are longer than Latency\u2019s; nowrap pushed a control over the next column at ~900px');
+  assert.doesNotMatch(html, /autoLocRow|setAutoLoc/, 'the Auto-location checkbox is gone, not hidden: Auto is a button beside Find and a row in the saved pane');
+});
+
+test('the code that named the Server tab follows it to the Ookla and iperf3 tabs', () => {
+  assert.match(script.match(/const serverTabActive = [^;]*;[^;]*;/)[0], /dataset\.tab==='ookla'/,
+    'the deferred server-list fetch keys on the Ookla tab');
+  assert.match(extract('function activateTab'), /name==='ookla'\) loadServers\(\)/);
+  assert.doesNotMatch(script, /activateTab\('server'\)|dataset\.tab==='server'|name==='server'/, 'nothing still names the removed tab');
+  const start = script.indexOf("$('saveSettings').addEventListener");
+  const save = script.slice(start, script.indexOf("$('discardSettings')", start));
+  assert.equal((save.match(/activateTab\('iperf'\)/g) || []).length, 2,
+    'a bad iperf3 address and an orphaned password both send the user to the iperf3 tab');
+  const restore = extract('function restoreDrawerPlace');
+  assert.match(restore, /if\(want==='server'\) want='ookla'/, 'a drawer place saved before the split reopens on the Ookla half');
+});
+
+test('the two panes are laid out by one shared column definition', () => {
+  const list = html.match(/\n\s*\.fp-list\{[^}]*\}/)[0];
+  assert.match(list, /--tracks:/, 'the tracks are declared once, on the list both panes are');
+  for (const sel of ['.fp-hdr', '.fp-btn']) {
+    assert.match(html.match(new RegExp('\\n\\s*\\' + sel + '\\{[^}]*\\}'))[0], /var\(--tracks\)/,
+      sel + ' has to inherit the shared tracks, or the two panes stop lining up');
+  }
+  assert.match(list, /--rows:6/, 'the results pane shows six rows and scrolls for the rest');
+  assert.match(html.match(/\n\s*\.fp-kept \.fp-rows\{[^}]*\}/)[0], /height:auto/,
+    'the saved pane is capped at twelve and grows instead of scrolling');
+  assert.match(html, /\.fp-list\.more-below::after,\.fp-list\.more-above::before\{opacity:1;\}/,
+    'the fade is a scroll cue, so it may only show when there is more to scroll');
+  assert.match(html.match(/\n\s*\.fp-row:has\(\.fp-btn\.on\)\{[^}]*\}/)[0], /inset 3px 0 0 var\(--accent\)/,
+    'the chosen row needs a mark that survives scrolling past the radio');
+  assert.match(html, /<div class="fp-list fp-kept" id="fpFav"><\/div>/, 'the saved pane needs its own host');
+  assert.match(html, /<div class="fp-list" id="fpAll"><\/div>/, 'and so do the results');
+});
+
+test('the picker borrows no colour that already means something else', () => {
+  const css = html.slice(html.indexOf('---- Ookla server picker'), html.indexOf('.drawer-actions{'));
+  assert.doesNotMatch(css, /--accent2/,
+    '--accent2 is purple, pink, green and magenta across the shipped themes');
+  assert.doesNotMatch(css, /--down/, '--down means the link is down, which an unsupported server is not');
+  assert.match(html.match(/\n\s*\.fp-badge\.bad\{[^}]*\}/)[0], /var\(--muted\)/);
+  for (const c of ['.fp-list', '.fp-star', '.fp-badge']) {
+    assert.ok(html.includes('html:not(.round) ' + c + ',\n'),
+      c + ' has to follow the flat/round corner setting like every other rounded thing');
+  }
+});
+
 // --- Ookla list requests: only the newest may write the page's scope ----------
 // fetchServers is the single entry point for the city search, the by-ID pin and
-// the auto refetch, and every one of them mutates autoLoc/autoLabel/pendingServer
+// the auto refetch, and every one of them mutates pendingServer
 // and repopulates the dropdown when it lands. They overlap for real - ticking Auto
 // starts the auto refetch under a running city search - so the real functions are
 // driven here against fetches the test resolves by hand, in the order that breaks.
 const tick = () => new Promise(r => setTimeout(r, 0));
 function driveServers() {
   const fetches = [];
-  const fetchStub = () => new Promise((resolve, reject) => {
-    fetches.push({ ok: body => resolve({ json: async () => body }), fail: () => reject(new Error('offline')) });
+  const fetchStub = url => new Promise((resolve, reject) => {
+    fetches.push({ url, ok: body => resolve({ ok: true, json: async () => body }), fail: () => reject(new Error('offline')),
+      // A daemon error: text/plain, so the body is not JSON either way.
+      status: code => resolve({ ok: false, status: code, json: async () => { throw new Error('not json'); } }) });
   });
   const els = {
     serverCity: { value: '' },
     setServer: { value: '', disabled: false },
-    serverSearchBtn: { disabled: false, innerHTML: 'Search' },
+    // Find shares btnBusy with every other spinner button now, so the stub has to
+    // answer the same calls a real button does.
+    serverSearchBtn: { disabled: false, busy: false, classList: { toggle(c, on) { els.serverSearchBtn.busy = on; } },
+      setAttribute() {}, removeAttribute() {} },
     settingsMsg: { textContent: '' },
+    serverAuto: { disabled: false, busy: false, classList: { toggle(c, on) { els.serverAuto.busy = on; } },
+      setAttribute() {}, removeAttribute() {} },
   };
-  const log = { loading: [], populated: [], errs: [] };
+  const log = { loading: [], populated: [], errs: [], drew: 0 };
   const api = new Function('$', 'fetch', 'setServerLoading', 'populateServers',
-    'applyPendingServer', 'updateScopeNote', 'clearServerFieldError', 'serverFieldError', 'serverTabActive',
-    'let serversLoaded=false, serversScope="", serverTabSeen=true, pendingServer="", autoLoc="", '
-    + 'autoLabel="", autoDefaultLoc="", autoCentreLastRun=false, serverSearchInFlight=null, serverSearchFailed=false;\n'
+    'applyPendingServer', 'updateScopeNote', 'clearServerFieldError', 'serverFieldError', 'serverTabActive', 'btnBusy', 'fpDraw',
+    'let serversLoaded=false, serversScope="", serverTabSeen=true, pendingServer="", '
+    + 'autoDefaultLoc="", autoCentreLastRun=false, serverSearchInFlight=null, serverSearchFailed=false, '
+    // Every page-level name the lifted functions write, or a sloppy-mode
+    // assignment creates a global that leaks between drives and a test passes
+    // only because an earlier one ran.
+    + 'browseLoc="", browseLabel="", serverPinUnverified="", serverErrShown="", fpListLabel="Server", fpRefusedID="";\n'
+    + extract('function fpRefuse') + '\n'
     // The generation counter itself is lifted from the page, so deleting it there
     // fails this drive rather than letting the test supply its own.
     + script.match(/let serversGen\s*=\s*0;/)[0] + '\n'
     + script.match(/const shortPlace = [^;]*;/)[0] + '\n'
     + extract('async function fetchServers') + '\n'
     + extract('async function loadServers') + '\n'
-    + extract('function chooseAutoServer') + '\n'
     + extract('async function searchServers') + '\n'
-    + 'return { fetchServers, chooseAutoServer, searchServers, '
-    + 'state: () => ({ autoLoc, autoLabel, pendingServer, searchFailed: serverSearchFailed }) };')(
+    + extract('function fpAutoList') + '\n'
+    + 'return { fetchServers, searchServers, fpAutoList, '
+    + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, autoCentreLastRun,'
+    + ' searchFailed: serverSearchFailed, pinUnverified: serverPinUnverified, errShown: serverErrShown, listLabel: fpListLabel }) };')(
     id => els[id], fetchStub, on => log.loading.push(on), s => log.populated.push(s),
-    () => {}, () => {}, () => {}, m => log.errs.push(m), () => true);
+    () => {}, () => {}, () => {}, m => log.errs.push(m), () => true,
+    // The real btnBusy, lifted from the page: the button-release assertions below
+    // are about what it does, so a hand-written stand-in would prove nothing.
+    new Function(extract('function btnBusy') + '\nreturn btnBusy;')(), () => { log.drew++; });
   return { api, els, fetches, log };
 }
-
-test('server list: a city search abandoned for Auto cannot restore city scope', async () => {
-  const { api, els, fetches, log } = driveServers();
-  els.serverCity.value = 'Paris';
-  const search = api.searchServers();
-  await tick();
-  assert.equal(fetches.length, 1, 'the search must be in flight for this race to exist');
-  api.chooseAutoServer();              // Auto ticked before the city answer lands
-  await tick();
-  assert.equal(fetches.length, 2, 'ticking Auto refetches the auto-scoped list');
-
-  // The abandoned city request answers FIRST, while the auto one is still running.
-  fetches[0].ok({ lat: 48.8, lon: 2.3, location: 'Paris, FR, Europe', servers: [{ id: 'p' }] });
-  await search; await tick();
-  assert.deepEqual(log.populated, [],
-    'the abandoned city list repopulated the dropdown under a checked Auto box');
-  assert.deepEqual(log.loading, [true, true],
-    'the abandoned request cleared the spinner the live request is still showing');
-  assert.deepEqual(log.errs, []);
-
-  fetches[1].ok({ location: 'Berlin, DE', centre: 'last_run', servers: [{ id: 'a' }] });
-  await tick();
-  const st = api.state();
-  assert.equal(st.autoLoc, '', 'a stale city response restored city scope while Auto is checked');
-  assert.equal(st.autoLabel, '');
-  assert.deepEqual(log.populated, [[{ id: 'a' }]], 'the auto list is what the dropdown ends up showing');
-  assert.deepEqual(log.loading, [true, true, false]);
-});
 
 test('server list: of two overlapping searches the newest wins, whichever answers first', async () => {
   const { api, fetches, log } = driveServers();
@@ -3283,8 +3845,8 @@ test('server list: of two overlapping searches the newest wins, whichever answer
   fetches[0].ok({ lat: 48.8, lon: 2.3, location: 'Paris, FR', servers: [{ id: 'p' }] });
   await tick();
   const st = api.state();
-  assert.equal(st.autoLoc, '52.5,13.4', 'the older search overwrote the newer one');
-  assert.equal(st.autoLabel, 'Berlin, DE');
+  assert.equal(st.browseLoc, '52.5,13.4', 'the older search overwrote the newer one');
+  assert.equal(st.browseLabel, 'Berlin', 'the city alone: the geocoder\u2019s regional tail is dropped');
   assert.deepEqual(log.populated, [[{ id: 'b' }]], 'and it put the older city list back in the dropdown');
 });
 
@@ -3293,7 +3855,7 @@ test('server list: an abandoned search cannot report a failure the page has move
   els.serverCity.value = 'Nowherecity';
   const search = api.searchServers();
   await tick();
-  api.chooseAutoServer();
+  api.fetchServers({});                // a newer request supersedes it
   await tick();
   fetches[0].fail();                   // the abandoned lookup fails, late
   await search; await tick();
@@ -3302,8 +3864,128 @@ test('server list: an abandoned search cannot report a failure the page has move
   assert.equal(api.state().searchFailed, false,
     'the abandoned failure left the save-blocking flag set');
   assert.equal(els.serverSearchBtn.disabled, false,
-    'the Search button must be released even when its search was abandoned');
-  assert.equal(els.serverSearchBtn.innerHTML, 'Search', 'and its label restored, not left as a spinner');
+    'the Find button must be released even when its search was abandoned');
+  assert.equal(els.serverSearchBtn.busy, false, 'and its label restored, not left as a spinner');
+});
+
+// The daemon answers 404 only when Ookla knows no such server; a 502/504 - or
+// no answer at all - says nothing about the ID. Refusing to save over that
+// would lock a real server out for as long as Ookla is unreachable, so the
+// typed ID takes unverified instead.
+test('server list: an ID the daemon could not check is pinned unverified, not refused', async () => {
+  for (const [name, land] of [['502', f => f.status(502)], ['504', f => f.status(504)], ['offline', f => f.fail()]]) {
+    const { api, els, fetches, log } = driveServers();
+    els.serverCity.value = '1993';
+    const search = api.searchServers();
+    await tick();
+    land(fetches[0]);
+    await search; await tick();
+    const st = api.state();
+    assert.equal(st.pendingServer, '1993', `${name}: the typed ID must take`);
+    assert.equal(st.searchFailed, false, `${name}: and must not block Save`);
+    assert.deepEqual(log.errs, [], `${name}: nor be painted as "not found"`);
+    assert.equal(els.serverCity.value, '', `${name}: the query was consumed`);
+    assert.match(els.settingsMsg.textContent, /could not be reached/, `${name}: the user is told it went unchecked`);
+    assert.equal(st.errShown, els.settingsMsg.textContent,
+      `${name}: the notice is owned like a search error, so typing, the next Find, a row click or closing the drawer retire it`);
+    assert.equal(st.pinUnverified, '1993', `${name}: Save can tell the user after the drawer closes over the footer`);
+    assert.equal(log.drew, 1, `${name}: the radio moves to the pin now`);
+  }
+});
+
+// Only 502/504 (or no answer at all) mean Ookla could not be asked. A 401 is the
+// daemon refusing the page (the login overlay is opening); a reconcile 503 is a
+// restore in progress. Neither is an Ookla outage, and neither pins anything.
+test('server list: a status the daemon itself answers with is not "Ookla unreachable"', async () => {
+  for (const code of [401, 503]) {
+    const { api, els, fetches, log } = driveServers();
+    els.serverCity.value = '1993';
+    const search = api.searchServers();
+    await tick();
+    fetches[0].status(code);
+    await search; await tick();
+    assert.equal(api.state().pendingServer, '', `${code}: nothing may be pinned`);
+    assert.equal(api.state().searchFailed, true, `${code}: the box stays in error`);
+    assert.deepEqual(log.errs, ['could not check server 1993'], `${code}: and the message does not blame Ookla or claim "not found"`);
+  }
+});
+
+test('server list: a 404 on an ID still means no such server', async () => {
+  const { api, els, fetches, log } = driveServers();
+  els.serverCity.value = '1993';
+  const search = api.searchServers();
+  await tick();
+  fetches[0].status(404);
+  await search; await tick();
+  assert.equal(api.state().pendingServer, '', 'a server Ookla does not know must not be pinned');
+  assert.equal(api.state().searchFailed, true, 'and Save stays blocked until the box is fixed');
+  assert.deepEqual(log.errs, ['server 1993 not found']);
+  assert.equal(els.serverCity.value, '1993', 'the typed ID stays so it can be fixed');
+});
+
+// Auto is not a browse list around one city: it asks the daemon for the field
+// an automatic run would race - every origin's pool, deduplicated and pinged -
+// and the results pane says so. A Find afterwards puts the header back.
+test('server list: Auto shows the candidates a run would race, and says so', async () => {
+  const { api, fetches, log } = driveServers();
+  api.fetchServers({ candidates: true });
+  await tick();
+  assert.equal(fetches[0].url, 'api/speedtest/candidates', 'the race field, not the browse list');
+  fetches[0].ok({ winner: { kind: 'saved', label: 'Montréal, QC, Canada' },
+    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 10.4, origin: 'saved' }] });
+  await tick();
+  let st = api.state();
+  assert.equal(st.listLabel, 'Candidates', 'the results pane is headed as the race field');
+  assert.equal(st.autoDefaultLoc, 'Montréal', 'the winner is where a run now would centre');
+  assert.equal(st.autoCentreLastRun, false, 'and it is not a past-tense claim about the last run');
+  assert.equal(st.pendingServer, '', 'listing the field chooses nothing');
+  assert.deepEqual(log.populated[0][0].ping_ms, 10.4, 'the ping reaches the rows');
+  assert.equal(log.populated[0][0].distance_km, undefined,
+    'a racer\u2019s distance is from its own origin, not from the user: not comparable across pools, so not shown');
+  api.fetchServers({ city: 'Toronto' });
+  await tick();
+  fetches[1].ok({ lat: 43.7, lon: -79.4, location: 'Toronto, ON', servers: [{ id: 't', ping_ms: 27.7 }] });
+  await tick();
+  assert.equal(api.state().listLabel, 'Server', 'a Find is a browse list again');
+  assert.match(extract('function fpAutoList'), /fetchServers\(\{candidates:true\}\)/, 'the Auto button is what asks for the field');
+  assert.match(script, /\$\('serverAuto'\)\.addEventListener\('click', fpAutoList\)/);
+});
+
+// Find paints its failures; Auto used to swallow every one. The daemon refuses
+// the race during a run (409) and reports a race that could not be run (502),
+// and each is told in the footer, owned like a search error so it retires.
+test('server list: an Auto that could not race says why', async () => {
+  for (const [code, want] of [[409, /speedtest is running/], [502, /could not race/i], [503, /not available/]]) {
+    const { api, els, fetches } = driveServers();
+    const p = api.fpAutoList();
+    await tick();
+    fetches[0].status(code);
+    await p; await tick();
+    assert.match(els.settingsMsg.textContent, want, `${code}`);
+    assert.equal(api.state().errShown, els.settingsMsg.textContent, `${code}: owned like a search error`);
+    assert.equal(els.serverAuto.busy, false, `${code}: the button is released`);
+  }
+  // A failure of a request the page already moved past says nothing.
+  const { api, els, fetches } = driveServers();
+  const p = api.fpAutoList();
+  await tick();
+  api.fetchServers({ city: 'Paris' });
+  await tick();
+  fetches[0].status(502);
+  await p; await tick();
+  assert.equal(els.settingsMsg.textContent, '', 'an abandoned Auto must not paint its failure over the Find that replaced it');
+});
+
+test('server list: a city that cannot be found is "not found" whatever the status', async () => {
+  const { api, els, fetches, log } = driveServers();
+  els.serverCity.value = 'Nowherecity';
+  const search = api.searchServers();
+  await tick();
+  fetches[0].status(502);   // the geocoder's answer for an unknown city
+  await search; await tick();
+  assert.deepEqual(log.errs, ['city not found']);
+  assert.equal(api.state().searchFailed, true);
+  assert.equal(api.state().pendingServer, '', 'a city search never pins anything');
 });
 
 // --- container-awareness surfaces (I1/I5/I8/I9) ------------------------------
@@ -3494,13 +4176,13 @@ test('the loopback trap fires only in a BRIDGED container, skips deleted rows, a
 });
 
 // The trap itself asks only "bridged container + a loopback server in the list",
-// which is the right question for the drawer, where the bubble lives inside
-// #iperfServerRow and is hidden outright whenever the engine is Ookla. The
-// post-save TOAST has no such markup around it, so it inherited none of that
-// gating: an install running Ookla, with an iperf3 server still sitting in the
-// saved list (added while trying iperf3, or kept for later), got told on every
-// single save that its iperf3 server would refuse connections - about an engine
-// that never runs. Two surfaces, same warning, opposite answers.
+// which is the right question for the drawer: its bubble sits on the iperf3 tab
+// beside the list it describes, so the reader has the context. The post-save
+// TOAST has no such context - it fires on every save - so it alone must consult
+// the engine: an install running Ookla, with an iperf3 server still sitting in
+// the saved list (added while trying iperf3, or kept for later), used to be told
+// on every single save that its iperf3 server would refuse connections - about
+// an engine that never runs.
 test('the post-save loopback toast is gated on iperf3 actually being the engine', () => {
   const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
   const j = save.indexOf('const lb=');
@@ -3508,8 +4190,8 @@ test('the post-save loopback toast is gated on iperf3 actually being the engine'
   const guard = save.slice(j, save.indexOf(';', j));
   assert.match(guard, /setSpeedEngine/,
     'the toast fires without consulting the engine, so an Ookla install with a leftover iperf3 server ' +
-    'is warned about iperf3 on every save; the drawer bubble is gated by its container markup and stays ' +
-    'silent, so the two surfaces disagree');
+    'is warned about iperf3 on every save - the drawer bubble has the iperf3 tab around it for context; ' +
+    'the toast has nothing');
 });
 
 // M5: the trap must key on the settings payload's BRIDGED flag, never on the
@@ -4980,4 +5662,58 @@ test('every save that does not save turns the button red', () => {
     'each attempt has to start clean, or a retry that works still looks failed');
   assert.match(html.slice(html.indexOf('function openDrawer(')), /classList\.remove\('err'\)/,
     'a failure that was discarded must not colour a freshly opened drawer');
+});
+
+// A server can be chosen and in neither pane: saved in Montreal, then a search for
+// Toronto, or a pin restored from a backup. Without a row the picker shows nothing
+// chosen while every run still uses it, and unstarring the last saved copy would
+// leave no way back to it.
+test('the chosen server is always shown, even when neither list holds it', () => {
+  const p = drivePicker();
+  p.els.setServer.value = '1993';
+  p.els.setServer.selectedOptions = [{ textContent: 'EBOX - Montréal, QC, Canada (356 km)' }];
+  p.fpAdoptSaved([]);
+  p.fpAdopt([{ id: '55', sponsor: 'Rogers', name: 'North York, ON' },
+             { id: '66', sponsor: 'Bell', name: 'Toronto, ON' }]);
+  const ids = fpIds(p.els.fpAll);
+  assert.ok(ids.includes('1993'),
+    `the chosen server has no row: results were ${JSON.stringify(ids)}`);
+  const row = fpRowOf(p.els.fpAll, '1993');
+  assert.match(fpBtn(row).innerHTML, /EBOX/, 'its label should come from the resolved option');
+  assert.ok(fpBtn(row).className.includes('on'), 'and it should read as the chosen one');
+});
+
+test('a chosen server already listed is not shown twice', () => {
+  const p = drivePicker();
+  p.els.setServer.value = '55';
+  p.els.setServer.selectedOptions = [{ textContent: 'Rogers - North York, ON (5 km)' }];
+  p.fpAdoptSaved([]);
+  p.fpAdopt([{ id: '55', sponsor: 'Rogers', name: 'North York, ON' }]);
+  assert.deepEqual(fpIds(p.els.fpAll).filter(x => x === '55'), ['55']);
+});
+
+test('unstarring the last copy of a chosen server leaves a row to re-star', () => {
+  const p = drivePicker();
+  p.els.setServer.value = '1993';
+  p.els.setServer.selectedOptions = [{ textContent: 'EBOX - Montréal, QC (356 km)' }];
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC' }]);
+  p.fpAdopt([{ id: '7', sponsor: 'Bell', name: 'Toronto, ON' }]);
+  p.fpToggleStar('1993');
+  assert.deepEqual(p.saved(), [], 'it should leave the saved list');
+  assert.ok(fpIds(p.els.fpAll).includes('1993'),
+    'but it must still have a row, or one stray click strands the server a run uses');
+});
+
+// Browsing is not committing. A search moves the list; the scope a run uses is
+// changed only by choosing something, never by looking around.
+test('server list: searching a city moves the list without committing a scope', async () => {
+  const { api, els, fetches } = driveServers();
+  els.serverCity.value = 'Toronto';
+  const search = api.searchServers();
+  await tick();
+  fetches[0].ok({ lat: 43.7, lon: -79.4, location: 'Toronto, ON', servers: [{ id: 't' }] });
+  await search; await tick();
+  const st = api.state();
+  assert.equal(st.browseLoc, '43.7,-79.4', 'the list should follow the search');
+  assert.equal(st.pendingServer, '', 'and a search must not silently unpin a chosen server');
 });

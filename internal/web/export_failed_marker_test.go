@@ -84,11 +84,20 @@ func TestExportStampsFiveOnlyWhenSpeedRowsAreFlagged(t *testing.T) {
 // exportSchema must be at least what any file this build can emit demands, or
 // this build would write backups it refuses to read back.
 func TestExportSchemaCoversTheFlaggedStamp(t *testing.T) {
-	if got := exportSchemaFor([]string{"speed", "speed_servers"}, true); got > exportSchema {
+	if got := exportSchemaFor([]string{"speed", "speed_servers"}, store.AllSpeedColumnsPastSchema4InUse()); got > exportSchema {
 		t.Fatalf("a flagged speed export needs %d but exportSchema is %d", got, exportSchema)
 	}
-	if exportSchemaFor([]string{"speed", "speed_servers"}, false) >= 5 {
+	if got := exportSchemaFor([]string{"speed", "speed_servers"}, map[string]bool{"failed": true}); got != 5 {
+		t.Fatalf("a flagged speed export stamps %d, want 5", got)
+	}
+	if exportSchemaFor([]string{"speed", "speed_servers"}, nil) >= 5 {
 		t.Fatal("an unflagged speed export must not reach the marker's version")
+	}
+	// The race verdict columns came after the stamp of 5 shipped, so a file
+	// carrying one needs 6 - and only then; a file with the v5 columns alone
+	// keeps stamping 5, restorable on the builds that read it.
+	if got := exportSchemaFor([]string{"speed"}, map[string]bool{"race_outcome": true}); got != 6 {
+		t.Fatalf("a speed export carrying a race verdict stamps %d, want 6", got)
 	}
 }
 
