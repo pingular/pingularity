@@ -8,6 +8,8 @@ import (
 	"time"
 
 	ookla "github.com/showwin/speedtest-go/speedtest"
+
+	"github.com/pingular/pingularity/internal/stats"
 )
 
 // The measured case, from the user's connection. The pin is EBOX's Montreal
@@ -120,6 +122,9 @@ func TestRunReasonCentresAPinnedBestOfRunOnTheServersOwnCoordinate(t *testing.T)
 		{ID: "44444", Sponsor: "EBOX", Name: "Quebec City", Lat: "46.81", Lon: "-71.21", Distance: 720},
 		{ID: "1993", Sponsor: "EBOX", Name: "Montreal", Lat: realLat, Lon: realLon, Distance: 504.6},
 	}, nil)
+	// A saved pair is a snapshot from star time; the live catalogue outranks it
+	// whenever it answers. A decoy here proves the order.
+	o.SavedCoordFn = func(string) (float64, float64, bool) { return 40.0, -70.0, true }
 
 	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
 		t.Fatalf("pinned best-of run: %v", err)
@@ -128,6 +133,9 @@ func TestRunReasonCentresAPinnedBestOfRunOnTheServersOwnCoordinate(t *testing.T)
 	loc := registeredLocation("pinned")
 	if loc == nil {
 		t.Fatal("the run centred on nothing; the pin's own coordinate never reached the fetch")
+	}
+	if loc.Lat == 40.0 && loc.Lon == -70.0 {
+		t.Fatalf("centred on the saved snapshot %v,%v although the live catalogue answered", loc.Lat, loc.Lon)
 	}
 	if loc.Lat == 43.7154 && loc.Lon == -79.3896 {
 		t.Fatalf("centred on %v,%v - the CALLER's coordinate out of the by-ID reply. "+
@@ -212,32 +220,6 @@ func TestRunReasonIgnoresTheRowsOfAFailedCatalogueFetch(t *testing.T) {
 	}
 	if loc := registeredLocation("pinned"); loc != nil {
 		t.Fatalf("centred on %v,%v out of a fetch that errored", loc.Lat, loc.Lon)
-	}
-}
-
-// Recovery must not reach past the pin. A run with a searched city already has
-// a centre to fall back on, so a pin whose coordinate cannot be recovered
-// centres on the city and races nothing - unchanged from what a pin with no
-// coordinate at all has always done.
-func TestRunReasonFallsBackToTheSearchedCityWhenRecoveryFails(t *testing.T) {
-	o := pinnedBestOf(t)
-	o.AutoLocFn = func() (float64, float64, bool) { return 48.85, 2.35, true }
-	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
-		Lat: callerLat, Lon: callerLon, Distance: 0,
-	})
-	stubCatalogue(t, nil, nil)
-	pools := stubOriginPools(t, map[string]ookla.Servers{"exit": {srv("e1", 1)}})
-
-	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
-		t.Fatalf("pinned best-of run: %v", err)
-	}
-	if n := pools.fetches(); n != 0 {
-		t.Errorf("the run raced %d origin pools; a searched city is a stated centre and overrides the race", n)
-	}
-	loc := registeredLocation("auto")
-	if loc == nil || loc.Lat != 48.85 || loc.Lon != 2.35 {
-		t.Fatalf("centred on %v, want the searched city 48.85,2.35", loc)
 	}
 }
 
@@ -359,5 +341,126 @@ func TestKeywordConfigCarriesTheSponsorByte(t *testing.T) {
 	}
 	if keywordConfig("EBOX").UserAgent == "" {
 		t.Error("the catalogue fetch needs a user agent like every other Ookla call")
+	}
+}
+
+// The saved picker list holds the catalogue coordinate a starred server was
+// listed with. When the live lookup fails, that snapshot still puts the
+// companions beside the pin - ahead of the searched city, which is the answer
+// to "no idea where the pin is", not a better one than the pin's own row.
+func TestRunReasonFallsBackToTheSavedCoordinateWhenRecoveryFails(t *testing.T) {
+	o := pinnedBestOf(t)
+	o.SavedCoordFn = func(id string) (float64, float64, bool) {
+		if id == "1993" {
+			return 45.5017, -73.5673, true
+		}
+		return 0, 0, false
+	}
+	stubPinByID(t, &ookla.Server{
+		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		Lat: callerLat, Lon: callerLon, Distance: 0,
+	})
+	stubCatalogue(t, nil, nil)
+	pools := stubOriginPools(t, map[string]ookla.Servers{"exit": {srv("e1", 1)}})
+	unrecovered := stats.Lifetime().Counters["speed.pin_coord_unrecovered"]
+
+	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
+		t.Fatalf("pinned best-of run: %v", err)
+	}
+	if n := pools.fetches(); n != 0 {
+		t.Errorf("the run raced %d origin pools with a saved coordinate in hand", n)
+	}
+	loc := registeredLocation("pinned")
+	if loc == nil || loc.Lat != 45.5017 || loc.Lon != -73.5673 {
+		t.Fatalf("centred on %v, want the saved coordinate 45.5017,-73.5673", loc)
+	}
+	if registeredLocation("auto") != nil {
+		t.Error("the searched city was used although the saved list placed the pin")
+	}
+	if got := stats.Lifetime().Counters["speed.pin_coord_unrecovered"]; got != unrecovered {
+		t.Errorf("a pin placed from the saved list was counted as unrecovered (%d -> %d)", unrecovered, got)
+	}
+}
+
+// A saved row without a coordinate (starred from a by-ID reply, stored as 0,0)
+// or an ID that is not on the list changes nothing: the run falls back exactly
+// as it did before the list existed.
+func TestASavedCoordinateOfZeroIsNoCoordinate(t *testing.T) {
+	for name, fn := range map[string]func(string) (float64, float64, bool){
+		"zero pair":  func(string) (float64, float64, bool) { return 0, 0, true },
+		"not listed": func(string) (float64, float64, bool) { return 0, 0, false },
+	} {
+		o := pinnedBestOf(t)
+		o.SavedCoordFn = fn
+		stubPinByID(t, &ookla.Server{
+			ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+			Lat: callerLat, Lon: callerLon, Distance: 0,
+		})
+		stubCatalogue(t, nil, nil)
+		unrecovered := stats.Lifetime().Counters["speed.pin_coord_unrecovered"]
+		if _, err := o.RunReason(context.Background(), "manual"); err != nil {
+			t.Fatalf("%s: pinned best-of run: %v", name, err)
+		}
+		if loc := registeredLocation("auto"); loc == nil || loc.Lat != 48.85 || loc.Lon != 2.35 {
+			t.Errorf("%s: centred on %v, want the searched city - the saved list had nothing usable", name, loc)
+		}
+		// listCentre would refuse a 0,0 pair on its own, so the centre alone
+		// cannot tell whether savedCoord rejected it: the unrecovered warn and
+		// its counter are what a 0,0 accepted as a coordinate would skip.
+		if got := stats.Lifetime().Counters["speed.pin_coord_unrecovered"]; got != unrecovered+1 {
+			t.Errorf("%s: speed.pin_coord_unrecovered went %d -> %d, want +1: a 0,0 row must count as no coordinate", name, unrecovered, got)
+		}
+	}
+}
+
+// A pin under best-of is a pinned run whichever row wins its round, and the
+// report has to say so: the browse centring reads the winner's reason back to
+// find where AUTO last landed, and a "score" winner in the pin's city would
+// pass for that.
+func TestPinnedBestOfRecordsAPinnedWinReason(t *testing.T) {
+	for name, tc := range map[string]struct {
+		pinMbps, pinPing float64
+		want             string
+	}{
+		"the pin wins":     {200, 5, WinReasonPinnedBestOf},
+		"a companion wins": {1, 50, WinReasonPinnedCompanion},
+	} {
+		o := pinnedBestOf(t)
+		stubPinByID(t, &ookla.Server{
+			ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+			Lat: realLat, Lon: realLon, Distance: 504.6, // a trusted position: no recovery needed
+		})
+		stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+			r := Result{Server: "srv", ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 10, PingMS: 9}
+			if srv.ID == "1993" {
+				r.DownloadMbps, r.UploadMbps, r.PingMS = tc.pinMbps, tc.pinMbps/10, tc.pinPing
+			}
+			return r, nil
+		})
+		res, err := o.RunReason(context.Background(), "manual")
+		if err != nil {
+			t.Fatalf("%s: pinned best-of run: %v", name, err)
+		}
+		if res.Selection == nil {
+			t.Fatalf("%s: no selection report", name)
+		}
+		var win *CandidateReport
+		for i := range res.Selection.Candidates {
+			if res.Selection.Candidates[i].Winner {
+				win = &res.Selection.Candidates[i]
+			}
+		}
+		if win == nil {
+			t.Fatalf("%s: no winner row in %+v", name, res.Selection.Candidates)
+		}
+		if (win.ServerID == "1993") != (tc.want == WinReasonPinnedBestOf) {
+			t.Fatalf("%s: the fixture did not make the intended row win (winner %s)", name, win.ServerID)
+		}
+		if win.WinReason != tc.want || !PinnedRun(win.WinReason) {
+			t.Errorf("%s: winner %s recorded %q, want %q", name, win.ServerID, win.WinReason, tc.want)
+		}
+	}
+	if PinnedRun(winReasonScore) || PinnedRun(winReasonPingBoot) || PinnedRun(winReasonFastestRank) || !PinnedRun(WinReasonPinned) {
+		t.Error("PinnedRun must name exactly the reasons a pin was in effect for")
 	}
 }

@@ -9,11 +9,10 @@ import (
 )
 
 // The race is how AUTO finds its centre - it must never fire when the user has
-// already said where to test. A pinned server is the strongest statement, a
-// searched city the next; both bypass the race entirely, or the user could
-// state where they want to test from and be overruled by a tie-break between
-// coordinates they never chose.
-func TestRunReasonSkipsTheRaceWhenPinnedOrCitySearched(t *testing.T) {
+// already said where to test. A pinned server bypasses the race entirely, or
+// the user could state where they want to test from and be overruled by a
+// tie-break between coordinates they never chose.
+func TestRunReasonSkipsTheRaceWhenPinned(t *testing.T) {
 	requireQuiet(t)
 	stubServerList(t)
 	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
@@ -37,21 +36,9 @@ func TestRunReasonSkipsTheRaceWhenPinnedOrCitySearched(t *testing.T) {
 	if n := fetches.fetches(); n != 0 {
 		t.Fatalf("pinned run fetched %d origin pools, want 0 - a pin overrides the race", n)
 	}
-
-	// Searched city: the centre is the user's instruction, read without
-	// touching the network.
-	o = NewOokla()
-	o.OriginsFn = origins
-	o.AutoLocFn = func() (float64, float64, bool) { return 48.85, 2.35, true }
-	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
-		t.Fatalf("searched-city run: %v", err)
-	}
-	if n := fetches.fetches(); n != 0 {
-		t.Fatalf("searched-city run fetched %d origin pools, want 0 - a typed city overrides the race", n)
-	}
 }
 
-// With nothing pinned and no city searched, the run races and the fetch is
+// With nothing pinned, the run races and the fetch is
 // centred on the winning city's coordinate. The registered "auto" location is
 // how the coordinate reaches the Ookla API (newAnchoredLocation writes the
 // library's Locations map), so it is where the mapping is observable.
@@ -108,7 +95,12 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 		return Result{Server: "srv", ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 10, PingMS: 9}, nil
 	})
 	stubOriginPools(t, map[string]ookla.Servers{"exit": {srv("e1", 1)}})
-	stubRacePing(t, map[string]int{"e1": 5})
+	// Nobody answers, so the race goes SILENT and the run fetches its list
+	// itself - which is where the deadline is read off below. A decided race
+	// hands the run its own list instead (see raceResult.Field) and the fetch
+	// seam never runs; the allowance is sized before either outcome, so the
+	// silent race is the same arithmetic with the probe still reachable.
+	stubRacePing(t, map[string]int{})
 
 	var runDeadline time.Time
 	old := fetchServerList
@@ -134,11 +126,6 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 	}{
 		{"auto run races and is allowed for it",
 			func(o *Ookla) { o.OriginsFn = origins }, "", 1, true},
-		{"searched city centres without measuring",
-			func(o *Ookla) {
-				o.OriginsFn = origins
-				o.AutoLocFn = func() (float64, float64, bool) { return 48.85, 2.35, true }
-			}, "", 1, false},
 		{"pinned without best-of never races",
 			func(o *Ookla) {
 				o.OriginsFn = origins
@@ -162,6 +149,7 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 	for _, c := range cases {
 		o := NewOokla()
 		c.setup(o)
+		runDeadline = time.Time{} // a case whose fetch never ran must fail, not inherit the last one's reading
 		start := time.Now()
 		if _, err := o.RunReason(context.Background(), c.reason); err != nil {
 			t.Fatalf("%s: %v", c.name, err)
@@ -182,47 +170,6 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 				"Too small and the race is being spent from the measurement's budget",
 				c.name, got.Round(time.Second), want, base, c.races)
 		}
-	}
-}
-
-// A run's DEADLINE-SENSITIVE inputs must be read once. The searched city is a
-// live settings read that decides both whether the deadline carries the race's
-// budget and, later, whether the race happens at all - and a pinned best-of run
-// does a network fetch between those two points. Read twice, a city cleared in
-// that window sizes the deadline as "no race" and then races anyway, paying for
-// the race out of the exact base budget: the defect the allowance exists to
-// prevent, reintroduced through the back door.
-func TestRunReasonSnapshotsTheSearchedCityForTheWholeRun(t *testing.T) {
-	requireQuiet(t)
-	stubServerList(t)
-	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
-		return Result{Server: "srv", ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 10, PingMS: 9}, nil
-	})
-	fetches := stubOriginPools(t, map[string]ookla.Servers{"exit": {srv("e1", 1)}})
-	stubRacePing(t, map[string]int{"e1": 5})
-	forgetLocation(t, "auto")
-	forgetLocation(t, "city")
-
-	// The user clears the searched city mid-run: the first read sees it, every
-	// later read does not.
-	var reads int
-	o := NewOokla()
-	o.OriginsFn = func() []Origin {
-		return []Origin{{Kind: "exit", Lat: 25.76, Lon: -80.19, Anchored: true}}
-	}
-	o.AutoLocFn = func() (float64, float64, bool) {
-		reads++
-		if reads == 1 {
-			return 48.85, 2.35, true
-		}
-		return 0, 0, false
-	}
-	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if n := fetches.fetches(); n != 0 {
-		t.Fatalf("the run raced (%d origin pools fetched) after being sized as a run that would not "+
-			"race; the race is being paid for out of the measurement's budget", n)
 	}
 }
 

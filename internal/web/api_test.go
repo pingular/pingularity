@@ -3,10 +3,13 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/pingular/pingularity/internal/logbuf"
 	"github.com/pingular/pingularity/internal/settings"
+	"github.com/pingular/pingularity/internal/speedtest"
 	"github.com/pingular/pingularity/internal/store"
 	"github.com/pingular/pingularity/internal/update"
 )
@@ -199,6 +203,301 @@ func TestHandleSettingsPartialPost(t *testing.T) {
 	}
 	if s.settings.IperfPassword() != "secret" {
 		t.Errorf("stored password = %q, want secret", s.settings.IperfPassword())
+	}
+}
+
+// The picker's saved list is a slice, so it is skipped by the DTO round-trip
+// test above (that one walks pointer fields). Without this the star could reach
+// the settings body, POST cleanly, and be gone at the next drawer open.
+func TestSettingsSpeedServersRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	h := s.Handler()
+	body := `{"speed_servers":[{"id":"1993","sponsor":"EBOX","name":"Montreal, QC","country":"Canada","lat":45.5,"lon":-73.5}],
+		"speed_server_id":"1993"}`
+	if w := do(t, h, "POST", "/api/settings", body); w.Code != http.StatusOK {
+		t.Fatalf("POST %d: %s", w.Code, w.Body)
+	}
+	want := []settings.SavedServer{{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Country: "Canada", Lat: 45.5, Lon: -73.5}}
+	if got := s.settings.SpeedServers(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored %+v, want %+v", got, want)
+	}
+	read := func() []any {
+		w := do(t, h, "GET", "/api/settings", "")
+		var got map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		list, _ := got["speed_servers"].([]any)
+		return list
+	}
+	list := read()
+	if len(list) != 1 {
+		t.Fatalf("GET did not echo the saved list: %v", list)
+	}
+	if row := list[0].(map[string]any); row["id"] != "1993" || row["lat"] != 45.5 || row["country"] != "Canada" {
+		t.Errorf("the coordinate or country did not survive the round trip: %v", row)
+	}
+	// Absent = keep, the same PATCH rule the iperf3 list follows: a form that
+	// never mentions the list must not empty it.
+	if w := do(t, h, "POST", "/api/settings", `{"speedtest_enabled":false}`); w.Code != http.StatusOK {
+		t.Fatalf("partial POST %d: %s", w.Code, w.Body)
+	}
+	if len(read()) != 1 {
+		t.Error("a partial update wiped the saved server list")
+	}
+	// An explicit empty list is the user unstarring the last one, and must apply.
+	if w := do(t, h, "POST", "/api/settings", `{"speed_servers":[]}`); w.Code != http.StatusOK {
+		t.Fatalf("clear POST %d: %s", w.Code, w.Body)
+	}
+	if n := len(s.settings.SpeedServers()); n != 0 {
+		t.Errorf("unstarring every server left %d behind", n)
+	}
+}
+
+// The browse listing is the picker's only trustworthy source of a server's
+// coordinate: ServerInfo withholds Lat/Lon from JSON because the by-ID endpoint
+// fills them with the CALLER's position (recentrePin). The list fetch's values
+// are the catalogue's own, so they - and only they - go on the wire.
+func TestBrowseServersCarryTheCatalogueCoordinate(t *testing.T) {
+	b, err := json.Marshal(browseServers([]speedtest.ServerInfo{
+		{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
+		{ID: "42", Sponsor: "ByID", Name: "Nowhere"}, // as GetOoklaServer leaves it
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[0]["lat"] != 45.5 || got[0]["lon"] != -73.5 {
+		t.Errorf("the listing dropped the coordinate the picker saves: %v", got[0])
+	}
+	if _, ok := got[1]["lat"]; ok {
+		t.Errorf("a server with no catalogue position must send none, not a zero: %v", got[1])
+	}
+	// The plain type must still withhold them, or the reason for this wrapper is gone.
+	plain, _ := json.Marshal(speedtest.ServerInfo{ID: "1993", Lat: 45.5, Lon: -73.5})
+	if strings.Contains(string(plain), "45.5") {
+		t.Error("ServerInfo started serializing Lat/Lon; the by-ID reply would now carry our own position")
+	}
+}
+
+// ...and the browse endpoint has to actually send that shape. The picker stars a
+// server straight out of this response, so a listing that dropped the coordinate
+// would store every kept server at 0,0 and no test of the wrapper alone notices.
+func TestBrowseEndpointSendsTheCoordinate(t *testing.T) {
+	old := listOoklaServers
+	listOoklaServers = func(_ context.Context, lat, lon float64) ([]speedtest.ServerInfo, error) {
+		return []speedtest.ServerInfo{{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5}}, nil
+	}
+	t.Cleanup(func() { listOoklaServers = old })
+	s := &Server{netinfo: stubNetInfo{}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers", nil)
+	req.Header.Set("Content-Type", "application/json")
+	s.handleSpeedtestServers(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Servers) != 1 {
+		t.Fatalf("servers = %v", body.Servers)
+	}
+	if body.Servers[0]["lat"] != 45.5 || body.Servers[0]["lon"] != -73.5 {
+		t.Errorf("the browse listing did not carry the coordinate: %v", body.Servers[0])
+	}
+	if body.Servers[0]["sponsor"] != "EBOX" {
+		t.Errorf("the wrapper dropped a ServerInfo field: %v", body.Servers[0])
+	}
+}
+
+// The pin and the auto scope travel as three independent *string keys, and the
+// picker relies on two things the DTO's pointer fields give it that nothing
+// pinned: an explicit "" is stored as Auto (an omitted key keeps the pin), and
+// a pin never clears a saved scope on the daemon side - the scope still centres
+// a pinned best-of run's companions when the pin's own position cannot be
+// found, and a legacy install has no way to recreate one.
+func TestSettingsPinAndScopeTravelIndependently(t *testing.T) {
+	s := newTestServer(t)
+	h := s.Handler()
+	get := func() map[string]any {
+		w := do(t, h, "GET", "/api/settings", "")
+		var got map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if w := do(t, h, "POST", "/api/settings", `{"speed_server_id":"1993"}`); w.Code != http.StatusOK {
+		t.Fatalf("POST %d: %s", w.Code, w.Body)
+	}
+	if got := get(); got["speed_server_id"] != "1993" {
+		t.Fatalf("pin did not survive: %v", got["speed_server_id"])
+	}
+	// A body that never mentions the pin keeps it...
+	if w := do(t, h, "POST", "/api/settings", `{"speedtest_enabled":true}`); w.Code != http.StatusOK {
+		t.Fatalf("partial POST %d: %s", w.Code, w.Body)
+	}
+	if got := get(); got["speed_server_id"] != "1993" {
+		t.Errorf("an omitted speed_server_id must keep the pin, got %v", got["speed_server_id"])
+	}
+	// ...and an explicit "" is Auto, stored and echoed as such - the failure the
+	// picker rewrite exists to prevent is a Save that posts "" by mistake, and
+	// this echo is the only place the loss is visible.
+	w := do(t, h, "POST", "/api/settings", `{"speed_server_id":""}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear POST %d: %s", w.Code, w.Body)
+	}
+	var echo map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &echo); err != nil {
+		t.Fatal(err)
+	}
+	if echo["speed_server_id"] != "" || s.settings.SpeedServerID() != "" {
+		t.Errorf("an explicit \"\" must store and echo as Auto, got echo %v stored %q", echo["speed_server_id"], s.settings.SpeedServerID())
+	}
+	// The retired city scope is not a setting any more: a legacy key in the body
+	// is ignored, never echoed, and never resurrected as a centre.
+	if w := do(t, h, "POST", "/api/settings", `{"speed_auto_loc":"45.5,-73.5","speed_auto_label":"Montreal"}`); w.Code != http.StatusOK {
+		t.Fatalf("legacy scope POST %d: %s", w.Code, w.Body)
+	}
+	if got := get(); got["speed_auto_loc"] != nil || got["speed_auto_label"] != nil {
+		t.Errorf("the retired scope keys must not be echoed, got %v %v", got["speed_auto_loc"], got["speed_auto_label"])
+	}
+}
+
+// A never-set list reads as [] and never null, on the live values and in the
+// defaults block alike. The existing round-trip test decodes into []any, which
+// cannot tell the two apart, so this reads the raw body.
+func TestSettingsSpeedServersNeverNull(t *testing.T) {
+	w := do(t, newTestServer(t).Handler(), "GET", "/api/settings", "")
+	var got struct {
+		SpeedServers json.RawMessage `json:"speed_servers"`
+		Defaults     struct {
+			SpeedServers json.RawMessage `json:"speed_servers"`
+		} `json:"defaults"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.SpeedServers) != "[]" || string(got.Defaults.SpeedServers) != "[]" {
+		t.Errorf("a never-set list must read as [] (live and defaults), not null or absent: live %s defaults %s", got.SpeedServers, got.Defaults.SpeedServers)
+	}
+}
+
+// The by-ID lookup fails for two reasons and only one is the user's to fix.
+// Everything used to be 404 "server not found" - including a transport error,
+// an Ookla 5xx and this handler's own deadline - and the page reads a 404 as
+// "no such server" and refuses to save the pin. An outage must not do that.
+func TestBrowseByIDStatusDistinguishesNotFoundFromUnreachable(t *testing.T) {
+	old := getOoklaServer
+	t.Cleanup(func() { getOoklaServer = old })
+	ask := func(t *testing.T) *httptest.ResponseRecorder {
+		t.Helper()
+		s := &Server{netinfo: stubNetInfo{}}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers?id=1993", nil)
+		req.Header.Set("Content-Type", "application/json")
+		s.handleSpeedtestServers(rec, req)
+		return rec
+	}
+	for name, tc := range map[string]struct {
+		err  error
+		want int
+	}{
+		"no such server":  {speedtest.ErrServerNotFound, http.StatusNotFound},
+		"wrapped":         {fmt.Errorf("fetch: %w", speedtest.ErrServerNotFound), http.StatusNotFound},
+		"transport":       {&url.Error{Op: "Get", URL: "https://www.speedtest.net/", Err: errors.New("dial tcp: connection refused")}, http.StatusBadGateway},
+		"malformed body":  {errors.New("XML syntax error on line 1: expected element name after <"), http.StatusBadGateway}, // an Ookla error page, the usual (malformed-HTML) case; a well-formed one still decodes to "not found" - see the handler
+		"handler timeout": {&url.Error{Op: "Get", URL: "https://www.speedtest.net/", Err: context.DeadlineExceeded}, http.StatusGatewayTimeout},
+	} {
+		getOoklaServer = func(_ context.Context, id string) (speedtest.ServerInfo, error) {
+			return speedtest.ServerInfo{}, tc.err
+		}
+		if rec := ask(t); rec.Code != tc.want {
+			t.Errorf("%s: status %d, want %d (body %q)", name, rec.Code, tc.want, rec.Body.String())
+		}
+	}
+	// And the shape the picker relies on when it does answer: exactly one row,
+	// with fallback_ok absent (not false) when the probe was inconclusive.
+	getOoklaServer = func(_ context.Context, id string) (speedtest.ServerInfo, error) {
+		return speedtest.ServerInfo{ID: id, Sponsor: "EBOX", Name: "Montreal, QC"}, nil
+	}
+	rec := ask(t)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Servers) != 1 || body.Servers[0]["id"] != "1993" {
+		t.Fatalf("by-ID reply = %v, want exactly the one server", body.Servers)
+	}
+	if _, ok := body.Servers[0]["fallback_ok"]; ok {
+		t.Errorf("an inconclusive probe must leave fallback_ok absent, not false: %v", body.Servers[0])
+	}
+}
+
+// The status poll names the last run's server by ID as well as by label, and
+// only for engines that have one. The picker keys its "last run" bookkeeping on
+// the ID, so the wire has to promise it. A guard on a contract that predates
+// this change, not a test of it.
+func TestStatusCarriesLastRunServerID(t *testing.T) {
+	s := newMetricsServer(t)
+	ctx := context.Background()
+	if err := s.store.InsertSpeed(ctx, store.SpeedSample{TS: 1000, Server: "Example ISP, Newtown", ServerID: "777", Engine: "ookla"}); err != nil {
+		t.Fatal(err)
+	}
+	speed := func() map[string]any {
+		w := do(t, s.Handler(), "GET", "/api/status", "")
+		var got map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		sp, _ := got["speed"].(map[string]any)
+		return sp
+	}
+	if sp := speed(); sp == nil || sp["server_id"] != "777" || sp["server"] != "Example ISP, Newtown" {
+		t.Errorf("speed = %v, want server_id 777 beside the label", sp)
+	}
+	if err := s.store.InsertSpeed(ctx, store.SpeedSample{TS: 2000, Server: "iperf.local", Engine: "iperf3"}); err != nil {
+		t.Fatal(err)
+	}
+	if sp := speed(); sp == nil || sp["engine"] != "iperf3" {
+		t.Fatalf("speed = %v, want the iperf3 run", sp)
+	} else if _, ok := sp["server_id"]; ok {
+		t.Errorf("an iperf3 run has no Ookla ID and must not send one: %v", sp)
+	}
+}
+
+// The by-ID reply is the one that must NOT carry a coordinate: that endpoint
+// answers with the caller's own position for a server on the caller's ISP, and
+// the picker stars whatever this reply describes.
+func TestBrowseByIDSendsNoCoordinate(t *testing.T) {
+	old := getOoklaServer
+	getOoklaServer = func(_ context.Context, id string) (speedtest.ServerInfo, error) {
+		// As the endpoint answers for an ISP-owned server: our coordinates, its name.
+		return speedtest.ServerInfo{ID: id, Sponsor: "EBOX", Name: "Montreal, QC", Lat: 43.65, Lon: -79.38}, nil
+	}
+	t.Cleanup(func() { getOoklaServer = old })
+	s := &Server{netinfo: stubNetInfo{}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers?id=1993", nil)
+	req.Header.Set("Content-Type", "application/json")
+	s.handleSpeedtestServers(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "43.65") {
+		t.Errorf("the by-ID reply carried a coordinate; starring it would file the server at our own address: %s", rec.Body)
 	}
 }
 
@@ -477,7 +776,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		DowntimeRetention: 365 * 24 * time.Hour,
 		Timeout:           5 * time.Second,
 		DownAfter:         3, UpAfter: 2,
-		SpeedServerID: "1234", SpeedAutoLoc: "45.5,-73.5", SpeedAutoLabel: "Montreal",
+		SpeedServerID:    "1234",
 		SpeedtestEnabled: true, SpeedtestOnReconnect: true, IPv6Mode: "on", ExitTarget: "8.8.8.8", DNSProbe: true, NetinfoEnabled: true,
 		SpeedtestAdaptive: true, SpeedtestOnDegraded: true, DegradedPingMS: 120, SpeedtestSkipBusy: true, SpeedBusyMbps: 5,
 		SpeedEngine: "iperf3", IperfServer: "10.0.0.5:5201",

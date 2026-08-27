@@ -133,7 +133,26 @@ CREATE TABLE IF NOT EXISTS speed (
     -- second, and deleting the scheduled run then destroyed the manual run's
     -- record. No listing shows a flagged row, so nothing told the operator that
     -- run existed or that its bytes had just been un-billed.
-    usage_run_ts       INTEGER
+    usage_run_ts       INTEGER,
+    -- How the run's centre was chosen (speedtest.RaceVerdict), so a surprising
+    -- city is explainable from the DB the way speed_servers explains the server
+    -- inside it. race_outcome: decided|silent|unanchored|failed|skipped|
+    -- bypassed_pin (NULL on rows before this existed and on
+    -- iperf3 runs); race_origins: the field in one line, per origin with its
+    -- pool's fastest answer ("exit:Montréal, QC(8.4ms) | isp:Toronto(15.1ms) | geo(-)");
+    -- race_winner_kind/label: the origin the run centred on, and lat/lon its
+    -- coordinate when the race was decided on an anchored origin (NULL on
+    -- silent rows: the stand-in is named but not re-entered), so the next run
+    -- can enter it as the "recent" origin; race_winner_ms: the fastest racer's
+    -- floor; race_racers: servers pinged.
+    race_outcome       TEXT,
+    race_origins       TEXT,
+    race_winner_kind   TEXT,
+    race_winner_label  TEXT,
+    race_winner_ms     REAL,
+    race_racers        INTEGER,
+    race_winner_lat    REAL,
+    race_winner_lon    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
@@ -143,7 +162,7 @@ CREATE TABLE IF NOT EXISTS speed_servers (
     server TEXT,                          -- "Sponsor, Name" label, as on speed.server
     distance_km REAL,
     rank_order INTEGER,                   -- 1-based ping-race rank; 0 = never ranked (a pin resolved outside the list)
-    rank_ping_ms REAL,                    -- ranking ping (library mean); NULL when the ranking ping went unanswered
+    rank_ping_ms REAL,                    -- ranking ping (the floor of ~10 samples; rows before 2026-08-27 hold the library mean); NULL when the ranking ping went unanswered
     selected INTEGER NOT NULL,            -- became a measurement target
     measured INTEGER NOT NULL,            -- produced a result
     error TEXT,                           -- failure text; selected+unmeasured+EMPTY = never attempted (the app writes '', not NULL)
@@ -154,7 +173,7 @@ CREATE TABLE IF NOT EXISTS speed_servers (
     capped_direction TEXT,                -- direction(s) the guard held down for this row: down|up|down,up
     score REAL,                           -- what the winner decision compared
     winner INTEGER NOT NULL,
-    win_reason TEXT                       -- score|ping_bootstrap|fastest_ranked|pinned
+    win_reason TEXT                       -- score|ping_bootstrap|fastest_ranked|incumbent|on_net|challenger|challenger_won|challenger_failed|pinned|pinned_bestof|pinned_companion (vocabulary: speedtest/selection.go)
 );
 CREATE INDEX IF NOT EXISTS idx_speed_servers_ts ON speed_servers(run_ts);
 
@@ -577,6 +596,10 @@ func applySchema(db *sql.DB) error {
 		{"speed", "ip_family", "TEXT"}, {"speed", "udp_direction", "TEXT"},
 		{"speed", "failed", "INTEGER"},
 		{"speed", "usage_run_ts", "INTEGER"},
+		{"speed", "race_outcome", "TEXT"}, {"speed", "race_origins", "TEXT"},
+		{"speed", "race_winner_kind", "TEXT"}, {"speed", "race_winner_label", "TEXT"},
+		{"speed", "race_winner_ms", "REAL"}, {"speed", "race_racers", "INTEGER"},
+		{"speed", "race_winner_lat", "REAL"}, {"speed", "race_winner_lon", "REAL"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -2759,6 +2782,24 @@ type SpeedSample struct {
 	// repairUnreadableIntColumns, which exists because one such row broke the
 	// speed panel and the status table permanently.
 	UsageRunTS *int64 `json:"usage_run_ts,omitempty"`
+	// Race is how the run's centre was chosen - the city race's outcome, or
+	// why it did not run (see speedtest.RaceVerdict for the vocabulary). All
+	// empty/nil on rows written before it existed and on iperf3 runs; the
+	// pair of pointers stays nil rather than 0 so "unrecorded" has one spelling.
+	RaceOutcome     string   `json:"race_outcome,omitempty"`
+	RaceOrigins     string   `json:"race_origins,omitempty"`
+	RaceWinnerKind  string   `json:"race_winner_kind,omitempty"`
+	RaceWinnerLabel string   `json:"race_winner_label,omitempty"`
+	RaceWinnerMS    *float64 `json:"race_winner_ms,omitempty"`
+	RaceRacers      *int64   `json:"race_racers,omitempty"`
+	RaceWinnerLat   *float64 `json:"race_winner_lat,omitempty"`
+	RaceWinnerLon   *float64 `json:"race_winner_lon,omitempty"`
+	// WinReason is why the run's server was the one measured - the winner
+	// row's win_reason from the selection report (speed_servers), copied onto
+	// the listing by the web layer for the runs table's benefit (see
+	// WinReasonsFor). DISPLAY ONLY: never stored on the speed row, never
+	// exported, empty on every read but the runs listing.
+	WinReason string `json:"win_reason,omitempty"`
 	// UDPDirection is which way the UDP loss/jitter probe sampled ("down"/"up");
 	// empty when loss/jitter went unmeasured or the row predates the field. Loss
 	// on an asymmetric path differs by direction, so a sample without it stays
@@ -2782,7 +2823,9 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	packet_loss, healthy, jitter_ms, download_bytes, upload_bytes,
 	COALESCE(cf_colo,''), COALESCE(exit_summary,''), COALESCE(run_trigger,''),
 	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
-	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,''), failed`
+	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,''), failed,
+	COALESCE(race_outcome,''), COALESCE(race_origins,''), COALESCE(race_winner_kind,''), COALESCE(race_winner_label,''),
+	race_winner_ms, race_racers, race_winner_lat, race_winner_lon`
 
 // speedNotFailed is the predicate every MEASUREMENT read of the speed table
 // carries, and the reason the accounting rows recordFailedUsage writes cannot
@@ -2861,13 +2904,20 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	// /api/speed and emits "+Inf" in CSV - either way one poisoned row would wedge
 	// EVERY speed read. nzFinite/ptrFinite collapse both to 0 / nil.
 	var down, up, ping sql.NullFloat64
-	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest sql.NullFloat64
-	var healthy, downB, upB, failed sql.NullInt64
+	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest, raceMS, raceLat, raceLon sql.NullFloat64
+	var healthy, downB, upB, failed, racers sql.NullInt64
 	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
 		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
-		&sp.IPFamily, &sp.UDPDirection, &failed)
+		&sp.IPFamily, &sp.UDPDirection, &failed,
+		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon)
+	sp.RaceWinnerMS = ptrFinite(raceMS)
+	sp.RaceWinnerLat, sp.RaceWinnerLon = ptrFinite(raceLat), ptrFinite(raceLon)
+	if racers.Valid {
+		v := racers.Int64
+		sp.RaceRacers = &v
+	}
 	sp.DownMbps, sp.UpMbps, sp.PingMS = nzFinite(down), nzFinite(up), nzFinite(ping)
 	sp.IdleMS = ptrFinite(idle)
 	sp.LoadedDownMS = ptrFinite(loadDown)
@@ -2891,6 +2941,17 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	}
 	sp.Failed = failed.Valid && failed.Int64 == 1
 	return sp, err
+}
+
+// nullStr stores an empty string as NULL, so a column that has "unrecorded"
+// as its only meaning of empty (the race_* text columns) has one spelling of
+// it in the table, the same one every row written before the column existed
+// carries.
+func nullStr(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
 }
 
 // InsertSpeed records a speedtest result and the connection it ran in.
@@ -2998,19 +3059,24 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
 			packet_loss, healthy, jitter_ms, download_bytes, upload_bytes, cf_colo, exit_summary, run_trigger,
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
-			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts)
+			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts,
+			race_outcome, race_origins, race_winner_kind, race_winner_label, race_winner_ms, race_racers,
+			race_winner_lat, race_winner_lon)
 		 SELECT COALESCE((SELECT MIN(t) FROM (
 					SELECT ?1 AS t WHERE NOT EXISTS (SELECT 1 FROM speed WHERE ts = ?1)
 					UNION ALL
 					SELECT ts + 1 FROM speed WHERE ts >= ?1
 					  AND NOT EXISTS (SELECT 1 FROM speed s2 WHERE s2.ts = speed.ts + 1)
 				)), ?1),
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
-		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS))
+		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS),
+		nullStr(sp.RaceOutcome), nullStr(sp.RaceOrigins), nullStr(sp.RaceWinnerKind), nullStr(sp.RaceWinnerLabel),
+		ptrArg(sp.RaceWinnerMS), ptrArg(sp.RaceRacers), ptrArg(sp.RaceWinnerLat), ptrArg(sp.RaceWinnerLon))
 	if err != nil {
 		recordDBErr(err)
 		return 0, err
@@ -3120,8 +3186,196 @@ func (s *Store) SpeedRunExists(ctx context.Context, ts int64) (bool, error) {
 // restored from pre-feature backups, iperf3 runs, and runs whose report
 // insert failed all have a speed row with no companions.
 func (s *Store) SpeedServers(ctx context.Context, runTS int64) ([]SpeedServerRow, error) {
-	rows, err := s.db.QueryContext(ctx,
+	return s.speedServerRows(ctx,
 		`SELECT `+speedServerCols+` FROM speed_servers WHERE run_ts = ? ORDER BY rank_order`, runTS)
+}
+
+// LastSpeedWinners returns the winners of the most recent runs that have a
+// selection report, newest first, at most limit of them. It is the incumbent
+// lookup (see speedtest.Ookla.IncumbentFn): the caller skips the pinned ones
+// itself, since which win reasons name a pin is the speedtest package's
+// vocabulary and this package cannot import it. Walks idx_speed_servers_ts
+// backwards and stops at the limit, so it costs a handful of index steps, not
+// a scan of the history.
+func (s *Store) LastSpeedWinners(ctx context.Context, limit int) ([]SpeedServerRow, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	return s.speedServerRows(ctx,
+		`SELECT `+speedServerCols+` FROM speed_servers WHERE winner = 1 ORDER BY run_ts DESC LIMIT ?`, limit)
+}
+
+// RecentServerScores returns one server's last n measured scores (the
+// selection report's ping-discounted capacity, see speedtest.roundScore),
+// newest first, for the challenge verdict: a rival takes the incumbent's seat
+// only by beating the median of these. The record is per test DIRECTION - a
+// score is download-only, upload-only or a weighted mean of both depending on
+// how the run was configured, so only same-direction rows are comparable; the
+// row's own readings say which it was. Unmeasured rows and unusable scores
+// (NULL, zero - a failed direction - or non-finite) are skipped BEFORE the
+// window of n is counted; a server with no history yields none.
+func (s *Store) RecentServerScores(ctx context.Context, serverID, dir string, n int) ([]float64, error) {
+	if serverID == "" || n <= 0 {
+		return nil, nil
+	}
+	sameDir := `down_mbps > 0 AND up_mbps > 0`
+	switch dir {
+	case "down":
+		sameDir = `down_mbps > 0 AND up_mbps = 0`
+	case "up":
+		sameDir = `up_mbps > 0 AND down_mbps = 0`
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT score FROM speed_servers WHERE server_id = ? AND measured = 1 AND score > 0 AND `+sameDir+
+			` ORDER BY run_ts DESC LIMIT ?`, serverID, n)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	var out []float64
+	for rows.Next() {
+		var sc sql.NullFloat64
+		if err := rows.Scan(&sc); err != nil {
+			recordDBErr(err)
+			return nil, err
+		}
+		if sc.Valid && !math.IsNaN(sc.Float64) && !math.IsInf(sc.Float64, 0) && sc.Float64 > 0 {
+			out = append(out, sc.Float64)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	return out, nil
+}
+
+// WinReasonsFor returns the winner row's win_reason for each of the given
+// runs (keyed by run ts), for the runs table: a run absent from the map has no
+// selection report (pre-feature history, an import, an iperf3 run). One query
+// for the whole page rather than one per row.
+func (s *Store) WinReasonsFor(ctx context.Context, runTS []int64) (map[int64]string, error) {
+	out := map[int64]string{}
+	if len(runTS) == 0 {
+		return out, nil
+	}
+	args := make([]any, 0, len(runTS))
+	marks := make([]string, 0, len(runTS))
+	for _, ts := range runTS {
+		args = append(args, ts)
+		marks = append(marks, "?")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT run_ts, COALESCE(win_reason,'') FROM speed_servers WHERE winner = 1 AND run_ts IN (`+strings.Join(marks, ",")+`)`, args...)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ts int64
+		var reason string
+		if err := rows.Scan(&ts, &reason); err != nil {
+			recordDBErr(err)
+			return nil, err
+		}
+		if reason != "" {
+			out[ts] = reason
+		}
+	}
+	if err := rows.Err(); err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	return out, nil
+}
+
+// LastSpeedWinnersExcluding is LastSpeedWinners without the rows whose
+// win_reason is one of reasons, so a caller counting AUTOMATIC winners is not
+// starved by a long pinned stretch: the window is measured in the rows that
+// count, not in rows. The vocabulary is the speedtest package's, which this
+// package cannot import, so the caller names the reasons.
+func (s *Store) LastSpeedWinnersExcluding(ctx context.Context, limit int, reasons ...string) ([]SpeedServerRow, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if len(reasons) == 0 {
+		return s.LastSpeedWinners(ctx, limit)
+	}
+	args := make([]any, 0, len(reasons)+1)
+	marks := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		args = append(args, r)
+		marks = append(marks, "?")
+	}
+	args = append(args, limit)
+	return s.speedServerRows(ctx,
+		`SELECT `+speedServerCols+` FROM speed_servers WHERE winner = 1 AND COALESCE(win_reason,'') NOT IN (`+strings.Join(marks, ",")+`)
+		 ORDER BY run_ts DESC LIMIT ?`, args...)
+}
+
+// RecentRankPings is the median of each server's last `runs` ranking pings
+// (rank_ping_ms, unanswered ones excluded), keyed by server ID, for the IDs
+// asked about. A server never ranked - or never answered - is absent. It is
+// what the picker shows for a kept server before anyone re-measures it: what
+// the daemon's own runs measured, which costs no network at all. The window
+// is per server, not per run, so a server that is ranked only when its city
+// wins still gets its own last `runs` answers.
+func (s *Store) RecentRankPings(ctx context.Context, ids []string, runs int) (map[string]float64, error) {
+	if len(ids) == 0 || runs <= 0 {
+		return map[string]float64{}, nil
+	}
+	args := make([]any, 0, len(ids))
+	marks := make([]string, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+		marks = append(marks, "?")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT server_id, rank_ping_ms FROM speed_servers
+		 WHERE server_id IN (`+strings.Join(marks, ",")+`) AND rank_ping_ms IS NOT NULL
+		 ORDER BY run_ts DESC`, args...)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	samples := map[string][]float64{}
+	for rows.Next() {
+		var id string
+		var ms sql.NullFloat64
+		if err := rows.Scan(&id, &ms); err != nil {
+			recordDBErr(err)
+			return nil, err
+		}
+		if !ms.Valid || math.IsNaN(ms.Float64) || math.IsInf(ms.Float64, 0) || ms.Float64 <= 0 {
+			continue
+		}
+		if len(samples[id]) < runs {
+			samples[id] = append(samples[id], ms.Float64)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	out := make(map[string]float64, len(samples))
+	for id, v := range samples {
+		sort.Float64s(v)
+		n := len(v)
+		if n%2 == 1 {
+			out[id] = v[n/2]
+		} else {
+			out[id] = (v[n/2-1] + v[n/2]) / 2
+		}
+	}
+	return out, nil
+}
+
+// speedServerRows runs one speed_servers query and scans its rows.
+func (s *Store) speedServerRows(ctx context.Context, query string, args ...any) ([]SpeedServerRow, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		recordDBErr(err)
 		return nil, err
@@ -5015,7 +5269,9 @@ var exportTables = map[string]struct {
 		"public_ipv4", "public_ipv6", "isp", "isp_location", "dns_ip", "dns_provider", "dns_location",
 		"packet_loss", "healthy", "jitter_ms", "download_bytes", "upload_bytes", "cf_colo", "exit_summary", "run_trigger",
 		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
-		"ping_best_ms", "ip_family", "udp_direction", "failed", "usage_run_ts"},
+		"ping_best_ms", "ip_family", "udp_direction", "failed", "usage_run_ts",
+		"race_outcome", "race_origins", "race_winner_kind", "race_winner_label", "race_winner_ms", "race_racers",
+		"race_winner_lat", "race_winner_lon"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted
@@ -5028,9 +5284,10 @@ var exportTables = map[string]struct {
 		// arrives as text no `usage_run_ts = ?` can match is an accounting row
 		// deleting its run will never find, billing bytes for a speedtest that no
 		// longer exists with nothing in the UI to remove them.
-		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes", "failed", "usage_run_ts"},
+		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes", "failed", "usage_run_ts", "race_racers"},
 		realCols: []string{"down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms", "packet_loss",
-			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms"}},
+			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "race_winner_ms",
+			"race_winner_lat", "race_winner_lon"}},
 	// The per-run selection reports ride the speed category (they are the
 	// speed rows' explanations - see SpeedServerRow). Merged by (run_ts,
 	// server_id): one row per candidate per run, so a re-import is idempotent
@@ -5255,9 +5512,31 @@ func (s *Store) HasQuarantinedPausesTx(ctx context.Context, tx *sql.Tx) (bool, e
 // cascades on: a restored backup that dropped it would put every accounting row
 // back beyond the reach of deleting its run, billing bytes for speedtests the
 // operator has removed.
+//
+// The race verdict columns (race_*) came later still, after the stamp of 5 had
+// shipped, so a file carrying any of them needs 6: the builds that accept 5
+// abort on them the same way. speedColumnSchema is the one place each column's
+// version lives; the list below and the export's stamp both read it.
 func speedColumnsPastSchema4() []string {
-	return []string{"ip_family", "udp_direction", "failed", "usage_run_ts"}
+	out := make([]string, 0, len(speedColumnSchema))
+	for c := range speedColumnSchema {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
+
+// speedColumnSchema is the envelope version a file needs to carry each speed
+// column added after schema 4 (see speedColumnsPastSchema4).
+var speedColumnSchema = map[string]int{
+	"ip_family": 5, "udp_direction": 5, "failed": 5, "usage_run_ts": 5,
+	"race_outcome": 6, "race_origins": 6, "race_winner_kind": 6, "race_winner_label": 6,
+	"race_winner_ms": 6, "race_racers": 6, "race_winner_lat": 6, "race_winner_lon": 6,
+}
+
+// SpeedColumnSchema is the envelope version a file carrying col needs, or 0
+// for a column every reader has always known.
+func SpeedColumnSchema(col string) int { return speedColumnSchema[col] }
 
 // SpeedColumnsPastSchema4InUse reports which of those columns actually carry a
 // value in the snapshot an export streams from - not which exist in the schema,
@@ -5288,16 +5567,66 @@ func speedColumnsPastSchema4() []string {
 // cost is a file older builds refuse up front.
 func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
 	var ipFamily, udpDirection, failed, usageRunTS bool
+	var raceOutcome, raceOrigins, raceKind, raceLabel, raceMS, raceRacers, raceLat, raceLon bool
 	err := tx.QueryRowContext(ctx, `SELECT
 		EXISTS(SELECT 1 FROM speed WHERE ip_family IS NOT NULL AND ip_family <> ''),
 		EXISTS(SELECT 1 FROM speed WHERE udp_direction IS NOT NULL AND udp_direction <> ''),
 		EXISTS(SELECT 1 FROM speed WHERE failed IS NOT NULL AND failed <> 0),
-		EXISTS(SELECT 1 FROM speed WHERE usage_run_ts IS NOT NULL)`).Scan(&ipFamily, &udpDirection, &failed, &usageRunTS)
+		EXISTS(SELECT 1 FROM speed WHERE usage_run_ts IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE race_outcome IS NOT NULL AND race_outcome <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE race_origins IS NOT NULL AND race_origins <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_kind IS NOT NULL AND race_winner_kind <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_label IS NOT NULL AND race_winner_label <> ''),
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_ms IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE race_racers IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_lat IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_lon IS NOT NULL)`).Scan(
+		&ipFamily, &udpDirection, &failed, &usageRunTS,
+		&raceOutcome, &raceOrigins, &raceKind, &raceLabel, &raceMS, &raceRacers, &raceLat, &raceLon)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]bool{"ip_family": ipFamily, "udp_direction": udpDirection,
-		"failed": failed, "usage_run_ts": usageRunTS}, nil
+		"failed": failed, "usage_run_ts": usageRunTS,
+		"race_outcome": raceOutcome, "race_origins": raceOrigins, "race_winner_kind": raceKind,
+		"race_winner_label": raceLabel, "race_winner_ms": raceMS, "race_racers": raceRacers,
+		"race_winner_lat": raceLat, "race_winner_lon": raceLon}, nil
+}
+
+// LastDecidedRace is the newest run whose city race was decided and whose
+// winner carries a USABLE coordinate: the city the next run enters as its
+// "recent" origin (see main autoOrigins). ok=false with no such run. An
+// unusable coordinate (NULL, 0,0, off the globe - reachable through an
+// imported backup, whose column check is a type check only) is skipped in
+// the query itself, so the walk goes on to the previous decided race rather
+// than stopping at a row it cannot use. Walks the speed table newest-first
+// and stops at the first hit: a row or two on an install that races, but a
+// pinned install (whose runs still read OriginsFn, see RunReason) walks every
+// bypassed_pin row back to its last decided race - or the whole table if it
+// never raced - once per run. The table is a few rows an hour, so that is
+// milliseconds at a decade of history; no ts floor is worth the "recent"
+// candidate going missing.
+func (s *Store) LastDecidedRace(ctx context.Context) (label string, lat, lon float64, ok bool, err error) {
+	var la, lo sql.NullFloat64
+	var lbl sql.NullString
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(race_winner_label,''), race_winner_lat, race_winner_lon FROM speed
+		 WHERE race_outcome = 'decided' AND race_winner_lat IS NOT NULL AND race_winner_lon IS NOT NULL
+		   AND (race_winner_lat <> 0 OR race_winner_lon <> 0)
+		   AND race_winner_lat BETWEEN -90 AND 90 AND race_winner_lon BETWEEN -180 AND 180
+		 ORDER BY ts DESC LIMIT 1`).Scan(&lbl, &la, &lo)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, 0, false, nil
+	}
+	if err != nil {
+		recordDBErr(err)
+		return "", 0, 0, false, err
+	}
+	if !la.Valid || !lo.Valid || (la.Float64 == 0 && lo.Float64 == 0) ||
+		math.IsNaN(la.Float64) || math.IsNaN(lo.Float64) || math.IsInf(la.Float64, 0) || math.IsInf(lo.Float64, 0) {
+		return "", 0, 0, false, nil
+	}
+	return lbl.String, la.Float64, lo.Float64, true, nil
 }
 
 // AllSpeedColumnsPastSchema4InUse is what a caller must assume when the check

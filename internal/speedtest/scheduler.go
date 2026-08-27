@@ -512,6 +512,22 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		LoadedDownP95MS: res.LoadedDownP95MS,
 		LoadedUpP95MS:   res.LoadedUpP95MS,
 	}
+	// How the centre was chosen rides the speed row itself (see RaceVerdict):
+	// one line per run, beside the selection report that explains the server
+	// inside that centre. Ookla only; iperf3 has no race to record.
+	if res.Race != nil {
+		sp.RaceOutcome, sp.RaceOrigins = res.Race.Outcome, res.Race.Origins
+		sp.RaceWinnerKind, sp.RaceWinnerLabel = res.Race.WinnerKind, res.Race.WinnerLabel
+		sp.RaceWinnerMS = res.Race.WinnerMS
+		if res.Race.WinnerLat != 0 || res.Race.WinnerLon != 0 {
+			la, lo := res.Race.WinnerLat, res.Race.WinnerLon
+			sp.RaceWinnerLat, sp.RaceWinnerLon = &la, &lo
+		}
+		if res.Race.Racers > 0 {
+			n := int64(res.Race.Racers)
+			sp.RaceRacers = &n
+		}
+	}
 	// Capture the connection context (public IP/ISP/DNS) this run ran in.
 	if s.ConnInfoFn != nil {
 		ci := s.ConnInfoFn(ctx)

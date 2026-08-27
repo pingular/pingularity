@@ -502,7 +502,7 @@ func TestFormKeysOverlayRoundTrip(t *testing.T) {
 		DowntimeRetention: 365 * 24 * time.Hour,
 		Timeout:           5 * time.Second,
 		DownAfter:         3, UpAfter: 2,
-		SpeedServerID: "1234", SpeedAutoLoc: "45.5,-73.5", SpeedAutoLabel: "Montreal",
+		SpeedServerID: "1234",
 		SpeedServers: []SavedServer{
 			{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
 			{ID: "5678", Sponsor: "Rogers", Name: "Toronto, ON"}, // no coordinate: the 0,0 case must round-trip too
@@ -573,26 +573,6 @@ func TestUpdatePatchKeepsOmittedFields(t *testing.T) {
 	}
 	if got := c.Snapshot().IperfServers; len(got) != 0 {
 		t.Errorf("explicit empty list must clear, got %+v", got)
-	}
-}
-
-// normalize must drop an unusable auto-picker location (NaN/Inf, out-of-range,
-// malformed) to "" so the Ookla auto-select falls back instead of centring on
-// garbage coordinates; valid pairs survive.
-func TestNormalizeAutoLocation(t *testing.T) {
-	for loc, want := range map[string]string{
-		"45.5,-73.5":  "45.5,-73.5",
-		" 45.5,-73.5": "45.5,-73.5", // trimmed
-		"NaN,NaN":     "",
-		"Inf,0":       "",
-		"9999,9999":   "",
-		"0,181":       "",
-		"garbage":     "",
-	} {
-		v := normalize(Values{SpeedAutoLoc: loc})
-		if v.SpeedAutoLoc != want {
-			t.Errorf("normalize SpeedAutoLoc %q = %q, want %q", loc, v.SpeedAutoLoc, want)
-		}
 	}
 }
 
@@ -690,7 +670,6 @@ func TestNormalizeLengthCaps(t *testing.T) {
 	v.WebhookURL = "https://h/" + big
 	v.HeartbeatURL = "https://h/" + big
 	v.IperfServer = big
-	v.SpeedAutoLabel = big
 	v.SpeedServerID = big
 	v.IperfServers = []IperfTarget{{Addr: "h:5201", Bind: big}}
 	got := normalize(v)
@@ -703,9 +682,6 @@ func TestNormalizeLengthCaps(t *testing.T) {
 	}
 	if len(got.IperfServer) > maxServerAddr {
 		t.Errorf("IperfServer not capped: len=%d", len(got.IperfServer))
-	}
-	if len(got.SpeedAutoLabel) > maxLabelLen {
-		t.Errorf("SpeedAutoLabel not capped: len=%d", len(got.SpeedAutoLabel))
 	}
 	if len(got.SpeedServerID) > maxServerID {
 		t.Errorf("SpeedServerID not capped: len=%d", len(got.SpeedServerID))

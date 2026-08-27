@@ -36,9 +36,7 @@ const (
 	keyDownAfter         = "down_after"
 	keyUpAfter           = "up_after"
 	keySpeedServer       = "speed_server_id"
-	keySpeedServers      = "speed_servers"    // JSON array of SavedServer (the Ookla picker list)
-	keySpeedAutoLoc      = "speed_auto_loc"   // "lat,lon" the auto picker centres on ("" = your IP)
-	keySpeedAutoLabel    = "speed_auto_label" // human label for the auto location
+	keySpeedServers      = "speed_servers" // JSON array of SavedServer (the Ookla picker list)
 	keySpeedEnabled      = "speedtest_enabled"
 	keySpeedOnRecon      = "speedtest_on_reconnect"
 	keyIPv6Mode          = "ipv6_mode"
@@ -107,6 +105,12 @@ const (
 	keyOoklaConnections = "ookla_connections" // Ookla parallel connections (0 = library default)
 	keyOoklaLoss        = "ookla_loss"        // run Ookla's UDP packet-loss probe
 	keySpeedBestOf      = "speed_best_of"     // Ookla: race 3 servers, keep the best result
+	// Ookla auto-select: after every N automatic (unpinned) tests, the next
+	// scheduled test measures the incumbent's strongest rival instead of the
+	// incumbent (0 = never), and the rival takes the seat only if it beats the
+	// incumbent's recent record by this margin (%).
+	keySpeedChallengeEvery  = "speed_challenge_every"
+	keySpeedChallengeMargin = "speed_challenge_margin"
 	// Per-server network path + RSA auth (bind, ipver, auth, username, password, rsa
 	// key) live inside each IperfTarget, serialized in keyIperfServers - not as their
 	// own keys - so they're scoped to the server they belong to.
@@ -153,10 +157,14 @@ const (
 	MaxIperfStreams = 32
 
 	MaxOoklaConnections = 16 // ceiling for Ookla parallel connections; 0 = library default
-	MaxIperfOmit        = 5
-	MaxIperfWindow      = 65536 // KB (64 MB) ceiling for -w; 0 = auto
-	MaxSpeedRetries     = 3     // ceiling for per-direction retries; 0 = no retry
-	MaxIperfMSS         = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
+	// MaxSpeedChallengeEvery bounds the challenge cadence (tests between
+	// challenges); MaxSpeedChallengeMargin the bar a challenger must clear (%).
+	MaxSpeedChallengeEvery  = 1000
+	MaxSpeedChallengeMargin = 100
+	MaxIperfOmit            = 5
+	MaxIperfWindow          = 65536 // KB (64 MB) ceiling for -w; 0 = auto
+	MaxSpeedRetries         = 3     // ceiling for per-direction retries; 0 = no retry
+	MaxIperfMSS             = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
 )
 
 // AllDays selects every weekday (the schedule default).
@@ -179,14 +187,19 @@ type Window struct {
 const maxSpeedServers = 12
 
 // SavedServer is one Ookla server on the user's picker list: the ID a test runs
-// against, plus the sponsor and name the list shows.
+// against, plus the sponsor, name and country the list shows. Country is what
+// tells two same-named cities apart (Kingston, ON and Kingston, JM); it can be
+// empty on a row starred from a by-ID reply, whose endpoint omits it on sparse
+// records.
 //
-// Lat/Lon are the server's registered position, kept so a later run never has to
-// ask Ookla where the server is. Its by-ID endpoint answers with the CALLER'S
-// own position whenever the server belongs to the caller's ISP, which drags a
-// pinned server's companions to the wrong city (see recentrePin in
-// internal/speedtest); the catalogue listing the picker read reports the real
-// one. 0,0 means no coordinate - the sentinel serverCoord already uses.
+// Lat/Lon are the server's registered position as the catalogue listing
+// reported it. The picker lists a starred server from this record whether or
+// not the browse page includes it (distance is the page's when it does), and a
+// pinned best-of run falls back to it when the live catalogue cannot place the
+// pin (see recentrePin in internal/speedtest): Ookla's by-ID endpoint answers
+// with the CALLER'S own position whenever the server belongs to the caller's
+// ISP, which would drag the pin's companions to the wrong city. 0,0 means no
+// coordinate - the sentinel serverCoord already uses.
 //
 // float64 rather than the Ookla API's strings: serverCoord parses them at the
 // boundary and is the one place that decides a pair is usable, so a list saved
@@ -196,6 +209,7 @@ type SavedServer struct {
 	ID      string  `json:"id"`
 	Sponsor string  `json:"sponsor,omitempty"`
 	Name    string  `json:"name,omitempty"`
+	Country string  `json:"country,omitempty"`
 	Lat     float64 `json:"lat,omitempty"`
 	Lon     float64 `json:"lon,omitempty"`
 }
@@ -270,8 +284,6 @@ type Values struct {
 	UpAfter              int
 	SpeedServerID        string        // Ookla server ID ("" = auto)
 	SpeedServers         []SavedServer // the saved Ookla picker list; SpeedServerID is the selected one
-	SpeedAutoLoc         string        // "lat,lon" the auto picker centres on ("" = your IP)
-	SpeedAutoLabel       string        // human label for SpeedAutoLoc
 	SpeedtestEnabled     bool
 	SpeedtestOnReconnect bool
 	IPv6Mode             string // "auto" | "on" | "off"
@@ -388,6 +400,15 @@ type Values struct {
 	// OoklaConnections is the number of parallel Ookla connections (0 = the
 	// library's default). The Ookla analogue of iperf's parallel streams.
 	OoklaConnections int
+	// SpeedChallengeEvery: an automatic Ookla run keeps measuring the same
+	// server while it pings within noise of the fastest (the incumbent), which
+	// never measures a rival's throughput. After this many automatic tests the
+	// next scheduled run measures the strongest rival instead, and the rival takes the seat
+	// only if its score beats the incumbent's recent median by
+	// SpeedChallengeMargin percent. 0 = never challenge. Same data as an
+	// ordinary test: one server is measured either way.
+	SpeedChallengeEvery  int
+	SpeedChallengeMargin int
 	// OoklaLoss gates Ookla's packet-loss probe - a few extra seconds of UDP after
 	// the transfers. The Ookla analogue of IperfUDP (which also measures jitter;
 	// Ookla gets jitter from its ping phase, so this only adds loss).
@@ -814,12 +835,6 @@ func overlay(v Values, m map[string]string) Values {
 			v.SpeedServers = ss
 		}
 	}
-	if val, ok := m[keySpeedAutoLoc]; ok {
-		v.SpeedAutoLoc = val
-	}
-	if val, ok := m[keySpeedAutoLabel]; ok {
-		v.SpeedAutoLabel = val
-	}
 	if b, ok := pbool(m[keySpeedEnabled]); ok {
 		v.SpeedtestEnabled = b
 	}
@@ -882,6 +897,12 @@ func overlay(v Values, m map[string]string) Values {
 	}
 	if n, ok := atoi(m[keyOoklaConnections]); ok {
 		v.OoklaConnections = n
+	}
+	if n, ok := atoi(m[keySpeedChallengeEvery]); ok {
+		v.SpeedChallengeEvery = n
+	}
+	if n, ok := atoi(m[keySpeedChallengeMargin]); ok {
+		v.SpeedChallengeMargin = n
 	}
 	if b, ok := pbool(m[keyOoklaLoss]); ok {
 		v.OoklaLoss = b
@@ -1075,31 +1096,12 @@ func (c *Controller) Timeout() time.Duration           { return c.get().Timeout 
 func (c *Controller) DownAfter() int                   { return c.get().DownAfter }
 func (c *Controller) UpAfter() int                     { return c.get().UpAfter }
 func (c *Controller) SpeedServerID() string            { return c.get().SpeedServerID }
-func (c *Controller) SpeedAutoLabel() string           { return c.get().SpeedAutoLabel }
 
 // SpeedServers returns the saved Ookla picker list. Copied, not shared, by the
 // same rule as Snapshot: the controller keeps serving this slice after the call
 // returns, so a caller that edited what it got back would edit live settings.
 func (c *Controller) SpeedServers() []SavedServer { return slices.Clone(c.get().SpeedServers) }
 
-// AutoLocation parses the stored "lat,lon" the auto picker centres on. ok is
-// false when unset, meaning use the caller's own IP location.
-func (c *Controller) AutoLocation() (lat, lon float64, ok bool) {
-	s := c.get().SpeedAutoLoc
-	if s == "" {
-		return 0, 0, false
-	}
-	parts := strings.SplitN(s, ",", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	lat, e1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-	lon, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-	if e1 != nil || e2 != nil {
-		return 0, 0, false
-	}
-	return lat, lon, true
-}
 func (c *Controller) SpeedtestEnabled() bool     { return c.get().SpeedtestEnabled }
 func (c *Controller) SpeedtestOnReconnect() bool { return c.get().SpeedtestOnReconnect }
 func (c *Controller) SpeedtestAdaptive() bool    { return c.get().SpeedtestAdaptive }
@@ -1112,6 +1114,8 @@ func (c *Controller) IperfServer() string        { return c.get().IperfServer }
 func (c *Controller) IperfDur() int              { return c.get().IperfDur }
 func (c *Controller) IperfStreams() int          { return c.get().IperfStreams }
 func (c *Controller) OoklaConnections() int      { return c.get().OoklaConnections }
+func (c *Controller) SpeedChallengeEvery() int   { return c.get().SpeedChallengeEvery }
+func (c *Controller) SpeedChallengeMargin() int  { return c.get().SpeedChallengeMargin }
 func (c *Controller) OoklaLoss() bool            { return c.get().OoklaLoss }
 func (c *Controller) SpeedBestOf() bool          { return c.get().SpeedBestOf }
 
@@ -1347,8 +1351,6 @@ type Patch struct {
 	UpAfter              *int
 	SpeedServerID        *string
 	SpeedServers         []SavedServer
-	SpeedAutoLoc         *string
-	SpeedAutoLabel       *string
 	SpeedtestEnabled     *bool
 	SpeedtestOnReconnect *bool
 	IPv6Mode             *string
@@ -1364,6 +1366,8 @@ type Patch struct {
 	IperfDur             *int
 	IperfStreams         *int
 	OoklaConnections     *int
+	SpeedChallengeEvery  *int
+	SpeedChallengeMargin *int
 	OoklaLoss            *bool
 	SpeedBestOf          *bool
 	IperfOmit            *int
@@ -1414,8 +1418,6 @@ func (p Patch) apply(v *Values) {
 	if p.SpeedServers != nil {
 		v.SpeedServers = p.SpeedServers
 	}
-	setIf(&v.SpeedAutoLoc, p.SpeedAutoLoc)
-	setIf(&v.SpeedAutoLabel, p.SpeedAutoLabel)
 	setIf(&v.SpeedtestEnabled, p.SpeedtestEnabled)
 	setIf(&v.SpeedtestOnReconnect, p.SpeedtestOnReconnect)
 	setIf(&v.IPv6Mode, p.IPv6Mode)
@@ -1433,6 +1435,8 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.IperfDur, p.IperfDur)
 	setIf(&v.IperfStreams, p.IperfStreams)
 	setIf(&v.OoklaConnections, p.OoklaConnections)
+	setIf(&v.SpeedChallengeEvery, p.SpeedChallengeEvery)
+	setIf(&v.SpeedChallengeMargin, p.SpeedChallengeMargin)
 	setIf(&v.OoklaLoss, p.OoklaLoss)
 	setIf(&v.SpeedBestOf, p.SpeedBestOf)
 	setIf(&v.IperfOmit, p.IperfOmit)
@@ -1502,8 +1506,6 @@ func (p Patch) keys() map[string]bool {
 	mark(p.UpAfter != nil, keyUpAfter)
 	mark(p.SpeedServerID != nil, keySpeedServer)
 	mark(p.SpeedServers != nil, keySpeedServers)
-	mark(p.SpeedAutoLoc != nil, keySpeedAutoLoc)
-	mark(p.SpeedAutoLabel != nil, keySpeedAutoLabel)
 	mark(p.SpeedtestEnabled != nil, keySpeedEnabled)
 	mark(p.SpeedtestOnReconnect != nil, keySpeedOnRecon)
 	mark(p.IPv6Mode != nil, keyIPv6Mode)
@@ -1519,6 +1521,8 @@ func (p Patch) keys() map[string]bool {
 	mark(p.IperfDur != nil, keyIperfDur)
 	mark(p.IperfStreams != nil, keyIperfStreams)
 	mark(p.OoklaConnections != nil, keyOoklaConnections)
+	mark(p.SpeedChallengeEvery != nil, keySpeedChallengeEvery)
+	mark(p.SpeedChallengeMargin != nil, keySpeedChallengeMargin)
 	mark(p.OoklaLoss != nil, keyOoklaLoss)
 	mark(p.SpeedBestOf != nil, keySpeedBestOf)
 	mark(p.IperfOmit != nil, keyIperfOmit)
@@ -1645,68 +1649,68 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 // key/value pairs.
 func formKeys(v Values) map[string]string {
 	return map[string]string{
-		keyLatency:           sec(v.Latency),
-		keyLatencyEnabled:    b2s(v.LatencyEnabled),
-		keyDNSProbe:          b2s(v.DNSProbe),
-		keyNetinfo:           b2s(v.NetinfoEnabled),
-		keySpeed:             sec(v.Speed),
-		keyRetention:         sec(v.Retention),
-		keySpeedRet:          sec(v.SpeedRetention),
-		keyDowntimeRet:       sec(v.DowntimeRetention),
-		keyTimeout:           sec(v.Timeout),
-		keyDownAfter:         strconv.Itoa(v.DownAfter),
-		keyUpAfter:           strconv.Itoa(v.UpAfter),
-		keySpeedServer:       v.SpeedServerID,
-		keySpeedServers:      speedServersJSON(v.SpeedServers),
-		keySpeedAutoLoc:      v.SpeedAutoLoc,
-		keySpeedAutoLabel:    v.SpeedAutoLabel,
-		keySpeedEnabled:      b2s(v.SpeedtestEnabled),
-		keySpeedOnRecon:      b2s(v.SpeedtestOnReconnect),
-		keyIPv6Mode:          v.IPv6Mode,
-		keyExitTarget:        v.ExitTarget,
-		keyThreshDown:        f2s(v.ThreshDownMbps),
-		keyThreshUp:          f2s(v.ThreshUpMbps),
-		keyThreshPing:        f2s(v.ThreshPingMS),
-		keyThreshJitter:      f2s(v.ThreshJitterMS),
-		keyThreshLoss:        f2s(v.ThreshLossPct),
-		keyThreshConsec:      strconv.Itoa(v.ThreshConsec),
-		keyThreshBloatDown:   f2s(v.ThreshBloatDownMS),
-		keyThreshBloatUp:     f2s(v.ThreshBloatUpMS),
-		keySpeedAdaptive:     b2s(v.SpeedtestAdaptive),
-		keySpeedOnDegraded:   b2s(v.SpeedtestOnDegraded),
-		keyDegradedPingMS:    f2s(v.DegradedPingMS),
-		keySpeedSkipBusy:     b2s(v.SpeedtestSkipBusy),
-		keySpeedBusyMbps:     f2s(v.SpeedBusyMbps),
-		keySpeedEngine:       v.SpeedEngine,
-		keyIperfServer:       v.IperfServer,
-		keyIperfServers:      iperfServersJSON(v.IperfServers),
-		keyIperfDur:          strconv.Itoa(v.IperfDur),
-		keyIperfStreams:      strconv.Itoa(v.IperfStreams),
-		keyOoklaConnections:  strconv.Itoa(v.OoklaConnections),
-		keyOoklaLoss:         b2s(v.OoklaLoss),
-		keySpeedBestOf:       b2s(v.SpeedBestOf),
-		keyIperfOmit:         strconv.Itoa(v.IperfOmit),
-		keySpeedDirection:    v.SpeedDirection,
-		keyIperfDirection:    v.IperfDirection,
-		keyIperfUDP:          b2s(v.IperfUDP),
-		keyIperfUDPRate:      strconv.Itoa(v.IperfUDPRate),
-		keyIperfWindow:       strconv.Itoa(v.IperfWindow),
-		keySpeedRetries:      strconv.Itoa(v.SpeedRetries),
-		keyIperfRetries:      strconv.Itoa(v.IperfRetries),
-		keyIperfCongest:      v.IperfCongestion,
-		keyIperfNoDelay:      b2s(v.IperfNoDelay),
-		keyIperfDSCP:         v.IperfDSCP,
-		keyIperfMSS:          strconv.Itoa(v.IperfMSS),
-		keyAlertOnOutage:     b2s(v.AlertOnOutage),
-		keyWebhookURL:        v.WebhookURL,
-		keyWebhookFormat:     v.WebhookFormat,
-		keyHeartbeatURL:      v.HeartbeatURL,
-		keyDigestFreq:        v.DigestFreq,
-		keySchedLatEnabled:   b2s(v.SchedLatEnabled),
-		keySchedLatWindows:   windowsJSON(v.SchedLatWindows),
-		keySchedSpeedEnabled: b2s(v.SchedSpeedEnabled),
-		keySchedSpeedWindows: windowsJSON(v.SchedSpeedWindows),
-		keyQuickSetup:        b2s(v.QuickSetupDone),
+		keyLatency:              sec(v.Latency),
+		keyLatencyEnabled:       b2s(v.LatencyEnabled),
+		keyDNSProbe:             b2s(v.DNSProbe),
+		keyNetinfo:              b2s(v.NetinfoEnabled),
+		keySpeed:                sec(v.Speed),
+		keyRetention:            sec(v.Retention),
+		keySpeedRet:             sec(v.SpeedRetention),
+		keyDowntimeRet:          sec(v.DowntimeRetention),
+		keyTimeout:              sec(v.Timeout),
+		keyDownAfter:            strconv.Itoa(v.DownAfter),
+		keyUpAfter:              strconv.Itoa(v.UpAfter),
+		keySpeedServer:          v.SpeedServerID,
+		keySpeedServers:         speedServersJSON(v.SpeedServers),
+		keySpeedEnabled:         b2s(v.SpeedtestEnabled),
+		keySpeedOnRecon:         b2s(v.SpeedtestOnReconnect),
+		keyIPv6Mode:             v.IPv6Mode,
+		keyExitTarget:           v.ExitTarget,
+		keyThreshDown:           f2s(v.ThreshDownMbps),
+		keyThreshUp:             f2s(v.ThreshUpMbps),
+		keyThreshPing:           f2s(v.ThreshPingMS),
+		keyThreshJitter:         f2s(v.ThreshJitterMS),
+		keyThreshLoss:           f2s(v.ThreshLossPct),
+		keyThreshConsec:         strconv.Itoa(v.ThreshConsec),
+		keyThreshBloatDown:      f2s(v.ThreshBloatDownMS),
+		keyThreshBloatUp:        f2s(v.ThreshBloatUpMS),
+		keySpeedAdaptive:        b2s(v.SpeedtestAdaptive),
+		keySpeedOnDegraded:      b2s(v.SpeedtestOnDegraded),
+		keyDegradedPingMS:       f2s(v.DegradedPingMS),
+		keySpeedSkipBusy:        b2s(v.SpeedtestSkipBusy),
+		keySpeedBusyMbps:        f2s(v.SpeedBusyMbps),
+		keySpeedEngine:          v.SpeedEngine,
+		keyIperfServer:          v.IperfServer,
+		keyIperfServers:         iperfServersJSON(v.IperfServers),
+		keyIperfDur:             strconv.Itoa(v.IperfDur),
+		keyIperfStreams:         strconv.Itoa(v.IperfStreams),
+		keyOoklaConnections:     strconv.Itoa(v.OoklaConnections),
+		keySpeedChallengeEvery:  strconv.Itoa(v.SpeedChallengeEvery),
+		keySpeedChallengeMargin: strconv.Itoa(v.SpeedChallengeMargin),
+		keyOoklaLoss:            b2s(v.OoklaLoss),
+		keySpeedBestOf:          b2s(v.SpeedBestOf),
+		keyIperfOmit:            strconv.Itoa(v.IperfOmit),
+		keySpeedDirection:       v.SpeedDirection,
+		keyIperfDirection:       v.IperfDirection,
+		keyIperfUDP:             b2s(v.IperfUDP),
+		keyIperfUDPRate:         strconv.Itoa(v.IperfUDPRate),
+		keyIperfWindow:          strconv.Itoa(v.IperfWindow),
+		keySpeedRetries:         strconv.Itoa(v.SpeedRetries),
+		keyIperfRetries:         strconv.Itoa(v.IperfRetries),
+		keyIperfCongest:         v.IperfCongestion,
+		keyIperfNoDelay:         b2s(v.IperfNoDelay),
+		keyIperfDSCP:            v.IperfDSCP,
+		keyIperfMSS:             strconv.Itoa(v.IperfMSS),
+		keyAlertOnOutage:        b2s(v.AlertOnOutage),
+		keyWebhookURL:           v.WebhookURL,
+		keyWebhookFormat:        v.WebhookFormat,
+		keyHeartbeatURL:         v.HeartbeatURL,
+		keyDigestFreq:           v.DigestFreq,
+		keySchedLatEnabled:      b2s(v.SchedLatEnabled),
+		keySchedLatWindows:      windowsJSON(v.SchedLatWindows),
+		keySchedSpeedEnabled:    b2s(v.SchedSpeedEnabled),
+		keySchedSpeedWindows:    windowsJSON(v.SchedSpeedWindows),
+		keyQuickSetup:           b2s(v.QuickSetupDone),
 	}
 }
 
@@ -2432,14 +2436,6 @@ func normalize(v Values) Values {
 	default:
 		v.WebhookFormat = "auto"
 	}
-	// Auto-picker location: keep only a usable "lat,lon" pair (finite, in range).
-	// ParseFloat accepts "NaN"/"Inf", which would centre the Ookla server picker
-	// on garbage coordinates; "" means centre on your own IP, same as unset.
-	v.SpeedAutoLoc = strings.TrimSpace(v.SpeedAutoLoc)
-	if v.SpeedAutoLoc != "" && !validAutoLoc(v.SpeedAutoLoc) {
-		v.SpeedAutoLoc = ""
-	}
-	v.SpeedAutoLabel = capLen(v.SpeedAutoLabel, maxLabelLen)
 	v.SpeedServerID = capLen(strings.TrimSpace(v.SpeedServerID), maxServerID)
 	v.SpeedServers = sanitizeSpeedServers(v.SpeedServers)
 	// Exit-path target: trim and drop anything that can't be a host/IP (empty,
@@ -2500,6 +2496,8 @@ func normalize(v Values) Values {
 	v.IperfDur = clampI(v.IperfDur, MinIperfDur, MaxIperfDur)
 	v.IperfStreams = clampI(v.IperfStreams, MinIperfStreams, MaxIperfStreams)
 	v.OoklaConnections = clampI(v.OoklaConnections, 0, MaxOoklaConnections)
+	v.SpeedChallengeEvery = clampI(v.SpeedChallengeEvery, 0, MaxSpeedChallengeEvery)
+	v.SpeedChallengeMargin = clampI(v.SpeedChallengeMargin, 0, MaxSpeedChallengeMargin)
 	v.IperfOmit = clampI(v.IperfOmit, 0, MaxIperfOmit)
 	switch v.SpeedDirection { // Ookla is always sequential - no bidir
 	case "both", "down", "up":
@@ -2540,21 +2538,6 @@ func normalize(v Values) Values {
 		v.AuthUser = "admin"
 	}
 	return v
-}
-
-// validAutoLoc reports whether s is a usable "lat,lon" pair: two parseable
-// numbers within [-90,90] / [-180,180] (NaN/Inf fail the range checks).
-func validAutoLoc(s string) bool {
-	if len(s) > 64 {
-		return false
-	}
-	parts := strings.SplitN(s, ",", 2)
-	if len(parts) != 2 {
-		return false
-	}
-	lat, e1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-	lon, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-	return e1 == nil && e2 == nil && validCoord(lat, lon)
 }
 
 // validCoord reports whether a coordinate pair can centre a server search:
@@ -2681,6 +2664,7 @@ func sanitizeSpeedServers(ss []SavedServer) []SavedServer {
 			ID:      id,
 			Sponsor: capLen(strings.TrimSpace(s.Sponsor), maxLabelLen), // rune-safe: free-form text
 			Name:    capLen(strings.TrimSpace(s.Name), maxLabelLen),
+			Country: capLen(strings.TrimSpace(s.Country), maxLabelLen),
 			Lat:     lat, Lon: lon,
 		})
 		if len(out) >= maxSpeedServers {

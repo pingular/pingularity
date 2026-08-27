@@ -78,6 +78,11 @@ type Result struct {
 	// Result is never JSON-marshalled and never leaves the package boundary
 	// except as store.SpeedSample, which this deliberately does not join.
 	Selection *SelectionReport
+
+	// Race is how this run's centre was chosen (see RaceVerdict): the city
+	// race's outcome, or the reason it did not run. Set beside Selection, on
+	// the Ookla engine's winner Result only; nil for iperf3 and fakes.
+	Race *RaceVerdict
 }
 
 // Tester runs one measurement. Implemented by Ookla and Iperf.

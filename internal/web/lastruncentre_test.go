@@ -96,6 +96,8 @@ type browseBody struct {
 	Servers  []struct {
 		ID         string  `json:"id"`
 		DistanceKM float64 `json:"distance_km"`
+		Lat        float64 `json:"lat"`
+		Lon        float64 `json:"lon"`
 	} `json:"servers"`
 }
 
@@ -159,15 +161,26 @@ func TestBrowseListCentresOnLastAutoRun(t *testing.T) {
 	if len(body.Servers) != 2 || body.Servers[0].ID != "777" || body.Servers[0].DistanceKM != 0 {
 		t.Errorf("servers = %+v, want the last-used server prepended at distance 0", body.Servers)
 	}
+	// The prepended row was resolved by ID, which carries no coordinate, but the
+	// list was centred on this server's own catalogue position - so the row
+	// goes out with it. The picker stars straight out of this response, and a
+	// row without a pair is saved at 0,0: the one server the caption names
+	// would be the one starred without a position.
+	if body.Servers[0].Lat != 45.4 || body.Servers[0].Lon != -73.6 {
+		t.Errorf("prepended row carries %v,%v; want the catalogue coordinate the list was centred on", body.Servers[0].Lat, body.Servers[0].Lon)
+	}
 
 	// When the metro fetch does contain the server, nothing is prepended: the
-	// guarantee is presence, not position.
-	f.list = []speedtest.ServerInfo{{ID: "888", Name: "Oldtown Heights, QC", DistanceKM: 6}, {ID: "777", Name: "Newtown, QC", DistanceKM: 9}}
+	// guarantee is presence, not position - and the row keeps its own pair.
+	f.list = []speedtest.ServerInfo{{ID: "888", Name: "Oldtown Heights, QC", DistanceKM: 6}, {ID: "777", Name: "Newtown, QC", DistanceKM: 9, Lat: 45.4, Lon: -73.6}}
 	body = f.ask(t)
 	n := 0
 	for _, srv := range body.Servers {
 		if srv.ID == "777" {
 			n++
+			if srv.Lat != 45.4 || srv.Lon != -73.6 {
+				t.Errorf("listed row carries %v,%v; want its own catalogue pair", srv.Lat, srv.Lon)
+			}
 		}
 	}
 	if n != 1 || len(body.Servers) != 2 {
@@ -181,10 +194,12 @@ func TestBrowseListCentresOnLastAutoRun(t *testing.T) {
 // selection report cannot prove how its server was chosen.
 func TestBrowseListSkipsRunsAutoDidNotChoose(t *testing.T) {
 	f := newLastRunFixture(t)
-	f.seedRun(t, 1000, "777", "ookla", "fastest_ranked")          // the last AUTO run
-	f.seedRun(t, 2000, "999", "ookla", speedtest.WinReasonPinned) // newer, but pinned
-	f.seedRun(t, 2500, "555", "ookla", "")                        // newer still, no report rows
-	f.seedRun(t, 3000, "444", "iperf3", "score")                  // newest, wrong engine
+	f.seedRun(t, 1000, "777", "ookla", "fastest_ranked")                   // the last AUTO run
+	f.seedRun(t, 2000, "999", "ookla", speedtest.WinReasonPinned)          // newer, but pinned
+	f.seedRun(t, 2200, "998", "ookla", speedtest.WinReasonPinnedBestOf)    // a pinned best-of the pin won: still the pin's city
+	f.seedRun(t, 2400, "997", "ookla", speedtest.WinReasonPinnedCompanion) // a pinned best-of a neighbour won: still beside the pin
+	f.seedRun(t, 2500, "555", "ookla", "")                                 // newer still, no report rows
+	f.seedRun(t, 3000, "444", "iperf3", "score")                           // newest, wrong engine
 
 	f.ask(t)
 	if f.askedID != "777" {

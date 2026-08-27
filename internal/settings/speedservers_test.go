@@ -31,10 +31,10 @@ func TestSpeedServersStorageContract(t *testing.T) {
 		t.Errorf("settings key = %q; already-saved lists are stored under %q", keySpeedServers, "speed_servers")
 	}
 	got := speedServersJSON([]SavedServer{
-		{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
-		{ID: "5678"}, // no sponsor, name, or coordinate
+		{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Country: "Canada", Lat: 45.5, Lon: -73.5},
+		{ID: "5678"}, // no sponsor, name, country, or coordinate
 	})
-	want := `[{"id":"1234","sponsor":"Bell","name":"Montreal, QC","lat":45.5,"lon":-73.5},{"id":"5678"}]`
+	want := `[{"id":"1234","sponsor":"Bell","name":"Montreal, QC","country":"Canada","lat":45.5,"lon":-73.5},{"id":"5678"}]`
 	if got != want {
 		t.Errorf("stored JSON shape changed\n want %s\n got  %s", want, got)
 	}
@@ -314,8 +314,10 @@ func TestUpdateSpeedServers(t *testing.T) {
 	}
 }
 
-// The accessor hands out a copy: the controller's slice is shared with the
-// monitor and scheduler, so a caller that edits what it got would race them.
+// The accessor hands out a copy: get() returns the controller's Values by value,
+// so the slice's backing array is shared with the scheduler's run goroutine (the
+// Ookla tester's SavedCoordFn reads it during a pinned best-of run's selection
+// phase), and a caller that edits what it got would race it.
 func TestSpeedServersAccessorCopies(t *testing.T) {
 	c := newController(t)
 	if _, err := c.Update(context.Background(), Patch{SpeedServers: []SavedServer{{ID: "1234", Sponsor: "Bell"}}}); err != nil {
@@ -348,7 +350,7 @@ func TestSpeedServersSurviveExportImport(t *testing.T) {
 	}
 	defer src.Close()
 
-	saved := []SavedServer{{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5}}
+	saved := []SavedServer{{ID: "1234", Sponsor: "Bell", Name: "Montreal, QC", Country: "Canada", Lat: 45.5, Lon: -73.5}}
 	raw := speedServersJSON(saved)
 	if _, err := src.SetSettingsDiff(ctx, map[string]string{keySpeedServers: raw}); err != nil {
 		t.Fatalf("seed: %v", err)

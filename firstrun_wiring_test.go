@@ -93,12 +93,6 @@ func TestFirstRunReadyFnComposition(t *testing.T) {
 		t.Error("pinned server must be ready immediately")
 	}
 
-	// Searched city: overrides the race.
-	set, ni = mk(settings.Values{NetinfoEnabled: true, SpeedAutoLoc: "43.65,-79.38"})
-	if !newFirstRunReadyFn(set, ni)() {
-		t.Error("searched city must be ready immediately")
-	}
-
 	// Connection info off: nothing is ever coming.
 	set, ni = mk(settings.Values{NetinfoEnabled: false})
 	if !newFirstRunReadyFn(set, ni)() {

@@ -344,10 +344,13 @@
   /* Latency runs three across, like the iperf test parameters: nine rows of short
      labels and small controls, which read better as three tight rows than five
      wide ones. Narrower screens step back down. */
-  .tabpane[data-tab="latency"]{grid-template-columns:repeat(3,minmax(0,1fr));column-gap:24px;}
-  .tabpane[data-tab="latency"] .lbl{white-space:nowrap;}
-  @media (max-width:900px){ .tabpane[data-tab="latency"]{grid-template-columns:repeat(2,minmax(0,1fr));column-gap:48px;} }
-  @media (max-width:600px){ .tabpane[data-tab="latency"]{grid-template-columns:1fr;} }
+  .tabpane[data-tab="latency"],
+  .tabpane[data-tab="ookla"]{grid-template-columns:repeat(3,minmax(0,1fr));column-gap:24px;}
+  .tabpane[data-tab="latency"] .lbl{white-space:nowrap;}   /* Ookla's longer labels wrap instead: nowrap would push a control into the next column between ~900 and ~940px */
+  @media (max-width:900px){ .tabpane[data-tab="latency"],
+    .tabpane[data-tab="ookla"]{grid-template-columns:repeat(2,minmax(0,1fr));column-gap:48px;} }
+  @media (max-width:600px){ .tabpane[data-tab="latency"],
+    .tabpane[data-tab="ookla"]{grid-template-columns:1fr;} }
   /* Theme picker (Appearance tab). */
   .theme-opts{grid-column:1/-1;display:flex;gap:12px;flex-wrap:wrap;margin-top:2px;}
   .theme-opt{display:flex;align-items:center;gap:9px;background:var(--bg2);color:var(--fg);
@@ -444,6 +447,13 @@
      carry no heading. */
   .sgroup h3{margin:16px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);}
   .srow{display:grid;grid-template-columns:1fr 150px;align-items:center;gap:12px;min-height:33px;font-size:13px;}
+  /* The engine decides what the Ookla and iperf3 tabs mean, so it gets the line
+     to itself at the top of Speedtest. The trailing track absorbs the second
+     column so the toggle still lands on the first column's right edge, in line
+     with the controls below it: half the pane, plus half the 48px gutter, less
+     the 12px this row gains from its own extra gap. */
+  .srow.eng-row{grid-column:1/-1;grid-template-columns:1fr 150px calc(50% + 12px);}
+  @media (max-width:600px){ .srow.eng-row{grid-template-columns:1fr 150px;} }
   .lbl{display:flex;align-items:center;gap:7px;color:var(--fg);}
   .ctl{display:grid;grid-template-columns:1fr 30px;align-items:center;column-gap:6px;width:150px;}
   .ctl>input[type=number]{width:64px;justify-self:end;text-align:right;background:var(--bg2);color:var(--fg);
@@ -537,7 +547,7 @@
   .tab-uniform .ctl:has(>select){grid-template-columns:1fr;}
   .tab-uniform .ctl:has(>input[type=checkbox]),
   .tab-uniform .ctl>select{width:60%;}
-  /* The engine pill is the headline control of the Server tab - 50% wider than the
+  /* The engine pill is the headline control of the Speedtest tab - 50% wider than the
      other toggles (after the 60% rule so this width wins). */
   .tab-uniform .ctl:has(>input.eng-toggle){width:90%;}
   /* Centre the dropdown label in the WHOLE pill: drop the native arrow (it shifts the
@@ -680,17 +690,13 @@
   .ie-rsa textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
   .ie-creds{display:flex;flex-direction:column;gap:8px;min-width:0;}
   @media (max-width:600px){ .ie-grid,.ie-auth-cols{grid-template-columns:1fr;} }
-  /* Test parameters: with the iperf3 engine's 12 knobs visible, three columns
-     keep the section 4 rows tall instead of a 6-row column pair. Each row keeps
-     its normal label + 150px control rail (pills, inputs and text unchanged);
-     labels never wrap. */
-  /* Ookla: a full-width block that mirrors the pane's own two-column flow, so
-     the group starts on a fresh line (as the old Test-parameters heading made
-     it) and rows pair up exactly as they always did. iperf3: 3 x 4 grid. */
-  .tp-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 48px;align-content:start;}
-  .tp-grid.iperf-mode{grid-template-columns:repeat(3,1fr);gap:8px 24px;align-items:center;}
-  .tp-grid.iperf-mode .lbl{white-space:nowrap;}
-  @media (max-width:900px){ .tp-grid.iperf-mode{grid-template-columns:repeat(2,1fr);} }
+  /* iperf3 test parameters: twelve knobs in three columns keep the section four
+     rows tall instead of a six-row column pair. Each row keeps its normal label
+     + 150px control rail (pills, inputs and text unchanged); labels never wrap.
+     The grid lives on the iperf3 tab alone now, so this is its only shape. */
+  .tp-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,1fr);gap:8px 24px;align-items:center;align-content:start;}
+  .tp-grid .lbl{white-space:nowrap;}
+  @media (max-width:900px){ .tp-grid{grid-template-columns:repeat(2,1fr);} }
   @media (max-width:600px){ .tp-grid{grid-template-columns:1fr;} }
   .srow-wide select,.srow-wide input[type=text],.srow-wide input[type=password]{width:100%;background:var(--bg2);color:var(--fg);
     border:1px solid var(--line2);border-radius:8px;padding:7px 9px;font:inherit;}
@@ -788,6 +794,122 @@
   html[data-theme="light"] .info{border-color:var(--muted);background:color-mix(in srgb,var(--muted) 12%,transparent);}
   html[data-theme="light"] .info:hover, html[data-theme="light"] .info:focus{border-color:var(--accent);}
   @media (max-width:600px){ .info::after{width:min(250px,86vw);left:auto;right:0;} .lbl .info::after,.ie-lbl .info::after,.netinfo .info:not(.conn-off)::after{position:fixed;left:8px !important;right:auto !important;top:auto;bottom:12px;width:min(250px,86vw);} }
+
+  /* ---- Ookla server picker: the saved pane above, the search results below ---- */
+  .fp-cols{display:flex;flex-direction:column;gap:16px;}
+  /* Sits where the section label would be, so it lines up with the header row
+     of the list above it. */
+  #serverRow .fp-find{margin-bottom:8px;min-height:32px;align-items:center;}
+  #serverRow .fp-find .btn{flex:none;}
+  /* Find and Auto are two ways of filling the same list, so they match. */
+  #serverRow .fp-find .btn{min-width:72px;}
+  /* --tracks is declared here, on the element both panes are, so the header and
+     the rows of both lists lay their columns out from one definition. */
+  .fp-list{border:1px solid var(--line2);border-radius:10px;overflow:hidden;background:var(--bg2);
+    --tracks:15px minmax(0,1fr) 66px 64px 66px; --star-w:34px; --row-h:38px; --rows:6;}
+  /* The saved list is capped at 12 and is the thing being managed: it grows with
+     its content rather than hiding half of itself behind a scrollbar. */
+  .fp-kept .fp-rows{height:auto;overflow:visible;}
+  .fp-rows{height:calc(var(--row-h) * var(--rows));overflow-y:auto;
+    scrollbar-width:thin;scrollbar-color:var(--line2) transparent;}
+  .fp-rows::-webkit-scrollbar{width:8px;}
+  .fp-rows::-webkit-scrollbar-track{background:transparent;}
+  .fp-rows::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px;}
+  .fp-rows::-webkit-scrollbar-thumb:hover{background:var(--muted);}
+  .fp-list{position:relative;}
+  /* Enough to read as "more below" without dimming the row underneath: it stops
+     partway to the page ground rather than reaching it. */
+  .fp-list::after,.fp-list::before{content:"";position:absolute;left:1px;right:1px;height:26px;
+    pointer-events:none;opacity:0;transition:opacity .15s ease;}
+  .fp-list::after{bottom:1px;
+    background:linear-gradient(transparent,color-mix(in srgb,var(--bg) 55%,var(--bg2)));}
+  .fp-list::before{top:29px;z-index:1;
+    background:linear-gradient(color-mix(in srgb,var(--bg) 55%,var(--bg2)),transparent);}
+  .fp-list.more-below::after,.fp-list.more-above::before{opacity:1;}
+  @media (prefers-reduced-motion:reduce){ .fp-list::after,.fp-list::before{transition:none;} }
+  /* One step lighter than the rows, so the list reads as a well set into the
+     panel. --bg / --bg2 / --panel keep that order in every theme. */
+  .fp-hdr{display:grid;grid-template-columns:var(--tracks) var(--star-w);gap:16px;
+    align-items:center;
+    padding:7px 12px;background:var(--panel);border-bottom:1px solid var(--line);
+    font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);
+    font-weight:600;}
+  .fp-hdr span:nth-child(3),.fp-hdr span:nth-child(4),.fp-hdr span:nth-child(5){text-align:right;}
+  .fp-radio{width:14px;height:14px;border-radius:50%;border:1.5px solid var(--line2);}
+  .fp-btn:hover .fp-radio{border-color:var(--muted);}
+  .fp-btn.on .fp-radio{border-color:var(--accent);
+    background:radial-gradient(circle at center,var(--accent) 0 3.4px,transparent 3.5px);}
+  .fp-row{display:grid;grid-template-columns:1fr var(--star-w);gap:16px;align-items:center;
+    border-bottom:1px solid var(--line);height:var(--row-h);box-sizing:border-box;}
+  .fp-row:last-child{border-bottom:0;}
+  .fp-row:hover{background:var(--panel2);}
+  .fp-row:has(.fp-btn.on){background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent);}
+  .fp-btn{display:grid;grid-template-columns:var(--tracks);align-items:center;gap:16px;
+    padding:0 12px;height:100%;cursor:pointer;border:0;width:100%;background:transparent;color:inherit;
+    font:inherit;text-align:left;}
+  .fp-btn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+  .fp-btn.on .fp-name{color:var(--accent);font-weight:700;}
+  .fp-name{display:flex;align-items:center;gap:8px;min-width:0;}
+  .fp-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .fp-sub{color:var(--muted);font-size:11.5px;}
+  .fp-id,.fp-km,.fp-ping{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;
+    font-size:11.5px;color:var(--muted);}
+  .fp-id{text-align:right;}
+  .fp-ping{text-align:right;}
+  .fp-ping.none{color:var(--line2);}
+  .fp-ping.hist{color:var(--muted);}
+  .fp-km{text-align:right;}
+  .fp-star{background:transparent;border:0;padding:0;cursor:pointer;line-height:0;color:var(--line2);
+    border-radius:6px;width:var(--star-w);height:26px;display:grid;place-items:center;}
+  .fp-star:hover{color:var(--fg);}
+  /* The connection panel's refresh, without its border: it sits inside a column
+     header rather than on a panel corner, so a box around it would be the only
+     framed thing in the row. */
+  .fp-hdr-ping{display:flex;align-items:center;justify-content:flex-end;gap:6px;}
+  .fp-refresh{display:inline-flex;align-items:center;justify-content:center;
+    width:14px;height:14px;padding:0;background:transparent;border:0;flex:none;
+    color:var(--muted);cursor:pointer;transition:color .15s;}
+  .fp-refresh:hover:not(:disabled){color:var(--accent);}
+  .fp-refresh:disabled{opacity:.35;cursor:default;}
+  .fp-refresh:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  .fp-refresh svg{display:block;}
+  .fp-refresh.spin svg{animation:fpspin .9s linear infinite;}
+  @keyframes fpspin{to{transform:rotate(360deg);}}
+  @media (prefers-reduced-motion:reduce){ .fp-refresh.spin svg{animation:none;} }
+  /* Narrow screens drop columns from the least load-bearing end. Below about
+     350px the fixed tracks left the name no width at all and rows showed only
+     numbers. */
+  @media (max-width:760px){
+    .fp-list{--tracks:15px minmax(0,1fr) 66px 64px;}
+    .fp-km,.fp-hdr>span:nth-child(5){display:none;}
+  }
+  @media (max-width:560px){
+    .fp-list{--tracks:15px minmax(0,1fr) 64px;}
+    .fp-id,.fp-hdr>span:nth-child(3){display:none;}
+  }
+  .fp-star.full{opacity:.25;cursor:default;}
+  .fp-star.full:hover{color:var(--line2);}
+  .fp-star:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  .fp-star svg{width:16px;height:16px;display:block;}
+  .fp-star[aria-pressed="true"]{color:var(--fg);}
+  .fp-badge{font-size:10px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;
+    border-radius:5px;padding:2px 6px;border:1px solid;}
+  /* The muted grey, never the outage red: a server that cannot be tested is not
+     a connection that is down. */
+  .fp-badge.bad{color:var(--muted);border-color:var(--line2);}
+  /* Unsupported: every transfer against it fails, so it cannot be chosen. The
+     row still reads, because knowing the nearest server is unusable explains
+     why the chosen one is further away. */
+  .fp-btn.bad{cursor:default;}
+  .fp-btn.bad .fp-name,.fp-btn.bad .fp-id,.fp-btn.bad .fp-ping,.fp-btn.bad .fp-km{opacity:.45;}
+  .fp-btn.bad:hover{background:transparent;}
+  .fp-row:has(.fp-btn.bad):hover{background:transparent;}
+  /* The radio, faded: there is nothing to draw for a row you cannot choose, so
+     it is the same control turned down rather than a mark of its own. */
+  .fp-radio.off{opacity:.3;}
+  /* Selected AND unsupported: it was chosen before it went bad, so it keeps the
+     selected marks - hiding them would misreport what a run will use. */
+  .fp-btn.bad.on .fp-name{opacity:1;}
   .drawer-actions{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;
     border-top:1px solid var(--line);padding-top:16px;margin-top:4px;}
   /* The message takes whatever space the buttons leave and wraps inside it, which
@@ -1517,6 +1639,9 @@
   html:not(.round) .chart-win,
   html:not(.round) .win-rm,
   html:not(.round) .run-del,
+  html:not(.round) .fp-list,
+  html:not(.round) .fp-star,
+  html:not(.round) .fp-badge,
   html:not(.round) .log-ic,
   html:not(.round) .url-a,
   html:not(.round) .url-copy,
@@ -1574,7 +1699,8 @@
     <div class="drawer-inner">
       <div class="tabbar" role="tablist">
         <button class="tab active" type="button" role="tab" aria-selected="true" data-tab="speedtest">Speedtest</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="server">Server</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="ookla">Ookla</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="iperf">iperf3</button>
         <button class="tab" type="button" role="tab" aria-selected="false" data-tab="latency">Latency</button>
         <button class="tab" type="button" role="tab" aria-selected="false" data-tab="schedule">Schedule</button>
         <button class="tab" type="button" role="tab" aria-selected="false" data-tab="retention">Data</button>
@@ -1628,6 +1754,12 @@
       </div><!-- /latency pane -->
       <div class="tabpane tab-uniform active" data-tab="speedtest">
       <div class="sgroup">
+        <label class="srow eng-row"><span class="lbl">Engine
+          <span class="info" tabindex="0" data-tip="Which speedtest backend runs.
+• Ookla - the global speedtest.net server network.
+• iperf3 - your own 'iperf3 -s' server (a LAN box or VPS); good for internal links and accurate upload.">i</span></span>
+          <span class="ctl"><input type="checkbox" id="setSpeedEngine" class="eng-toggle" role="switch" aria-label="Speedtest engine: unchecked Ookla, checked iperf3"><span class="unit"></span></span></label>
+        <div class="info-note hidden" id="iperfMissingNote"><span class="wi">ℹ&#xFE0E;</span>iperf3 isn’t installed on this host. Install the <code>iperf3</code> package first. Works best on Linux.</div>
         <label class="srow"><span class="lbl">Automatic
           <span class="info" tabindex="0" data-tip="Run speedtests on a schedule (the 'Run every' interval), plus one shortly after startup. Needs monitoring on.
 • Also enables the degraded, test-more-often and skip-when-busy options below.
@@ -1668,16 +1800,89 @@
         <div class="info-note hidden" id="busyOsNote"><span class="wi">ℹ&#xFE0E;</span>Skip-when-busy needs to read the network interface's byte counters. This host's operating system doesn't offer them, so the option has no effect here.</div>
       </div>
       </div><!-- /speedtest pane -->
-      <div class="tabpane tab-uniform" data-tab="server">
+      <div class="tabpane tab-uniform" data-tab="ookla">
       <div class="sgroup">
-        <label class="srow"><span class="lbl">Engine
-          <span class="info" tabindex="0" data-tip="Which speedtest backend runs.
-• Ookla - the global speedtest.net server network.
-• iperf3 - your own 'iperf3 -s' server (a LAN box or VPS); good for internal links and accurate upload.">i</span></span>
-          <span class="ctl"><input type="checkbox" id="setSpeedEngine" class="eng-toggle" role="switch" aria-label="Speedtest engine: unchecked Ookla, checked iperf3"><span class="unit"></span></span></label>
-        <div class="info-note hidden" id="iperfMissingNote"><span class="wi">ℹ&#xFE0E;</span>iperf3 isn’t installed on this host. Install the <code>iperf3</code> package first. Works best on Linux.</div>
+        <label class="srow"><span class="lbl">Best of 3 servers
+          <span class="info" tabindex="0" data-tip="Runs each scheduled test against your chosen server plus two nearby ones, and keeps only the best result.
+• Costs about 3x the time and 3x the data of a normal test.
+• Useful when one server is having a bad day and you'd rather it didn't define your history.
+• The kept run is one real test, so its ping and jitter belong to whichever server won - those columns can jump when a round changes hands, not because your connection did. Read latency from the charts below.
+• Scheduled tests and the RUN button only.">i</span></span>
+          <span class="ctl"><input type="checkbox" id="setSpeedBestOf"><span class="unit"></span></span></label>
+        <label class="srow"><span class="lbl">Retries
+          <span class="info" tabindex="0" data-tip="Retry a transfer that fails - often the server was still busy from the last test.
+• Ookla retries any failed direction.
+• 0 = no retry. Careful on a very slow uplink (roughly under 6 Mbps): the retry is also what drops the upload to a single stream so it can finish at all - at 0 that upload always fails and records nothing, though the download half of the run is kept.
+• Independent of the iperf3 Retries setting.">i</span></span>
+          <span class="ctl"><input type="number" id="setSpeedRetries" min="0" max="3" step="1"><span class="unit"></span></span></label>
+        <label class="srow"><span class="lbl">Direction
+          <span class="info" tabindex="0" data-tip="Which directions to test.
+• Both runs them one after the other.
+• Download- or upload-only halves the data and time.
+• Ookla is always sequential; iperf3 adds a simultaneous mode.
+• Independent of the iperf3 Direction setting.">i</span></span>
+          <span class="ctl"><select id="setSpeedDirection"><option value="both">Both</option><option value="down">Download only</option><option value="up">Upload only</option></select><span class="unit"></span></span></label>
+        <label class="srow"><span class="lbl">Packet-loss probe
+          <span class="info" tabindex="0" data-tip="A short UDP pass after the transfers to measure packet loss (TCP can't).
+• Adds about 5 seconds per test.
+• Many networks and servers block the UDP it uses. Loss then stays blank, and the probe (not the speedtest) is skipped for that server for a while.
+• Turn it off to keep every test as short as it can be, at the cost of the loss figure.">i</span></span>
+          <span class="ctl"><input type="checkbox" id="setOoklaLoss"><span class="unit"></span></span></label>
+        <label class="srow"><span class="lbl">Challenge every
+          <span class="info" tabindex="0" data-tip="Auto keeps measuring the same server while it pings within a hair of the fastest, so it never learns whether a rival is actually faster. After this many automatic tests, the next scheduled test measures the strongest rival instead.
+• Same data as any other test: one server is measured.
+• The rival takes over only if it beats the incumbent&#39;s recent results by the margin below; otherwise the incumbent keeps its place and the run is just a data point. A server needs three tests of record before it can be challenged.
+• 0 = never challenge. 12 is about twice a day at hourly tests (manual and reconnect tests count too).">i</span></span>
+          <span class="ctl"><input type="number" id="setSpeedChallengeEvery" min="0" max="1000" step="1"><span class="unit">tests</span></span></label>
+        <label class="srow"><span class="lbl">Challenger must beat by
+          <span class="info" tabindex="0" data-tip="How much better than the incumbent&#39;s recent median score a challenger has to be to take its place.
+• Compared across different hours, so set it above your line&#39;s normal run-to-run swing - a lucky hour must not steal the seat.
+• 15% suits a wired line; a wireless one swings more.">i</span></span>
+          <span class="ctl"><input type="number" id="setSpeedChallengeMargin" min="0" max="100" step="1"><span class="unit">%</span></span></label>
+        <label class="srow"><span class="lbl">Parallel connections
+          <span class="info" tabindex="0" data-tip="Parallel Ookla connections.
+• More connections fill a fast or high-latency link better.
+• Too few under-reads.
+• 0 = auto: one per logical CPU for downloads, at most 8 for uploads.">i</span></span>
+          <span class="ctl"><input type="number" id="setOoklaConnections" min="0" max="16" step="1"><span class="unit"></span></span></label>
+        <div class="srow-wide" id="serverRow">
+          <span class="lbl hidden">Speedtest server
+            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table).
+• Find only moves the list you are looking at; it never changes where a test runs.
+• Your ISP's own server always gets to compete when Ookla lists one.
+• The list is for browsing: it centres on your last auto test's server (always included), or before any auto run, on a city Auto location would consider.">i</span></span>
+          <div class="fp-cols">
+            <div>
+              <div class="fp-list fp-kept" id="fpFav"></div>
+            </div>
+            <div>
+              <div class="server-search fp-find">
+                <input type="text" id="serverCity" placeholder="Place or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
+                <button class="btn" id="serverSearchBtn" type="button" title="List the Ookla servers near a place, fastest first - or type a server's Ookla ID to pin exactly that one"><span class="btn-lbl">Find</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
+                <button class="btn" id="serverAuto" type="button" title="Show what Auto would pick right now: every candidate city's servers, deduplicated and pinged, fastest first. Pings only - no speedtest runs, and nothing is chosen"><span class="btn-lbl">Auto</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
+              </div>
+              <div class="fp-list" id="fpAll"></div>
+            </div>
+          </div>
+          <!-- Hidden, not removed: #setServer is still where speed_server_id lives for
+               settingsBody, formSnapshot and applyPendingServer (which synthesizes a row
+               for a pin outside the browse page and probes it by ID). The picker drives
+               it; nothing reads it as a control. -->
+          <div class="server-select hidden" id="serverSelectWrap">
+            <select id="setServer"><option value="">Auto - fastest near you</option></select>
+            <span class="sel-spin btn-spin" aria-hidden="true"></span>
+          </div>
+          <!-- Hidden: the caption's text is still built (updateScopeNote also
+               keeps the Find box placeholder current), but the paragraph under
+               the list was judged noise; the buttons' titles carry the gist. -->
+          <span class="muted hidden" id="serverLoc" style="font-size:12px"></span>
+        </div>
+      </div>
+      </div><!-- /ookla pane -->
+      <div class="tabpane tab-uniform" data-tab="iperf">
+      <div class="sgroup">
         <div class="info-note hidden" id="iperfVersionNote"><span class="wi">ℹ&#xFE0E;</span>Detected <code id="iperfVersionText">iperf3</code> on this host. Authentication padding and the unambiguous bidirectional result need a recent build (3.17+ / 3.11+); an older iperf3 may reject some options.</div>
-        <div class="srow-wide hidden" id="iperfServerRow">
+        <div class="srow-wide" id="iperfServerRow">
           <span class="lbl">iperf3 servers
             <span class="info" tabindex="0" data-tip="Your saved 'iperf3 -s' servers.
 • Tests run against the selected one.
@@ -1742,132 +1947,77 @@
           </div>
         </div>
         <div class="tp-grid">
-        <label class="srow iperf-opt"><span class="lbl">Test duration
+        <label class="srow"><span class="lbl">Test duration
           <span class="info" tabindex="0" data-tip="Seconds per direction for each transfer.
 • Longer is steadier, but uses more data and takes longer.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfDur" min="1" max="30" step="1"><span class="unit">sec</span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Parallel streams
+        <label class="srow"><span class="lbl">Parallel streams
           <span class="info" tabindex="0" data-tip="How many connections send at once during each transfer (default 8).
 • 1 often under-reads badly - a single connection is capped by how much data TCP lets it keep in flight (a roughly 350 Mbps line measured 116 Mbps with 1 stream, 268 with 8).
 • Keep it fixed once chosen - changing it shifts every later number, so your history stops comparing like with like.
 • Raise it cautiously: weak servers struggle.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfStreams" min="1" max="32" step="1"><span class="unit"></span></span></label>
-        <label class="srow ookla-opt"><span class="lbl">Parallel connections
-          <span class="info" tabindex="0" data-tip="Parallel Ookla connections.
-• More connections fill a fast or high-latency link better.
-• Too few under-reads.
-• 0 = auto: one per logical CPU for downloads, at most 8 for uploads.">i</span></span>
-          <span class="ctl"><input type="number" id="setOoklaConnections" min="0" max="16" step="1"><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Window size
+        <label class="srow"><span class="lbl">Window size
           <span class="info" tabindex="0" data-tip="TCP window / socket-buffer size (-w).
 • 0 = auto.
 • Raise it to unlock speed on high-latency, long-distance links where the default window caps the rate.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfWindow" min="0" max="65536" step="64"><span class="unit">KB</span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Warm-up
+        <label class="srow"><span class="lbl">Warm-up
           <span class="info" tabindex="0" data-tip="Seconds to discard at the start of each transfer (TCP slow-start), for steadier numbers.
 • 0 = off.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfOmit" min="0" max="5" step="1"><span class="unit">sec</span></span></label>
-        <label class="srow ookla-opt"><span class="lbl">Retries
-          <span class="info" tabindex="0" data-tip="Retry a transfer that fails - often the server was still busy from the last test.
-• Ookla retries any failed direction.
-• 0 = no retry. Careful on a very slow uplink (roughly under 6 Mbps): the retry is also what drops the upload to a single stream so it can finish at all - at 0 that upload always fails and records nothing, though the download half of the run is kept.
-• Independent of the iperf3 Retries setting.">i</span></span>
-          <span class="ctl"><input type="number" id="setSpeedRetries" min="0" max="3" step="1"><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Retries
+        <label class="srow"><span class="lbl">Retries
           <span class="info" tabindex="0" data-tip="Retry a transfer that fails - often the server was still busy from the last test.
 • iperf3 retries only transient errors (busy / reset), each direction, plus the loss &amp; jitter probe.
 • 0 = no retry.
 • Independent of the Ookla Retries setting.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfRetries" min="0" max="3" step="1"><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Max segment size
+        <label class="srow"><span class="lbl">Max segment size
           <span class="info" tabindex="0" data-tip="TCP max segment size (-M), in bytes.
 • 0 = auto.
 • Lower it to test small-MTU links such as VPNs or PPPoE.
 • Most users leave it at 0.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfMSS" min="0" max="9000" step="1"><span class="unit">B</span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">No delay (Nagle off)
+        <label class="srow"><span class="lbl">No delay (Nagle off)
           <span class="info" tabindex="0" data-tip="Disable Nagle's algorithm (-N) so small writes go out immediately.
 • Rarely changes throughput.
 • Useful for latency-sensitive tests.
 • TCP only.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setIperfNoDelay"><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Congestion control
+        <label class="srow"><span class="lbl">Congestion control
           <span class="info" tabindex="0" data-tip="Pick the TCP congestion-control algorithm (-C) from this host's allowed list.
 • Runs on the sender's kernel - the server for downloads, this host for uploads - so for downloads the server must have it too.
 • An unavailable one fails the test and can crash old iperf3 servers.
 • Auto = system default.">i</span></span>
           <span class="ctl"><select id="setIperfCongestion"><option value="">Auto</option></select><span class="unit"></span></span></label>
-        <!-- Shown by updateCongestionHint (NOT class iperf-opt: updateEngineUI's blanket
-             iperf-opt toggle would un-hide it whenever iperf3 is selected, natively too). -->
+        <!-- Shown by updateCongestionHint alone. -->
         <div class="info-note hidden" id="congestionContainerNote"><span class="wi">ℹ&#xFE0E;</span><span class="sub">No suggestions: this daemon runs in a container, which cannot see the host's allowed-algorithm list (it lives in the host's network namespace). A saved algorithm is still passed to iperf3 unchanged.</span></div>
-        <label class="srow iperf-opt"><span class="lbl">DSCP marking
+        <label class="srow"><span class="lbl">DSCP marking
           <span class="info" tabindex="0" data-tip="DSCP value (--dscp) on test packets.
 • 0-63, or a name like ef, cs5, af11.
 • Blank = none.
 • Tests how your network prioritises the marked traffic.">i</span></span>
           <span class="ctl"><input type="text" id="setIperfDSCP" placeholder="none" maxlength="32" autocomplete="off" spellcheck="false"><span class="unit"></span></span></label>
-        <label class="srow ookla-opt"><span class="lbl">Direction
-          <span class="info" tabindex="0" data-tip="Which directions to test.
-• Both runs them one after the other.
-• Download- or upload-only halves the data and time.
-• Ookla is always sequential; iperf3 adds a simultaneous mode.
-• Independent of the iperf3 Direction setting.">i</span></span>
-          <span class="ctl"><select id="setSpeedDirection"><option value="both">Both</option><option value="down">Download only</option><option value="up">Upload only</option></select><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Direction
+        <label class="srow"><span class="lbl">Direction
           <span class="info" tabindex="0" data-tip="Which directions to test.
 • Both runs them one after the other.
 • Download- or upload-only halves the data and time.
 • 'Both, simultaneous' (--bidir) loads both directions at once, catching slowdowns that only show when traffic flows both ways at the same time.
 • Independent of the Ookla Direction setting.">i</span></span>
           <span class="ctl"><select id="setIperfDirection"><option value="both">Both</option><option value="down">Download only</option><option value="up">Upload only</option><option value="bidir">Both, simultaneous</option></select><span class="unit"></span></span></label>
-        <label class="srow iperf-opt"><span class="lbl">Loss &amp; jitter probe
+        <label class="srow"><span class="lbl">Loss &amp; jitter probe
           <span class="info" tabindex="0" data-tip="A short UDP pass after the transfers to measure packet loss and jitter (TCP can't).
 • Turn off for servers that block UDP, or to save a little data.">i</span></span>
           <span class="ctl"><input type="checkbox" id="setIperfUDP"><span class="unit"></span></span></label>
-        <label class="srow hidden iperf-opt" id="iperfUdpRateRow"><span class="lbl">UDP rate
+        <label class="srow" id="iperfUdpRateRow"><span class="lbl">UDP rate
           <span class="info" tabindex="0" data-tip="Send rate for the loss/jitter probe (a 2-second burst).
 • 0 = auto: about half your measured speed, capped at 50 Mbps and normally no lower than 5 - on a very slow link it drops below 5 so the probe doesn't cause the loss it measures.
 • Raise it to sample loss on a fast link.
 • The probe's data isn't counted in the usage figure - at 1000 Mbps that's about 250 MB per test.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfUDPRate" min="0" max="10000" step="1"><span class="unit">Mbps</span></span></label>
-        <label class="srow ookla-opt"><span class="lbl">Packet-loss probe
-          <span class="info" tabindex="0" data-tip="A short UDP pass after the transfers to measure packet loss (TCP can't).
-• Adds about 5 seconds per test.
-• Many networks and servers block the UDP it uses. Loss then stays blank, and the probe (not the speedtest) is skipped for that server for a while.
-• Turn it off to keep every test as short as it can be, at the cost of the loss figure.">i</span></span>
-          <span class="ctl"><input type="checkbox" id="setOoklaLoss"><span class="unit"></span></span></label>
-        </div>
-        <label class="srow" id="autoLocRow"><span class="lbl">Auto location
-          <span class="info" tabindex="0" data-tip="Picks where to test from by measurement, fresh on every test.
-• The places your connection names - where your traffic leaves the ISP, where your IP is registered, and where speedtest.net places you - race on ping, and the fastest becomes the centre of the server search.
-• Turn it off to type a city and search there instead.
-• Pinning a server shows this as off too - the test then uses that server.">i</span></span>
-          <span class="ctl"><input type="checkbox" id="setAutoLoc"><span class="unit"></span></span></label>
-        <label class="srow ookla-opt"><span class="lbl">Best of 3 servers
-          <span class="info" tabindex="0" data-tip="Runs each scheduled test against your chosen server plus two nearby ones, and keeps only the best result.
-• Costs about 3x the time and 3x the data of a normal test.
-• Useful when one server is having a bad day and you'd rather it didn't define your history.
-• The kept run is one real test, so its ping and jitter belong to whichever server won - those columns can jump when a round changes hands, not because your connection did. Read latency from the charts below.
-• Scheduled tests and the RUN button only.">i</span></span>
-          <span class="ctl"><input type="checkbox" id="setSpeedBestOf"><span class="unit"></span></span></label>
-        <div class="srow-wide" id="serverRow">
-          <span class="lbl">Speedtest server
-            <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table).
-• Typing a city instead centres the server search there - the server is still picked by lowest ping, not pinned.
-• Your ISP's own server always gets to compete when Ookla lists one.
-• The list is for browsing: it centres on your last auto test's server (always included), or before any auto run, on a city Auto location would consider.">i</span></span>
-          <div class="server-search">
-            <input type="text" id="serverCity" placeholder="City or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
-            <button class="btn" id="serverSearchBtn" type="button">Search</button>
-          </div>
-          <div class="server-select" id="serverSelectWrap">
-            <select id="setServer"><option value="">Auto - fastest near you</option></select>
-            <span class="sel-spin btn-spin" aria-hidden="true"></span>
-          </div>
-          <span class="muted" id="serverLoc" style="font-size:12px"></span>
         </div>
       </div>
-      </div><!-- /server pane -->
+      </div><!-- /iperf3 pane -->
       <div class="tabpane tab-uniform" data-tab="schedule">
       <div class="sgroup">
         <div class="sched-feat">
@@ -2417,7 +2567,7 @@ Turn it back on in Settings → Latency.">!</span>
           <thead><tr>
             <th class="act" aria-label="Delete"></th>
             <th>When</th><th>↓&nbsp;Mbps</th><th>↑&nbsp;Mbps</th><th>Ping</th><th>Jitter</th><th>Packet&nbsp;loss</th><th title="Bufferbloat: latency added under load, down / up (ms)">Bufferbloat</th>
-            <th>↓&nbsp;Data</th><th>↑&nbsp;Data</th><th>Server</th><th>Server&nbsp;ID</th>
+            <th>↓&nbsp;Data</th><th>↑&nbsp;Data</th><th>Server</th><th>Server&nbsp;ID</th><th title="How the run chose where to test from: the city whose server answered the ping race fastest, or a pinned server. Hover for every city that raced.">Centre</th>
             <th>ISP</th><th>ISP location</th><th>Public IPv4</th><th>Public IPv6</th>
             <th title="Recursive resolver egress IP - where this run's DNS queries exit to the internet, which can differ from the resolver you configured">DNS server</th><th title="Network operator of the DNS egress IP (from its ASN) - the egress network, not necessarily the DNS service brand">DNS provider</th><th title="Approximate location of the DNS egress IP">DNS location</th>
             <th>PoP</th><th>Exit path</th><th>Health</th><th title="What started the test: scheduled, manual, reconnect, startup, or degraded latency">Trigger</th>
@@ -3216,7 +3366,8 @@ document.querySelectorAll('.viz-acc').forEach(b=> b.addEventListener('click', ()
 function restoreDrawerPlace(){
   const acc = lsGet('vizAcc')||'';
   if(acc && document.querySelector('.viz-acc[aria-controls="'+acc+'"]')) setVizAcc(acc);
-  const want = lsGet('tab')||'';
+  let want = lsGet('tab')||'';
+  if(want==='server') want='ookla';   // the Server tab split into Ookla and iperf3; a place saved before that lands on its Ookla half
   return (want && document.querySelector('.tab[data-tab="'+want+'"]')) ? want : 'speedtest';
 }
 $('palReset').addEventListener('click', ()=>{ for(const k of ['bg','bg2','panel','panel2','line','line2','fg','muted','up','down','warn','accent2','hm0']) palettePrefs[k]=''; applyPalette(); syncPaletteControls(); }); // UI-colours keys only; the Top bar section has its own reset (barReset)
@@ -3468,7 +3619,7 @@ function openDrawer(){
     // Re-sync the derived Auto-location toggle (+ search visibility) to the saved
     // server state: toggling it without searching isn't a settings change, so the
     // dirty check / discard won't revert it - do it here so a reopen is clean.
-    $('setAutoLoc').checked = !autoLoc && !pendingServer; updateAutoLocUI();
+    updateAutoLocUI();
     // A long-lived tab goes stale: another session (or machine - the fleet view is
     // multi-viewer) may have changed settings since this page loaded, and Save posts
     // every field, so without a refetch it would silently revert their change. Pull
@@ -4129,7 +4280,7 @@ function activateTab(name){
   document.querySelectorAll('.tab').forEach(x => { const on=x.dataset.tab===name; x.classList.toggle('active', on); x.setAttribute('aria-selected', on); });
   document.querySelectorAll('.tabpane').forEach(p => p.classList.toggle('active', p.dataset.tab===name));
   lsSet('tab', name);                  // reopen here next time (see openDrawer)
-  if(name==='server') loadServers();   // deferred Ookla server-list fetch
+  if(name==='ookla') loadServers();    // deferred Ookla server-list fetch
   if(name==='about') loadLogs();       // populate the log viewer on open
   syncDrawerHeight();
   syncBlackout();                      // blackout follows the active tab (off on Themes)
@@ -4372,7 +4523,7 @@ async function refreshStatus() {
     // claim (the fallback wording stays true either way) and refetch on the
     // next tab visit. The initial ''->server transition invalidates nothing -
     // a list fetched before it already had this run in the store.
-    if (hadRun && !autoLoc){ autoCentreLastRun=false; serversLoaded=false; }
+    if (hadRun){ autoCentreLastRun=false; serversLoaded=false; }
     if (wasLoaded) updateScopeNote();
   }
   if (!!s.bridged_container !== bridgedContainer){ bridgedContainer=!!s.bridged_container; refreshNetinfo(); }
@@ -4385,7 +4536,7 @@ async function refreshStatus() {
   // (fetched before the backend registered the run) - mirrors powerPending.
   // running=true still applies: it carries the server name once known.
   if(!(speedtestPending && !s.speedtest_running))
-    setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_auto_label, s.speedtest_run_id);
+    setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_run_id);
   if (s.speed) lastSpeedTs = s.speed.ts;
   // A run that actually completed after the error supersedes it.
   if (speedRunErr && s.speed && s.speed.ts > speedRunErrSince) speedRunErr='';
@@ -5866,6 +6017,46 @@ const bytesStr = b => { if(typeof b!=='number' || !isFinite(b)) return '-';
   const u=['B','KB','MB','GB','TB']; let i=0,v=b;
   while(i<u.length-1 && v>=(i>=2?999.95:999.5)){ v/=1000; i++; }
   return (i>=2 ? v.toFixed(1) : Math.round(v))+' '+u[i]; };
+// winTag says why the run's server was the one measured (the winner row's
+// win_reason, copied onto the listing): a muted tag beside the server name,
+// so a row whose server differs from its neighbours explains itself. Rows
+// without a selection report (old history, imports, iperf3) carry nothing.
+const WIN_TAGS={
+  fastest_ranked:['fastest','Pinged fastest of the candidates this run'],
+  incumbent:['incumbent','The server the previous test measured, kept because it still pinged within a hair of the fastest'],
+  on_net:['on-net','Your ISP\u2019s own server, preferred within a hair of the fastest'],
+  challenger:['challenger','A challenge run: the incumbent\u2019s strongest rival was measured and did not beat its record'],
+  challenger_won:['challenger won','A challenge run: the rival beat the incumbent\u2019s record and holds the seat now'],
+  challenger_failed:['challenger failed','A challenge run whose rival could not be measured; the incumbent was measured instead'],
+  score:['best of 3','Best of 3: the highest-scoring of the round'],
+  ping_bootstrap:['first run','Best of 3 with no history yet: decided on ping alone'],
+  pinned:['pinned','The server you pinned'],
+  pinned_bestof:['pinned','The server you pinned, which also won its Best of 3 round'],
+  pinned_companion:['companion','Best of 3 beside your pinned server: a neighbour out-scored the pin this round'],
+};
+function winTag(r){
+  const t=r&&r.win_reason ? WIN_TAGS[r.win_reason] : null;
+  if(!t) return r&&r.win_reason ? ' <span class="muted">· '+esc(r.win_reason)+'</span>' : '';
+  return ' <span class="muted" title="'+esc(t[1])+'">· '+esc(t[0])+'</span>';
+}
+// raceCell says how a run chose its centre (the run's race_* fields): the city
+// race's verdict - the winning city and its fastest answer, every city that
+// raced in the title - or why no race ran. Rows from before it was recorded
+// carry nothing and say so.
+function raceCell(r){
+  const o=r.race_outcome; if(!o) return '<span class="muted">-</span>';
+  const where=esc(r.race_winner_label||r.race_winner_kind||'');
+  const title=r.race_origins?' title="'+esc(String(r.race_origins).split(' | ').join(' · '))+'"':'';
+  switch(o){
+    case 'decided': return `<span${title}>${where}${typeof r.race_winner_ms==='number'?' <span class="muted">· '+num1(r.race_winner_ms)+' ms</span>':''}</span>`;
+    case 'silent': return `<span${title}>${where} <span class="muted">· race unanswered</span></span>`;
+    case 'unanchored': return '<span class="muted">no city to race</span>';
+    case 'failed': return '<span class="muted">race failed</span>';
+    case 'skipped': return '<span class="muted">no race</span>';
+    case 'bypassed_pin': return '<span class="muted">pinned</span>';
+  }
+  return esc(o);
+}
 const healthBadge = v => v===true ? '<span class="badge ok">healthy</span>'
   : v===false ? '<span class="badge bad">unhealthy</span>'
   : '<span class="muted" title="Not graded - set alert thresholds (Settings → Alerts) and future runs get a healthy/unhealthy verdict">-</span>';
@@ -5889,8 +6080,9 @@ async function loadRuns(){
       <td class="mono">${bloatCell(r.idle_ms, r.loaded_down_ms, r.loaded_up_ms)}</td>
       <td class="mono">${bytesStr(r.download_bytes)}</td>
       <td class="mono">${bytesStr(r.upload_bytes)}</td>
-      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}${famLabel(r.ip_family)?' <span class="muted"'+(famTitle(r.ip_family,engOf(r))?' title="'+famTitle(r.ip_family,engOf(r))+'"':'')+'>· '+famLabel(r.ip_family)+'</span>':''}</td>
+      <td>${showEngine(r)?'<span class="muted">'+esc(engOf(r))+'</span> · ':''}${esc(r.server)}${winTag(r)}${famLabel(r.ip_family)?' <span class="muted"'+(famTitle(r.ip_family,engOf(r))?' title="'+famTitle(r.ip_family,engOf(r))+'"':'')+'>· '+famLabel(r.ip_family)+'</span>':''}</td>
       <td class="mono">${esc(r.server_id)}</td>
+      <td>${raceCell(r)}</td>
       <td>${esc(r.isp)}</td>
       <td>${esc(r.isp_location)}</td>
       <td class="mono">${esc(r.public_ipv4)}</td>
@@ -5903,7 +6095,7 @@ async function loadRuns(){
       <td>${healthBadge(r.healthy)}</td>
       <td class="muted">${esc(r.trigger)}</td>
     </tr>`).join('')
-    : `<tr><td class="muted" colspan="23">No runs recorded yet.</td></tr>`;
+    : `<tr><td class="muted" colspan="24">No runs recorded yet.</td></tr>`;
   updateRunsPager();
   applyRunHighlight(pinnedRunTs);
 }
@@ -6346,9 +6538,9 @@ function drawHeatmap(){
 // nearby server pings well and delivers badly. Best of 3 is the exception; it
 // measures all three and keeps the best result, so it may claim fastest. isAuto
 // is false on iperf3, which has no candidate pool and selects nothing.
-function speedtestRunText(server, isAuto, city){
+function speedtestRunText(server, isAuto){
   if(server) return 'Running speedtest on '+esc(server)+'…';
-  if(isAuto) return 'Finding the nearest responsive server '+(city ? 'in '+esc(city) : 'near you')+'…';
+  if(isAuto) return 'Finding the nearest responsive server near you…';
   return 'Running speedtest…';
 }
 // speedtestRunningNow mirrors the BACKEND's speedtest_running - a run started by
@@ -6362,7 +6554,7 @@ let speedtestRunningNow=false;
 // the id with the request so the daemon stops the run that was meant, rather than
 // whichever one happens to hold the flag when the click finally arrives.
 let speedtestRunId=0;
-function setSpeedtestRunning(running, server, isAuto, city, runId){
+function setSpeedtestRunning(running, server, isAuto, runId){
   speedtestRunningNow=!!running;
   speedtestRunId=runId||0;
   const b=$('runSpeed');
@@ -6376,7 +6568,7 @@ function setSpeedtestRunning(running, server, isAuto, city, runId){
     : speedtestAbortable(speedtestPending, speedtestRunningNow, speedtestRunId)
       ? 'Speedtest running - click to stop' : 'Speedtest starting…';
   b.setAttribute('aria-label', lbl); b.title = lbl;
-  if(running){ $('speedWhen').classList.remove('run-err'); $('speedWhen').innerHTML=speedtestRunText(server, isAuto, city); }
+  if(running){ $('speedWhen').classList.remove('run-err'); $('speedWhen').innerHTML=speedtestRunText(server, isAuto); }
 }
 
 // Whether a click on the RUN button means "stop that". It must be exactly the
@@ -6422,7 +6614,7 @@ $('runSpeed').addEventListener('click', async () => {
   // Instant feedback using the loaded settings; the poll then keeps it accurate.
   speedRunErr=''; speedRunErrSince=lastSpeedTs; // only a run newer than now clears the error
   speedtestPending=true;
-  setSpeedtestRunning(true, '', pendingServer==='', autoLabel);
+  setSpeedtestRunning(true, '', pendingServer==='');
   let errText='';
   try {
     const r=await fetch('api/speedtest',{method:'POST',headers:{'Content-Type':'application/json'}});
@@ -6621,8 +6813,14 @@ $('netinfoRefresh').addEventListener('click', async () => {
   try{ await refreshNetinfo(true); } finally{ b.classList.remove('spinning'); }
 });
 
-let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoLoc='', autoLabel='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
-const shortPlace = s => s ? s.split(',').slice(0,2).join(',').trim() : '';
+// browseLoc is where the LIST is centred (a searched place); a run never reads it.
+// They were one variable, so searching a city committed a scope nobody asked for.
+let browseLoc='', browseLabel='';
+let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
+// shortPlace is the city alone: the geocoder answers with a whole address
+// ("Toronto, Golden Horseshoe, Ontario, Canada"), and the second part is
+// whatever regional label it felt like adding.
+const shortPlace = s => s ? s.split(',')[0].trim() : '';
 // autoOptionText / autoScopeText are pure so the two most-read strings in this
 // panel are unit-tested rather than eyeballed. Only a SEARCHED city may be named
 // as auto's centre: with none, auto re-decides by racing the cities this
@@ -6634,9 +6832,8 @@ const shortPlace = s => s ? s.split(',').slice(0,2).join(',').trim() : '';
 // fallback centre (a candidate city, before any auto run exists) is never
 // allowed to stand in for auto's answer, which is what it used to do while
 // captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
-const autoOptionText = label => { return label ? `Auto - fastest in ${label}` : 'Auto - fastest near you'; };
-const autoScopeText = (what, label, listCentre, lastServer, centredOnLastRun) => {
-  if(label) return `Auto picks ${what} in <b>${esc(label)}</b>.`;
+const autoOptionText = () => { return 'Auto - fastest near you'; };
+const autoScopeText = (what, listCentre, lastServer, centredOnLastRun) => {
   let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - the location is chosen fresh when the next test runs.`;
   if(centredOnLastRun && listCentre)
     t += ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b> where your last auto test ran - not where the next one will.`;
@@ -6648,10 +6845,15 @@ const autoScopeText = (what, label, listCentre, lastServer, centredOnLastRun) =>
   if(lastServer) t += ` Your last test measured <b>${esc(lastServer)}</b>.`;
   return t;
 };
-const autoText = () => autoOptionText(autoLabel);
+const autoText = () => autoOptionText();
 
+// findBoxText is the Find box's placeholder: the prompt, plus the place the
+// list below is currently centred on when there is one - a searched city, a
+// saved scope, or where Auto last centred - so the box says what "here" is.
+const findBoxText = cur => 'Place or Ookla server ID' + (cur ? ` (Current: ${cur})` : '');
 function updateScopeNote(){
   const el=$('serverLoc'), sel=$('setServer');
+  const box=$('serverCity'); if(box) box.placeholder = findBoxText(browseLabel||autoDefaultLoc);
   // Best of 3 keeps the chosen server and adds two companions. Those come from
   // around whatever the list is centred on - the pinned server when there is
   // one, the auto location otherwise - so say which, because "Using X." alone
@@ -6660,14 +6862,17 @@ function updateScopeNote(){
   if(sel.value){
     const o=sel.selectedOptions[0];
     let t='Using '+esc(o?o.textContent:'server '+sel.value)+'.';
-    if(bestOf) t += ' Best of 3 also measures the two nearest responsive servers and keeps the best result.';
+    if(bestOf) t += ' Best of 3 also measures the two fastest-pinging servers near it and keeps the best result.';
     el.innerHTML=t; return;
   }
   // Best of 3 measures its candidates and keeps the best-SCORING one - "best",
   // not "fastest": a near-tie on speed goes to the lower-ping server. A single
-  // run just takes the lowest-latency candidate.
-  const what = bestOf ? 'the 3 nearest responsive servers, keeping the best result,' : 'the nearest responsive server';
-  el.innerHTML = autoScopeText(what, autoLabel, autoDefaultLoc, lastRunServer, autoCentreLastRun);
+  // run takes the fastest-pinging candidate - but keeps the server the last
+  // test measured while it stays within noise of the fastest, so the history
+  // compares like with like rather than flipping on a millisecond of jitter.
+  const what = bestOf ? 'the 3 fastest-pinging servers, keeping the best result,'
+    : 'the fastest-pinging server (keeping the last test\u2019s server while it stays within a couple of milliseconds of the fastest)';
+  el.innerHTML = autoScopeText(what, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
 // serverOptionText renders one dropdown row. The daemon's by-ID resolve can
 // return an empty country (Ookla's by-ID endpoint omits it on sparse records -
@@ -6690,6 +6895,14 @@ const serverOptionText = s => { return `${s.sponsor} - ${s.name}`+(s.country?`, 
 // been told lets every rebuilt row (and the synthesized pin row) keep its
 // annotation across repopulates.
 const serverHealth = new Map();
+// serverProbes bounds the by-ID health probe (applyPendingServer): per id, in
+// flight or not, and how many times it has been asked this page load. Two
+// tries: one retry covers a transport blip; re-asking on every repopulate
+// while the daemon cannot tell (Ookla unreachable, the probe timing out) is a
+// fan-out at a third party with no ceiling. The daemon's own cache expires an
+// inconclusive verdict in ten minutes, so the retry that matters is the next
+// page load, not the next redraw.
+const serverProbes = new Map();
 function rememberServerHealth(list){
   for (const s of (list||[])) if (s && s.id !== undefined && s.fallback_ok !== undefined) serverHealth.set(String(s.id), s.fallback_ok);
 }
@@ -6718,6 +6931,7 @@ function populateServers(list){
     annotateOption(o, s.id);
     sel.appendChild(o); }
   applyPendingServer(); updateScopeNote();
+  fpAdopt(list);   // the picker takes its results from this one arrival point
 }
 // setServerLoading toggles the dropdown's spinner overlay while the Ookla list
 // is in flight: the select dims + disables and a spinner shows beside it, so the
@@ -6736,10 +6950,14 @@ function setServerLoading(on){
 // slower response lands last and restores city scope - and a city list - under a
 // checked Auto box, or the older of two searches wins.
 let serversGen=0;
+// What the results pane is showing: a browse list ('Server') or, after Auto, the
+// candidates a run would race ('Candidates'). Read by fpHeader.
+let fpListLabel='Server';
 async function fetchServers(opts){
   opts=opts||{};
   let u='api/speedtest/servers';
-  if(opts.id) u+='?id='+encodeURIComponent(opts.id);
+  if(opts.candidates) u='api/speedtest/candidates';   // the field an auto run would race, pinged - not a browse list
+  else if(opts.id) u+='?id='+encodeURIComponent(opts.id);
   else if(opts.city) u+='?city='+encodeURIComponent(opts.city);
   else if(opts.lat) u+=`?lat=${encodeURIComponent(opts.lat)}&lon=${encodeURIComponent(opts.lon)}`;
   const my=++serversGen;
@@ -6748,10 +6966,34 @@ async function fetchServers(opts){
     // POST with a JSON content type, not a bare GET: the daemon requires both
     // before it will reach out to Ookla/the geocoder, so a page on another site
     // cannot aim this at someone's localhost (see handleSpeedtestServers).
-    const d=await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'}})).json();
+    const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'}});
+    // The status before the body: every daemon error is text/plain, so .json()
+    // would throw anyway, but a thrown parse says nothing about WHY - and for an
+    // ID that difference is "no such server" versus "Ookla could not be asked"
+    // (see searchServers).
+    if(!r.ok){ const e=new Error('servers '+r.status); e.status=r.status; throw e; }
+    const d=await r.json();
     if(my!==serversGen) return;   // superseded while in flight: this answer is no longer the page's truth
-    if(opts.id){ pendingServer=String(opts.id); autoLoc=''; autoLabel=''; } // pin a specific server (not a location scope)
-    else if(opts.city){ autoLoc=`${d.lat},${d.lon}`; autoLabel=shortPlace(d.location); pendingServer=''; } // a fresh city search sets the auto scope, clearing any pinned server
+    fpListLabel = opts.candidates ? 'Candidates' : 'Server';
+    if(opts.id){
+      // An ID typed in Find pins that server - unless the daemon's by-ID
+      // probe says it has no speedtest endpoint: every transfer against it
+      // fails, so it is listed with its Unsupported mark and NOT chosen,
+      // the same refusal a click on such a row gets (see fpChoose). The
+      // search reports it (fpRefusedID) once the box is cleared.
+      const s=(d.servers||[])[0];
+      if(s && s.fallback_ok===false) fpRefusedID=String(opts.id);
+      else pendingServer=String(opts.id); // pin a specific server
+    }
+    else if(opts.city){ browseLoc=`${d.lat},${d.lon}`; browseLabel=shortPlace(d.location); } // a search moves the browse list; it commits nothing
+    else if(opts.candidates){
+      browseLoc=''; browseLabel=''; autoDefaultLoc=shortPlace(d.winner&&d.winner.label||''); autoCentreLastRun=false; // the race's own field: the winner's city is where a run now would centre
+      // This IS the list for the centre now in effect, so a tab revisit or a
+      // settings reload reuses it rather than refetching a browse list over it.
+      serversLoaded=true; serversScope=browseLoc;
+      // Distances are the daemon's, measured from the winning city for every
+      // row (see RaceListing), so the column means one thing down the list.
+    }
     else { autoDefaultLoc=shortPlace(d.location||''); autoCentreLastRun = d.centre==='last_run'; } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
     populateServers(d.servers);
     // Scoped to the newest request too: an abandoned one finishing must not clear
@@ -6759,10 +7001,10 @@ async function fetchServers(opts){
   }finally{ if(my===serversGen) setServerLoading(false); }
 }
 const serverTabActive = () => { const at=document.querySelector('.tab.active');
-  return _drawer.classList.contains('open') && at && at.dataset.tab==='server'; };
+  return _drawer.classList.contains('open') && at && at.dataset.tab==='ookla'; };
 async function loadServers(){
   // The Ookla server-list fetch is an external call and most page loads never
-  // open the Server tab - defer it until that tab is first shown. The select
+  // open the Ookla tab - defer it until that tab is first shown. The select
   // still reflects the saved server via applyPendingServer meanwhile.
   if(!serverTabSeen && !serverTabActive()){ applyPendingServer(); updateScopeNote(); return; }
   serverTabSeen=true;
@@ -6770,22 +7012,37 @@ async function loadServers(){
   // fetched for the location currently in effect. Reopening the drawer restores
   // straight onto this tab while the settings refetch is still in flight, and an
   // import can swap the scope under us - both used to latch a stale list.
-  if(serversLoaded && serversScope===autoLoc){ applyPendingServer(); updateScopeNote(); return; }
-  serversLoaded=true; serversScope=autoLoc;
+  const centre=browseLoc;
+  if(serversLoaded && serversScope===centre){ applyPendingServer(); updateScopeNote(); return; }
+  serversLoaded=true; serversScope=centre;
   try{
-    if(autoLoc){ const p=autoLoc.split(','); await fetchServers({lat:p[0],lon:p[1]}); }
+    if(centre){ const p=centre.split(','); await fetchServers({lat:p[0],lon:p[1]}); }
     else await fetchServers({});
   }catch(e){ serversLoaded=false; }
 }
 // Track the in-flight city search so a quick Save waits for it: searchServers is
-// async and only sets autoLoc/autoLabel + repopulates the dropdown after the
+// async and only repopulates the dropdown after the
 // network round-trip, so saving before it lands would persist the pre-search
 // state and silently drop the searched city.
 let serverSearchInFlight=null, serverSearchFailed=false;
+// The ID the last search pinned WITHOUT a catalogue answer (see the catch in
+// searchServers), so a Save that triggered that search can say so after the
+// drawer has closed over the footer.
+let serverPinUnverified='';
+// The ID the last search listed but refused to pin (no speedtest endpoint).
+let fpRefusedID='';
+// fpRefuse says why a server cannot be chosen, in the footer, owned like a
+// search error (serverErrShown) so typing, the next Find, a row click or
+// closing the drawer retire it. The design's rule: a silent no-op click is
+// how two entry points came to disagree, so a refusal always says so.
+function fpRefuse(id){
+  serverErrShown='Server '+id+' has no speedtest endpoint - every test against it would fail, so it cannot be chosen.';
+  $('settingsMsg').textContent=serverErrShown;
+}
 async function searchServers(){
   const q=$('serverCity').value.trim(); if(!q){ return; }
   const b=$('serverSearchBtn'); if(b.disabled) return; // a search is already running (re-entrant Enter)
-  b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
+  btnBusy(b, true);
   const opts = /^\d+$/.test(q) ? {id:q} : {city:q};   // all-digits = pin an exact Ookla server ID
   const p=fetchServers(opts), myGen=serversGen;   // fetchServers takes its generation synchronously, so this names THIS request
   serverSearchInFlight=p; serverSearchFailed=false;
@@ -6795,11 +7052,30 @@ async function searchServers(){
   // Both arms are generation-guarded: a search abandoned mid-flight (Auto ticked,
   // a newer request started) must not touch the box or paint "city not found" over
   // a page that has moved on - fetchServers already dropped its answer.
-  try{ await p; if(myGen!==serversGen) return; $('serverCity').value=''; clearServerFieldError(); }
+  try{ await p; if(myGen!==serversGen) return; $('serverCity').value=''; clearServerFieldError();
+    if(fpRefusedID){ fpRefuse(fpRefusedID); fpRefusedID=''; } }   // after the clear, or the clear would eat it
   catch(e){ if(myGen!==serversGen) return;
-    serverFieldError(opts.id ? ('server '+q+' not found') : 'city not found'); serverSearchFailed=true; }
+    if(opts.id && (e.status===502 || e.status===504 || e.status===undefined)){
+      // The daemon answers 404 only when Ookla knows no such server; 502/504 -
+      // or no status at all - mean Ookla could not be asked, which says nothing
+      // about the ID. So the pin takes unverified: an ID typed on purpose takes,
+      // and refusing to save it over an Ookla blip would lock a real server out
+      // for the outage. Any other status (401, a reconcile 503) is the daemon
+      // itself declining and falls through to the ordinary error below.
+      pendingServer=q;
+      serverPinUnverified=q;
+      applyPendingServer(); updateScopeNote(); fpDraw();
+      $('serverCity').value=''; clearServerFieldError();
+      // Owned like a search error (serverErrShown) so typing, the next Find,
+      // choosing a row or Auto, and closing the drawer all retire it - but no
+      // red outline: the box is empty and nothing needs fixing.
+      serverErrShown='Pinned server '+q+' without checking it - Ookla could not be reached.';
+      $('settingsMsg').textContent=serverErrShown;
+      return;
+    }
+    serverFieldError(opts.id ? (e.status===404 ? 'server '+q+' not found' : 'could not check server '+q) : 'city not found'); serverSearchFailed=true; }
   finally{ if(serverSearchInFlight===p) serverSearchInFlight=null;
-    b.disabled=false; b.innerHTML=t; }   // in the finally so an abandoned search still releases the button
+    btnBusy(b, false); }   // in the finally so an abandoned search still releases the button
 }
 function applyPendingServer(){
   const sel=$('setServer');
@@ -6808,19 +7084,25 @@ function applyPendingServer(){
     annotateOption(o, pendingServer);   // keep a known-bad verdict on the synthesized row
     sel.appendChild(o);
     // Never seen this id: ask the daemon, which probes by ID, and re-annotate.
-    if (!serverHealth.has(String(pendingServer))){
+    // Dedupe on ASKED, not on answered, and at most twice per page load (see
+    // serverProbes). The id is captured: pendingServer can change while the
+    // reply is in flight, and the verdict belongs to the id that was asked.
+    const id=String(pendingServer), pr=serverProbes.get(id)||{inflight:false,tries:0};
+    if (!serverHealth.has(id) && !pr.inflight && pr.tries<2){
+      pr.inflight=true; pr.tries++; serverProbes.set(id, pr);
       // POST + JSON + a RELATIVE url, exactly like fetchServers: the handler
       // requires POST and an application/json content type (see
       // handleSpeedtestServers / requireJSONCT), so a bare GET 405s and this whole
       // lookup was silently swallowed - the synthesized "Server <id>" row never
       // got its "unavailable" annotation. Relative so it still resolves under a
       // reverse-proxy subpath.
-      fetch('api/speedtest/servers?id='+encodeURIComponent(pendingServer),
+      fetch('api/speedtest/servers?id='+encodeURIComponent(id),
             {method:'POST',headers:{'Content-Type':'application/json'}})
         .then(r=>r.ok?r.json():null)
         .then(d=>{ const s=d&&d.servers&&d.servers[0]; if(!s) return;
-          rememberServerHealth([s]); annotateOption(o, pendingServer); })
-        .catch(()=>{});
+          rememberServerHealth([s]); annotateOption(o, id); })
+        .catch(()=>{})
+        .finally(()=>{ pr.inflight=false; });
     }
   }
   sel.value=pendingServer;
@@ -6847,25 +7129,273 @@ $('serverCity').addEventListener('input', clearServerFieldError);
 // and hides the city search; off reveals the search so you can look up a city and
 // choose a server. Persisted via the underlying server/scope fields (both empty =
 // auto), so no separate setting is needed.
-function chooseAutoServer(){
-  $('serverCity').value=''; clearServerFieldError(); // else a prior search error lingers in the footer under a now-hidden box
-  // An in-flight city search is abandoned by the refetch below - it takes the next
-  // generation, so the city answer lands superseded (see fetchServers). Reachable
-  // only from the open Server tab, so that refetch always happens.
-  pendingServer=''; autoLoc=''; autoLabel='';
-  $('setServer').value='';
-  updateScopeNote();
-  serversLoaded=false; loadServers();
-}
 function updateAutoLocUI(){
-  // Auto location hides only the city search; the server dropdown stays visible
-  // so you can still pick a specific server within the auto-chosen location.
-  $('serverRow').querySelector('.server-search').style.display = $('setAutoLoc').checked ? 'none' : '';
+  // The box is the results pane header now, and Find is how you discover servers
+  // to star - worth doing whether or not each run picks its own location. It used
+  // to exist only to set an auto-location city, which is why it used to hide.
+  $('serverRow').querySelector('.server-search').style.display = '';
 }
-$('setAutoLoc').addEventListener('change', ()=>{
-  if($('setAutoLoc').checked) chooseAutoServer();
-  updateAutoLocUI();
-});
+
+// ---- Ookla server picker ----------------------------------------------------
+// Two panes over one column layout: the servers you kept on top, whatever the
+// last Find or Auto returned below. A star KEEPS a server (settings speed_servers);
+// the radio CHOOSES the one a run uses (speed_server_id, still carried by the
+// hidden #setServer so every path that reads it keeps working).
+const FP_MAX=12;   // settings.maxSpeedServers - a 13th star is dropped there too
+let speedServers=[];   // the kept list: [{id,sponsor,name,lat,lon}]
+let fpBrowse=[];       // the last list populateServers received
+const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3.1l2.63 5.33 5.88.86-4.25 4.15 1 5.86L12 16.53l-5.26 2.77 1-5.86L3.5 9.29l5.88-.86z"/></svg>';
+const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.1l2.63 5.33 5.88.86-4.25 4.15 1 5.86L12 16.53l-5.26 2.77 1-5.86L3.5 9.29l5.88-.86z"/></svg>';
+// The same three-state rule the dropdown labels by: only an explicit false is a
+// verdict, and serverHealth is the only source for a kept server the current
+// browse page does not list.
+const fpUnsupported = id => serverHealth.get(String(id))===false;
+const fpKept = id => speedServers.some(s=>s.id===String(id));
+// fpPanes splits one browse page in two. A kept server appears once, in the
+// saved pane - listing it below as well is the same table printed twice - and it
+// appears there whether or not this page happens to include it, since the pane
+// is the saved list rather than a filter over the results.
+function fpPanes(browse, saved, held){
+  const seen=new Map((browse||[]).map(s=>[s.id,s]));
+  // A kept server's ping is the listing's when the listing has it (the fetch
+  // echo, or the race's), else its own - a refresh (fpRefreshPings) or the
+  // median of what the daemon's runs measured (fpLoadStoredPings), which
+  // pingSrc says so the column can show which.
+  const kept=(saved||[]).map(s=>{ const b=seen.get(s.id)||{};
+    return {id:s.id, sponsor:s.sponsor||b.sponsor||'', name:s.name||b.name||'', km:b.km,
+      ping:(b.ping>0?b.ping:s.ping), pingSrc:(b.ping>0?'':s.pingSrc)}; });
+  const keep=new Set(kept.map(s=>s.id));
+  const rest=(browse||[]).filter(b=>!keep.has(b.id));
+  // The chosen server may be in neither list - saved in Montreal, then a search
+  // for Toronto, or a pin restored from a backup. Without a row for it the picker
+  // shows nothing chosen while every run still uses it, and unstarring the last
+  // saved copy would leave no way back. applyPendingServer already resolves that
+  // server into the hidden select, so its label is the one to borrow.
+  if(held && !keep.has(held.id) && !rest.some(b=>b.id===held.id)) rest.unshift(held);
+  return {kept:kept, rest:rest};
+}
+// fpHeldServer describes the chosen server when neither pane would list it, or
+// null when one of them would. The label comes from the hidden select, which
+// applyPendingServer keeps populated for exactly this case.
+function fpHeldServer(){
+  const sel=$('setServer'); if(!sel) return null;
+  const id=sel.value; if(!id) return null;
+  const opt=sel.selectedOptions && sel.selectedOptions[0];
+  const txt=(opt && opt.textContent || '').trim();
+  // serverOptionText renders "Sponsor - City, Country (N km)"; keep the halves it
+  // joined, and fall back to the bare id when the option has not resolved yet.
+  const m=txt.match(/^(.*?)\s+-\s+(.*?)(?:\s+\(\d+\s*km\))?$/);
+  return {id:id, sponsor:m?m[1]:('Server '+id), name:m?m[2]:'', held:true};
+}
+// fpHeader builds one pane's column header. The refresh belongs to the saved
+// pane, the list worth re-measuring: its servers are mostly outside whatever
+// list was last fetched, so nothing else pings them (see fpRefreshPings).
+// Redrawn on every fpDraw, so the in-flight state lives in fpPinging.
+let fpPinging=false;
+function fpHeader(saved){
+  const h=document.createElement('div'); h.className='fp-hdr';
+  h.innerHTML='<span></span><span>'+(saved?'Saved':fpListLabel)+'</span><span>ID</span>'+
+    '<span class="fp-hdr-ping"><span>Ping</span>'+(saved?'<button class="fp-refresh'+(fpPinging?' spin':'')+'" id="fpRefreshPings" type="button"'+
+      (fpPinging?' disabled':'')+' title="Measure the ping to each of your servers now" aria-label="Refresh pings for your servers"><svg width="13" height="13" viewBox="0 0 24 24"'+
+      ' fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"'+
+      ' stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/>'+
+      '<polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64'+
+      ' 4.36A9 9 0 0 0 20.49 15"/></svg></button>':'')+'</span>'+
+    '<span>Distance</span><span></span>';
+  return h;
+}
+// fpPingText prints a ping for a list column: one decimal under 10 ms, where
+// the decimal is the difference, whole milliseconds above. Deliberately coarser
+// than the connection panel's fmtMs (a decimal to 100 ms): a column of
+// 27.7 / 28.1 / 28.4 reads worse than 28 / 28 / 28 and says no more.
+function fpPingText(ms){ return ms<10 ? (Math.round(ms*10)/10).toFixed(1) : String(Math.round(ms)); }
+// fpKmText prints a distance for innerHTML: whole kilometres, and "<1 km"
+// under one - a server at the city's own point is near, not unknown. Blank
+// when there is no figure (a by-ID row carries none worth showing).
+function fpKmText(km){ return !(km>0) ? '' : km<1 ? '&lt;1 km' : Math.round(km)+' km'; }
+// Why a server is Unsupported, on the badge: the verdict without the reason
+// reads as a judgement rather than a fact about the server.
+const FP_UNSUPPORTED_TIP='This server has no HTTP speedtest endpoint (Ookla\u2019s legacy upload path), so every test against it fails. It cannot be chosen, but it can still be kept.';
+// fpRow renders one server: the radio and its name in a full-width button, the
+// star as a control of its own in the last column.
+function fpRow(s){
+  const chosen=$('setServer').value===s.id, bad=fpUnsupported(s.id), kept=fpKept(s.id);
+  const w=document.createElement('div'); w.className='fp-row'; w.dataset.pick=s.id;
+  const b=document.createElement('button'); b.type='button';
+  const hist=s.pingSrc==='history';
+  b.className='fp-btn'+(chosen?' on':'')+(bad?' bad':'');
+  b.innerHTML='<span class="fp-radio'+(bad&&!chosen?' off':'')+'"></span>'+
+    '<span class="fp-name"><span class="fp-txt">'+esc(s.sponsor)+'<span class="fp-sub"> · '+esc(s.name)+'</span></span>'+
+    (bad?'<span class="fp-badge bad" title="'+FP_UNSUPPORTED_TIP+'">Unsupported</span>':'')+'</span>'+
+    '<span class="fp-id">#'+esc(s.id)+'</span>'+
+    (s.ping>0?'<span class="fp-ping'+(hist?' hist':'')+'"'+(hist?' title="Median of the ranking pings recent tests measured to it"':'')+'>'+fpPingText(s.ping)+' ms</span>':'<span class="fp-ping none">—</span>')+
+    '<span class="fp-km">'+fpKmText(s.km)+'</span>';
+  w.appendChild(b);
+  const h=document.createElement('button'); h.type='button'; h.className='fp-star';
+  h.dataset.star=s.id; h.setAttribute('aria-pressed', String(kept));
+  // At the cap the remaining stars go inert rather than disappearing: the row is
+  // still worth reading, and the title says why the star will not take.
+  if(!kept && speedServers.length>=FP_MAX){ h.classList.add('full'); h.title='Keeping '+FP_MAX+' servers already'; }
+  h.setAttribute('aria-label',(kept?'Remove ':'Keep ')+s.sponsor);
+  h.innerHTML=kept?STAR_ON:STAR_OFF;
+  w.appendChild(h);
+  return w;
+}
+// The Auto row is a choice, not a server, so it carries no ID, ping, distance or
+// star - only the radio and the explanation.
+function fpAutoRow(){
+  const w=document.createElement('div'); w.className='fp-row'; w.dataset.pick='';
+  const b=document.createElement('button'); b.type='button';
+  b.className='fp-btn'+($('setServer').value===''?' on':'');
+  b.innerHTML='<span class="fp-radio"></span>'+
+    '<span class="fp-name"><span class="fp-txt">Auto<span class="fp-sub"> · fastest near you, measured each run</span></span></span>'+
+    '<span></span><span class="fp-ping"></span><span class="fp-km"></span>';
+  w.appendChild(b); w.appendChild(document.createElement('span'));
+  return w;
+}
+// fpCue shows the fade only while there is more to scroll to.
+function fpCue(list, rows){
+  const upd=()=>{ list.classList.toggle('more-below', rows.scrollTop + rows.clientHeight < rows.scrollHeight - 1);
+                  list.classList.toggle('more-above', rows.scrollTop > 1); };
+  rows.addEventListener('scroll', upd, {passive:true});
+  // The drawer starts closed, so the rows have no height at first render and the
+  // check reads "nothing to scroll". Re-run it once the list gets a size.
+  if(window.ResizeObserver) new ResizeObserver(upd).observe(rows);
+  upd();
+}
+function fpFill(host, head, rows){
+  // A redraw replaces the scroller, which resets it to the top. The position is
+  // carried across and restored in the SAME frame: restoring a frame later left
+  // the list at the top for one paint, so a quick second click landed on
+  // whichever row had slid under the cursor.
+  const prev=host.querySelector('.fp-rows'), at=prev?prev.scrollTop:0;
+  host.textContent='';
+  host.appendChild(head);
+  const r=document.createElement('div'); r.className='fp-rows'; host.appendChild(r);
+  for(const row of rows) r.appendChild(row);
+  r.scrollTop=at;
+  fpCue(host, r);
+}
+function fpDraw(){
+  const f=$('fpFav'), a=$('fpAll'); if(!f||!a) return;
+  const p=fpPanes(fpBrowse, speedServers, fpHeldServer());
+  fpFill(f, fpHeader(true), [fpAutoRow()].concat(p.kept.map(fpRow)));
+  fpFill(a, fpHeader(false), p.rest.map(fpRow));
+}
+// fpAdopt takes the browse page. populateServers is the one place a fetched list
+// arrives, whatever asked for it, so the first load, Find and Auto all land here.
+function fpAdopt(list){
+  fpBrowse=(list||[]).map(s=>({id:String(s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'',
+    km:s.distance_km, ping:s.ping_ms, lat:s.lat||0, lon:s.lon||0}));
+  fpDraw();
+}
+// fpAdoptSaved takes the kept list from a settings load or from Reset. Both go
+// through here so the shape and the cap are decided in one place. The pings
+// the daemon's own runs measured to them are fetched afterwards: no network,
+// and a kept server is usually outside whatever list the pane below holds.
+function fpAdoptSaved(list){
+  speedServers=(Array.isArray(list)?list:[])
+    .map(s=>({id:String(s.id==null?'':s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'', lat:s.lat||0, lon:s.lon||0}))
+    .filter(s=>s.id).slice(0, FP_MAX);
+  fpDraw();
+  fpLoadStoredPings();
+}
+// fpLoadStoredPings fills the kept rows' pings from the daemon's history (the
+// median of each server's recent ranking pings), marked so the column can say
+// so. A row that already has a fresh measurement keeps it.
+let fpStoredGen=0;
+async function fpLoadStoredPings(){
+  const ids=speedServers.map(s=>s.id); if(!ids.length) return;
+  const my=++fpStoredGen;
+  let d; try{ const r=await fetch('api/speed/server-pings?ids='+encodeURIComponent(ids.join(','))); if(!r.ok) return; d=await r.json(); }catch(e){ return; }
+  if(my!==fpStoredGen) return;
+  const p=(d&&d.pings)||{}; let changed=false;
+  for(const s of speedServers){ if(s.pingSrc==='live') continue; const ms=p[s.id]; if(ms>0){ s.ping=ms; s.pingSrc='history'; changed=true; } }
+  if(changed) fpDraw();
+}
+// fpRefreshPings measures the ping to every kept server now (the saved pane's
+// refresh): the daemon resolves each by ID and pings it the way the race
+// pings, no transfer. 409 while a test runs - a ping through a transfer
+// measures the transfer.
+async function fpRefreshPings(){
+  if(fpPinging) return;
+  const ids=speedServers.map(s=>s.id); if(!ids.length) return;
+  fpPinging=true; fpDraw();
+  try{
+    const r=await fetch('api/speedtest/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+    if(!r.ok){ const e=new Error('ping '+r.status); e.status=r.status; throw e; }
+    const d=await r.json(), p=(d&&d.pings)||{}, h=(d&&d.health)||{};
+    // The refresh probed each server's endpoint on the way (it has to, to
+    // follow a migrated server's hop), so its verdict is the one chance a
+    // starred server outside every listing has to earn its Unsupported mark.
+    // A fresh verdict beats a remembered one; an undetermined one is absent
+    // and leaves whatever was known.
+    for(const id in h) serverHealth.set(String(id), !!h[id]);
+    for(const s of speedServers){ if(!(s.id in p)) continue; const ms=p[s.id];
+      if(ms>0){ s.ping=ms; s.pingSrc='live'; } else { s.ping=0; s.pingSrc='none'; }
+      // The listing's copy of this server would otherwise outrank the fresh
+      // measurement in fpPanes; make it agree, so a later Find/Auto still wins.
+      const b=fpBrowse.find(x=>x.id===s.id); if(b) b.ping = ms>0 ? ms : 0; }
+  }catch(e){
+    $('settingsMsg').textContent = e&&e.status===409 ? 'A speedtest is running - try again when it finishes.' : 'Could not measure your servers.';
+  }finally{ fpPinging=false; fpDraw(); }
+}
+function fpToggleStar(id){
+  id=String(id);
+  const at=speedServers.findIndex(s=>s.id===id);
+  if(at>=0){ speedServers.splice(at,1); fpDraw(); return; }
+  if(speedServers.length>=FP_MAX) return;   // at the cap the star it was clicked on is already drawn inert
+  const b=fpBrowse.find(s=>s.id===id)||{};
+  // The coordinate comes from the browse listing, which carries the catalogue
+  // position for the server. The by-ID endpoint reports OUR position for a server
+  // on our own ISP and sends no coordinate here at all, so a by-ID row is kept
+  // without one - the 0,0 the settings layer reads as unknown.
+  speedServers.push({id:id, sponsor:b.sponsor||'', name:b.name||'', country:b.country||'', lat:b.lat||0, lon:b.lon||0});
+  fpDraw();
+}
+// A server that fails every transfer cannot be chosen. One that is ALREADY chosen
+// keeps its radio, because hiding it would misreport what the next run will use.
+function fpChoose(id){
+  if(id==null) return;
+  if(fpUnsupported(id) && $('setServer').value!==id){ fpRefuse(id); return; }
+  if(!serverSearchFailed) clearServerFieldError();   // retire an unverified-pin notice; a failed search's error stays until its box is fixed
+  pendingServer=id;
+  applyPendingServer();   // synthesizes the option for a pin outside this browse page
+  updateScopeNote();
+  fpDraw();
+}
+// The whole row is the click target - a 38px strip is a far easier thing to hit
+// than the radio inside it. The star owns its own button and nothing more, so the
+// gap beside it still chooses the row.
+function fpClick(ev){
+  const refresh=ev.target.closest('.fp-refresh');
+  if(refresh){ ev.preventDefault(); fpRefreshPings(); return; }
+  const star=ev.target.closest('.fp-star');
+  if(star){ ev.preventDefault(); fpToggleStar(star.dataset.star); return; }
+  const row=ev.target.closest('.fp-row');
+  if(row) fpChoose(row.dataset.pick);
+}
+$('serverRow').addEventListener('click', fpClick);
+// Auto shows the candidates a run would race right now: every origin's pool,
+// deduplicated and pinged, fastest first. It is a listing button: it does not
+// touch which server is chosen, and it runs no transfer.
+function fpAutoList(){
+  const b=$('serverAuto'); if(b.disabled) return;
+  $('serverCity').value=''; clearServerFieldError();
+  btnBusy(b, true);
+  const p=fetchServers({candidates:true}), myGen=serversGen;   // fetchServers takes its generation synchronously
+  return p.catch(e=>{
+    if(myGen!==serversGen) return;   // superseded by a Find or a reload: its failure is not the page's news
+    // Owned like a search error (serverErrShown), so typing, the next Find, a
+    // row click or closing the drawer retire it - but no red outline: the box
+    // is empty and there is nothing to fix.
+    serverErrShown = e&&e.status===409 ? 'A speedtest is running - try Auto again when it finishes.'
+      : e&&e.status===503 ? 'Auto selection is not available.'
+      : 'Could not race the candidate cities.';
+    $('settingsMsg').textContent=serverErrShown;
+  }).finally(()=>btnBusy(b, false));
+}
+$('serverAuto').addEventListener('click', fpAutoList);
 
 // One descriptor per setting - [inputId, jsonKey, kind, emptyFallback] - drives
 // form load (applySettings), save (settingsBody), AND Reset to defaults, so the
@@ -6885,6 +7415,8 @@ const FIELDS=[
   ['setIperfDur','iperf_duration','int',5],
   ['setIperfStreams','iperf_streams','int',8],  // blank falls back to the shipping default (config.go IperfStreams), not the minimum
   ['setOoklaConnections','ookla_connections','int',0],
+  ['setSpeedChallengeEvery','speed_challenge_every','int',12],
+  ['setSpeedChallengeMargin','speed_challenge_margin','int',15],
   ['setOoklaLoss','ookla_loss','bool'],
   ['setSpeedBestOf','speed_best_of','bool'],
   ['setIperfWindow','iperf_window','int',0],
@@ -7026,7 +7558,7 @@ function congestionContainerHint(algos, containerized){
 let congestionAlgosList=[]; // last GET/POST's congestion_algos (for the hint; the <select> holds saved-value extras too)
 function updateCongestionHint(){
   const note=$('congestionContainerNote'); if(!note) return;
-  note.classList.toggle('hidden', !($('setSpeedEngine').checked && congestionContainerHint(congestionAlgosList, iperfInContainer)));
+  note.classList.toggle('hidden', !congestionContainerHint(congestionAlgosList, iperfInContainer));
 }
 function applySettings(s){
   if(s.defaults) defaultSettings=s.defaults;
@@ -7080,8 +7612,13 @@ function applySettings(s){
   if(s.max_streak){ $('setDown').max=s.max_streak; $('setUp').max=s.max_streak; $('setThreshConsec').max=s.max_streak; }
   if(s.min_speed_seconds){ $('setSpeed').min=Math.max(1,Math.round(s.min_speed_seconds/60)); }
   if(s.max_speed_seconds){ $('setSpeed').max=Math.round(s.max_speed_seconds/60); }
-  pendingServer=s.speed_server_id||''; autoLoc=s.speed_auto_loc||''; autoLabel=s.speed_auto_label||''; loadServers();
-  $('setAutoLoc').checked=!autoLoc&&!pendingServer; updateAutoLocUI();
+  pendingServer=s.speed_server_id||'';
+  browseLoc=''; browseLabel=''; loadServers();
+  // After loadServers, which restores the pin onto #setServer - the radio is drawn
+  // from that. The saved pane draws whether or not the browse fetch ever runs; it
+  // is deferred until the tab is first opened.
+  fpAdoptSaved(s.speed_servers);
+  updateAutoLocUI();
 }
 // updateEngineUI shows the controls that belong to the selected engine: the
 // Ookla server picker + auto-location + data estimate for Ookla, the iperf3
@@ -7157,15 +7694,12 @@ function updateEngineUI(){
     // fact is known instead of emitting a flag the local binary will reject.
     applyPKCS1Gate();
   }
-  $('iperfServerRow').classList.toggle('hidden', !iperf);
-  document.querySelectorAll('.iperf-opt').forEach(el=>el.classList.toggle('hidden', !iperf)); // iperf3-only params
-  document.querySelectorAll('.ookla-opt').forEach(el=>el.classList.toggle('hidden', iperf));  // ookla-only params (.speed-opt show for both)
-  document.querySelector('.tp-grid')?.classList.toggle('iperf-mode', iperf); // 3-column layout is iperf3-only; Ookla keeps the classic rows
-  // Direction and Retries are per-engine now: each engine has its own control (ookla-opt /
-  // iperf-opt), so the class toggle above shows the right one and each holds its own value.
-  // Only iperf3's select carries 'Both, simultaneous' (--bidir); Ookla's has no bidir option.
-  $('serverRow').classList.toggle('hidden', iperf);
-  $('autoLocRow').classList.toggle('hidden', iperf);
+  // Each engine has its own tab and both are always on the bar, so the engine
+  // hides nothing any more: the Ookla tab shows its picker and options, the
+  // iperf3 tab its servers and options, whichever will run. Direction and
+  // Retries are per-engine controls, each holding its own value; only iperf3's
+  // Direction carries 'Both, simultaneous' (--bidir). The data estimate is the
+  // one engine-gated thing left: it is an Ookla figure on the Speedtest tab.
   if(iperf) $('speedDataEst').classList.add('hidden'); else updateSpeedEstimate();
   updateUdpRateRow();
   updateLossProbeWarn();
@@ -7173,8 +7707,8 @@ function updateEngineUI(){
   updateIperfAuthRows();
   renderIperfServers();
 }
-// UDP rate belongs to iperf3 (hidden under Ookla via .iperf-opt like its siblings)
-// and depends on the loss/jitter probe: probe off greys it, same as Degraded/Busy.
+// UDP rate belongs to iperf3 (on its own tab, with its siblings) and depends on
+// the loss/jitter probe: probe off greys it, same as Degraded/Busy.
 function updateUdpRateRow(){ setDep('setIperfUDPRate', $('setIperfUDP').checked); }
 $('setIperfUDP').addEventListener('change', updateUdpRateRow);
 // Loss is only recorded when the selected engine's probe runs. With the probe off a
@@ -7189,8 +7723,8 @@ function updateLossProbeWarn(){
   $(id).addEventListener('change', updateLossProbeWarn);
   $(id).addEventListener('input', updateLossProbeWarn);
 });
-// The auth credential fields show only when iperf3 + authentication are both on.
-function updateIperfAuthRows(){ const show=$('setSpeedEngine').checked && $('setIperfAuth').checked;
+// The auth credential fields show only when authentication is on.
+function updateIperfAuthRows(){ const show=$('setIperfAuth').checked;
   document.querySelectorAll('.iperf-auth').forEach(el=>el.classList.toggle('hidden', !show)); }
 $('setIperfAuth').addEventListener('change', updateIperfAuthRows);
 // Selecting iperf3 when it isn't installed must not switch the engine: snap the pill
@@ -7338,7 +7872,7 @@ function renderIperfServers(){
 // fields the user has typed but not yet captured.
 function renderIperfEditor(){
   const s=editingIperfServer();
-  const show=$('setSpeedEngine').checked && !!s;
+  const show=!!s;   // the iperf3 tab is always on the bar, so editing works whichever engine runs
   $('iperfEditor').classList.toggle('hidden', !show);
   if(show){ if(iperfLoadedId!==s._id){ loadIperfEditor(s); iperfLoadedId=s._id; } }
   else iperfLoadedId=null;
@@ -7782,12 +8316,15 @@ function settingsBody(){
   // Fold the open editor (IP version, bind, auth + creds) back onto its server before
   // serializing, so edits ride along and trip the dirty check.
   captureIperfEditor();
-  // The server list rides outside FIELDS: its active target pairs with the autoLoc/
-  // autoLabel state set by the city search rather than a single input. Each server
-  // carries its own path + creds; the password is write-only (blank = keep stored).
+  // The server list rides outside FIELDS: it is a list, not a single input. Each
+  // server carries its own path + creds; the password is write-only (blank = keep stored).
   // Drop blank-address drafts (an Add that was never filled in) so they don't persist.
   const iperfActiveSrv = activeIperfServer();
-  const b={ speed_server_id: $('setServer').value, speed_auto_loc: autoLoc, speed_auto_label: autoLabel,
+  // The kept Ookla list rides outside FIELDS too: it is a list, not an input, and
+  // starring is an edit like any other - being here is what puts it in
+  // formSnapshot's dirty check and in what Save posts.
+  const b={ speed_server_id: $('setServer').value,
+            speed_servers: speedServers.map(s=>({id:s.id, sponsor:s.sponsor, name:s.name, country:s.country, lat:s.lat, lon:s.lon})),
             speed_engine: iperfWanted?'iperf3':'ookla', // the committed choice, not the pill (which is forced to Ookla when iperf3 is missing), so a saved iperf3 preference survives a temporarily-absent binary
 
             iperf_server: iperfActiveSrv ? iperfActiveSrv.addr : '',
@@ -7816,6 +8353,11 @@ function saveFailed(text){
   // box without re-searching" (otherwise the typed location is silently dropped).
   if($('serverCity').value.trim()) searchServers();
   if(serverSearchInFlight){ try{ await serverSearchInFlight; }catch(e){} }
+  // A search that pinned an ID without a catalogue answer wrote its notice into
+  // the footer, which this save is about to overwrite and the closing drawer to
+  // hide. Taken now, said after the close (below) - only if that ID is still
+  // what was saved.
+  const unverified=serverPinUnverified; serverPinUnverified='';
   // Don't save the old scope under a failed search - but an emptied box means the
   // user gave up on that query (Auto location's programmatic clear included), so it
   // no longer blocks. The failed text is kept in the box, so "fix" is followable.
@@ -7825,7 +8367,7 @@ function saveFailed(text){
   const addrErr=iperfAddrError();
   if(addrErr){
     iperfAddrBad(addrErr);
-    activateTab('server'); $('setIperfAddr').focus();
+    activateTab('iperf'); $('setIperfAddr').focus();
     saveFailed('Fix the iperf3 server address before saving.');
     return;
   }
@@ -7840,7 +8382,7 @@ function saveFailed(text){
   captureIperfEditor();
   { const orphan=iperfPwOrphan();
     if(orphan){
-      activateTab('server');
+      activateTab('iperf');
       saveFailed('Re-enter '+(orphan.label||orphan.orig_addr)+"'s password (its address changed), or change the address back, before saving.");
       return;
     } }
@@ -7877,13 +8419,14 @@ function saveFailed(text){
       // I1, judged on the SAVED list (applySettings just re-baselined it): the save
       // went through - a loopback target is never a gate - but the drawer is closing
       // over the warn bubble, so the trap gets said out loud where the operator is.
-      // Gated on the engine, which the drawer's own bubble gets for free from the
-      // markup it sits in (#iperfServerRow is hidden under Ookla). Without it an
-      // Ookla install that still has an iperf3 server saved - added while trying
-      // it out, or kept for later - was warned on every save about an engine that
-      // never runs.
+      // Gated on the engine. The drawer's own bubble sits on the iperf3 tab, which
+      // is always there now, and describes the saved list whatever runs; a toast
+      // on every save is a louder claim, and an Ookla install that still has an
+      // iperf3 server saved - added while trying it out, or kept for later - must
+      // not hear it about an engine that never runs.
       { const lb=$('setSpeedEngine').checked ? iperfLoopbackTrap() : null;
-        if(lb) flashStatus('Saved - but '+(lb.label||lb.addr)+' points at localhost, which inside this bridged container is the container itself, not the machine running your iperf3 server. Use the host\'s LAN IP or host.docker.internal.'); } }
+        if(lb) flashStatus('Saved - but '+(lb.label||lb.addr)+' points at localhost, which inside this bridged container is the container itself, not the machine running your iperf3 server. Use the host\'s LAN IP or host.docker.internal.');
+        else if(unverified && $('setServer').value===unverified) flashStatus('Saved - server '+unverified+' was pinned without being checked: Ookla could not be reached. Its name appears once a server list includes it.'); } }
     // Access was POSTed first (and applied); if the settings POST fails, say so -
     // so Discard isn't mistaken for "nothing was saved".
     else saveFailed((await r.text())+' (access/security settings, if changed, were already applied)');
@@ -7926,9 +8469,10 @@ $('resetSettings').addEventListener('click', () => {
   // greying by hand - otherwise the latency/speedtest sub-controls keep the
   // pre-reset disabled/grey state (busyDeferSupported is a host capability, unchanged).
   syncLatencyDeps(); syncSpeedDeps();
-  pendingServer=''; autoLoc=''; autoLabel=''; serversLoaded=false; loadServers();
+  pendingServer=''; serversLoaded=false; loadServers();
+  fpAdoptSaved(d.speed_servers);   // the kept list rides outside FIELDS, like the iperf3 one below
   $('serverCity').value=''; clearServerFieldError(); // else leftover text re-searches on Save and overrides the reset to Auto
-  $('setAutoLoc').checked=true; updateAutoLocUI();
+  updateAutoLocUI();
   // Engine + iperf3 server list ride outside FIELDS, so reset them by hand (direction/retries
   // are per-engine FIELDS entries now, already handled by setFields above).
   iperfServers = (Array.isArray(d.iperf_servers) ? d.iperf_servers.map(mapIperfServer) : []).map(sv=>{ sv._id=nextIperfId(); return sv; });
@@ -8216,7 +8760,7 @@ $('accessUrls').addEventListener('click', async e=>{
 // for the unsaved-changes check so edits on any tab count.
 // Include the live theme/brightness/fade previews so changing only those still
 // trips the unsaved-changes check (otherwise close would silently revert them).
-function formSnapshot(){ return JSON.stringify([settingsBody(), accessBody(), $('setAutoLoc').checked, $('setWide').checked,
+function formSnapshot(){ return JSON.stringify([settingsBody(), accessBody(), $('setWide').checked,
   $('setCorners').checked, document.documentElement.dataset.theme, parseInt($('setBrightness').value)||100, parseInt($('setFade').value)||100,
   JSON.stringify(vizPrefs), JSON.stringify(palettePrefs)]); }
 // Update-check: an IMMEDIATE toggle (its own change->POST), independent of the

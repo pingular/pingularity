@@ -325,7 +325,7 @@ func TestRealCategoriesPinSurvives(t *testing.T) {
 		servers = append(servers, s)
 	}
 	o := &Ookla{}
-	targets, _, err := o.pickServers(context.Background(), nil, servers, dead.id, 1, nil)
+	targets, _, _, err := o.pickServers(context.Background(), nil, servers, dead.id, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
