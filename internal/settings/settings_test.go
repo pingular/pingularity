@@ -513,7 +513,7 @@ func TestFormKeysOverlayRoundTrip(t *testing.T) {
 			{Label: "NAS", Addr: "10.0.0.5:5201"},
 			{Label: "VPS", Addr: "vps.example.com:5201", Bind: "10.0.0.1", IPVer: "6", Auth: true, Username: "bob", Password: "secret", RSAKey: "KEYPEM", PKCS1: true},
 		},
-		IperfDur: 15, IperfStreams: 4, OoklaConnections: 8, OoklaLoss: true, SpeedBestOf: true, IperfOmit: 2, SpeedDirection: "down", IperfUDP: true,
+		IperfDur: 15, IperfStreams: 4, OoklaConnections: 8, OoklaLoss: true, SpeedBestOfCount: 3, IperfOmit: 2, SpeedDirection: "down", IperfUDP: true,
 		// Direction/Retries are per-engine: distinct values here prove they round-trip independently.
 		IperfDirection: "bidir", IperfRetries: 3,
 		IperfUDPRate: 200, IperfWindow: 4096, SpeedRetries: 2,
@@ -794,5 +794,38 @@ func TestNormalizeClampsRetention(t *testing.T) {
 	}
 	if got.DowntimeRetention != 0 {
 		t.Errorf("DowntimeRetention 0 (forever) = %v, want 0", got.DowntimeRetention)
+	}
+}
+
+// The Best-of count replaces an on/off. A database or backup from before the
+// count carries only the on/off: on meant three servers, off one. The count
+// wins when both are present, and the derived on/off is still written so an
+// older build reads it.
+func TestBestOfCountMigratesFromTheOnOff(t *testing.T) {
+	cases := []struct {
+		name string
+		m    map[string]string
+		want int
+	}{
+		{"old on", map[string]string{"speed_best_of": "true"}, LegacyBestOfCount},
+		{"old off", map[string]string{"speed_best_of": "false"}, 1},
+		{"count wins", map[string]string{"speed_best_of": "true", "speed_best_of_count": "5"}, 5},
+		{"count alone", map[string]string{"speed_best_of_count": "2"}, 2},
+		{"neither", map[string]string{}, 1},
+		{"above the ceiling", map[string]string{"speed_best_of_count": "99"}, MaxSpeedBestOf},
+		{"zero", map[string]string{"speed_best_of_count": "0"}, 1},
+	}
+	for _, c := range cases {
+		v := normalize(overlay(Values{SpeedBestOfCount: 1}, c.m))
+		if v.SpeedBestOfCount != c.want {
+			t.Errorf("%s: count %d, want %d", c.name, v.SpeedBestOfCount, c.want)
+		}
+	}
+	m := formKeys(Values{SpeedBestOfCount: 4})
+	if m["speed_best_of_count"] != "4" {
+		t.Errorf("stored %v, want the count", m["speed_best_of_count"])
+	}
+	if _, ok := m["speed_best_of"]; ok {
+		t.Error("the retired on/off is read, never written: a downgrade sees it as it was before the upgrade")
 	}
 }

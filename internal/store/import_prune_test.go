@@ -460,3 +460,36 @@ func TestImportClampsSpeedBytes(t *testing.T) {
 		t.Fatalf("SpeedDataUsage overflowed on imported bytes: %v", err)
 	}
 }
+
+// A backup from before Best-of was a count restores the count its on/off
+// meant, even on a host that has since stored a count of its own - the count
+// wins whenever present, so the on/off alone would never come back.
+func TestImportMigratesTheBestOfOnOff(t *testing.T) {
+	st := open(t)
+	if _, err := st.SetSettingsDiff(context.Background(), map[string]string{"speed_best_of_count": "8"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ImportTable(context.Background(), "settings", []map[string]any{{"key": "speed_best_of", "value": "0"}}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.AllSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["speed_best_of_count"] != "1" {
+		t.Errorf("count %q after restoring a backup with Best-of off, want 1", m["speed_best_of_count"])
+	}
+	if _, err := st.ImportTable(context.Background(), "settings", []map[string]any{{"key": "speed_best_of", "value": "true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = st.AllSettings(context.Background()); m["speed_best_of_count"] != "3" {
+		t.Errorf("count %q after restoring a backup with Best-of on, want 3", m["speed_best_of_count"])
+	}
+	// A backup that carries its own count is restored as it is.
+	if _, err := st.ImportTable(context.Background(), "settings", []map[string]any{{"key": "speed_best_of", "value": "1"}, {"key": "speed_best_of_count", "value": "5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = st.AllSettings(context.Background()); m["speed_best_of_count"] != "5" {
+		t.Errorf("count %q after restoring a backup with its own count, want 5", m["speed_best_of_count"])
+	}
+}

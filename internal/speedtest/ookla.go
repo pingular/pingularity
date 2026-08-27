@@ -85,10 +85,27 @@ type Ookla struct {
 	// than sampled once, because "first" stops being true after one run.
 	PriorDataFn func() bool
 
-	// BestOfFn gates "best of 3 servers" (read live): measure against the chosen
-	// server AND the next two by ping, then keep the best result (see bestResult).
-	// Nil -> off. Only scheduled and manual runs honour it - see RunReason.
-	BestOfFn func() bool
+	// BestOfCountFn is how many servers a Best-of round measures (read live),
+	// keeping the best result (see bestResult): 1 or less is a single server;
+	// N is the pinned server if any, then the starred servers by ping, then the
+	// fastest of the field, N in all (see pickServers). On an automatic run the
+	// field is the whole city race - every candidate city's pool, widened to N
+	// - not just the winning city's. Clamped to maxBestOfServers. Nil -> 1.
+	// Only scheduled and manual runs honour it - see RunReason.
+	BestOfCountFn func() int
+
+	// FavouritesFn, if set, names the starred servers (IDs). Every Best-of
+	// round seats them, fastest ping first, after the pin and before the
+	// field; a starred server the race did not reach is resolved and pinged
+	// for the round (see seatFavourites). Nil -> none.
+	FavouritesFn func() []string
+
+	// unionRound / favourites: this run's candidates are the race's whole
+	// union (rank them all; no distance window or cap applies across cities)
+	// and the starred IDs among them, for the round's seating and the win
+	// reason. Per-run fields for the same single-flight reason as upRec.
+	unionRound bool
+	favourites map[string]bool
 
 	// IncumbentFn, if set, names the server the last AUTOMATIC run measured
 	// (its selection report's winner; "" when there is none, or every recent
@@ -177,9 +194,15 @@ func (o *Ookla) warnf(msg string, args ...any) {
 	}
 }
 
-// bestOfServers is how many servers a best-of-N run measures. Each one is a full
-// sequential speedtest, so this multiplies both run time and data used.
-const bestOfServers = 3
+// bestOfServers is what the retired on/off Best-of setting measured, kept as
+// the legacy count (settings.LegacyBestOfCount) and for tests; the run itself
+// takes its count from BestOfCountFn. maxBestOfServers bounds it: each server
+// is a full sequential speedtest, so the count multiplies both run time and
+// data used, and the run's budget grows with it (runBudget).
+const (
+	bestOfServers    = 3
+	maxBestOfServers = 16
+)
 
 // bestOfReasons are the triggers allowed to spend 3x the time and data. Reconnect
 // and degraded runs are asking "is the link back", not "which server is fastest",
@@ -2028,25 +2051,19 @@ const bestOfServerTimeout = 90 * time.Second
 // regardless of server count: the server-list fetch and the candidate ping race.
 const bestOfSelectionBudget = 90 * time.Second
 
-// bestOfTotalCap is the hard ceiling on a whole best-of run, however many servers
-// it measures. Three 90s servers plus selection comes to 6m, so this is headroom
-// rather than the binding constraint - it exists so raising bestOfServers can
-// never quietly turn a speedtest into a ten-minute job again.
-const bestOfTotalCap = 7 * time.Minute
-
 // runBudget sizes a run's deadlines: how long any single server may take, and
 // how long the whole run may take. A single-server run is unchanged from before
-// best-of existed - one server, the full ooklaRunTimeout.
+// best-of existed - one server, the full ooklaRunTimeout. A Best-of round is
+// the sum of its servers' bounded turns plus selection: the per-server bound
+// is what contains a stall (a stalled server costs its own 90 s and the round
+// moves on), so the total needs no separate cap - one that did not scale with
+// the count quietly starved the last servers of a large round.
 func runBudget(retries, want int) (perServer, total time.Duration) {
 	total = ooklaRunTimeout(retries)
 	if want <= 1 {
 		return total, total
 	}
-	total = time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget
-	if total > bestOfTotalCap {
-		total = bestOfTotalCap
-	}
-	return bestOfServerTimeout, total
+	return bestOfServerTimeout, time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget
 }
 
 // errMeasurementNA: the library's transfers never return an error - a failed
@@ -2103,8 +2120,13 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// How many servers this run measures. Best-of-N is opt-in AND trigger-gated:
 	// a reconnect run must stay cheap and quick.
 	want := 1
-	if o.BestOfFn != nil && bestOfReasons[reason] && o.BestOfFn() {
-		want = bestOfServers
+	if bestOfReasons[reason] && o.BestOfCountFn != nil {
+		if n := o.BestOfCountFn(); n > 1 {
+			want = n
+			if want > maxBestOfServers {
+				want = maxBestOfServers
+			}
+		}
 	}
 
 	// Deadlines (see runBudget): without them a single stalled request wedges the
@@ -2125,8 +2147,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// finish the run short - measured, a raced best-of-3 gave its third server
 	// 80s of the 90s it is designed to get. The allowance is added here rather
 	// than inside runBudget because only this scope knows whether a race can
-	// happen at all: runBudget cannot see the pin, and its result is clamped by
-	// bestOfTotalCap, which would swallow the allowance.
+	// happen at all: runBudget cannot see the pin.
 	id := o.serverID()
 	origins := o.candidateOrigins()
 	perServer, total := runBudget(retries, want)
@@ -2174,6 +2195,8 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// than leave the column blank as if nothing decided.
 	var race raceResult
 	o.raced = nil
+	o.unionRound = false
+	o.favourites = nil
 	// A challenge is a scheduled, unpinned, single-server run's business: a
 	// manual run is the user asking about their line now, and Best-of already
 	// explores. Decided here, once, so pickServers and the verdict agree.
@@ -2189,7 +2212,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		// server, so Location stays nil and that same pool is what gets fetched
 		// below. A failed race leaves Location nil too, which is the pre-race
 		// behaviour.
-		race = o.runRace(ctx, origins)
+		race = o.runRace(ctx, origins, racePoolSize(want))
 		if race.OK && race.Origin.Anchored {
 			uc.Location = newAnchoredLocation("auto", race.Origin.Lat, race.Origin.Lon)
 		}
@@ -2228,7 +2251,17 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// and a round of pings re-learning them; the servers only need re-homing
 	// onto this run's client, the way the pin above is.
 	var servers ookla.Servers
-	if len(race.Field) > 0 {
+	if want > 1 && len(race.Union) > 0 {
+		// A Best-of round is drawn from the WHOLE race - every candidate city's
+		// pool, widened to the round's size (racePoolSize) - not the winning
+		// city's list: the round wants the N fastest servers reachable, and the
+		// race just measured exactly that. The city verdict still names where
+		// the fastest racer was; for a round it is a label, not a fence.
+		servers = adoptRaceField(ctx, client, race.Union)
+		o.raced = race.Raced
+		o.unionRound = true
+		stats.Inc("speed.cityrace_field_reused")
+	} else if len(race.Field) > 0 {
 		servers = adoptRaceField(ctx, client, race.Field)
 		o.raced = race.Raced
 		stats.Inc("speed.cityrace_field_reused")
@@ -2501,6 +2534,8 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		winReason = winReasonFastestRank
 	case bootstrap:
 		winReason = winReasonPingBoot
+	case o.favourites[best.ServerID]:
+		winReason = WinReasonFavourite // a starred server scored highest in an auto round
 	}
 	best.Selection = finishSelection(sel, results, errByID, dir, best.ServerID, winReason)
 	best.Race = &race.Verdict
@@ -2809,7 +2844,12 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 	if o.ISPFn != nil {
 		isp = o.ISPFn()
 	}
-	ranked, rankPings, noFallback, allNoFallback := rankedServersRaced(ctx, servers, isp, o.raced)
+	// A Best-of round seats the starred servers; the ones the race did not
+	// reach are resolved and pinged here so they rank with the rest.
+	if want > 1 {
+		servers = o.seatFavourites(ctx, client, servers, pinned)
+	}
+	ranked, rankPings, noFallback, allNoFallback := rankedServersRaced(ctx, servers, isp, o.raced, o.unionRound, o.favourites, want)
 	if allNoFallback {
 		// Every nearby server lacks the fallback, so none was excluded - the run
 		// goes ahead and will probably fail. Silence here would make the worst
@@ -2902,18 +2942,32 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		return targets, sel, lead, nil
 	}
 
+	// The round: the pin, then the starred servers fastest first, then the
+	// rest of the ranking (the incumbent leads it) - N in all. ranked is ping
+	// order, so one pass per tier keeps each tier's own order. A star that
+	// did not answer its ping (Latency 0 after applyRankPing) is not seated
+	// by right: nowhere else in selection does an unanswered server displace
+	// one that answered, so it waits for the second tier, where the
+	// unanswered sort last and are measured only if the round has room.
 	out := make(ookla.Servers, 0, want)
 	if pinned != nil {
 		out = append(out, pinned)
 	}
-	for _, s := range ranked {
-		if len(out) == want {
-			break
+	for _, tier := range []func(*ookla.Server) bool{
+		func(s *ookla.Server) bool { return o.favourites[s.ID] && s.Latency > 0 },
+		func(*ookla.Server) bool { return true },
+	} {
+		for _, s := range ranked {
+			if len(out) == want {
+				break
+			}
+			if (pinned != nil && s.ID == pinned.ID) || seatedIn(out, s.ID) { // already seated; don't race itself
+				continue
+			}
+			if tier(s) {
+				out = append(out, s)
+			}
 		}
-		if pinned != nil && s.ID == pinned.ID { // already leading; don't race itself
-			continue
-		}
-		out = append(out, s)
 	}
 	if len(out) == 0 {
 		return nil, nil, "", fmt.Errorf("no speedtest servers available")
@@ -2935,6 +2989,93 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		sel = append([]CandidateReport{pinnedRow(pinned, true)}, sel...)
 	}
 	return out, sel, lead, nil
+}
+
+// racePoolSize is how many of each candidate city's nearest servers enter the
+// race for a run measuring want servers: the tuned six for the city verdict,
+// or the round's size when that is larger, so a Best-of-N has N candidates
+// from every city to draw its N fastest from.
+func racePoolSize(want int) int {
+	if want > cityPoolSize {
+		return want
+	}
+	return cityPoolSize
+}
+
+// seatedIn reports whether a server ID is already in the round.
+func seatedIn(out ookla.Servers, id string) bool {
+	for _, s := range out {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// seatFavourites folds the starred servers into a Best-of round's candidate
+// list: the ones already listed are just marked; the rest are resolved by ID,
+// re-homed onto the run's client, probed for their endpoint (the by-ID record
+// carries the legacy URL, see PingServersByID) and pinged the way the race
+// pings, with the floor recorded in o.raced so the ranking does not ping them
+// twice. Unresolvable ones are skipped - a star is a wish, not a guarantee. A
+// pinned server is never a favourite seat: it leads the round already.
+func (o *Ookla) seatFavourites(ctx context.Context, client *ookla.Speedtest, servers ookla.Servers, pinned *ookla.Server) ookla.Servers {
+	if o.FavouritesFn == nil {
+		return servers
+	}
+	ids := o.FavouritesFn()
+	if len(ids) == 0 {
+		return servers
+	}
+	o.favourites = make(map[string]bool, len(ids))
+	listed := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		listed[s.ID] = true
+	}
+	var missing []string
+	for _, id := range ids {
+		if id == "" || (pinned != nil && id == pinned.ID) {
+			continue
+		}
+		o.favourites[id] = true
+		if !listed[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return servers
+	}
+	res := make([]*ookla.Server, len(missing))
+	var wg sync.WaitGroup
+	for i, id := range missing {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			uc := &ookla.UserConfig{UserAgent: ookla.DefaultUserAgent} // one per client: the library writes its transport onto it
+			s, err := fetchServerByID(ctx, uc, id)
+			if err != nil || s == nil {
+				o.logf("starred speedtest server could not be resolved for the round", "server_id", id, "err", err)
+				return
+			}
+			_ = probeEndpoint(ctx, s) // follow the migration hop; the health verdict is re-judged by the ranking's probe
+			racePing(ctx, s)
+			res[i] = s
+		}(i, id)
+	}
+	wg.Wait()
+	if o.raced == nil {
+		o.raced = map[string]time.Duration{}
+	}
+	out := append(ookla.Servers(nil), servers...)
+	for _, s := range res {
+		if s == nil {
+			continue
+		}
+		s.Context = client
+		o.raced[s.ID] = s.Latency
+		out = append(out, s)
+	}
+	return out
 }
 
 // incumbentID is IncumbentFn with the nil case folded in.
@@ -4036,12 +4177,28 @@ const (
 // trim would have cut it - it still has to WIN the race on ping like everyone
 // else. The trim itself is trimToCap, shared with the city race's pools.
 func autoCandidates(sorted ookla.Servers, isp string) ookla.Servers {
+	return autoCandidatesN(sorted, isp, 1)
+}
+
+// autoCandidatesN is autoCandidates sized to a round of want servers: the
+// window takes at least want (past the distance margin if it must) and the
+// cap rises to want, so a Best-of-16 around a pin has sixteen to measure
+// rather than the single run's twelve. A want of one (or three) changes
+// nothing.
+func autoCandidatesN(sorted ookla.Servers, isp string, want int) ookla.Servers {
+	floor, cap := autoPingMin, autoPingMax
+	if want > floor {
+		floor = want
+	}
+	if want > cap {
+		cap = want
+	}
 	n := 0
-	for n < len(sorted) && (n < autoPingMin || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
+	for n < len(sorted) && (n < floor || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
 		n++
 	}
 	pool := sorted[:n]
-	return trimToCap(pool, sorted, isp, autoPingMax, autoISPMax)
+	return trimToCap(pool, sorted, isp, cap, autoISPMax)
 }
 
 // trimToCap cuts a distance-ordered pool down to max servers the way a race
@@ -4191,7 +4348,7 @@ func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Durat
 // dropped for having no HTTP Legacy Fallback (see fallbackHealth) so the caller
 // can say so in the log.
 func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64, []string, bool) {
-	return rankedServersRaced(ctx, servers, isp, nil)
+	return rankedServersRaced(ctx, servers, isp, nil, false, nil, 1)
 }
 
 // rankedServersRaced is rankedServers with the city race's pings carried in:
@@ -4201,7 +4358,20 @@ func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookl
 // ranks unanswered rather than getting a second chance nobody else gets. The
 // fallback health probe still runs for it: the race judges nothing about the
 // legacy bundle.
-func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, raced map[string]time.Duration) (ookla.Servers, map[string]*float64, []string, bool) {
+//
+// all=true ranks EVERY server given, with no distance window, sponsor trim or
+// reserves: the caller has already chosen the field (a Best-of round drawn
+// from the whole race, whose distances are from different cities and cannot
+// be windowed together).
+//
+// Otherwise the window is sized to the round: want is how many servers the
+// run will measure (1 for a single-server run), so a Best-of round centred on
+// a pin, or one whose race did not decide, reaches past the single run's
+// window until it has its count. keep names the servers that are in the
+// field by right whatever their distance - the starred ones (see
+// seatFavourites), which the window would otherwise cut when they sit in
+// another city, exactly the star the round resolved and pinged for itself.
+func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, raced map[string]time.Duration, all bool, keep map[string]bool, want int) (ookla.Servers, map[string]*float64, []string, bool) {
 	if len(servers) == 0 {
 		return nil, nil, nil, false
 	}
@@ -4211,14 +4381,22 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 	// server can report the same distance, and an unstable sort made the
 	// one-per-sponsor trim below pick the first of each sponsor by chance.
 	sort.SliceStable(sorted, byDistanceThenEcho(sorted))
-	cand := autoCandidates(sorted, isp)
+	cand := sorted
+	if !all {
+		cand = autoCandidatesN(sorted, isp, want)
+		for _, s := range sorted {
+			if keep[s.ID] && !seatedIn(cand, s.ID) {
+				cand = append(cand, s)
+			}
+		}
+	}
 
 	// Reserves: the next servers past the candidate cap, so health filtering can
 	// REPLENISH rather than merely subtract. autoCandidates caps at autoPingMax,
 	// and filtering afterwards used to shrink that set with nothing to refill it
 	// - if the nearest 12 all lacked the fallback, a working 13th was never
 	// considered and the run fell back to measuring the known-bad 12. Partial
-	// attrition could likewise leave a best-of-3 with fewer than three targets.
+	// attrition could likewise leave a Best-of round with fewer targets than its count.
 	// Reserves are contacted LAZILY, in shortfall-sized batches, only after
 	// exclusions actually leave the pool short: a healthy pool sends them zero
 	// traffic, and N exclusions ping/probe only ~N of them (a further batch per

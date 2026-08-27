@@ -104,7 +104,14 @@ const (
 	keyIperfMSS         = "iperf_mss"         // TCP max segment size bytes (-M); 0 = auto
 	keyOoklaConnections = "ookla_connections" // Ookla parallel connections (0 = library default)
 	keyOoklaLoss        = "ookla_loss"        // run Ookla's UDP packet-loss probe
-	keySpeedBestOf      = "speed_best_of"     // Ookla: race 3 servers, keep the best result
+	// keySpeedBestOfCount is how many Ookla servers a scheduled or manual run
+	// measures, keeping the best result (1 = a single server). keySpeedBestOf
+	// is the setting it replaced - a plain on/off that meant 3 - READ only,
+	// when the count is absent (a database or backup from before the count
+	// existed); never written again, so on a downgrade the older build sees
+	// the on/off as it was before the upgrade.
+	keySpeedBestOfCount = "speed_best_of_count"
+	keySpeedBestOf      = "speed_best_of"
 	// Ookla auto-select: after every N automatic (unpinned) tests, the next
 	// scheduled test measures the incumbent's strongest rival instead of the
 	// incumbent (0 = never); the rival takes the seat only by beating a bar
@@ -161,10 +168,16 @@ const (
 	// MaxSpeedChallengeEvery bounds the challenge cadence (tests between
 	// challenges).
 	MaxSpeedChallengeEvery = 1000
-	MaxIperfOmit           = 5
-	MaxIperfWindow         = 65536 // KB (64 MB) ceiling for -w; 0 = auto
-	MaxSpeedRetries        = 3     // ceiling for per-direction retries; 0 = no retry
-	MaxIperfMSS            = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
+	// MaxSpeedBestOf bounds how many servers one Best-of round may measure.
+	// Sixteen is a lot of data (N times a test, both directions) and the run's
+	// budget scales with it (speedtest.runBudget); the picker warns above four.
+	MaxSpeedBestOf = 16
+	// LegacyBestOfCount is what the retired on/off setting meant when on.
+	LegacyBestOfCount = 3
+	MaxIperfOmit      = 5
+	MaxIperfWindow    = 65536 // KB (64 MB) ceiling for -w; 0 = auto
+	MaxSpeedRetries   = 3     // ceiling for per-direction retries; 0 = no retry
+	MaxIperfMSS       = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
 )
 
 // AllDays selects every weekday (the schedule default).
@@ -412,11 +425,12 @@ type Values struct {
 	// the transfers. The Ookla analogue of IperfUDP (which also measures jitter;
 	// Ookla gets jitter from its ping phase, so this only adds loss).
 	OoklaLoss bool
-	// SpeedBestOf runs a scheduled or manual Ookla test against the chosen server
-	// AND the next two by ping, keeping only the best result. Costs ~3x the time and
-	// data of a normal test. Ookla-only: iperf3 dials one configured host and has no
-	// candidate list to rank.
-	SpeedBestOf bool
+	// SpeedBestOfCount is how many servers a scheduled or manual Ookla run
+	// measures, keeping the best-scoring result: 1 is a single server; N>1 is
+	// the pinned server (if any), then the starred servers by ping, then the
+	// fastest of the race's field, N in all (see speedtest.pickServers). Costs
+	// N times the data and up to N times the time of a single test.
+	SpeedBestOfCount int
 	// Advanced iperf3 transfer knobs. Congestion is the TCP congestion algorithm (-C,
 	// e.g. cubic/bbr); NoDelay disables Nagle (-N); DSCP marks the IP DiffServ value
 	// (--dscp); MSS pins the TCP max segment size in bytes (-M). All optional - blank/0
@@ -903,8 +917,16 @@ func overlay(v Values, m map[string]string) Values {
 	if b, ok := pbool(m[keyOoklaLoss]); ok {
 		v.OoklaLoss = b
 	}
-	if b, ok := pbool(m[keySpeedBestOf]); ok {
-		v.SpeedBestOf = b
+	// The count wins; the retired on/off is read only when the count is absent
+	// (a pre-count database or backup): on meant three servers, off one.
+	if n, ok := atoi(m[keySpeedBestOfCount]); ok {
+		v.SpeedBestOfCount = n
+	} else if b, ok := pbool(m[keySpeedBestOf]); ok {
+		if b {
+			v.SpeedBestOfCount = LegacyBestOfCount
+		} else {
+			v.SpeedBestOfCount = 1
+		}
 	}
 	if n, ok := atoi(m[keyIperfOmit]); ok {
 		v.IperfOmit = n
@@ -1112,7 +1134,7 @@ func (c *Controller) IperfStreams() int          { return c.get().IperfStreams }
 func (c *Controller) OoklaConnections() int      { return c.get().OoklaConnections }
 func (c *Controller) SpeedChallengeEvery() int   { return c.get().SpeedChallengeEvery }
 func (c *Controller) OoklaLoss() bool            { return c.get().OoklaLoss }
-func (c *Controller) SpeedBestOf() bool          { return c.get().SpeedBestOf }
+func (c *Controller) SpeedBestOfCount() int      { return c.get().SpeedBestOfCount }
 
 // Direction and Retries are per-engine: Speed* is Ookla's, Iperf* is iperf3's.
 // honor them.
@@ -1363,7 +1385,7 @@ type Patch struct {
 	OoklaConnections     *int
 	SpeedChallengeEvery  *int
 	OoklaLoss            *bool
-	SpeedBestOf          *bool
+	SpeedBestOfCount     *int
 	IperfOmit            *int
 	SpeedDirection       *string
 	IperfDirection       *string
@@ -1431,7 +1453,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.OoklaConnections, p.OoklaConnections)
 	setIf(&v.SpeedChallengeEvery, p.SpeedChallengeEvery)
 	setIf(&v.OoklaLoss, p.OoklaLoss)
-	setIf(&v.SpeedBestOf, p.SpeedBestOf)
+	setIf(&v.SpeedBestOfCount, p.SpeedBestOfCount)
 	setIf(&v.IperfOmit, p.IperfOmit)
 	setIf(&v.SpeedDirection, p.SpeedDirection)
 	setIf(&v.IperfDirection, p.IperfDirection)
@@ -1516,7 +1538,7 @@ func (p Patch) keys() map[string]bool {
 	mark(p.OoklaConnections != nil, keyOoklaConnections)
 	mark(p.SpeedChallengeEvery != nil, keySpeedChallengeEvery)
 	mark(p.OoklaLoss != nil, keyOoklaLoss)
-	mark(p.SpeedBestOf != nil, keySpeedBestOf)
+	mark(p.SpeedBestOfCount != nil, keySpeedBestOfCount)
 	mark(p.IperfOmit != nil, keyIperfOmit)
 	mark(p.SpeedDirection != nil, keySpeedDirection)
 	mark(p.IperfDirection != nil, keyIperfDirection)
@@ -1679,7 +1701,7 @@ func formKeys(v Values) map[string]string {
 		keyOoklaConnections:    strconv.Itoa(v.OoklaConnections),
 		keySpeedChallengeEvery: strconv.Itoa(v.SpeedChallengeEvery),
 		keyOoklaLoss:           b2s(v.OoklaLoss),
-		keySpeedBestOf:         b2s(v.SpeedBestOf),
+		keySpeedBestOfCount:    strconv.Itoa(v.SpeedBestOfCount),
 		keyIperfOmit:           strconv.Itoa(v.IperfOmit),
 		keySpeedDirection:      v.SpeedDirection,
 		keyIperfDirection:      v.IperfDirection,
@@ -2488,6 +2510,7 @@ func normalize(v Values) Values {
 	v.IperfStreams = clampI(v.IperfStreams, MinIperfStreams, MaxIperfStreams)
 	v.OoklaConnections = clampI(v.OoklaConnections, 0, MaxOoklaConnections)
 	v.SpeedChallengeEvery = clampI(v.SpeedChallengeEvery, 0, MaxSpeedChallengeEvery)
+	v.SpeedBestOfCount = clampI(v.SpeedBestOfCount, 1, MaxSpeedBestOf)
 	v.IperfOmit = clampI(v.IperfOmit, 0, MaxIperfOmit)
 	switch v.SpeedDirection { // Ookla is always sequential - no bidir
 	case "both", "down", "up":

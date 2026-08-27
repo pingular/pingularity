@@ -97,7 +97,7 @@ func pinnedBestOf(t *testing.T) *Ookla {
 	forgetLocation(t, "auto")
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.ServerIDFn = func() string { return "1993" }
 	o.OriginsFn = func() []Origin {
 		return []Origin{{Kind: "exit", Label: "Toronto, CA", Lat: 43.65, Lon: -79.38, Anchored: true}}
@@ -235,7 +235,7 @@ func TestOnlyAPinnedBestOfRunLooksUpAPinsCoordinate(t *testing.T) {
 		// Pins an id the stubbed run list already carries: with best-of off the pin
 		// is resolved from that list, and an id outside it would reach the network.
 		{"pinned with best-of off", func(o *Ookla) {
-			o.BestOfFn = func() bool { return false }
+			o.BestOfCountFn = func() int { return 1 }
 			o.ServerIDFn = func() string { return "1" }
 		}},
 	}

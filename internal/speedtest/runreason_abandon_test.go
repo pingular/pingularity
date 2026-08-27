@@ -59,7 +59,7 @@ func TestRunReasonCarriesOnPastAStalledServer(t *testing.T) {
 	})
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true } // best-of-3, so servers exist behind the stall
+	o.BestOfCountFn = func() int { return 3 } // best-of-3, so servers exist behind the stall
 
 	res, err := o.RunReason(context.Background(), "manual")
 	if err != nil {
@@ -109,7 +109,7 @@ func TestResumeAfterAbandonDoesNotReadTheOrphanedServersLabel(t *testing.T) {
 	})
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	res, err := o.RunReason(context.Background(), "manual")
 	close(stop)
 	<-done

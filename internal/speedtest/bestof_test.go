@@ -281,11 +281,15 @@ func TestOoklaImplementsReasonTester(t *testing.T) {
 }
 
 func TestBestOfOffByDefault(t *testing.T) {
-	// A nil BestOfFn must mean off, so an engine built without the hook (tests,
-	// older wiring) can never start spending 3x the user's data.
+	// A nil BestOfCountFn must mean a single server, so an engine built without
+	// the hook (tests, older wiring) can never start spending N times the
+	// user's data.
 	o := NewOokla()
-	if o.BestOfFn != nil {
-		t.Fatal("BestOfFn should default to nil (off)")
+	if o.BestOfCountFn != nil {
+		t.Fatal("BestOfCountFn should default to nil (a single server)")
+	}
+	if o.bestOfCount() != 1 {
+		t.Fatalf("bestOfCount() = %d with no hook, want 1", o.bestOfCount())
 	}
 }
 
@@ -364,18 +368,18 @@ func TestRunBudgetCapsEachServer(t *testing.T) {
 	}
 }
 
-func TestBestOfNeverExceedsTheHardCeiling(t *testing.T) {
-	// Whatever the retry setting, a best-of run is capped. Retries must not
-	// inflate the whole-run budget: the per-server minute already bounds each
-	// attempt chain.
+func TestBestOfBudgetIsTheSumOfBoundedTurns(t *testing.T) {
+	// Whatever the retry setting, a best-of run's budget is its servers'
+	// bounded turns plus selection. Retries must not inflate it: the
+	// per-server bound already contains each attempt chain.
 	for _, retries := range []int{0, 1, 2, 3} {
-		if _, total := runBudget(retries, bestOfServers); total > bestOfTotalCap {
-			t.Errorf("retries=%d: total %v exceeds the %v ceiling", retries, total, bestOfTotalCap)
+		if _, total := runBudget(retries, bestOfServers); total != time.Duration(bestOfServers)*bestOfServerTimeout+bestOfSelectionBudget {
+			t.Errorf("retries=%d: total %v, want three bounded turns plus selection", retries, total)
 		}
 	}
-	// The ceiling has to bind if the server count is ever raised, so growing
-	// bestOfServers can't quietly restore a ten-minute run.
-	if _, total := runBudget(1, 12); total != bestOfTotalCap {
-		t.Fatalf("12 servers: got %v want it clamped to %v", total, bestOfTotalCap)
+	// A larger round gets a larger budget - a fixed ceiling starved the last
+	// servers of the round - and the largest allowed is still bounded.
+	if _, total := runBudget(1, maxBestOfServers); total != time.Duration(maxBestOfServers)*bestOfServerTimeout+bestOfSelectionBudget {
+		t.Fatalf("%d servers: got %v", maxBestOfServers, total)
 	}
 }

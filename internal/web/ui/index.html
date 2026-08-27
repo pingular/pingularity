@@ -713,7 +713,7 @@
   .server-select.loading select{opacity:.55;}
   .server-select .sel-spin{position:absolute;right:30px;top:50%;margin-top:-6px;display:none;pointer-events:none;}
   .server-select.loading .sel-spin{display:inline-block;}
-  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning */ .warn-bubble b{color:var(--accent);font-weight:600;} .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:var(--muted);font-size:11.5px;}
+  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning */ .warn-bubble b{color:var(--accent);font-weight:600;} .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note.warn{background:color-mix(in srgb,#e0a030 14%,transparent);border-color:color-mix(in srgb,#e0a030 55%,transparent);} .info-note.warn .wi{color:#e0a030;} .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:var(--muted);font-size:11.5px;}
   .server-search input{flex:1;background:var(--bg2);color:var(--fg);border:1px solid var(--line2);
     border-radius:8px;padding:7px 9px;font:inherit;}
   .server-search input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
@@ -1802,13 +1802,14 @@
       </div><!-- /speedtest pane -->
       <div class="tabpane tab-uniform" data-tab="ookla">
       <div class="sgroup">
-        <label class="srow"><span class="lbl">Best of 3 servers
-          <span class="info" tabindex="0" data-tip="Runs each scheduled test against your chosen server plus two nearby ones, and keeps only the best result.
-• Costs about 3x the time and 3x the data of a normal test.
+        <label class="srow"><span class="lbl">Best of
+          <span class="info" tabindex="0" data-tip="How many servers each scheduled test measures, keeping only the best result. 1 is a single server.
+• The round is your pinned server if you have one, then your starred servers fastest first, then the fastest of the servers Auto races - from every candidate city, not just the winning one - up to this many.
+• Costs about N times the time and N times the data of a single test, so the estimate on the Speedtest tab turns amber above 4.
 • Useful when one server is having a bad day and you'd rather it didn't define your history.
 • The kept run is one real test, so its ping and jitter belong to whichever server won - those columns can jump when a round changes hands, not because your connection did. Read latency from the charts below.
-• Scheduled tests and the RUN button only.">i</span></span>
-          <span class="ctl"><input type="checkbox" id="setSpeedBestOf"><span class="unit"></span></span></label>
+• Scheduled tests and the RUN button only. Above 1 the automatic challenger stands down: a round already measures rivals.">i</span></span>
+          <span class="ctl"><input type="number" id="setSpeedBestOf" min="1" max="16" step="1"><span class="unit">servers</span></span></label>
         <label class="srow"><span class="lbl">Retries
           <span class="info" tabindex="0" data-tip="Retry a transfer that fails - often the server was still busy from the last test.
 • Ookla retries any failed direction.
@@ -6017,11 +6018,12 @@ const WIN_TAGS={
   challenger:['challenger','A challenge run: the incumbent\u2019s strongest rival was measured and did not beat its record'],
   challenger_won:['challenger won','A challenge run: the rival beat the incumbent\u2019s record and holds the seat now'],
   challenger_failed:['challenger failed','A challenge run whose rival could not be measured; the incumbent was measured instead'],
-  score:['best of 3','Best of 3: the highest-scoring of the round'],
-  ping_bootstrap:['first run','Best of 3 with no history yet: decided on ping alone'],
+  score:['best of round','A Best-of round: the highest-scoring server of the round'],
+  favourite:['favourite','A Best-of round: one of your starred servers scored highest'],
+  ping_bootstrap:['first run','A Best-of round with no history yet: decided on ping alone'],
   pinned:['pinned','The server you pinned'],
-  pinned_bestof:['pinned','The server you pinned, which also won its Best of 3 round'],
-  pinned_companion:['companion','Best of 3 beside your pinned server: a neighbour out-scored the pin this round'],
+  pinned_bestof:['pinned','The server you pinned, which also won its Best-of round'],
+  pinned_companion:['companion','A Best-of round beside your pinned server: a neighbour out-scored the pin this round'],
 };
 function winTag(r){
   const t=r&&r.win_reason ? WIN_TAGS[r.win_reason] : null;
@@ -6524,8 +6526,8 @@ function drawHeatmap(){
 //
 // "nearest responsive", not "fastest": selection ranks candidates on LATENCY
 // (rankLess compares Latency), which is not the same as throughput - a congested
-// nearby server pings well and delivers badly. Best of 3 is the exception; it
-// measures all three and keeps the best result, so it may claim fastest. isAuto
+// nearby server pings well and delivers badly. A Best-of round is the exception;
+// it measures every server in it and keeps the best result, so it may claim fastest. isAuto
 // is false on iperf3, which has no candidate pool and selects nothing.
 function speedtestRunText(server, isAuto){
   if(server) return 'Running speedtest on '+esc(server)+'…';
@@ -6580,13 +6582,13 @@ function speedtestAbortable(pending, running, runId){ return speedtestBusy(pendi
 
 let speedtestPending=false; // suppress a stale poll's not-running while the manual POST is in flight (see refreshStatus)
 $('runSpeed').addEventListener('click', async () => {
-  // A click while a run is in flight aborts it, guarded by a confirm. A best-of-3
+  // A click while a run is in flight aborts it, guarded by a confirm. A Best-of round
   // keeps the best result already measured; an abort before the first result keeps
   // nothing (the in-flight POST below returns and the status simply re-syncs).
   if(speedtestAbortable(speedtestPending, speedtestRunningNow, speedtestRunId)){
     // Captured BEFORE the dialog: that is the run the operator is deciding about.
     const target=speedtestRunId;
-    if(!confirm('Stop the running speedtest?\n\nIf it’s a best-of-3, the best result measured so far is kept.')) return;
+    if(!confirm('Stop the running speedtest?\n\nIf it’s a Best-of round, the best result measured so far is kept.')) return;
     // Always by id - the predicate guaranteed one. An id-less abort stops
     // "whatever is running now", which by delivery time can be a different run.
     const q='?run='+encodeURIComponent(target);
@@ -6871,7 +6873,7 @@ const shortPlace = s => s ? s.split(',')[0].trim() : '';
 // captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
 const autoOptionText = () => { return 'Auto - fastest near you'; };
 const autoScopeText = (what, listCentre, lastServer, centredOnLastRun) => {
-  let t = `Auto races the cities your connection points at and uses ${what} in whichever answers fastest - the location is chosen fresh when the next test runs.`;
+  let t = `Auto races the cities your connection points at and ${what} - the location is chosen fresh when the next test runs.`;
   if(centredOnLastRun && listCentre)
     t += ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b> where your last auto test ran - not where the next one will.`;
   else t += listCentre
@@ -6900,24 +6902,24 @@ let fpAutoCities=[];
 function updateScopeNote(){
   const el=$('serverLoc'), sel=$('setServer');
   const box=$('serverCity'); if(box) box.placeholder = findBoxText(browseLabel||autoDefaultLoc, fpListLabel==='Candidates' ? fpAutoCities : null);
-  // Best of 3 keeps the chosen server and adds two companions. Those come from
-  // around whatever the list is centred on - the pinned server when there is
-  // one, the auto location otherwise - so say which, because "Using X." alone
-  // reads as though X is the only thing measured.
-  const bestOf = $('setSpeedBestOf').checked;
+  // A Best-of round keeps the chosen server and adds companions: the starred
+  // servers, then the fastest-pinging from around the pinned server - so say
+  // so, because "Using X." alone reads as though X is the only thing measured.
+  const bestOfN = Math.max(1, parseInt($('setSpeedBestOf').value)||1), bestOf = bestOfN>1;
   if(sel.value){
     const o=sel.selectedOptions[0];
     let t='Using '+esc(o?o.textContent:'server '+sel.value)+'.';
-    if(bestOf) t += ' Best of 3 also measures the two fastest-pinging servers near it and keeps the best result.';
+    if(bestOf) t += ' Best of '+bestOfN+' also measures your starred servers and the fastest-pinging ones near it, and keeps the best result.';
     el.innerHTML=t; return;
   }
-  // Best of 3 measures its candidates and keeps the best-SCORING one - "best",
+  // A Best-of round measures its candidates and keeps the best-SCORING one - "best",
   // not "fastest": a near-tie on speed goes to the lower-ping server. A single
   // run takes the fastest-pinging candidate - but keeps the server the last
   // test measured while it stays within noise of the fastest, so the history
   // compares like with like rather than flipping on a millisecond of jitter.
-  const what = bestOf ? 'the 3 fastest-pinging servers, keeping the best result,'
-    : 'the fastest-pinging server (keeping the last test\u2019s server while it stays within a couple of milliseconds of the fastest)';
+  // A Best-of round is drawn from every city it races, not the winning one.
+  const what = bestOf ? 'measures your starred servers and the fastest-pinging of the rest across every city it races, '+bestOfN+' in all, keeping the best result'
+    : 'uses the fastest-pinging server (keeping the last test\u2019s server while it stays within a couple of milliseconds of the fastest) in whichever answers fastest';
   el.innerHTML = autoScopeText(what, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
 // serverOptionText renders one dropdown row. The daemon's by-ID resolve can
@@ -7559,7 +7561,7 @@ const FIELDS=[
   ['setIperfStreams','iperf_streams','int',8],  // blank falls back to the shipping default (config.go IperfStreams), not the minimum
   ['setOoklaConnections','ookla_connections','int',0],
   ['setOoklaLoss','ookla_loss','bool'],
-  ['setSpeedBestOf','speed_best_of','bool'],
+  ['setSpeedBestOf','speed_best_of_count','int',1],
   ['setIperfWindow','iperf_window','int',0],
   ['setIperfOmit','iperf_omit','int',1],  // blank falls back to the shipping default warm-up (config.go IperfOmit), not zero
   ['setSpeedRetries','speed_retries','int',1],
@@ -7702,6 +7704,7 @@ function updateCongestionHint(){
   note.classList.toggle('hidden', !congestionContainerHint(congestionAlgosList, iperfInContainer));
 }
 function applySettings(s){
+  savedBestOfN=Math.max(1, parseInt(s.speed_best_of_count)||1);
   if(s.defaults) defaultSettings=s.defaults;
   setFields(s);
   // Busy-defer reads the interface byte counters (Linux, macOS and Windows have
@@ -8434,6 +8437,7 @@ $('setSchedLatEnabled').addEventListener('change', ()=>{ updateSchedDisabled(); 
 $('setSchedSpeedEnabled').addEventListener('change', updateSchedDisabled);
 $('setWebhook').addEventListener('input', updateConflictWarnings);
 let speedAvgDown=0, speedAvgUp=0;
+let savedBestOfN=1; // the Best-of count in force when the recorded averages were measured (as saved; see applySettings)
 const EST_RUN_DOWN=200e6, EST_RUN_UP=120e6; // rough per-run fallback before any test has run
 function updateSpeedEstimate(){
   const el=$('speedDataEst'); if(!el) return;
@@ -8445,22 +8449,28 @@ function updateSpeedEstimate(){
   const runs=86400/(min*60);
   const have=speedAvgDown>0||speedAvgUp>0;
   const pD=have?speedAvgDown:EST_RUN_DOWN, pU=have?speedAvgUp:EST_RUN_UP;
-  // Best of 3 measures three servers per scheduled test. A RECORDED average
-  // already covers all three - the run stores the whole round's volume (see
-  // totalBytes in ookla.go) - so only the single-server fallback constants,
-  // used before any test has run, need scaling. Multiplying the recorded figure
-  // too would treble a number that already counts three servers.
-  const bestOf=$('setSpeedBestOf').checked;
-  const servers=(!have && bestOf)?3:1;
+  // A Best-of round measures N servers per scheduled test. A RECORDED average
+  // already covers a whole round - the run stores the round's volume (see
+  // totalBytes in ookla.go) - of the count that was SAVED when those tests
+  // ran; so it is taken back to one server and multiplied by the count in
+  // the box, which may differ from it (history built at one server, sixteen
+  // typed in: sixteen times, not the same). The single-server fallback
+  // constants, used before any test has run, are per server already.
+  const n=Math.max(1, parseInt($('setSpeedBestOf').value)||1), bestOf=n>1;
+  const servers=n/(have?savedBestOfN:1);
   const d=runs*pD*servers, u=runs*pU*servers, mo=(d+u)*30.44;
-  $('speedDataEstText').innerHTML='At this interval, speedtests use roughly <b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day ('+Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?', 3 servers each':'')+').'+
+  $('speedDataEstText').innerHTML='At this interval, speedtests use roughly <b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day ('+Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?', '+n+' servers each':'')+').'+
     '<br><span class="sub">\u2248 '+bytesStr(mo)+'/month total \u00b7 '+(have?'based on your recent tests':'rough estimate until a test runs')+'.</span>';
+  // Above four servers a round is a serious amount of data on a metered link;
+  // the note turns amber so the figure cannot be missed.
+  el.classList.toggle('warn', n>4);
   el.style.width='100%'; el.classList.remove('hidden');
 }
 $('setSpeed').addEventListener('input', updateSpeedEstimate);
 $('setStEnabled').addEventListener('change', updateSpeedEstimate);
 // The estimate changes with the server count, and so does the scope note - it
-// only mentions the two companion servers while Best of 3 is on.
+// only mentions the companion servers while the count is above one.
+$('setSpeedBestOf').addEventListener('input', ()=>{ updateSpeedEstimate(); updateScopeNote(); });
 $('setSpeedBestOf').addEventListener('change', ()=>{ updateSpeedEstimate(); updateScopeNote(); });
 
 function settingsBody(){

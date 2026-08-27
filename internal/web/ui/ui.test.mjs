@@ -3749,6 +3749,23 @@ test('the saved servers are re-measured on reopen when their pings are stale', (
   assert.match(extract('async function fpRefreshPings'), /if\(!\(opts && opts\.quiet\)\)\s*\n\s*\$\('settingsMsg'\)/, 'a page-started measurement that fails does not shout in the footer');
 });
 
+test('Best of is a count, not a switch: a number box that drives the data estimate', () => {
+  const ookla = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
+  assert.match(ookla, /<input type="number" id="setSpeedBestOf" min="1" max="16" step="1">/, 'one to sixteen servers');
+  assert.match(script, /\['setSpeedBestOf','speed_best_of_count','int',1\]/, 'saved as the count; blank falls back to one server');
+  assert.doesNotMatch(script, /'speed_best_of','bool'/, 'the on/off descriptor is gone');
+  const est = extract('function updateSpeedEstimate');
+  assert.match(est, /const n=Math\.max\(1, parseInt\(\$\('setSpeedBestOf'\)\.value\)\|\|1\), bestOf=n>1;/, 'the estimate multiplies by the count');
+  assert.match(est, /el\.classList\.toggle\('warn', n>4\);/, 'and turns amber above four');
+  assert.match(html, /\.info-note\.warn\{/, 'the amber style exists');
+  const tags = script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0];
+  assert.match(tags, /favourite:\['favourite'/, 'a starred server winning a round has its own tag');
+  assert.doesNotMatch(tags, /best[ -]of[ -]3/i, 'no tag hard-codes three any more');
+  assert.doesNotMatch(script, /best[ -]of[ -]3\b/i, 'nothing the page says to the user names three: the round is whatever count is set');
+  assert.match(est, /const servers=n\/\(have\?savedBestOfN:1\);/, 'a recorded average is a round of the SAVED count, taken back to one server before the count in the box multiplies it');
+  assert.match(extract('function applySettings'), /savedBestOfN=Math\.max\(1, parseInt\(s\.speed_best_of_count\)\|\|1\);/, 'the saved count is remembered when settings load');
+});
+
 test('only the saved pane offers to re-measure', () => {
   const p = drivePicker();
   const kept = p.fpHeader(true).innerHTML, results = p.fpHeader(false).innerHTML;

@@ -5450,6 +5450,35 @@ func redactIperfPasswords(raw string) string {
 // import replaces the server list. Exports carry none (see above), so without this,
 // restoring your own backup would silently wipe the passwords you are still using.
 // Matched by address - the same key the settings layer merges on.
+// withBestOfCount migrates a backup from before Best-of was a count: its
+// "speed_best_of" on/off becomes the "speed_best_of_count" it meant (on =
+// three servers, off = one) when the backup carries no count of its own.
+// Without this the import's per-row upsert would leave a count this host had
+// already stored, which then outranks the restored on/off (the count wins
+// whenever present) and the backup's Best-of would silently not come back.
+func withBestOfCount(rows []map[string]any) []map[string]any {
+	var legacy string
+	hasLegacy, hasCount := false, false
+	for _, r := range rows {
+		switch k, _ := r["key"].(string); k {
+		case "speed_best_of":
+			legacy, _ = r["value"].(string)
+			hasLegacy = true
+		case "speed_best_of_count":
+			hasCount = true
+		}
+	}
+	if !hasLegacy || hasCount {
+		return rows
+	}
+	n := "1"
+	switch strings.ToLower(strings.TrimSpace(legacy)) {
+	case "1", "true":
+		n = "3"
+	}
+	return append(rows, map[string]any{"key": "speed_best_of_count", "value": n})
+}
+
 func mergeImportedIperfPasswords(incoming, existing string) string {
 	var in, ex []map[string]any
 	if json.Unmarshal([]byte(incoming), &in) != nil {
@@ -5845,6 +5874,9 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 	const maxRowsPerTS = 256
 	if perTS == nil { // single-shot callers may pass nil; batch callers share one map
 		perTS = map[int64]int{}
+	}
+	if table == "settings" {
+		rows = withBestOfCount(rows)
 	}
 	for _, r := range rows {
 		// The export denylist guards imports too: a crafted file must not implant

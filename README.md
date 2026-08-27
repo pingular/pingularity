@@ -921,7 +921,7 @@ six in the city race that picks the centre, with distance ties broken by the
 echo the server list itself came back with) and the lowest latency wins -
 judged on the **floor** of each server's ten probes, not their mean, because one
 stalled probe among nine fast ones moves a mean by 20 ms and a floor by nothing
-(the city race and the Best-of-3 verdict use the same floor, so the three
+(the city race and the Best-of verdict use the same floor, so the three
 decisions agree). Your own ISP's
 server, when Ookla lists one nearby **and the sponsor name can be matched to
 your ISP**, is guaranteed a place in the race - traffic to it never leaves your
@@ -942,7 +942,7 @@ city's list does not carry is not pinged at all, and loses the seat the same
 way. Ping alone
 never learns whether a rival is *faster* to transfer, so after every twelve
 automatic tests (any unpinned Ookla run counts; the challenge itself lands on
-the next *scheduled* single-server run, and with **Best of 3** on it never
+the next *scheduled* single-server run, and with **Best of** above 1 it never
 does, because every round already measures rivals) the run measures the
 incumbent's strongest rival instead - one server, no extra data - and the
 rival takes the seat only if its one score clears a bar set by the
@@ -1222,11 +1222,20 @@ and persist across restarts:
   rival server take the seat now and then has no knob here - see *Choosing an
   Ookla server*.) The engine itself (**Ookla** or
   **iperf3**) is chosen on the Speedtest tab; iperf3's servers and per-test
-  options live on their own **iperf3** tab. **Best of 3 servers** (Ookla only, off by default) tests your chosen
-  server plus the two fastest by ping *near it* - the search is centred on the
-  server you picked, not on your exit, so the round stays in the area you asked
-  for (with nothing pinned, the round is drawn from the city the race chose - the
-  server the incumbent rule would lead with, plus the two fastest of the rest). It keeps
+  options live on their own **iperf3** tab. **Best of** (Ookla only, default 1 =
+  a single server, up to 16) is how many servers each scheduled or manual test
+  measures, keeping only the best result. The round is your pinned server if
+  you have one, then your starred servers fastest ping first, then the fastest
+  of the rest, N in all: under a pin the rest come from *around the pin*; on
+  Auto they come from the whole city race - every candidate city's pool,
+  widened to N, ranked together by ping - so a Toronto server that pings well
+  sits in the same round as Montréal's. A starred server the race did not
+  reach is looked up and pinged for the round. It costs N times the data and
+  up to N times the time of a single test (each server's turn is bounded, and
+  the run's budget grows with N), so the estimate on the Speedtest tab turns
+  amber above 4; above 1 the automatic challenger stands down. (Upgrading from
+  a version with the old on/off: on becomes 3, off becomes 1; the old setting
+  is left as it was, so a downgrade reads it as before the upgrade.) It keeps
   only the best result - handy when one server has a bad day and you'd rather
   it didn't define your history. The best result is the highest *score*: a
   capacity figure weighting download 70% and upload 30% **relative to each
@@ -1235,7 +1244,7 @@ and persist across restarts:
   at 20ms). So a server that measured a fifth of your real upload can't hide
   behind a big download number, a near-tie on speed goes to the lower-ping
   server, and a clearly faster one still wins. Ties break on ping, then jitter, then
-  bufferbloat; the other two runs are discarded (their
+  bufferbloat; the other runs are discarded (their
   data volume is still counted, since it was really spent). The run that is kept
   is one real test, so its **ping, jitter and bufferbloat are the winner's too**:
   when a round is decided on throughput, those columns can jump because the round
@@ -1251,7 +1260,8 @@ and persist across restarts:
   winner won - stored next to the run (`GET /api/speed/runs/servers?ts=`) and
   summarised in the logs. Each server gets 90
   seconds before it is dropped and the next is tried, so a stalled server can't
-  hold up the round; a whole round budgets 6 minutes of work (3 servers x 90s, plus 90s to pick them), under a 7-minute hard ceiling. It costs roughly **3x
+  hold up the round; a whole round budgets 90 seconds per server plus 90 seconds to pick them (a Best of 3 is
+  about six minutes of work; the largest round, 16, about 25). It costs roughly **N times
   the time and data** of a normal test, so only the runs worth being thorough
   about use it: the ones on your chosen interval, and the **RUN** button. The
   quick automatic tests - at startup, after a reconnect, and the while-degraded
@@ -1934,16 +1944,18 @@ and `-d '{…}'` where a body is listed below.
   capacity the round believed, any direction it refused to believe, and the
   rule that made the winner win (`win_reason` on the winner row:
   `fastest_ranked`, `incumbent`, `on_net`, `challenger`, `challenger_won`,
-  `challenger_failed`, `pinned`, and for Best-of rounds `score`,
-  `ping_bootstrap`, `pinned_bestof`, `pinned_companion` - the same value the
-  runs table shows as the muted tag). `404` only when no such run exists; a run
+  `challenger_failed`, `pinned`, and for Best-of rounds `score`, `favourite`
+  (a starred server scored highest), `ping_bootstrap`, `pinned_bestof`,
+  `pinned_companion` - the same value the runs table shows as the muted tag). `404` only when no such run exists; a run
   with no report (an iperf3 run, history from before the report existed, an
   old backup) answers `200` with an empty `servers` array
 - `GET /api/speed/usage` - cumulative data used per window
 - `POST /api/speedtest/candidates` - the field an automatic Ookla run would race
   right now: every origin's pool (exit router, ISP city, starred servers' cities,
   the last race's winning city, Ookla's placement), deduplicated and pinged, fastest first, plus the rest of
-  the winning city's field pinged the same way; `in_field` marks the rows a run
+  the winning city's field pinged the same way (a Best of above 1 ranks the
+  whole union instead, its pools widened to the count, so every row is then
+  in the field and nothing more is pinged); `in_field` marks the rows a run
   would actually choose from, and `distance_km` is re-measured from the winning
   city for every row that has a coordinate; when Ookla's own placement wins
   (it has no coordinate to measure from) each row keeps the distance from the

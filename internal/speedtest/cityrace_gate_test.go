@@ -143,7 +143,7 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 		{"best-of pays for the race too",
 			func(o *Ookla) {
 				o.OriginsFn = origins
-				o.BestOfFn = func() bool { return true }
+				o.BestOfCountFn = func() int { return 3 }
 			}, "manual", bestOfServers, true},
 	}
 	for _, c := range cases {
