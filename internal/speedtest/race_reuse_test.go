@@ -57,7 +57,7 @@ func TestRankedServersReuseTheRacesPings(t *testing.T) {
 	pings := countingPing(t, map[string]time.Duration{"C": 20 * time.Millisecond})
 	servers := ookla.Servers{srv("A", 1), srv("B", 1), srv("C", 1)}
 	raced := map[string]time.Duration{"A": 9 * time.Millisecond, "B": 0}
-	out, rank, _, _ := rankedServersRaced(context.Background(), servers, "", raced)
+	out, rank, _, _ := rankedServersRaced(context.Background(), servers, "", raced, false, nil, 1)
 	if len(out) != 3 || out[0].ID != "A" || out[1].ID != "C" || out[2].ID != "B" {
 		t.Fatalf("order %v, want A (raced 9ms), C (pinged 20ms), B (raced, unanswered)", fbIDs(out))
 	}
@@ -205,7 +205,7 @@ func TestRunRaceRecordsAVerdictAndHandsOnItsField(t *testing.T) {
 	})
 	stubRacePing(t, map[string]int{"e1": 30, "e2": 12, "i1": 4})
 	o := NewOokla()
-	r := o.runRace(context.Background(), origins)
+	r := o.runRace(context.Background(), origins, cityPoolSize)
 	if !r.OK || r.Origin.Kind != "isp" {
 		t.Fatalf("winner %+v ok=%v, want isp", r.Origin, r.OK)
 	}
@@ -229,7 +229,7 @@ func TestRunRaceRecordsAVerdictAndHandsOnItsField(t *testing.T) {
 	// Silence: nobody answers. The first anchored origin stands in, the
 	// verdict says so, and there is no field to hand on.
 	stubRacePing(t, map[string]int{})
-	r = o.runRace(context.Background(), origins)
+	r = o.runRace(context.Background(), origins, cityPoolSize)
 	if !r.OK || r.Origin.Kind != "exit" || r.Verdict.Outcome != RaceSilent || r.Verdict.Racers != 5 || r.Field != nil || r.Raced != nil {
 		t.Errorf("silent race: %+v verdict %+v", r.Origin, r.Verdict)
 	}
@@ -238,14 +238,14 @@ func TestRunRaceRecordsAVerdictAndHandsOnItsField(t *testing.T) {
 	}
 
 	// Nothing anchored, nothing at all, nothing fetchable.
-	if r := o.runRace(context.Background(), origins[2:]); r.Verdict.Outcome != RaceUnanchored || !r.OK || r.Verdict.WinnerLat != 0 || r.Verdict.WinnerLon != 0 {
+	if r := o.runRace(context.Background(), origins[2:], cityPoolSize); r.Verdict.Outcome != RaceUnanchored || !r.OK || r.Verdict.WinnerLat != 0 || r.Verdict.WinnerLon != 0 {
 		t.Errorf("unanchored: %+v (an unanchored winner has no coordinate to record)", r.Verdict)
 	}
-	if r := o.runRace(context.Background(), nil); r.Verdict.Outcome != RaceSkipped || r.OK {
+	if r := o.runRace(context.Background(), nil, cityPoolSize); r.Verdict.Outcome != RaceSkipped || r.OK {
 		t.Errorf("no origins: %+v", r.Verdict)
 	}
 	stubOriginPools(t, map[string]ookla.Servers{})
-	if r := o.runRace(context.Background(), origins[:2]); r.Verdict.Outcome != RaceFailed || r.OK {
+	if r := o.runRace(context.Background(), origins[:2], cityPoolSize); r.Verdict.Outcome != RaceFailed || r.OK {
 		t.Errorf("no pool fetchable: %+v", r.Verdict)
 	}
 }
@@ -360,6 +360,44 @@ func TestRaceListingMarksTheRunsFieldAndPingsItsExtras(t *testing.T) {
 	}
 	if l.Servers[0].ID != "e1" {
 		t.Errorf("fastest first: %s", l.Servers[0].ID)
+	}
+}
+
+// A Best-of listing is the round's field: every city's pool widened to the
+// count, all of it in the field, and none of the single-server run's deeper
+// "rest of the winner's field" pinged.
+func TestRaceListingForABestOfRoundIsTheWholeUnion(t *testing.T) {
+	oldProbe := probeFallback
+	probeFallback = func(context.Context, *ookla.Server) endpointState { return endpointOK }
+	t.Cleanup(func() { probeFallback = oldProbe })
+	exit := ookla.Servers{}
+	for i := 1; i <= 9; i++ {
+		exit = append(exit, srv("e"+string(rune('0'+i)), 1))
+	}
+	stubOriginPools(t, map[string]ookla.Servers{"exit": exit, "isp": {srv("i1", 1), srv("i2", 1)}})
+	pings := stubRacePing(t, map[string]int{"e1": 3, "e2": 9, "e3": 9, "e4": 9, "e5": 9, "e6": 9, "e7": 8, "e8": 8, "e9": 8, "i1": 7, "i2": 7})
+	o := NewOokla()
+	o.BestOfCountFn = func() int { return 8 }
+	o.OriginsFn = func() []Origin {
+		return []Origin{
+			{Kind: "exit", Label: "Miami, US", Lat: 25.76, Lon: -80.19, Anchored: true},
+			{Kind: "isp", Label: "Oldtown", Lat: 12.34, Lon: -76.54, Anchored: true},
+		}
+	}
+	l, err := o.RaceListing(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Servers) != 10 {
+		t.Fatalf("%d rows, want 10: exit's eight and isp's two, and not e9 - a Best-of round never reaches past the pools", len(l.Servers))
+	}
+	if pings.count("e9") != 0 {
+		t.Error("e9 was pinged: a Best-of listing has no extras to measure")
+	}
+	for _, c := range l.Servers {
+		if !c.InField {
+			t.Errorf("%s not in the field: a Best-of round ranks the whole union", c.ID)
+		}
 	}
 }
 

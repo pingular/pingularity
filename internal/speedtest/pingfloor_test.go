@@ -37,7 +37,7 @@ func TestRoundJudgesServersOnThePingFloorNotTheStalledMean(t *testing.T) {
 	})
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true } // scored normally, not the bootstrap rule
 
 	res, err := o.RunReason(context.Background(), "manual")
@@ -73,7 +73,7 @@ func TestBootstrapRoundPicksByThePingFloor(t *testing.T) {
 	})
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return false } // no history: decide on ping alone
 
 	res, err := o.RunReason(context.Background(), "manual")

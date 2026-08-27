@@ -161,7 +161,7 @@ func TestRunReasonStoresTheBelievedWinningDirectionNotTheVerbatimOne(t *testing.
 	})
 	o := NewOokla()
 	o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	res, err := o.RunReason(context.Background(), "manual")

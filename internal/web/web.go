@@ -2215,6 +2215,27 @@ func raceCandidatesDTO(in []speedtest.RaceCandidate) []raceCandidate {
 	return out
 }
 
+// bestOfCountFrom is the Best-of count a settings POST asks for: the count
+// when sent, else the retired on/off from an older client (on meant three
+// servers, off one), else nothing. current is the count in force: an old
+// client that read "on" and posts it back (the previous build's page, still
+// open after the daemon was upgraded, posts the whole form) means "keep the
+// round", not "make it three", so "on" over a round already larger than one
+// changes nothing.
+func bestOfCountFrom(count *int, legacy *bool, current int) *int {
+	if count != nil || legacy == nil {
+		return count
+	}
+	n := 1
+	if *legacy {
+		if current > 1 {
+			return nil
+		}
+		n = settings.LegacyBestOfCount
+	}
+	return &n
+}
+
 // maxPingIDs bounds one refresh: the kept list is capped at twelve (see
 // settings.maxSpeedServers), and each ID costs a by-ID fetch plus a probe set
 // at a third party.
@@ -2535,21 +2556,26 @@ type settingsDTO struct {
 	// next scheduled test measures the strongest rival instead of the
 	// incumbent (0 = never). API-only - no row in the settings drawer; the
 	// bar the rival must clear is derived from the incumbent's own record.
-	SpeedChallengeEvery *int    `json:"speed_challenge_every"`
-	OoklaLoss           *bool   `json:"ookla_loss"`
-	SpeedBestOf         *bool   `json:"speed_best_of"`
-	IperfOmit           *int    `json:"iperf_omit"`
-	SpeedDirection      *string `json:"speed_direction"`
-	IperfDirection      *string `json:"iperf_direction"`
-	IperfUDP            *bool   `json:"iperf_udp"`
-	IperfUDPRate        *int    `json:"iperf_udp_rate"`
-	IperfWindow         *int    `json:"iperf_window"`
-	SpeedRetries        *int    `json:"speed_retries"`
-	IperfRetries        *int    `json:"iperf_retries"`
-	IperfCongestion     *string `json:"iperf_congestion"`
-	IperfNoDelay        *bool   `json:"iperf_nodelay"`
-	IperfDSCP           *string `json:"iperf_dscp"`
-	IperfMSS            *int    `json:"iperf_mss"`
+	SpeedChallengeEvery *int  `json:"speed_challenge_every"`
+	OoklaLoss           *bool `json:"ookla_loss"`
+	// SpeedBestOfCount is how many servers a Best-of round measures (1 = one).
+	// SpeedBestOf is the retired on/off: still accepted on a POST from an older
+	// client (true -> 3, false -> 1) when no count is sent, and still emitted
+	// as the derived on/off for one release.
+	SpeedBestOfCount *int    `json:"speed_best_of_count"`
+	SpeedBestOf      *bool   `json:"speed_best_of"`
+	IperfOmit        *int    `json:"iperf_omit"`
+	SpeedDirection   *string `json:"speed_direction"`
+	IperfDirection   *string `json:"iperf_direction"`
+	IperfUDP         *bool   `json:"iperf_udp"`
+	IperfUDPRate     *int    `json:"iperf_udp_rate"`
+	IperfWindow      *int    `json:"iperf_window"`
+	SpeedRetries     *int    `json:"speed_retries"`
+	IperfRetries     *int    `json:"iperf_retries"`
+	IperfCongestion  *string `json:"iperf_congestion"`
+	IperfNoDelay     *bool   `json:"iperf_nodelay"`
+	IperfDSCP        *string `json:"iperf_dscp"`
+	IperfMSS         *int    `json:"iperf_mss"`
 
 	// The saved Ookla picker list, following the same nil/[] rule as the iperf3
 	// one above. settings.SavedServer holds nothing secret, so it IS the wire
@@ -2643,7 +2669,8 @@ func dtoFrom(v settings.Values) settingsDTO {
 		OoklaConnections:         ptr(v.OoklaConnections),
 		SpeedChallengeEvery:      ptr(v.SpeedChallengeEvery),
 		OoklaLoss:                ptr(v.OoklaLoss),
-		SpeedBestOf:              ptr(v.SpeedBestOf),
+		SpeedBestOfCount:         ptr(v.SpeedBestOfCount),
+		SpeedBestOf:              ptr(v.SpeedBestOfCount > 1),
 		IperfOmit:                ptr(v.IperfOmit),
 		SpeedDirection:           ptr(v.SpeedDirection),
 		IperfDirection:           ptr(v.IperfDirection),
@@ -2974,7 +3001,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			OoklaConnections:    in.OoklaConnections,
 			SpeedChallengeEvery: in.SpeedChallengeEvery,
 			OoklaLoss:           in.OoklaLoss,
-			SpeedBestOf:         in.SpeedBestOf,
+			SpeedBestOfCount:    bestOfCountFrom(in.SpeedBestOfCount, in.SpeedBestOf, s.settings.SpeedBestOfCount()),
 			IperfOmit:           in.IperfOmit,
 			SpeedDirection:      in.SpeedDirection,
 			IperfDirection:      in.IperfDirection,

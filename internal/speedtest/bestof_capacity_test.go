@@ -260,7 +260,7 @@ func TestRunReasonDecidesTheBootstrapRoundOnPing(t *testing.T) {
 	})
 
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 
 	// No history: the nearest server takes it, though another measured twice the
 	// throughput and would win on score.

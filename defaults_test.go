@@ -73,8 +73,8 @@ func TestDefaultSettings(t *testing.T) {
 			t.Errorf("default %s = false, want true", name)
 		}
 	}
-	if v.SpeedBestOf {
-		t.Error("SpeedBestOf defaults true; best-of-3 costs 3x data and must be opt-in")
+	if v.SpeedBestOfCount != 1 {
+		t.Errorf("SpeedBestOfCount defaults to %d; a round costs N times the data and must be opt-in (1 = a single server)", v.SpeedBestOfCount)
 	}
 	if v.LogLevel != "off" {
 		t.Errorf("LogLevel default = %q, want \"off\"", v.LogLevel)

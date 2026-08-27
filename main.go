@@ -708,7 +708,15 @@ func (p *program) run(ctx context.Context) {
 	tester.RetriesFn = set.SpeedRetries         // Ookla retries (per-engine; iperf3 has its own)
 	tester.ConnectionsFn = set.OoklaConnections // Ookla parallel connections (0 = auto)
 	tester.LossFn = set.OoklaLoss               // Ookla packet-loss probe
-	tester.BestOfFn = set.SpeedBestOf           // race 3 servers, keep the best (scheduled/manual only)
+	tester.BestOfCountFn = set.SpeedBestOfCount // measure N servers, keep the best (scheduled/manual only)
+	tester.FavouritesFn = func() []string {     // the starred servers: seats in every Best-of round
+		saved := set.SpeedServers()
+		ids := make([]string, 0, len(saved))
+		for _, s := range saved {
+			ids = append(ids, s.ID)
+		}
+		return ids
+	}
 	tester.Log = p.log
 	// iperf3 engine: tests against the user's own iperf3 server. Only selected when
 	// the binary is on PATH (otherwise we fall back to Ookla), so a missing
@@ -2123,7 +2131,7 @@ func defaultSettings(cfg config.Config) settings.Values {
 		IperfUDP:           true,           // iperf3 packet-loss/jitter UDP pass on by default
 		IperfWindow:        0,              // iperf3 TCP window/socket-buffer KB (0 = OS auto-tune)
 		OoklaLoss:          true,           // Ookla packet-loss UDP probe on by default
-		SpeedBestOf:        false,          // best-of-3 costs 3x the data - opt in
+		SpeedBestOfCount:   1,              // one server per test; a Best-of round costs N times the data - opt in
 		// Auto-select challenger: twice a day at the hourly default, no extra
 		// data; the bar the rival must clear is derived from the incumbent's own
 		// record (see speedtest.challengeWon), so there is no margin to set.

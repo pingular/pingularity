@@ -85,8 +85,18 @@ const (
 
 	// cityPoolISPMax is how many lanes the user's own ISP may hold in one
 	// city's pool of cityPoolSize: enough that its on-net box is always in the
-	// race, not so many that one provider fills a city's six.
+	// race, not so many that one provider fills a city's six. A pool widened
+	// for a Best-of round keeps the same share (see poolISPMax).
 	cityPoolISPMax = 2
+
+	// racePingParallel bounds how many race pings are in flight at once. The
+	// pools widen with the Best-of count (racePoolSize), so a five-origin
+	// race at sixteen per city is up to 96 racers; unbounded, that is 96
+	// probe sets of ~11 requests each opened in one instant, which a small
+	// host's socket buffers do not always survive (kernel mbuf exhaustion,
+	// measured on macOS). Thirty-six is what the six-per-city race always
+	// fanned out to, and the picker's Auto listing pings the same way.
+	racePingParallel = 36
 
 	// cityOriginDedupeKM folds two origins that name effectively the same
 	// place. 25 km of fiber is well under half a millisecond of round trip, so
@@ -345,9 +355,13 @@ func unionCityCandidates(pools []ookla.Servers) (ookla.Servers, map[*ookla.Serve
 			deepest = len(p)
 		}
 	}
-	out := make(ookla.Servers, 0, cityOriginMax*cityPoolSize)
-	owner := make(map[*ookla.Server]int, cityOriginMax*cityPoolSize)
-	seen := make(map[string]bool, cityOriginMax*cityPoolSize)
+	size := 0
+	for _, p := range pools {
+		size += len(p)
+	}
+	out := make(ookla.Servers, 0, size)
+	owner := make(map[*ookla.Server]int, size)
+	seen := make(map[string]bool, size)
 	for lane := 0; lane < deepest; lane++ {
 		for i, p := range pools {
 			if lane >= len(p) {
@@ -476,16 +490,20 @@ type raceResult struct {
 	// instead of pinging the same servers again seconds later. nil unless the
 	// race decided.
 	Raced map[string]time.Duration
+	// Union is every racer, deduplicated, in the race's round-robin order,
+	// with its ping on it: a Best-of round's field (see RunReason). nil
+	// unless the race decided.
+	Union ookla.Servers
 }
 
 // raceOrigins is raceCities over an already-picked field (see candidateOrigins),
 // reduced to the verdict the run acts on; runRace is the whole result.
 func (o *Ookla) raceOrigins(ctx context.Context, origins []Origin) (Origin, bool) {
-	r := o.runRace(ctx, origins)
+	r := o.runRace(ctx, origins, cityPoolSize)
 	return r.Origin, r.OK
 }
 
-func (o *Ookla) runRace(ctx context.Context, origins []Origin) raceResult {
+func (o *Ookla) runRace(ctx context.Context, origins []Origin, poolSize int) raceResult {
 	if len(origins) == 0 {
 		return raceResult{Verdict: RaceVerdict{Outcome: RaceSkipped}}
 	}
@@ -514,7 +532,7 @@ func (o *Ookla) runRace(ctx context.Context, origins []Origin) raceResult {
 	// needed. Per-pool trimming happens here, on a sorted copy: Distance is
 	// measured from THIS origin's coordinate, so "closest" only means something
 	// inside one pool.
-	pools, full, fetched := fetchOriginPools(ctx, origins, o.ispName())
+	pools, full, fetched := fetchOriginPools(ctx, origins, o.ispName(), poolSize)
 	// Abandoned, not awaited, when the run is cancelled: the library echoes the
 	// WHOLE list it fetched on a context of its OWN (speedtest-go server.go:288
 	// builds it from context.Background with a 4s deadline), so these goroutines
@@ -596,7 +614,7 @@ func (o *Ookla) runRace(ctx context.Context, origins []Origin) raceResult {
 			WinnerKind: winOrigin.Kind, WinnerLabel: winOrigin.Label,
 			WinnerLat: anchoredLat(winOrigin), WinnerLon: anchoredLon(winOrigin),
 			WinnerMS: &ms, Racers: len(union)},
-		Field: full[owner[win]], Raced: raced,
+		Field: full[owner[win]], Raced: raced, Union: union,
 	}
 }
 
@@ -677,7 +695,10 @@ func formatRaceOrigins(origins []Origin, union ookla.Servers, owner map[*ookla.S
 // Each goroutine writes only its own index, so no lock is needed; the caller
 // must not read pools or full before the channel closes, because a fetch
 // abandoned by a deadline goes on writing (see raceOrigins).
-func fetchOriginPools(ctx context.Context, origins []Origin, isp string) (pools, full []ookla.Servers, fetched <-chan struct{}) {
+//
+// poolSize is how many of each origin's nearest enter the race: cityPoolSize
+// for the city verdict, or a Best-of round's size when larger (racePoolSize).
+func fetchOriginPools(ctx context.Context, origins []Origin, isp string, poolSize int) (pools, full []ookla.Servers, fetched <-chan struct{}) {
 	pools = make([]ookla.Servers, len(origins))
 	full = make([]ookla.Servers, len(origins))
 	var wg sync.WaitGroup
@@ -700,10 +721,10 @@ func fetchOriginPools(ctx context.Context, origins []Origin, isp string) (pools,
 			// wherever is next - and a shared server then got credited to the
 			// wrong city.
 			n := 0
-			for n < len(sorted) && (n < cityPoolSize || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
+			for n < len(sorted) && (n < poolSize || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
 				n++
 			}
-			pool := append(ookla.Servers(nil), trimToCap(sorted[:n], sorted[:n], isp, cityPoolSize, cityPoolISPMax)...)
+			pool := append(ookla.Servers(nil), trimToCap(sorted[:n], sorted[:n], isp, poolSize, poolISPMax(poolSize))...)
 			// trimToCap's order is a seeding priority (ISP first); the lanes are
 			// distance order, because unionCityCandidates credits a server two
 			// cities both surfaced to the one that lists it earliest.
@@ -740,6 +761,22 @@ func echoLess(a, b *ookla.Server) bool {
 	return a.Latency > 0 && a.Latency < b.Latency
 }
 
+// bestOfCount is BestOfCountFn with the nil case folded in and the ceiling
+// applied: what a scheduled run would measure right now.
+func (o *Ookla) bestOfCount() int {
+	if o.BestOfCountFn == nil {
+		return 1
+	}
+	n := o.BestOfCountFn()
+	if n > maxBestOfServers {
+		return maxBestOfServers
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 // ispName is ISPFn with the nil case folded in.
 func (o *Ookla) ispName() string {
 	if o.ISPFn == nil {
@@ -748,15 +785,33 @@ func (o *Ookla) ispName() string {
 	return o.ISPFn()
 }
 
-// pingRacers pings every server in the union concurrently and returns a channel
-// closed once every ping has returned. Same reading rule as fetchOriginPools:
-// no server's Latency is stable before the channel closes.
+// poolISPMax is the ISP's lanes in a pool of poolSize: cityPoolISPMax of the
+// six-server pool, and the same share of a wider one, so a Best-of-16 pool
+// does not hold the ISP to two seats while it comes up short of sixteen (the
+// trim reaches past the lane cap for nobody).
+func poolISPMax(poolSize int) int {
+	if n := poolSize * cityPoolISPMax / cityPoolSize; n > cityPoolISPMax {
+		return n
+	}
+	return cityPoolISPMax
+}
+
+// pingRacers pings every server in the union, racePingParallel at a time, and
+// returns a channel closed once every ping has returned. Same reading rule as
+// fetchOriginPools: no server's Latency is stable before the channel closes.
 func pingRacers(ctx context.Context, union ookla.Servers) <-chan struct{} {
 	var pg sync.WaitGroup
+	slots := make(chan struct{}, racePingParallel)
 	for _, s := range union {
 		pg.Add(1)
 		go func(s *ookla.Server) {
 			defer pg.Done()
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return // out of time: this racer stays unanswered, like any other that did not make it
+			}
+			defer func() { <-slots }()
 			racePing(ctx, s)
 		}(s)
 	}
@@ -801,7 +856,9 @@ type RaceListing struct {
 // (autoCandidates), where the race pinged only that origin's cityPoolSize
 // pool. So after the race the listing pings the rest of the winner's field
 // too - the same servers a run would go on to rank, with the same statistic -
-// and InField marks the rows a run would actually choose between.
+// and InField marks the rows a run would actually choose between. A Best-of
+// round is the other way about: its field IS the union, pools widened to the
+// count, so every racer is in the field and no extras are pinged.
 func (o *Ookla) RaceListing(ctx context.Context) (RaceListing, error) {
 	origins := o.candidateOrigins()
 	if len(origins) == 0 {
@@ -809,7 +866,7 @@ func (o *Ookla) RaceListing(ctx context.Context) (RaceListing, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, cityRaceBudget)
 	defer cancel()
-	pools, full, fetched := fetchOriginPools(ctx, origins, o.ispName())
+	pools, full, fetched := fetchOriginPools(ctx, origins, o.ispName(), racePoolSize(o.bestOfCount()))
 	select {
 	case <-fetched:
 	case <-ctx.Done():
@@ -828,7 +885,15 @@ func (o *Ookla) RaceListing(ctx context.Context) (RaceListing, error) {
 	win := fastestRacer(union)
 	inField := map[string]bool{}
 	var extras ookla.Servers
-	if win != nil {
+	if o.bestOfCount() > 1 {
+		// A Best-of round ranks the whole union - every city's pool, already
+		// widened to the round - and never the winning city's deeper field
+		// (see RunReason), so every racer is in the field and there is nothing
+		// more to ping.
+		for _, s := range union {
+			inField[s.ID] = true
+		}
+	} else if win != nil {
 		raced := make(map[string]bool, len(union))
 		for _, s := range union {
 			raced[s.ID] = true

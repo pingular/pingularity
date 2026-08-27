@@ -243,3 +243,24 @@ func TestRunsListingCarriesTheWinReason(t *testing.T) {
 		t.Errorf("a run without a report must carry no reason, got %q", out.Runs[1].WinReason)
 	}
 }
+
+// An older client still posts the on/off; it is read as the count it meant.
+func TestSettingsAcceptTheRetiredBestOfOnOff(t *testing.T) {
+	n := 5
+	yes, no := true, false
+	if got := bestOfCountFrom(nil, &yes, 1); got == nil || *got != 3 {
+		t.Errorf("on -> %v, want 3", got)
+	}
+	if got := bestOfCountFrom(nil, &yes, 8); got != nil {
+		t.Errorf("on over a round of 8 -> %v, want no change: an old page echoing \"on\" must not shrink the round to three", got)
+	}
+	if got := bestOfCountFrom(nil, &no, 8); got == nil || *got != 1 {
+		t.Errorf("off -> %v, want 1", got)
+	}
+	if got := bestOfCountFrom(&n, &yes, 1); got == nil || *got != 5 {
+		t.Errorf("both -> %v, want the count", got)
+	}
+	if got := bestOfCountFrom(nil, nil, 1); got != nil {
+		t.Errorf("neither -> %v, want nil", got)
+	}
+}

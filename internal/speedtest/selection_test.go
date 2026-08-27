@@ -72,7 +72,7 @@ func TestSelectionReportCoversRankedCandidatesBeyondTheCut(t *testing.T) {
 			DownloadBytes: 3000, UploadBytes: 300}, nil
 	})
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	res, err := o.RunReason(context.Background(), "manual")
@@ -143,7 +143,7 @@ func TestSelectionReportRecordsTheImplausibleDirectionGuard(t *testing.T) {
 	var buf bytes.Buffer
 	o := NewOokla()
 	o.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	res, err := o.RunReason(context.Background(), "manual")
@@ -188,7 +188,7 @@ func TestSelectionReportNamesThePingBootstrapRule(t *testing.T) {
 		return Result{Server: "near", ServerID: "3", DownloadMbps: 45, UploadMbps: 48, PingMS: 5}, nil
 	})
 	o := NewOokla()
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return false }
 
 	res, err := o.RunReason(context.Background(), "manual")
@@ -220,7 +220,7 @@ func TestSelectionReportKeepsAFailedCandidatesError(t *testing.T) {
 	var buf bytes.Buffer
 	o := NewOokla()
 	o.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	res, err := o.RunReason(context.Background(), "manual")
@@ -250,7 +250,7 @@ func TestSelectionReportDistinguishesFastestRankedFromPinned(t *testing.T) {
 		return Result{Server: "s" + srv.ID, ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 100, PingMS: 10}, nil
 	})
 	o := NewOokla()
-	o.BestOfFn = func() bool { return false } // want=1
+	o.BestOfCountFn = func() int { return 1 } // want=1
 
 	res, err := o.RunReason(context.Background(), "manual")
 	if err != nil {
@@ -292,7 +292,7 @@ func TestRankingPhaseLogsEveryCandidate(t *testing.T) {
 	// The repo's other captures use the TextHandler default (Info) and would
 	// count zero Debug lines while passing - the explicit level is the test.
 	o.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
@@ -325,7 +325,7 @@ func TestRunReasonCountsFailedCandidatesBytesInDataUsed(t *testing.T) {
 	})
 	o := NewOokla()
 	o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
-	o.BestOfFn = func() bool { return true }
+	o.BestOfCountFn = func() int { return 3 }
 	o.PriorDataFn = func() bool { return true }
 
 	res, err := o.RunReason(context.Background(), "manual")
