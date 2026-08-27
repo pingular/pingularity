@@ -703,13 +703,14 @@ func (p *program) run(ctx context.Context) {
 	tester.ChallengeFn = newChallengeFn(p.store, set)
 	tester.IncumbentScoresFn = newIncumbentScoresFn(p.store)
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
-	tester.OnServer = sched.SetCurrentServer    // surface the live server during a run
-	tester.DirectionFn = set.SpeedDirection     // Ookla direction (per-engine; iperf3 has its own)
-	tester.RetriesFn = set.SpeedRetries         // Ookla retries (per-engine; iperf3 has its own)
-	tester.ConnectionsFn = set.OoklaConnections // Ookla parallel connections (0 = auto)
-	tester.LossFn = set.OoklaLoss               // Ookla packet-loss probe
-	tester.BestOfCountFn = set.SpeedBestOfCount // measure N servers, keep the best (scheduled/manual only)
-	tester.FavouritesFn = func() []string {     // the starred servers: seats in every Best-of round
+	tester.OnServer = sched.SetCurrentServer        // surface the live server during a run
+	tester.DirectionFn = set.SpeedDirection         // Ookla direction (per-engine; iperf3 has its own)
+	tester.RetriesFn = set.SpeedRetries             // Ookla retries (per-engine; iperf3 has its own)
+	tester.ConnectionsFn = set.OoklaConnections     // Ookla parallel connections (0 = auto)
+	tester.LossFn = set.OoklaLoss                   // Ookla packet-loss probe
+	tester.DiscardLosersFn = set.SpeedDiscardLosers // a Best-of round keeps only its winner, or every server it measured
+	tester.BestOfCountFn = set.SpeedBestOfCount     // measure N servers, keep the best (scheduled/manual only)
+	tester.FavouritesFn = func() []string {         // the starred servers: seats in every Best-of round
 		saved := set.SpeedServers()
 		ids := make([]string, 0, len(saved))
 		for _, s := range saved {
@@ -2131,6 +2132,7 @@ func defaultSettings(cfg config.Config) settings.Values {
 		IperfUDP:           true,           // iperf3 packet-loss/jitter UDP pass on by default
 		IperfWindow:        0,              // iperf3 TCP window/socket-buffer KB (0 = OS auto-tune)
 		OoklaLoss:          true,           // Ookla packet-loss UDP probe on by default
+		SpeedDiscardLosers: true,           // a Best-of round records only its winner; every result is opt-in
 		SpeedBestOfCount:   1,              // one server per test; a Best-of round costs N times the data - opt in
 		// Auto-select challenger: twice a day at the hourly default, no extra
 		// data; the bar the rival must clear is derived from the incumbent's own

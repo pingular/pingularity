@@ -66,7 +66,7 @@ func TestDefaultSettings(t *testing.T) {
 	wantBool := map[string]bool{
 		"Monitoring": v.Monitoring, "DNSProbe": v.DNSProbe, "NetinfoEnabled": v.NetinfoEnabled,
 		"UpdateCheckEnabled": v.UpdateCheckEnabled, "LogRedactPII": v.LogRedactPII,
-		"IperfUDP": v.IperfUDP, "OoklaLoss": v.OoklaLoss,
+		"IperfUDP": v.IperfUDP, "OoklaLoss": v.OoklaLoss, "SpeedDiscardLosers": v.SpeedDiscardLosers,
 	}
 	for name, got := range wantBool {
 		if !got {

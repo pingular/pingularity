@@ -99,6 +99,10 @@ type Ookla struct {
 	// field; a starred server the race did not reach is resolved and pinged
 	// for the round (see seatFavourites). Nil -> none.
 	FavouritesFn func() []string
+	// DiscardLosersFn says whether a Best-of round keeps only its winner
+	// (true, the default: one row per test) or records every server it
+	// measured (see Result.Losers). Nil -> discard.
+	DiscardLosersFn func() bool
 
 	// unionRound / favourites: this run's candidates are the race's whole
 	// union (rank them all; no distance window or cap applies across cities)
@@ -2401,6 +2405,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 				"bufferbloat_ms", f64v(bufferbloatMS(res)),
 				"capacity_mbps", util.Round2(resultCapacity(res, dir)))
 		}
+		res.MeasuredTS = time.Now().Unix() // where a kept loser lands in history (see Result.Losers)
 		results = append(results, res)
 		if want <= 1 {
 			break // a single-server run: the targets past the first are fallbacks, measured only when it failed
@@ -2469,13 +2474,39 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	if badUp {
 		best.UploadMbps = math.Min(best.UploadMbps, middleOf(results, func(r Result) float64 { return r.UploadMbps }))
 	}
+	// The losers: discarded from the DATA by default, or kept as rows of their
+	// own when the operator asked for every result (Result.Losers; the
+	// scheduler writes them as members of this round). The winner is the
+	// run's result either way.
+	keep := want > 1 && len(results) > 1 && !o.discardLosers()
+	if keep {
+		for i, r := range results {
+			if i != win {
+				// Held to what the round agrees on exactly as the winner is
+				// above: a loser's row lands in the same history, and a reading
+				// the round refused to believe must not reach it there either.
+				// The selection report keeps every raw reading.
+				if badDown {
+					r.DownloadMbps = math.Min(r.DownloadMbps, middleOf(results, func(x Result) float64 { return x.DownloadMbps }))
+				}
+				if badUp {
+					r.UploadMbps = math.Min(r.UploadMbps, middleOf(results, func(x Result) float64 { return x.UploadMbps }))
+				}
+				best.Losers = append(best.Losers, r)
+			}
+		}
+	}
 	if len(results) > 1 {
 		// One line per loser under the `server` key (logfilter masks by key;
 		// the old joined `discarded` attr leaked every loser's label in the
 		// masked form, and a joined list can only mask to one useless blob).
+		loserMsg := "best-of result discarded"
+		if keep {
+			loserMsg = "best-of result kept as a member of the round"
+		}
 		for i, r := range results {
 			if i != win {
-				o.logf("best-of result discarded", "server", r.Server, "server_id", r.ServerID)
+				o.logf(loserMsg, "server", r.Server, "server_id", r.ServerID)
 			}
 		}
 		o.logf("best-of run finished", "servers", len(results), "winner", best.Server,
@@ -2539,7 +2570,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	}
 	best.Selection = finishSelection(sel, results, errByID, dir, best.ServerID, winReason)
 	best.Race = &race.Verdict
-	foldRoundBytes(&best, results, spentDown, spentUp)
+	foldRoundBytes(&best, results, spentDown, spentUp, keep)
 	// Always name the server whose numbers are being returned. Without this a run
 	// whose last target failed would leave the mid-run label - a server that
 	// contributed nothing - showing as the current one.
@@ -3076,6 +3107,11 @@ func (o *Ookla) seatFavourites(ctx context.Context, client *ookla.Speedtest, ser
 		out = append(out, s)
 	}
 	return out
+}
+
+// discardLosers is DiscardLosersFn with the nil case folded in: discard.
+func (o *Ookla) discardLosers() bool {
+	return o.DiscardLosersFn == nil || o.DiscardLosersFn()
 }
 
 // incumbentID is IncumbentFn with the nil case folded in.
@@ -4826,8 +4862,17 @@ func totalExtraBytes(rs []Result) (down, up int64) {
 // usage-only Extra channel instead, and is billed identically. The download
 // side needs no twin guard: a run without a measured download fails outright,
 // so a winner always carries download bytes of its own.
-func foldRoundBytes(best *Result, results []Result, spentDown, spentUp int64) {
+func foldRoundBytes(best *Result, results []Result, spentDown, spentUp int64, keepLosers bool) {
 	dn, up := totalBytes(results)
+	if keepLosers {
+		// The losers are recorded as rows of their own (Result.Losers), each
+		// carrying its own bytes; the winner's row keeps only its own transfer
+		// plus the round's overhead, so the sum over the rows is the round's
+		// spend counted once. The losers' retried attempts still ride the
+		// winner's usage-only channel below: a loser row has no accounting
+		// row of its own.
+		dn, up = best.DownloadBytes, best.UploadBytes
+	}
 	xd, xu := totalExtraBytes(results)
 	best.DownloadBytes = dn + spentDown
 	best.ExtraDownBytes, best.ExtraUpBytes = xd, xu

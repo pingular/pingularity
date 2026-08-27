@@ -1622,3 +1622,91 @@ func TestSchedulerStartupLatchPollsForClockOpenedWindow(t *testing.T) {
 		t.Fatal("startup run never fired after the window opened by clock - the startup-latch recheck poll (scheduler.go:878) is dead")
 	}
 }
+
+// A kept Best-of round lands as rows: the winner as the run's result, judged
+// against thresholds, and each loser as a member of that round - on the
+// second it finished, naming the winner's ts, with no verdict of its own.
+// The reads that decide something see only the winner; the runs table sees
+// all; deleting the winner takes its round along.
+func TestSchedulerRecordsTheRoundMembersBesideTheWinner(t *testing.T) {
+	stats.ResetForTest()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	now := time.Now().Unix()
+	tester := testerFunc(func(context.Context) (Result, error) {
+		return Result{Server: "winner", ServerID: "w", DownloadMbps: 300, UploadMbps: 30, PingMS: 8,
+			DownloadBytes: 1000, UploadBytes: 100, Engine: "ookla",
+			Losers: []Result{
+				{Server: "loser-a", ServerID: "a", DownloadMbps: 50, UploadMbps: 5, PingMS: 12, DownloadBytes: 500, UploadBytes: 50, Engine: "ookla", MeasuredTS: now - 120},
+				// The last server measured finishes in the second the winner's row is
+				// stamped: it must still land before the winner, not be walked past it.
+				{Server: "loser-b", ServerID: "b", DownloadMbps: 80, UploadMbps: 8, PingMS: 10, DownloadBytes: 800, UploadBytes: 80, Engine: "ookla", MeasuredTS: time.Now().Unix()},
+			}}, nil
+	})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewScheduler(tester, st, time.Hour, log)
+	s.ThresholdsFn = func() settings.Thresholds { return settings.Thresholds{DownMbps: 100} } // the losers would breach it; the winner passes
+	sp, err := s.RunOnce(context.Background(), "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp.Healthy == nil || !*sp.Healthy {
+		t.Errorf("winner verdict %v, want healthy: the run is judged on its result", sp.Healthy)
+	}
+	ctx := context.Background()
+	runs, err := st.SpeedRuns(ctx, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 3 {
+		t.Fatalf("%d rows, want 3: the winner and both losers", len(runs))
+	}
+	members := 0
+	for _, r := range runs {
+		if r.TS == sp.TS {
+			if r.RoundTS != nil {
+				t.Errorf("the winner names no round: %+v", r)
+			}
+			continue
+		}
+		members++
+		if r.RoundTS == nil || *r.RoundTS != sp.TS {
+			t.Errorf("member %s round_ts %v, want the winner's %d", r.Server, r.RoundTS, sp.TS)
+		}
+		if r.Healthy != nil {
+			t.Errorf("member %s has a verdict %v: only the winner is judged", r.Server, *r.Healthy)
+		}
+		if r.TS >= sp.TS {
+			t.Errorf("member %s at %d, want the second it finished, before the winner's %d", r.Server, r.TS, sp.TS)
+		}
+		if r.DownBytes == nil || (*r.DownBytes != 500 && *r.DownBytes != 800) {
+			t.Errorf("member %s bytes %v, want its own", r.Server, r.DownBytes)
+		}
+	}
+	if members != 2 {
+		t.Errorf("%d members, want 2", members)
+	}
+	if n, _ := st.SpeedCount(ctx); n != 3 {
+		t.Errorf("count %d, want 3: the runs table pages over the members too", n)
+	}
+	latest, err := st.LatestSpeed(ctx)
+	if err != nil || latest == nil || latest.TS != sp.TS {
+		t.Errorf("latest %+v (%v), want the winner: a member is never the latest run", latest, err)
+	}
+	hist, err := st.SpeedHistoryRange(ctx, time.Unix(now-3600, 0), time.Time{}, 0)
+	if err != nil || len(hist) != 1 || hist[0].TS != sp.TS {
+		t.Errorf("chart rows %+v (%v), want the winner alone", hist, err)
+	}
+	if d, u, _ := st.SpeedAvgBytes(ctx); d != 2300 || u != 230 {
+		t.Errorf("average bytes %d/%d, want the round's 2300/230: the estimate counts the whole round", d, u)
+	}
+	if _, err := st.DeleteSpeed(ctx, sp.TS); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.SpeedCount(ctx); n != 0 {
+		t.Errorf("%d rows after deleting the winner, want 0: the round goes with it", n)
+	}
+}

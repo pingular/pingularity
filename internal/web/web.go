@@ -1523,7 +1523,11 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 		"packet_loss_pct", "idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "healthy", "download_bytes", "upload_bytes",
 		"trigger", "engine", "server", "server_id", "isp", "isp_location",
 		"public_ipv4", "public_ipv6", "dns_server", "dns_provider", "dns_location",
-		"cf_colo", "exit_path", "ip_family", "udp_direction"})
+		"cf_colo", "exit_path", "ip_family", "udp_direction",
+		// round_of: the winner's timestamp on a row that was measured in a
+		// Best-of round and did not win it (Discard losers off); blank on a
+		// test's own result. Appended at the end like the two before it.
+		"round_of"})
 	// Stream newest-first straight from a descending row iterator (no whole-history
 	// slice), flushing per row so back-pressure from a slow client bounds memory and
 	// the write deadline keeps advancing only while bytes actually move.
@@ -1552,6 +1556,7 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// csvSafe despite the closed "4"/"6" and "down"/"up" enums: a crafted
 			// backup can implant arbitrary text in these TEXT columns.
 			csvSafe(sp.IPFamily), csvSafe(sp.UDPDirection),
+			roundOf(sp.RoundTS),
 		})
 		cw.Flush()
 		bump()
@@ -2215,6 +2220,15 @@ func raceCandidatesDTO(in []speedtest.RaceCandidate) []raceCandidate {
 	return out
 }
 
+// roundOf renders a round member's winner timestamp for the CSV; blank when
+// the row is a test's own result.
+func roundOf(ts *int64) string {
+	if ts == nil {
+		return ""
+	}
+	return time.Unix(*ts, 0).UTC().Format(time.RFC3339)
+}
+
 // bestOfCountFrom is the Best-of count a settings POST asks for: the count
 // when sent, else the retired on/off from an older client (on meant three
 // servers, off one), else nothing. current is the count in force: an old
@@ -2376,7 +2390,7 @@ func (s *Server) lastAutoRunServerID(ctx context.Context) (string, bool) {
 	if s.store == nil {
 		return "", false
 	}
-	runs, err := s.store.SpeedRuns(ctx, scanRuns, 0)
+	runs, err := s.store.SpeedResults(ctx, scanRuns) // results only: a kept round's members have no report and would spend the dozen
 	if err != nil {
 		return "", false
 	}
@@ -2558,6 +2572,9 @@ type settingsDTO struct {
 	// bar the rival must clear is derived from the incumbent's own record.
 	SpeedChallengeEvery *int  `json:"speed_challenge_every"`
 	OoklaLoss           *bool `json:"ookla_loss"`
+	// SpeedDiscardLosers: a Best-of round keeps only its winner (true) or
+	// records every server it measured as a member of the round (false).
+	SpeedDiscardLosers *bool `json:"speed_discard_losers"`
 	// SpeedBestOfCount is how many servers a Best-of round measures (1 = one).
 	// SpeedBestOf is the retired on/off: still accepted on a POST from an older
 	// client (true -> 3, false -> 1) when no count is sent, and still emitted
@@ -2669,6 +2686,7 @@ func dtoFrom(v settings.Values) settingsDTO {
 		OoklaConnections:         ptr(v.OoklaConnections),
 		SpeedChallengeEvery:      ptr(v.SpeedChallengeEvery),
 		OoklaLoss:                ptr(v.OoklaLoss),
+		SpeedDiscardLosers:       ptr(v.SpeedDiscardLosers),
 		SpeedBestOfCount:         ptr(v.SpeedBestOfCount),
 		SpeedBestOf:              ptr(v.SpeedBestOfCount > 1),
 		IperfOmit:                ptr(v.IperfOmit),
@@ -3001,6 +3019,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			OoklaConnections:    in.OoklaConnections,
 			SpeedChallengeEvery: in.SpeedChallengeEvery,
 			OoklaLoss:           in.OoklaLoss,
+			SpeedDiscardLosers:  in.SpeedDiscardLosers,
 			SpeedBestOfCount:    bestOfCountFrom(in.SpeedBestOfCount, in.SpeedBestOf, s.settings.SpeedBestOfCount()),
 			IperfOmit:           in.IperfOmit,
 			SpeedDirection:      in.SpeedDirection,
@@ -3280,8 +3299,12 @@ var importReconcileHook func()
 // 5 abort on them exactly as the builds that read 4 abort on `failed`.
 // store.SpeedColumnSchema is where each column's version lives, so a column
 // added later is one map entry rather than one more paragraph here.
+//
+// It went to 7 when the speed table gained round_ts (a Best-of round's kept
+// losers, see store.SpeedSample.RoundTS): one more column on the same
+// content-dependent rule, its version one entry in store.SpeedColumnSchema.
 const (
-	exportSchema    = 6
+	exportSchema    = 7
 	minExportSchema = 1
 )
 
