@@ -492,49 +492,17 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		return store.SpeedSample{}, fmt.Errorf("speedtest: %w", err)
 	}
 
-	sp := store.SpeedSample{
-		TS: time.Now().Unix(), DownMbps: res.DownloadMbps, UpMbps: res.UploadMbps,
-		PingMS: res.PingMS, JitterMS: res.JitterMS, Server: res.Server, ServerID: res.ServerID,
-		// nil bytes = direction not measured (iperf3 best-effort partial), so it
-		// reads as "unknown", not a real 0, in the chart/table/thresholds.
-		PacketLoss: res.PacketLoss, DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
-		Trigger: reason,
-		Engine:  res.Engine,
-		// Empty stays empty (stored NULL-equivalent, absent in the API): a run
-		// that didn't record the family or probe direction must read as unknown,
-		// never as a guessed value.
-		IPFamily:        res.IPFamily,
-		UDPDirection:    res.UDPDirection,
-		PingBestMS:      res.PingBestMS,
-		IdleMS:          res.IdleMS,
-		LoadedDownMS:    res.LoadedDownMS,
-		LoadedUpMS:      res.LoadedUpMS,
-		LoadedDownP95MS: res.LoadedDownP95MS,
-		LoadedUpP95MS:   res.LoadedUpP95MS,
-	}
-	// How the centre was chosen rides the speed row itself (see RaceVerdict):
-	// one line per run, beside the selection report that explains the server
-	// inside that centre. Ookla only; iperf3 has no race to record.
-	if res.Race != nil {
-		sp.RaceOutcome, sp.RaceOrigins = res.Race.Outcome, res.Race.Origins
-		sp.RaceWinnerKind, sp.RaceWinnerLabel = res.Race.WinnerKind, res.Race.WinnerLabel
-		sp.RaceWinnerMS = res.Race.WinnerMS
-		if res.Race.WinnerLat != 0 || res.Race.WinnerLon != 0 {
-			la, lo := res.Race.WinnerLat, res.Race.WinnerLon
-			sp.RaceWinnerLat, sp.RaceWinnerLon = &la, &lo
+	ci := s.connInfo(ctx)
+	sp := s.sample(res, reason, ci)
+	// The round's result lands AFTER every member it keeps: the last server
+	// measured usually finished in the very second this row is stamped, and
+	// the free-second walk (InsertSpeedTS) only goes forward, which would put
+	// that member above the round it belongs to. A second later is still the
+	// round's end to the second.
+	for _, l := range res.Losers {
+		if l.MeasuredTS >= sp.TS {
+			sp.TS = l.MeasuredTS + 1
 		}
-		if res.Race.Racers > 0 {
-			n := int64(res.Race.Racers)
-			sp.RaceRacers = &n
-		}
-	}
-	// Capture the connection context (public IP/ISP/DNS) this run ran in.
-	if s.ConnInfoFn != nil {
-		ci := s.ConnInfoFn(ctx)
-		sp.PublicIPv4, sp.PublicIPv6 = ci.PublicIPv4, ci.PublicIPv6
-		sp.ISP, sp.ISPLocation = ci.ISP, ci.ISPLocation
-		sp.DNSIP, sp.DNSProvider, sp.DNSLocation = ci.DNSIP, ci.DNSProvider, ci.DNSLocation
-		sp.CFColo, sp.ExitSummary = ci.CFColo, ci.ExitSummary
 	}
 
 	// Check the run against the configured thresholds (if any) and record the
@@ -667,6 +635,10 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 			s.log.Error("speedtest selection store", "err", err)
 		}
 	}
+	// The round's other measurements, when the operator keeps them: one row
+	// each, on the second it finished, naming this run as its round. After
+	// the accounting row so the walk to a free second never lands on it.
+	s.recordLosers(ctx, res, reason, ci, sp.TS)
 	// Debounced alerting: fire only once a breach has persisted for the configured
 	// number of consecutive runs, so a single blip doesn't page. The counter only
 	// moves when thresholds are active; a recovered run resets it. Streak of 1
@@ -780,6 +752,92 @@ func (s *Scheduler) recordFailedUsage(ctx context.Context, res Result, reason st
 		// Non-fatal: the run already failed, and the caller's error is the one
 		// that explains it - losing the usage row costs accounting, not history.
 		s.log.Error("speedtest usage store", "err", err)
+	}
+}
+
+// sample is the history row for one measurement: the numbers, what started
+// it, and the connection it ran in. The round's winner and each loser it
+// keeps (see Result.Losers) are built here alike; only the winner carries a
+// race verdict, and only the winner is judged against thresholds.
+func (s *Scheduler) sample(res Result, reason string, ci ConnInfo) store.SpeedSample {
+	sp := store.SpeedSample{
+		TS: time.Now().Unix(), DownMbps: res.DownloadMbps, UpMbps: res.UploadMbps,
+		PingMS: res.PingMS, JitterMS: res.JitterMS, Server: res.Server, ServerID: res.ServerID,
+		// nil bytes = direction not measured (iperf3 best-effort partial), so it
+		// reads as "unknown", not a real 0, in the chart/table/thresholds.
+		PacketLoss: res.PacketLoss, DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
+		Trigger: reason,
+		Engine:  res.Engine,
+		// Empty stays empty (stored NULL-equivalent, absent in the API): a run
+		// that didn't record the family or probe direction must read as unknown,
+		// never as a guessed value.
+		IPFamily:        res.IPFamily,
+		UDPDirection:    res.UDPDirection,
+		PingBestMS:      res.PingBestMS,
+		IdleMS:          res.IdleMS,
+		LoadedDownMS:    res.LoadedDownMS,
+		LoadedUpMS:      res.LoadedUpMS,
+		LoadedDownP95MS: res.LoadedDownP95MS,
+		LoadedUpP95MS:   res.LoadedUpP95MS,
+	}
+	// How the centre was chosen rides the speed row itself (see RaceVerdict):
+	// one line per run, beside the selection report that explains the server
+	// inside that centre. Ookla only; iperf3 has no race to record.
+	if res.Race != nil {
+		sp.RaceOutcome, sp.RaceOrigins = res.Race.Outcome, res.Race.Origins
+		sp.RaceWinnerKind, sp.RaceWinnerLabel = res.Race.WinnerKind, res.Race.WinnerLabel
+		sp.RaceWinnerMS = res.Race.WinnerMS
+		if res.Race.WinnerLat != 0 || res.Race.WinnerLon != 0 {
+			la, lo := res.Race.WinnerLat, res.Race.WinnerLon
+			sp.RaceWinnerLat, sp.RaceWinnerLon = &la, &lo
+		}
+		if res.Race.Racers > 0 {
+			n := int64(res.Race.Racers)
+			sp.RaceRacers = &n
+		}
+	}
+	// The connection context (public IP/ISP/DNS) the run ran in.
+	sp.PublicIPv4, sp.PublicIPv6 = ci.PublicIPv4, ci.PublicIPv6
+	sp.ISP, sp.ISPLocation = ci.ISP, ci.ISPLocation
+	sp.DNSIP, sp.DNSProvider, sp.DNSLocation = ci.DNSIP, ci.DNSProvider, ci.DNSLocation
+	sp.CFColo, sp.ExitSummary = ci.CFColo, ci.ExitSummary
+	return sp
+}
+
+// connInfo is ConnInfoFn with the nil case folded in: nothing known.
+func (s *Scheduler) connInfo(ctx context.Context) ConnInfo {
+	if s.ConnInfoFn == nil {
+		return ConnInfo{}
+	}
+	return s.ConnInfoFn(ctx)
+}
+
+// recordLosers writes the rows for the servers a Best-of round measured and
+// did not choose (Result.Losers; nil when the operator discards them, the
+// default). Each is a real measurement, so it goes in as one - its own
+// speeds, ping, jitter, loss and bytes - on the second it finished, walked
+// forward if that second is taken (InsertSpeedTS), and stamped with the
+// winner's ts as RoundTS. That stamp is what makes it a member of the round
+// rather than the run's result: the charts, thresholds, baselines and the
+// incumbent (every read on store's speedIsResult) never see it, while the
+// runs table and the exports do. No verdict (Healthy nil) - the run's verdict
+// is the winner's - and no race verdict: the race is the run's, recorded
+// once. Non-fatal on error, like the selection report: the run is durable.
+func (s *Scheduler) recordLosers(ctx context.Context, res Result, reason string, ci ConnInfo, roundTS int64) {
+	for _, l := range res.Losers {
+		if ctx.Err() != nil {
+			return
+		}
+		l.Race = nil
+		sp := s.sample(l, reason, ci)
+		sp.RoundTS = &roundTS
+		sp.TS = l.MeasuredTS
+		if sp.TS <= 0 || sp.TS >= roundTS {
+			sp.TS = roundTS - 1 // unknown: just before its round, so it never sits above the result it belongs to
+		}
+		if _, err := s.store.InsertSpeedTS(ctx, sp); err != nil {
+			s.log.Error("speedtest round member store", "err", err, "server", sp.Server)
+		}
 	}
 }
 

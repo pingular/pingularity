@@ -1218,13 +1218,23 @@ and persist across restarts:
   and no speedtest has run since, raced again otherwise - and your kept
   servers' pings are measured again on the same ten-minute rule; Save leaves
   it all alone and Reset to defaults starts over), test direction, retries, parallel
-  connections, the packet-loss probe. (The automatic challenger that lets a
+  connections, the packet-loss probe, and **Discard losers** (on by default):
+  what a Best-of round keeps. On, only the best result is recorded - one row
+  per test, as always. Off, every server the round measured gets its own row
+  in the runs table, the chart and the exports, on the second it finished,
+  tagged *round* and pointing at the winner (`round_ts`); the winner alone
+  stays the test's result - thresholds, alerts and server selection look
+  only at it - and deleting the winner deletes its round with it. Each row
+  then carries its own data volume (the winner's adds the round's overhead),
+  so the totals are unchanged and the data estimate still counts the whole
+  round. (The automatic challenger that lets a
   rival server take the seat now and then has no knob here - see *Choosing an
   Ookla server*.) The engine itself (**Ookla** or
   **iperf3**) is chosen on the Speedtest tab; iperf3's servers and per-test
   options live on their own **iperf3** tab. **Best of** (Ookla only, default 1 =
   a single server, up to 16) is how many servers each scheduled or manual test
-  measures, keeping only the best result. The round is your pinned server if
+  measures, keeping only the best result (or every result, with **Discard
+  losers** off). The round is your pinned server if
   you have one, then your starred servers fastest ping first, then the fastest
   of the rest, N in all: under a pin the rest come from *around the pin*; on
   Auto they come from the whole city race - every candidate city's pool,
@@ -1236,8 +1246,8 @@ and persist across restarts:
   amber above 4; above 1 the automatic challenger stands down. (Upgrading from
   a version with the old on/off: on becomes 3, off becomes 1; the old setting
   is left as it was, so a downgrade reads it as before the upgrade.) It keeps
-  only the best result - handy when one server has a bad day and you'd rather
-  it didn't define your history. The best result is the highest *score*: a
+  only the best result as the test's result - handy when one server has a bad
+  day and you'd rather it didn't define your history. The best result is the highest *score*: a
   capacity figure weighting download 70% and upload 30% **relative to each
   other** (not as raw Mbps, so it means the same on a symmetric line and a 20:1
   asymmetric one), discounted by ping (roughly 1% per millisecond, topping out
@@ -1245,7 +1255,8 @@ and persist across restarts:
   behind a big download number, a near-tie on speed goes to the lower-ping
   server, and a clearly faster one still wins. Ties break on ping, then jitter, then
   bufferbloat; the other runs are discarded (their
-  data volume is still counted, since it was really spent). The run that is kept
+  data volume is still counted, since it was really spent) unless **Discard
+  losers** is off, which records them as rows of their own. The run that is kept
   is one real test, so its **ping, jitter and bufferbloat are the winner's too**:
   when a round is decided on throughput, those columns can jump because the round
   changed hands, not because your connection did. It is not averaged across
@@ -1928,6 +1939,10 @@ and `-d '{…}'` where a body is listed below.
   366-day reach as `/api/series`, so a window entirely older than that comes back
   empty however long retention keeps the runs
 - `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail).
+  With **Discard losers** off, a Best-of round's other measurements are rows
+  of their own here and on `/api/speed` (the chart plots them like any other
+  run), each carrying `round_ts` - the winner row's `ts`; the latest-run
+  endpoints and the digest never list them.
   Runs that recorded them carry `ip_family` (`4`/`6`/`mixed`, the family the
   transfer actually used) and `udp_direction` (`down`/`up`, which way the
   loss/jitter probe sampled); on runs that didn't establish one - and rows
@@ -1935,7 +1950,9 @@ and `-d '{…}'` where a body is listed below.
 - `GET /api/speed/runs.csv` - all runs as CSV. The same two fields are the
   final columns, `ip_family` and `udp_direction`, appended at the end so
   consumers indexing existing columns by position keep working; blank =
-  unrecorded
+  unrecorded. After them, `round_of`: on a row measured in a Best-of round
+  that another server won (**Discard losers** off), the winner's timestamp;
+  blank on a test's own result
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
   Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge

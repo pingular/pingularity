@@ -88,22 +88,23 @@ const (
 	keyIperfServers = "iperf_servers" // JSON array of saved IperfTarget (the picker list)
 	// Test parameters. The speed_* keys apply to whichever engine is selected; the
 	// iperf_* / ookla_* ones are that engine's own knobs and are ignored by the other.
-	keySpeedDirection   = "speed_direction"   // Ookla directions: both|down|up (sequential; no bidir)
-	keySpeedRetries     = "speed_retries"     // Ookla extra attempts per direction on a transient failure
-	keyIperfDirection   = "iperf_direction"   // iperf3 directions: both|down|up|bidir (migrated from speed_direction)
-	keyIperfRetries     = "iperf_retries"     // iperf3 extra attempts per direction (migrated from speed_retries)
-	keyIperfDur         = "iperf_duration"    // seconds per direction (-t)
-	keyIperfStreams     = "iperf_streams"     // parallel TCP streams (-P)
-	keyIperfOmit        = "iperf_omit"        // warm-up seconds discarded (-O)
-	keyIperfUDP         = "iperf_udp"         // run the UDP loss/jitter pass
-	keyIperfUDPRate     = "iperf_udp_rate"    // UDP probe rate Mbps; 0 = auto
-	keyIperfWindow      = "iperf_window"      // TCP window / socket-buffer KB (-w); 0 = auto
-	keyIperfCongest     = "iperf_congestion"  // TCP congestion algorithm (-C); "" = system default
-	keyIperfNoDelay     = "iperf_nodelay"     // disable Nagle (-N)
-	keyIperfDSCP        = "iperf_dscp"        // IP DSCP marking (--dscp); "" = none
-	keyIperfMSS         = "iperf_mss"         // TCP max segment size bytes (-M); 0 = auto
-	keyOoklaConnections = "ookla_connections" // Ookla parallel connections (0 = library default)
-	keyOoklaLoss        = "ookla_loss"        // run Ookla's UDP packet-loss probe
+	keySpeedDirection     = "speed_direction"      // Ookla directions: both|down|up (sequential; no bidir)
+	keySpeedRetries       = "speed_retries"        // Ookla extra attempts per direction on a transient failure
+	keyIperfDirection     = "iperf_direction"      // iperf3 directions: both|down|up|bidir (migrated from speed_direction)
+	keyIperfRetries       = "iperf_retries"        // iperf3 extra attempts per direction (migrated from speed_retries)
+	keyIperfDur           = "iperf_duration"       // seconds per direction (-t)
+	keyIperfStreams       = "iperf_streams"        // parallel TCP streams (-P)
+	keyIperfOmit          = "iperf_omit"           // warm-up seconds discarded (-O)
+	keyIperfUDP           = "iperf_udp"            // run the UDP loss/jitter pass
+	keyIperfUDPRate       = "iperf_udp_rate"       // UDP probe rate Mbps; 0 = auto
+	keyIperfWindow        = "iperf_window"         // TCP window / socket-buffer KB (-w); 0 = auto
+	keyIperfCongest       = "iperf_congestion"     // TCP congestion algorithm (-C); "" = system default
+	keyIperfNoDelay       = "iperf_nodelay"        // disable Nagle (-N)
+	keyIperfDSCP          = "iperf_dscp"           // IP DSCP marking (--dscp); "" = none
+	keyIperfMSS           = "iperf_mss"            // TCP max segment size bytes (-M); 0 = auto
+	keyOoklaConnections   = "ookla_connections"    // Ookla parallel connections (0 = library default)
+	keyOoklaLoss          = "ookla_loss"           // run Ookla's UDP packet-loss probe
+	keySpeedDiscardLosers = "speed_discard_losers" // a Best-of round keeps only its winner (true) or records every server it measured
 	// keySpeedBestOfCount is how many Ookla servers a scheduled or manual run
 	// measures, keeping the best result (1 = a single server). keySpeedBestOf
 	// is the setting it replaced - a plain on/off that meant 3 - READ only,
@@ -425,6 +426,11 @@ type Values struct {
 	// the transfers. The Ookla analogue of IperfUDP (which also measures jitter;
 	// Ookla gets jitter from its ping phase, so this only adds loss).
 	OoklaLoss bool
+	// SpeedDiscardLosers: a Best-of round keeps only the best result (true,
+	// the default - the history stays one row per test) or records every
+	// server it measured as its own row, marked as a member of the round
+	// (false). The winner is the test's result either way.
+	SpeedDiscardLosers bool
 	// SpeedBestOfCount is how many servers a scheduled or manual Ookla run
 	// measures, keeping the best-scoring result: 1 is a single server; N>1 is
 	// the pinned server (if any), then the starred servers by ping, then the
@@ -917,6 +923,9 @@ func overlay(v Values, m map[string]string) Values {
 	if b, ok := pbool(m[keyOoklaLoss]); ok {
 		v.OoklaLoss = b
 	}
+	if b, ok := pbool(m[keySpeedDiscardLosers]); ok {
+		v.SpeedDiscardLosers = b
+	}
 	// The count wins; the retired on/off is read only when the count is absent
 	// (a pre-count database or backup): on meant three servers, off one.
 	if n, ok := atoi(m[keySpeedBestOfCount]); ok {
@@ -1134,6 +1143,7 @@ func (c *Controller) IperfStreams() int          { return c.get().IperfStreams }
 func (c *Controller) OoklaConnections() int      { return c.get().OoklaConnections }
 func (c *Controller) SpeedChallengeEvery() int   { return c.get().SpeedChallengeEvery }
 func (c *Controller) OoklaLoss() bool            { return c.get().OoklaLoss }
+func (c *Controller) SpeedDiscardLosers() bool   { return c.get().SpeedDiscardLosers }
 func (c *Controller) SpeedBestOfCount() int      { return c.get().SpeedBestOfCount }
 
 // Direction and Retries are per-engine: Speed* is Ookla's, Iperf* is iperf3's.
@@ -1385,6 +1395,7 @@ type Patch struct {
 	OoklaConnections     *int
 	SpeedChallengeEvery  *int
 	OoklaLoss            *bool
+	SpeedDiscardLosers   *bool
 	SpeedBestOfCount     *int
 	IperfOmit            *int
 	SpeedDirection       *string
@@ -1453,6 +1464,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.OoklaConnections, p.OoklaConnections)
 	setIf(&v.SpeedChallengeEvery, p.SpeedChallengeEvery)
 	setIf(&v.OoklaLoss, p.OoklaLoss)
+	setIf(&v.SpeedDiscardLosers, p.SpeedDiscardLosers)
 	setIf(&v.SpeedBestOfCount, p.SpeedBestOfCount)
 	setIf(&v.IperfOmit, p.IperfOmit)
 	setIf(&v.SpeedDirection, p.SpeedDirection)
@@ -1538,6 +1550,7 @@ func (p Patch) keys() map[string]bool {
 	mark(p.OoklaConnections != nil, keyOoklaConnections)
 	mark(p.SpeedChallengeEvery != nil, keySpeedChallengeEvery)
 	mark(p.OoklaLoss != nil, keyOoklaLoss)
+	mark(p.SpeedDiscardLosers != nil, keySpeedDiscardLosers)
 	mark(p.SpeedBestOfCount != nil, keySpeedBestOfCount)
 	mark(p.IperfOmit != nil, keyIperfOmit)
 	mark(p.SpeedDirection != nil, keySpeedDirection)
@@ -1701,6 +1714,7 @@ func formKeys(v Values) map[string]string {
 		keyOoklaConnections:    strconv.Itoa(v.OoklaConnections),
 		keySpeedChallengeEvery: strconv.Itoa(v.SpeedChallengeEvery),
 		keyOoklaLoss:           b2s(v.OoklaLoss),
+		keySpeedDiscardLosers:  b2s(v.SpeedDiscardLosers),
 		keySpeedBestOfCount:    strconv.Itoa(v.SpeedBestOfCount),
 		keyIperfOmit:           strconv.Itoa(v.IperfOmit),
 		keySpeedDirection:      v.SpeedDirection,

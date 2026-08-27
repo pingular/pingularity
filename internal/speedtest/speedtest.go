@@ -83,6 +83,19 @@ type Result struct {
 	// race's outcome, or the reason it did not run. Set beside Selection, on
 	// the Ookla engine's winner Result only; nil for iperf3 and fakes.
 	Race *RaceVerdict
+	// MeasuredTS is the unix second this measurement finished - set for every
+	// server a Best-of round measured, so a loser kept in history (see Losers)
+	// lands on the second it actually ran rather than beside the winner. 0
+	// when unrecorded.
+	MeasuredTS int64
+	// Losers are the round's other measurements, carried out only when the
+	// operator chose NOT to discard them (Ookla.DiscardLosersFn): each is a
+	// real test of a server the round did not choose, recorded in history as
+	// a member of this round rather than as its result. nil when discarded
+	// (the default) and on single-server runs. Each carries its own bytes;
+	// the winner's row then carries only its own plus the round's overhead
+	// (see foldRoundBytes).
+	Losers []Result
 }
 
 // Tester runs one measurement. Implemented by Ookla and Iperf.

@@ -345,7 +345,9 @@ func TestSpeedFilterCoversEveryMeasurementRead(t *testing.T) {
 			continue
 		}
 		seen[name] = true
-		filtered := strings.Contains(body, "speedNotFailed")
+		// speedIsResult is speedNotFailed narrowed further (the round members a
+		// kept Best-of leaves are hidden too), so a read carrying it is filtered.
+		filtered := strings.Contains(body, "speedNotFailed") || strings.Contains(body, "speedIsResult")
 		why, isExempt := exempt[name]
 		switch {
 		case isExempt && filtered:

@@ -3761,6 +3761,17 @@ test('Best of is a count, not a switch: a number box that drives the data estima
   const tags = script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0];
   assert.match(tags, /favourite:\['favourite'/, 'a starred server winning a round has its own tag');
   assert.doesNotMatch(tags, /best[ -]of[ -]3/i, 'no tag hard-codes three any more');
+  const tagOf = new Function('esc', 'fmtTime', script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0] + '\n' + extract('function winTag') + '\nreturn winTag;')(esc, ts => 'T' + ts);
+  assert.match(tagOf({round_ts: 1700000000, win_reason: 'score'}), /· round/, 'a round member is tagged as such, whatever else the row says');
+  assert.match(tagOf({round_ts: 1700000000}), /round of T1700000000/, 'and the tag names the winner it belongs to');
+  assert.match(script, /\['setSpeedDiscardLosers','speed_discard_losers','bool'\]/, 'Discard losers is a saved on/off');
+  assert.doesNotMatch(extract('function drawSpeedChart') + extract('function drawQualityChart') + extract('function spdAverages'), /round_ts|roundResults|roundMembers/,
+    'a kept loser is plotted like any other run: the chart draws the rows it is given');
+  assert.match(extract('function runTip'), /Best-of round member/, 'hovering a member says what it is');
+  const pane = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
+  const pos = id => pane.indexOf('id="' + id + '"');
+  assert.ok(pos('setSpeedDirection') < pos('setSpeedDiscardLosers') && pos('setSpeedDiscardLosers') < pos('setOoklaLoss'),
+    'Discard losers opens the second row, right before the packet-loss probe');
   assert.doesNotMatch(script, /best[ -]of[ -]3\b/i, 'nothing the page says to the user names three: the round is whatever count is set');
   assert.match(est, /const servers=n\/\(have\?savedBestOfN:1\);/, 'a recorded average is a round of the SAVED count, taken back to one server before the count in the box multiplies it');
   assert.match(extract('function applySettings'), /savedBestOfN=Math\.max\(1, parseInt\(s\.speed_best_of_count\)\|\|1\);/, 'the saved count is remembered when settings load');

@@ -1823,6 +1823,12 @@
 • Ookla is always sequential; iperf3 adds a simultaneous mode.
 • Independent of the iperf3 Direction setting.">i</span></span>
           <span class="ctl"><select id="setSpeedDirection"><option value="both">Both</option><option value="down">Download only</option><option value="up">Upload only</option></select><span class="unit"></span></span></label>
+        <label class="srow"><span class="lbl">Discard losers
+          <span class="info" tabindex="0" data-tip="What a Best-of round keeps.
+• On: only the best result is recorded - one row per test, as always.
+• Off: every server the round measured gets its own row in the runs table, the chart and the exports, marked as a member of the round. The winner is still the test’s result: thresholds, alerts and server selection look at it alone; the data estimate counts the whole round either way.
+• Does nothing at Best of 1.">i</span></span>
+          <span class="ctl"><input type="checkbox" id="setSpeedDiscardLosers"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Packet-loss probe
           <span class="info" tabindex="0" data-tip="A short UDP pass after the transfers to measure packet loss (TCP can't).
 • Adds about 5 seconds per test.
@@ -5851,6 +5857,7 @@ function runTip(p){
   if(p.server_id) srv.push('#'+esc(p.server_id));
   if(famLabel(p.ip_family)) srv.push(famLabel(p.ip_family)); // the family the run measured; absent on rows that never recorded one
   if(srv.length) h+='<div class="tt-srv">'+srv.join(' · ')+'</div>';
+  if(p.round_ts) h+='<div class="tt-srv">Best-of round member · the round\u2019s result is at '+fmtTime(p.round_ts)+'</div>';
   h+='<div class="tt-sec"><span class="tt-h">Speed</span>↓ '+(spMeasured(p,'down_mbps')?num1(p.down_mbps):'-')+' · ↑ '+(spMeasured(p,'up_mbps')?num1(p.up_mbps):'-')+' Mbps</div>';
   const ext=qualityParts(p);
   if(ext.length) h+='<div class="tt-sec"><span class="tt-h">Quality</span>'+ext.join(' · ')+'</div>';
@@ -6026,6 +6033,9 @@ const WIN_TAGS={
   pinned_companion:['companion','A Best-of round beside your pinned server: a neighbour out-scored the pin this round'],
 };
 function winTag(r){
+  // A row measured in a Best-of round that another server won (Discard losers
+  // off): history, but not the test's result - that is the winner's row.
+  if(r&&r.round_ts) return ' <span class="muted" title="Measured in the Best-of round of '+esc(fmtTime(r.round_ts))+', which another server won; that row is the test\u2019s result">· round</span>';
   const t=r&&r.win_reason ? WIN_TAGS[r.win_reason] : null;
   if(!t) return r&&r.win_reason ? ' <span class="muted">· '+esc(r.win_reason)+'</span>' : '';
   return ' <span class="muted" title="'+esc(t[1])+'">· '+esc(t[0])+'</span>';
@@ -7560,6 +7570,7 @@ const FIELDS=[
   ['setIperfDur','iperf_duration','int',5],
   ['setIperfStreams','iperf_streams','int',8],  // blank falls back to the shipping default (config.go IperfStreams), not the minimum
   ['setOoklaConnections','ookla_connections','int',0],
+  ['setSpeedDiscardLosers','speed_discard_losers','bool'],
   ['setOoklaLoss','ookla_loss','bool'],
   ['setSpeedBestOf','speed_best_of_count','int',1],
   ['setIperfWindow','iperf_window','int',0],

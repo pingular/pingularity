@@ -361,3 +361,93 @@ func TestRacePingsAreBounded(t *testing.T) {
 		}
 	}
 }
+
+// With Discard losers off, the round's other measurements ride the result as
+// Losers - each with its own bytes and the second it finished - and the
+// winner's row carries only its own transfer plus the round's overhead, so
+// the bytes across the rows add up to the round's spend once. On (the
+// default) the winner absorbs the round as it always did.
+func TestBestOfKeepsTheLosersWhenAsked(t *testing.T) {
+	requireQuiet(t)
+	healthyEndpoints(t)
+	countingPing(t, map[string]time.Duration{"1": 5 * time.Millisecond, "2": 6 * time.Millisecond, "3": 7 * time.Millisecond})
+	stubServerList(t) // servers 1, 2, 3
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		down := 100.0
+		if srv.ID == "2" {
+			down = 150
+		}
+		return Result{Server: "S" + srv.ID, ServerID: srv.ID, DownloadMbps: down, UploadMbps: 20, PingMS: 9,
+			DownloadBytes: 1000, UploadBytes: 200, ExtraDownBytes: 10}, nil
+	})
+	o := NewOokla()
+	o.LossFn = func() bool { return false }
+	o.BestOfCountFn = func() int { return 3 }
+	o.DiscardLosersFn = func() bool { return false }
+	before := time.Now().Unix()
+	res, err := o.RunReason(context.Background(), "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ServerID != "2" || len(res.Losers) != 2 {
+		t.Fatalf("winner %s with %d losers, want 2 winning over two kept losers: %+v", res.ServerID, len(res.Losers), res.Losers)
+	}
+	if res.DownloadBytes != 1000 || res.UploadBytes != 200 {
+		t.Errorf("winner bytes %d/%d, want its own 1000/200: the losers carry theirs", res.DownloadBytes, res.UploadBytes)
+	}
+	if res.ExtraDownBytes != 30 {
+		t.Errorf("winner extra bytes %d, want 30: every server's retries ride the winner's usage-only channel", res.ExtraDownBytes)
+	}
+	total := res.DownloadBytes
+	for _, l := range res.Losers {
+		if l.DownloadBytes != 1000 || l.ServerID == "2" || l.MeasuredTS < before {
+			t.Errorf("loser %+v: want its own bytes, not the winner, and the second it finished", l)
+		}
+		if l.Losers != nil || l.Selection != nil {
+			t.Errorf("a loser carries no round of its own: %+v", l)
+		}
+		total += l.DownloadBytes
+	}
+	if total != 3000 {
+		t.Errorf("bytes across the rows %d, want 3000: the round's spend counted once", total)
+	}
+	// A reading the round refused to believe is held to the round middle on a
+	// kept loser's row too, as it is on the winner's.
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		down := 100.0
+		if srv.ID == "3" {
+			down = 950 // three times what the others saw: not believed
+		}
+		return Result{Server: "S" + srv.ID, ServerID: srv.ID, DownloadMbps: down, UploadMbps: 20, PingMS: 9, DownloadBytes: 1000, UploadBytes: 200}, nil
+	})
+	res, err = o.RunReason(context.Background(), "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range append([]Result{res}, res.Losers...) {
+		if l.DownloadMbps > 100 {
+			t.Errorf("%s stored at %.0f Mbps: a disbelieved reading reaches history on no row", l.ServerID, l.DownloadMbps)
+		}
+	}
+
+	// Discarding (the default, Fn nil): no losers, the winner absorbs the round.
+	o.DiscardLosersFn = nil
+	res, err = o.RunReason(context.Background(), "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Losers != nil || res.DownloadBytes != 3000 {
+		t.Errorf("discarding: %d losers, winner bytes %d; want none and 3000", len(res.Losers), res.DownloadBytes)
+	}
+	// Explicitly on behaves the same.
+	o.DiscardLosersFn = func() bool { return true }
+	if res, err = o.RunReason(context.Background(), "manual"); err != nil || res.Losers != nil {
+		t.Errorf("discard on: losers %v err %v, want none", res.Losers, err)
+	}
+	// A single-server run has no round to keep.
+	o.BestOfCountFn = func() int { return 1 }
+	o.DiscardLosersFn = func() bool { return false }
+	if res, err = o.RunReason(context.Background(), "manual"); err != nil || res.Losers != nil {
+		t.Errorf("single: losers %v err %v, want none", res.Losers, err)
+	}
+}

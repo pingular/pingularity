@@ -164,7 +164,7 @@ func TestFoldRoundBytes(t *testing.T) {
 
 	t.Run("mixed round folds spend into the measured winner", func(t *testing.T) {
 		best := full
-		foldRoundBytes(&best, []Result{full, partial}, 7, 9)
+		foldRoundBytes(&best, []Result{full, partial}, 7, 9, false)
 		if best.DownloadBytes != 157 || best.UploadBytes != 89 {
 			t.Fatalf("measured channels = %d/%d, want 157/89", best.DownloadBytes, best.UploadBytes)
 		}
@@ -180,7 +180,7 @@ func TestFoldRoundBytes(t *testing.T) {
 		// winner's absent upload as a measured 0.0 Mbps and fire a false
 		// upload-below-threshold alert.
 		best := partial
-		foldRoundBytes(&best, []Result{partial, full}, 7, 9)
+		foldRoundBytes(&best, []Result{partial, full}, 7, 9, false)
 		if best.UploadBytes != 0 {
 			t.Fatalf("UploadBytes=%d on a partial winner - the loser's bytes just marked an unmeasured upload as measured", best.UploadBytes)
 		}
@@ -194,7 +194,7 @@ func TestFoldRoundBytes(t *testing.T) {
 
 	t.Run("all-partial round keeps the upload unmeasured", func(t *testing.T) {
 		best := partial
-		foldRoundBytes(&best, []Result{partial, {DownloadBytes: 60, ExtraUpBytes: 40}}, 7, 9)
+		foldRoundBytes(&best, []Result{partial, {DownloadBytes: 60, ExtraUpBytes: 40}}, 7, 9, false)
 		if best.UploadBytes != 0 {
 			t.Fatalf("UploadBytes=%d - byte presence would render the absent upload as a measured 0.0 Mbps", best.UploadBytes)
 		}

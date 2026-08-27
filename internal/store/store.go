@@ -152,7 +152,17 @@ CREATE TABLE IF NOT EXISTS speed (
     race_winner_ms     REAL,
     race_racers        INTEGER,
     race_winner_lat    REAL,
-    race_winner_lon    REAL
+    race_winner_lon    REAL,
+    -- The round this row was measured in and did not win: the ts of the
+    -- winner's row, written when the operator keeps a Best-of round's losers
+    -- (speedtest.Scheduler.recordLosers). NULL on every row that is a run's
+    -- own result. A real measurement - every column above is that server's
+    -- own reading - that is history but not the line's record: the reads
+    -- that decide something (charts, the latest run, thresholds, baselines,
+    -- the data estimate, the next race's origin) carry speedIsResult and
+    -- skip it; the runs table, its counts and the exports show it.
+    -- DeleteSpeed cascades on it, so a deleted run takes its round along.
+    round_ts           INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
@@ -600,6 +610,7 @@ func applySchema(db *sql.DB) error {
 		{"speed", "race_winner_kind", "TEXT"}, {"speed", "race_winner_label", "TEXT"},
 		{"speed", "race_winner_ms", "REAL"}, {"speed", "race_racers", "INTEGER"},
 		{"speed", "race_winner_lat", "REAL"}, {"speed", "race_winner_lon", "REAL"},
+		{"speed", "round_ts", "INTEGER"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -619,6 +630,13 @@ func applySchema(db *sql.DB) error {
 	// value and they are a small minority of the table.
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_speed_usage_run_ts ON speed(usage_run_ts) WHERE usage_run_ts IS NOT NULL`); err != nil {
 		return fmt.Errorf("migrate index idx_speed_usage_run_ts: %w", err)
+	}
+	// round_ts likewise: DeleteSpeed cascades on it, and SpeedAvgBytes sums a
+	// round's members per run - forty correlated lookups per refresh, each a
+	// full scan without this. Partial for the same reason: only a kept
+	// Best-of round's losers carry a value.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_speed_round_ts ON speed(round_ts) WHERE round_ts IS NOT NULL`); err != nil {
+		return fmt.Errorf("migrate index idx_speed_round_ts: %w", err)
 	}
 	// The per-server reads of the selection reports (RecentRankPings for the
 	// picker's saved pane, RecentServerScores for the challenge verdict) ask
@@ -2805,6 +2823,10 @@ type SpeedSample struct {
 	RaceRacers      *int64   `json:"race_racers,omitempty"`
 	RaceWinnerLat   *float64 `json:"race_winner_lat,omitempty"`
 	RaceWinnerLon   *float64 `json:"race_winner_lon,omitempty"`
+	// RoundTS is the run this row was measured in and did not win - the
+	// winner row's ts - on a loser a Best-of round kept (Discard losers off);
+	// nil on every row that is a run's own result. See speedIsResult.
+	RoundTS *int64 `json:"round_ts,omitempty"`
 	// WinReason is why the run's server was the one measured - the winner
 	// row's win_reason from the selection report (speed_servers), copied onto
 	// the listing by the web layer for the runs table's benefit (see
@@ -2836,7 +2858,7 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
 	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,''), failed,
 	COALESCE(race_outcome,''), COALESCE(race_origins,''), COALESCE(race_winner_kind,''), COALESCE(race_winner_label,''),
-	race_winner_ms, race_racers, race_winner_lat, race_winner_lon`
+	race_winner_ms, race_racers, race_winner_lat, race_winner_lon, round_ts`
 
 // speedNotFailed is the predicate every MEASUREMENT read of the speed table
 // carries, and the reason the accounting rows recordFailedUsage writes cannot
@@ -2852,6 +2874,14 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 // The usage sums (SpeedDataUsage, SpeedDataUsageSince), Prune, DeleteSpeed and
 // export/import deliberately do NOT carry it: the row exists for those.
 const speedNotFailed = `(failed IS NULL OR failed = 0)`
+
+// speedIsResult narrows speedNotFailed to the rows that are a run's OWN
+// result. A Best-of round's kept losers (round_ts set, see SpeedSample.RoundTS)
+// are measurements, but of servers the run did not choose, so the reads that
+// decide something - the charts, the latest run, thresholds and baselines,
+// the data estimate, the next race's origin - read this; the runs table, the
+// counts behind its paging, and the exports read speedNotFailed and show them.
+const speedIsResult = speedNotFailed + ` AND round_ts IS NULL`
 
 // speedIsAccounting is the same question from the other side - "is this row
 // accounting rather than a measurement?" - DERIVED from the predicate above
@@ -2916,13 +2946,17 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	// EVERY speed read. nzFinite/ptrFinite collapse both to 0 / nil.
 	var down, up, ping sql.NullFloat64
 	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest, raceMS, raceLat, raceLon sql.NullFloat64
-	var healthy, downB, upB, failed, racers sql.NullInt64
+	var healthy, downB, upB, failed, racers, roundTS sql.NullInt64
 	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
 		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
 		&sp.IPFamily, &sp.UDPDirection, &failed,
-		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon)
+		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon, &roundTS)
+	if roundTS.Valid {
+		v := roundTS.Int64
+		sp.RoundTS = &v
+	}
 	sp.RaceWinnerMS = ptrFinite(raceMS)
 	sp.RaceWinnerLat, sp.RaceWinnerLon = ptrFinite(raceLat), ptrFinite(raceLon)
 	if racers.Valid {
@@ -3072,7 +3106,7 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
 			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts,
 			race_outcome, race_origins, race_winner_kind, race_winner_label, race_winner_ms, race_racers,
-			race_winner_lat, race_winner_lon)
+			race_winner_lat, race_winner_lon, round_ts)
 		 SELECT COALESCE((SELECT MIN(t) FROM (
 					SELECT ?1 AS t WHERE NOT EXISTS (SELECT 1 FROM speed WHERE ts = ?1)
 					UNION ALL
@@ -3080,14 +3114,14 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 					  AND NOT EXISTS (SELECT 1 FROM speed s2 WHERE s2.ts = speed.ts + 1)
 				)), ?1),
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?`,
+			?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
 		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS),
 		nullStr(sp.RaceOutcome), nullStr(sp.RaceOrigins), nullStr(sp.RaceWinnerKind), nullStr(sp.RaceWinnerLabel),
-		ptrArg(sp.RaceWinnerMS), ptrArg(sp.RaceRacers), ptrArg(sp.RaceWinnerLat), ptrArg(sp.RaceWinnerLon))
+		ptrArg(sp.RaceWinnerMS), ptrArg(sp.RaceRacers), ptrArg(sp.RaceWinnerLat), ptrArg(sp.RaceWinnerLon), ptrArg(sp.RoundTS))
 	if err != nil {
 		recordDBErr(err)
 		return 0, err
@@ -3583,7 +3617,7 @@ func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
 func (s *Store) LatestConnInfo(ctx context.Context) (*SpeedSample, error) {
 	sp, err := scanSpeed(s.db.QueryRowContext(ctx,
 		`SELECT `+speedCols+` FROM speed
-		 WHERE `+speedNotFailed+` AND ts <= ?
+		 WHERE `+speedIsResult+` AND ts <= ?
 		   AND (COALESCE(isp,'') <> '' OR COALESCE(public_ipv4,'') <> '')
 		 ORDER BY ts DESC LIMIT 1`, currentHorizon(time.Now().Unix())))
 	if err == sql.ErrNoRows {
@@ -3600,7 +3634,7 @@ func (s *Store) LatestSpeed(ctx context.Context) (*SpeedSample, error) {
 	// ts <= currentHorizon: a future-dated import must not win "latest" and pin the
 	// speed pills/metrics on a not-yet-real run.
 	sp, err := scanSpeed(s.db.QueryRowContext(ctx,
-		`SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` AND ts <= ? ORDER BY ts DESC LIMIT 1`,
+		`SELECT `+speedCols+` FROM speed WHERE `+speedIsResult+` AND ts <= ? ORDER BY ts DESC LIMIT 1`,
 		currentHorizon(time.Now().Unix())))
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -3653,6 +3687,9 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 		budget = 1
 	}
 	clause, winArgs := speedWindow(since, until)
+	// speedNotFailed, not speedIsResult: this is the chart's read, and a
+	// Best-of round's kept losers (round_ts) are plotted there like any other
+	// run - and are rows to the thinning like any other.
 	win := ` WHERE ` + speedNotFailed + clause
 	// Pass 1: timestamps only, over the ts index.
 	rows, err := s.db.QueryContext(ctx, `SELECT ts FROM speed`+win+` ORDER BY ts`, winArgs...)
@@ -3735,7 +3772,10 @@ func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, b
 	// carry it: a bucket whose newest row is an accounting row must yield the
 	// newest MEASUREMENT in that bucket, not an empty bucket.
 	clause, winArgs := speedWindow(since, until)
-	win := ` WHERE ` + speedNotFailed + clause
+	// Results only (speedIsResult): the digest summarises the runs, and a
+	// kept loser is not one; the chart, which does show them, reads
+	// SpeedHistoryBudget.
+	win := ` WHERE ` + speedIsResult + clause
 	q := `SELECT ` + speedCols + ` FROM speed` + win
 	args := append([]any(nil), winArgs...)
 	if bucketSec > 1 {
@@ -3862,6 +3902,14 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM speed_servers WHERE run_ts = ?`, ts); err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	// A kept Best-of round goes with its winner: the losers' rows name this
+	// run as their round (round_ts), and a member row without its round would
+	// be a measurement nothing explains. Deleting a member row alone (its own
+	// ts) takes just that row, like any other.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM speed WHERE round_ts = ?`, ts); err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
@@ -4024,13 +4072,15 @@ func (s *Store) SpeedAvgBytes(ctx context.Context) (avgDown, avgUp int64, err er
 	horizon := currentHorizon(time.Now().Unix())
 	err = s.db.QueryRowContext(ctx, `
 		SELECT
-		  (SELECT COALESCE(CAST(AVG(download_bytes) AS INTEGER), 0)
-		     FROM (SELECT download_bytes FROM speed
-		           WHERE `+speedNotFailed+` AND download_bytes IS NOT NULL AND ts <= ?
+		  (SELECT COALESCE(CAST(AVG(b) AS INTEGER), 0)
+		     FROM (SELECT s.download_bytes + COALESCE((SELECT SUM(l.download_bytes) FROM speed l WHERE l.round_ts = s.ts), 0) AS b
+		           FROM speed s
+		           WHERE `+speedIsResult+` AND download_bytes IS NOT NULL AND ts <= ?
 		           ORDER BY ts DESC LIMIT 20)),
-		  (SELECT COALESCE(CAST(AVG(upload_bytes) AS INTEGER), 0)
-		     FROM (SELECT upload_bytes FROM speed
-		           WHERE `+speedNotFailed+` AND upload_bytes IS NOT NULL AND ts <= ?
+		  (SELECT COALESCE(CAST(AVG(b) AS INTEGER), 0)
+		     FROM (SELECT s.upload_bytes + COALESCE((SELECT SUM(l.upload_bytes) FROM speed l WHERE l.round_ts = s.ts), 0) AS b
+		           FROM speed s
+		           WHERE `+speedIsResult+` AND upload_bytes IS NOT NULL AND ts <= ?
 		           ORDER BY ts DESC LIMIT 20))`, horizon, horizon).Scan(&avgDown, &avgUp)
 	if err != nil {
 		recordDBErr(err)
@@ -4158,6 +4208,32 @@ func (s *Store) SpeedDataUsageSince(ctx context.Context, since time.Time) (int64
 		 FROM speed WHERE ts>=? AND ts<=?`,
 		since.Unix(), currentHorizon(time.Now().Unix())).Scan(&b)
 	return b, err
+}
+
+// SpeedResults returns the newest limit runs that are a test's own result -
+// SpeedRuns without a kept Best-of round's members (speedIsResult). For a
+// scan that walks back over RUNS with a fixed budget: on SpeedRuns the
+// members would spend it, and a single kept round of a dozen servers could
+// then hide the run the scan is after.
+func (s *Store) SpeedResults(ctx context.Context, limit int) ([]SpeedSample, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+speedCols+` FROM speed WHERE `+speedIsResult+` ORDER BY ts DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpeedSample
+	for rows.Next() {
+		sp, err := scanSpeed(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sp)
+	}
+	return out, rows.Err()
 }
 
 // SpeedRuns returns a page of speedtests, newest first.
@@ -5291,7 +5367,7 @@ var exportTables = map[string]struct {
 		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
 		"ping_best_ms", "ip_family", "udp_direction", "failed", "usage_run_ts",
 		"race_outcome", "race_origins", "race_winner_kind", "race_winner_label", "race_winner_ms", "race_racers",
-		"race_winner_lat", "race_winner_lon"},
+		"race_winner_lat", "race_winner_lon", "round_ts"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted
@@ -5304,7 +5380,9 @@ var exportTables = map[string]struct {
 		// arrives as text no `usage_run_ts = ?` can match is an accounting row
 		// deleting its run will never find, billing bytes for a speedtest that no
 		// longer exists with nothing in the UI to remove them.
-		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes", "failed", "usage_run_ts", "race_racers"},
+		// round_ts likewise: a reference that arrives as text is a round member
+		// no `round_ts = ?` cascade or `round_ts IS NULL` read can classify.
+		intCols: []string{"ts", "healthy", "download_bytes", "upload_bytes", "failed", "usage_run_ts", "race_racers", "round_ts"},
 		realCols: []string{"down_mbps", "up_mbps", "ping_ms", "ping_best_ms", "jitter_ms", "packet_loss",
 			"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "race_winner_ms",
 			"race_winner_lat", "race_winner_lon"}},
@@ -5581,6 +5659,7 @@ var speedColumnSchema = map[string]int{
 	"ip_family": 5, "udp_direction": 5, "failed": 5, "usage_run_ts": 5,
 	"race_outcome": 6, "race_origins": 6, "race_winner_kind": 6, "race_winner_label": 6,
 	"race_winner_ms": 6, "race_racers": 6, "race_winner_lat": 6, "race_winner_lon": 6,
+	"round_ts": 7,
 }
 
 // SpeedColumnSchema is the envelope version a file carrying col needs, or 0
@@ -5616,7 +5695,7 @@ func SpeedColumnSchema(col string) int { return speedColumnSchema[col] }
 // cost is a file older builds refuse up front.
 func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
 	var ipFamily, udpDirection, failed, usageRunTS bool
-	var raceOutcome, raceOrigins, raceKind, raceLabel, raceMS, raceRacers, raceLat, raceLon bool
+	var raceOutcome, raceOrigins, raceKind, raceLabel, raceMS, raceRacers, raceLat, raceLon, roundTS bool
 	err := tx.QueryRowContext(ctx, `SELECT
 		EXISTS(SELECT 1 FROM speed WHERE ip_family IS NOT NULL AND ip_family <> ''),
 		EXISTS(SELECT 1 FROM speed WHERE udp_direction IS NOT NULL AND udp_direction <> ''),
@@ -5629,9 +5708,10 @@ func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (m
 		EXISTS(SELECT 1 FROM speed WHERE race_winner_ms IS NOT NULL),
 		EXISTS(SELECT 1 FROM speed WHERE race_racers IS NOT NULL),
 		EXISTS(SELECT 1 FROM speed WHERE race_winner_lat IS NOT NULL),
-		EXISTS(SELECT 1 FROM speed WHERE race_winner_lon IS NOT NULL)`).Scan(
+		EXISTS(SELECT 1 FROM speed WHERE race_winner_lon IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE round_ts IS NOT NULL)`).Scan(
 		&ipFamily, &udpDirection, &failed, &usageRunTS,
-		&raceOutcome, &raceOrigins, &raceKind, &raceLabel, &raceMS, &raceRacers, &raceLat, &raceLon)
+		&raceOutcome, &raceOrigins, &raceKind, &raceLabel, &raceMS, &raceRacers, &raceLat, &raceLon, &roundTS)
 	if err != nil {
 		return nil, err
 	}
@@ -5639,7 +5719,7 @@ func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (m
 		"failed": failed, "usage_run_ts": usageRunTS,
 		"race_outcome": raceOutcome, "race_origins": raceOrigins, "race_winner_kind": raceKind,
 		"race_winner_label": raceLabel, "race_winner_ms": raceMS, "race_racers": raceRacers,
-		"race_winner_lat": raceLat, "race_winner_lon": raceLon}, nil
+		"race_winner_lat": raceLat, "race_winner_lon": raceLon, "round_ts": roundTS}, nil
 }
 
 // LastDecidedRace is the newest run whose city race was decided and whose
@@ -5663,7 +5743,7 @@ func (s *Store) LastDecidedRace(ctx context.Context) (label string, lat, lon flo
 		 WHERE race_outcome = 'decided' AND race_winner_lat IS NOT NULL AND race_winner_lon IS NOT NULL
 		   AND (race_winner_lat <> 0 OR race_winner_lon <> 0)
 		   AND race_winner_lat BETWEEN -90 AND 90 AND race_winner_lon BETWEEN -180 AND 180
-		   AND `+speedNotFailed+`
+		   AND `+speedIsResult+`
 		 ORDER BY ts DESC LIMIT 1`).Scan(&lbl, &la, &lo)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, 0, false, nil
