@@ -606,6 +606,22 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		}
 	}
 
+	// A LOST challenge measured a rival the seat did not go to, not the server
+	// the history is built on. Its numbers are real and are kept (the row, the
+	// report, the cadence), but a breach on them is a fact about that rival, not
+	// a verdict on the line: it must not page, must not extend the breach
+	// streak, and must not pin the adaptive cadence. Downgraded to the same
+	// "no verdict" path an unmeasurable threshold takes. A rival that PASSED
+	// still records healthy - a good measurement is evidence the link is fine -
+	// and a won or failed challenge measured the seat holder and is judged as
+	// any run is.
+	if judged && len(failures) > 0 && challengeLostReport(res.Selection) {
+		judged = false
+		sp.Healthy = nil
+		s.log.Info("speedtest below threshold on a challenger; a rival's numbers are not a verdict on the line",
+			"server", sp.Server, "failures", failures)
+	}
+
 	// On shutdown (or a client disconnect mid-run) ctx is already cancelled by the
 	// time the test finishes; don't persist into a store that p.run is about to
 	// Close(), and don't alert during teardown. The run just isn't recorded - the
@@ -1251,6 +1267,20 @@ func thresholdsMeasurable(sp store.SpeedSample, t settings.Thresholds) bool {
 // same field-by-field seam RunOnce uses for Result -> store.SpeedSample. It
 // lives HERE, not in selection.go: the Scheduler is the package's only store
 // client, and the engine files stay persistence-free.
+// challengeLostReport says the report's winner was a challenger that lost
+// (see ChallengeLost): the measured server is not the seat holder.
+func challengeLostReport(rep *SelectionReport) bool {
+	if rep == nil {
+		return false
+	}
+	for _, c := range rep.Candidates {
+		if c.Winner {
+			return ChallengeLost(c.WinReason)
+		}
+	}
+	return false
+}
+
 func selectionRows(runTS int64, rep *SelectionReport) []store.SpeedServerRow {
 	rows := make([]store.SpeedServerRow, 0, len(rep.Candidates))
 	for _, c := range rep.Candidates {

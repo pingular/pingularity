@@ -44,29 +44,37 @@ func TestChallengeIncumbentPicksTheStrongestRival(t *testing.T) {
 	}
 }
 
-func TestChallengeWonNeedsARecordAndAMargin(t *testing.T) {
+func TestChallengeWonJudgesAgainstTheRecordsOwnGoodHours(t *testing.T) {
 	cases := []struct {
 		name    string
 		score   float64
 		history []float64
-		margin  int
 		want    bool
+		wantBar float64
 		wantMed float64
 	}{
-		{"beats the median by more than the margin", 120, []float64{100, 90, 110, 95}, 15, true, 97.5},
-		{"beats the median but not by the margin", 110, []float64{100, 90, 110, 95}, 15, false, 97.5},
-		{"exactly the bar is not a win", 115, []float64{100, 100, 100}, 15, false, 100},
-		{"too little history: the seat stays", 500, []float64{100, 100}, 15, false, 0},
-		{"no history: the seat stays", 500, nil, 15, false, 0},
-		{"zero margin: any edge wins", 101, []float64{100, 100, 100}, 0, true, 100},
-		{"a negative margin reads as zero", 101, []float64{100, 100, 100}, -5, true, 100},
-		{"one outlier hour of the incumbent does not decide it", 130, []float64{100, 100, 100, 100, 10}, 15, true, 100},
-		{"a score of nothing never wins", 0, []float64{1, 1, 1}, 0, false, 0},
+		// A tight record: the 15% floor decides (median 97.5, p90 110 < 112.125).
+		{"beats the floor", 120, []float64{100, 90, 110, 95}, true, 112.125, 97.5},
+		{"beats the median but not the floor", 110, []float64{100, 90, 110, 95}, false, 112.125, 97.5},
+		{"exactly the bar is not a win", 115, []float64{100, 100, 100}, false, 115, 100},
+		// A noisy record (swings of a third): the incumbent's own good hours set
+		// the bar - its second-best hour, 130 - so 125, which would have cleared
+		// a flat 15% (120.75), does not steal a seat one good hour of the
+		// incumbent's would take straight back.
+		{"a noisy record raises the bar to its good hours", 125, []float64{100, 140, 80, 130, 90, 110}, false, 130, 105},
+		{"and a real improvement clears it", 140, []float64{100, 140, 80, 130, 90, 110}, true, 130, 105},
+		// The single best hour is set aside once there are five to go on, so one
+		// freak reading cannot make the seat unassailable.
+		{"one freak hour does not decide it", 130, []float64{100, 100, 100, 100, 300}, true, 115, 100},
+		{"with fewer than five the best hour still counts", 130, []float64{100, 100, 100, 300}, false, 300, 100},
+		{"too little history: the seat stays", 500, []float64{100, 100}, false, 0, 0},
+		{"no history: the seat stays", 500, nil, false, 0, 0},
+		{"a score of nothing never wins", 0, []float64{1, 1, 1}, false, 0, 0},
 	}
 	for _, c := range cases {
-		won, med := challengeWon(c.score, c.history, c.margin)
-		if won != c.want || med != c.wantMed {
-			t.Errorf("%s: won=%v med=%v, want %v %v", c.name, won, med, c.want, c.wantMed)
+		won, bar, med := challengeWon(c.score, c.history)
+		if won != c.want || bar != c.wantBar || med != c.wantMed {
+			t.Errorf("%s: won=%v bar=%v med=%v, want %v %v %v", c.name, won, bar, med, c.want, c.wantBar, c.wantMed)
 		}
 	}
 }
@@ -101,7 +109,6 @@ func TestScheduledChallengeRunMeasuresTheRivalAndJudgesIt(t *testing.T) {
 		}
 		return history
 	}
-	o.ChallengeMarginFn = func() int { return 15 }
 
 	res, err := o.RunReason(context.Background(), "scheduled")
 	if err != nil {
@@ -220,5 +227,56 @@ func TestChallengeFallsBackToTheIncumbentWhenTheRivalFails(t *testing.T) {
 	}
 	if len(measured) != 1 {
 		t.Errorf("not a challenge: measured %v, want one server", measured)
+	}
+}
+
+// The rival of a challenge gets a best-of-sized slice, not the whole run: an
+// accept-then-stall rival must leave the incumbent fallback a window a run
+// can finish in, or every scheduled run fails on the same rival - and, with
+// no winner row written, is challenged again by it next time.
+func TestChallengeRivalIsBoundedSoTheFallbackKeepsItsBudget(t *testing.T) {
+	requireQuiet(t)
+	healthyEndpoints(t)
+	stubServerList(t)
+	countingPing(t, map[string]time.Duration{"1": 9 * time.Millisecond, "2": 8 * time.Millisecond, "3": 20 * time.Millisecond})
+	type slice struct {
+		id   string
+		left time.Duration
+	}
+	var slices []slice
+	stubMeasure(t, func(_ *Ookla, ctx context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		dl, _ := ctx.Deadline()
+		slices = append(slices, slice{srv.ID, time.Until(dl)})
+		if srv.ID == "1" {
+			return Result{}, errors.New("rival: stalled") // fails fast here; the SLICE is what is under test
+		}
+		return Result{Server: "S" + srv.ID, ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 20, PingMS: 9}, nil
+	})
+	o := NewOokla()
+	o.LossFn = func() bool { return false }
+	o.IncumbentFn = func() string { return "2" }
+	o.ChallengeFn = func() bool { return true }
+	o.IncumbentScoresFn = func(string, string) []float64 { return []float64{60, 62, 58} }
+	if _, err := o.RunReason(context.Background(), "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	if len(slices) != 2 || slices[0].id != "1" || slices[1].id != "2" {
+		t.Fatalf("measured %v, want the rival then the incumbent", slices)
+	}
+	perServer, _ := runBudget(speedRetries(nil), 1)
+	if slices[0].left > bestOfServerTimeout+time.Second {
+		t.Errorf("the rival's slice is %v, want at most the best-of slice %v so a stall cannot spend the fallback's budget", slices[0].left.Round(time.Second), bestOfServerTimeout)
+	}
+	if slices[1].left < perServer-bestOfServerTimeout-5*time.Second {
+		t.Errorf("the incumbent's slice is %v, want the rest of the run's %v budget", slices[1].left.Round(time.Second), perServer)
+	}
+	// An ordinary single-server run still gets its whole slice.
+	slices = nil
+	o.ChallengeFn = func() bool { return false }
+	if _, err := o.RunReason(context.Background(), "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	if len(slices) != 1 || slices[0].left < perServer-5*time.Second {
+		t.Errorf("not a challenge: slices %v, want one target with the full %v", slices, perServer)
 	}
 }

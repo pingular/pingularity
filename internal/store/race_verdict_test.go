@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -241,5 +242,60 @@ func TestLastDecidedRaceSkipsWhatCannotBeEntered(t *testing.T) {
 	label, lat, lon, ok, err := st.LastDecidedRace(ctx)
 	if err != nil || !ok || label != "Montréal" || lat != 45.5 || lon != -73.57 {
 		t.Errorf("got %q %v,%v ok=%v err=%v; want the Montréal race - the newer rows carry nothing a race can enter", label, lat, lon, ok, err)
+	}
+}
+
+// The per-server reads of the selection reports seek, they do not scan: the
+// index they need exists on a fresh and on a migrated database.
+func TestSpeedServersHasAPerServerIndex(t *testing.T) {
+	st := openTestStore(t)
+	rows, err := st.db.Query(`PRAGMA index_list(speed_servers)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatal(err)
+		}
+		if name == "idx_speed_servers_server" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("idx_speed_servers_server missing: RecentRankPings and RecentServerScores walk the whole table without it")
+	}
+	var plan string
+	if err := st.db.QueryRow(`EXPLAIN QUERY PLAN SELECT rank_ping_ms FROM speed_servers WHERE server_id = ? AND rank_ping_ms IS NOT NULL AND rank_ping_ms > 0 ORDER BY run_ts DESC LIMIT 20`, "1993").Scan(new(int), new(int), new(int), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "idx_speed_servers_server") {
+		t.Errorf("plan %q, want a seek on idx_speed_servers_server", plan)
+	}
+}
+
+// A failed run's accounting row is not a measurement: even if it carries a
+// decided verdict (reachable only through an imported backup - the scheduler
+// never stamps race_* on a failed row) it must not seed the next race.
+func TestLastDecidedRaceSkipsFailedRows(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	f := func(v float64) *float64 { return &v }
+	base := time.Now().Add(-time.Hour).Unix()
+	if err := st.InsertSpeed(ctx, SpeedSample{TS: base, Server: "s", Engine: "ookla", DownMbps: 1, UpMbps: 1, PingMS: 1,
+		RaceOutcome: "decided", RaceWinnerLabel: "Montréal", RaceWinnerLat: f(45.5), RaceWinnerLon: f(-73.57)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertSpeed(ctx, SpeedSample{TS: base + 60, Server: "s", Engine: "ookla", Failed: true,
+		RaceOutcome: "decided", RaceWinnerLabel: "Toronto", RaceWinnerLat: f(43.65), RaceWinnerLon: f(-79.38)}); err != nil {
+		t.Fatal(err)
+	}
+	label, _, _, ok, err := st.LastDecidedRace(ctx)
+	if err != nil || !ok || label != "Montréal" {
+		t.Errorf("got %q ok=%v err=%v; the newer row is accounting, not a race", label, ok, err)
 	}
 }

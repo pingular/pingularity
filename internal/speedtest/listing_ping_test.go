@@ -57,4 +57,10 @@ func TestListInfosMeasureDistanceFromTheCentre(t *testing.T) {
 	if out := listInfos(ookla.Servers{near}, 0, 0); out[0].DistanceKM != 0 {
 		t.Errorf("uncentred: %v, want the catalogue's figure untouched", out[0].DistanceKM)
 	}
+	// A server on the very point the list is centred on is near, not unknown:
+	// 0 is what a by-ID row (no distance at all) reads as.
+	atCentre := &ookla.Server{ID: "c", Lat: "45.5017", Lon: "-73.5673", Distance: 0}
+	if out := listInfos(ookla.Servers{atCentre}, 45.5017, -73.5673); !(out[0].DistanceKM > 0 && out[0].DistanceKM < 0.5) {
+		t.Errorf("at the centre: %v, want a small positive distance, never 0", out[0].DistanceKM)
+	}
 }

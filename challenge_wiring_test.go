@@ -28,7 +28,7 @@ func TestChallengeFnIsDueEveryNAutoRunsFromHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	set, err := settings.New(context.Background(), st, settings.Values{SpeedChallengeEvery: 3, SpeedChallengeMargin: 15,
+	set, err := settings.New(context.Background(), st, settings.Values{SpeedChallengeEvery: 3,
 		Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second, DownAfter: 3, UpAfter: 2})
 	if err != nil {
 		t.Fatal(err)

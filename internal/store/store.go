@@ -620,6 +620,17 @@ func applySchema(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_speed_usage_run_ts ON speed(usage_run_ts) WHERE usage_run_ts IS NOT NULL`); err != nil {
 		return fmt.Errorf("migrate index idx_speed_usage_run_ts: %w", err)
 	}
+	// The per-server reads of the selection reports (RecentRankPings for the
+	// picker's saved pane, RecentServerScores for the challenge verdict) ask
+	// "this server's last N rows": without this they walk the whole table
+	// through idx_speed_servers_ts - measured 55 ms and ~100k rows shipped to
+	// Go per settings-drawer open at a year of hourly runs, 675 ms at a
+	// five-minute cadence - and a kept server that was never ranked walks it
+	// to the end. With it each is a seek and a LIMIT. Twelve index inserts
+	// per run, ~30 bytes a row.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_speed_servers_server ON speed_servers(server_id, run_ts)`); err != nil {
+		return fmt.Errorf("migrate index idx_speed_servers_server: %w", err)
+	}
 	// Drop the unused (target, ts) index from existing DBs: no query filters by
 	// target, and the one per-target query pins idx_samples_ts - so it was pure
 	// write/storage cost on the hot probe path.
@@ -3322,55 +3333,64 @@ func (s *Store) LastSpeedWinnersExcluding(ctx context.Context, limit int, reason
 // the daemon's own runs measured, which costs no network at all. The window
 // is per server, not per run, so a server that is ranked only when its city
 // wins still gets its own last `runs` answers.
+//
+// One bounded query per ID, not one IN query for all: the window has to be
+// per server, and a single ordered query can only apply it after every
+// matching row has crossed the driver - measured at ~100k rows and 55 ms per
+// call at a year of hourly runs. Each query here is a seek on
+// idx_speed_servers_server plus LIMIT: a fraction of a millisecond, however
+// long the history (and the index is what keeps a never-ranked kept server
+// from walking the table to prove it).
 func (s *Store) RecentRankPings(ctx context.Context, ids []string, runs int) (map[string]float64, error) {
+	out := map[string]float64{}
 	if len(ids) == 0 || runs <= 0 {
-		return map[string]float64{}, nil
+		return out, nil
 	}
-	args := make([]any, 0, len(ids))
-	marks := make([]string, 0, len(ids))
 	for _, id := range ids {
-		args = append(args, id)
-		marks = append(marks, "?")
+		v, err := s.recentRankPingsFor(ctx, id, runs)
+		if err != nil {
+			return nil, err
+		}
+		if n := len(v); n > 0 {
+			sort.Float64s(v)
+			if n%2 == 1 {
+				out[id] = v[n/2]
+			} else {
+				out[id] = (v[n/2-1] + v[n/2]) / 2
+			}
+		}
 	}
+	return out, nil
+}
+
+// recentRankPingsFor is one server's last `runs` answered ranking pings,
+// newest first (see RecentRankPings).
+func (s *Store) recentRankPingsFor(ctx context.Context, id string, runs int) ([]float64, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT server_id, rank_ping_ms FROM speed_servers
-		 WHERE server_id IN (`+strings.Join(marks, ",")+`) AND rank_ping_ms IS NOT NULL
-		 ORDER BY run_ts DESC`, args...)
+		`SELECT rank_ping_ms FROM speed_servers
+		 WHERE server_id = ? AND rank_ping_ms IS NOT NULL AND rank_ping_ms > 0
+		 ORDER BY run_ts DESC LIMIT ?`, id, runs)
 	if err != nil {
 		recordDBErr(err)
 		return nil, err
 	}
 	defer rows.Close()
-	samples := map[string][]float64{}
+	var v []float64
 	for rows.Next() {
-		var id string
 		var ms sql.NullFloat64
-		if err := rows.Scan(&id, &ms); err != nil {
+		if err := rows.Scan(&ms); err != nil {
 			recordDBErr(err)
 			return nil, err
 		}
-		if !ms.Valid || math.IsNaN(ms.Float64) || math.IsInf(ms.Float64, 0) || ms.Float64 <= 0 {
-			continue
-		}
-		if len(samples[id]) < runs {
-			samples[id] = append(samples[id], ms.Float64)
+		if ms.Valid && !math.IsNaN(ms.Float64) && !math.IsInf(ms.Float64, 0) && ms.Float64 > 0 {
+			v = append(v, ms.Float64)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		recordDBErr(err)
 		return nil, err
 	}
-	out := make(map[string]float64, len(samples))
-	for id, v := range samples {
-		sort.Float64s(v)
-		n := len(v)
-		if n%2 == 1 {
-			out[id] = v[n/2]
-		} else {
-			out[id] = (v[n/2-1] + v[n/2]) / 2
-		}
-	}
-	return out, nil
+	return v, nil
 }
 
 // speedServerRows runs one speed_servers query and scans its rows.
@@ -5614,6 +5634,7 @@ func (s *Store) LastDecidedRace(ctx context.Context) (label string, lat, lon flo
 		 WHERE race_outcome = 'decided' AND race_winner_lat IS NOT NULL AND race_winner_lon IS NOT NULL
 		   AND (race_winner_lat <> 0 OR race_winner_lon <> 0)
 		   AND race_winner_lat BETWEEN -90 AND 90 AND race_winner_lon BETWEEN -180 AND 180
+		   AND `+speedNotFailed+`
 		 ORDER BY ts DESC LIMIT 1`).Scan(&lbl, &la, &lo)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, 0, false, nil

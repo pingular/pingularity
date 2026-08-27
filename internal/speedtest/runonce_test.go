@@ -301,3 +301,46 @@ func TestRunOnceReleasesFlagBeforeAlert(t *testing.T) {
 		t.Fatalf("alerts = %d, want 2 (exactly one per breaching run)", got)
 	}
 }
+
+// A lost challenge measured a rival, not the seat holder: its breach is a fact
+// about that rival and must neither page nor be recorded as the line's
+// verdict. A challenge the rival WON measured the new seat holder and is
+// judged like any run.
+func TestRunOnceDoesNotAlertOnALostChallengersBreach(t *testing.T) {
+	for _, tc := range []struct {
+		reason    string
+		wantAlert bool
+	}{
+		{WinReasonChallenger, false},
+		{WinReasonChallengerWon, true},
+		{WinReasonChallengerFailed, true},
+		{winReasonFastestRank, true},
+	} {
+		stats.ResetForTest()
+		res := Result{DownloadMbps: 5, UploadMbps: 1, PingMS: 20, Server: "S", ServerID: "1", DownloadBytes: 5_000_000, UploadBytes: 1_000_000,
+			Selection: &SelectionReport{Candidates: []CandidateReport{{ServerID: "1", Server: "S", RankOrder: 1, Selected: true, Measured: true, Winner: true, WinReason: tc.reason}}}}
+		s, _ := newRunOnceScheduler(t, res)
+		s.ThresholdsFn = func() settings.Thresholds { return settings.Thresholds{DownMbps: 100} } // min 100 Mbps down -> fails
+		var alerted []string
+		s.OnUnhealthy = func(sp store.SpeedSample, failures []string) { alerted = failures }
+		sp, err := s.RunOnce(context.Background(), "scheduled")
+		if err != nil {
+			t.Fatalf("%s: RunOnce: %v", tc.reason, err)
+		}
+		if tc.wantAlert {
+			if sp.Healthy == nil || *sp.Healthy || len(alerted) == 0 {
+				t.Errorf("%s: a breach on the seat holder must be recorded unhealthy and alert (healthy=%v alerted=%v)", tc.reason, sp.Healthy, alerted)
+			}
+			if !s.lastUnhealthy.Load() {
+				t.Errorf("%s: the adaptive cadence must see the breach", tc.reason)
+			}
+		} else {
+			if sp.Healthy != nil || len(alerted) != 0 {
+				t.Errorf("%s: a lost challenger's breach is not a verdict on the line (healthy=%v alerted=%v)", tc.reason, sp.Healthy, alerted)
+			}
+			if s.lastUnhealthy.Load() || s.consecBreach != 0 {
+				t.Errorf("%s: it must not pin the cadence or extend the breach streak", tc.reason)
+			}
+		}
+	}
+}

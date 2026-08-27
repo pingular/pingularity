@@ -105,14 +105,11 @@ type Ookla struct {
 	// rival's throughput - it ranks on ping alone - so on a challenge run the
 	// incumbent's strongest rival (the fastest-pinging other server) is
 	// measured instead, and takes the seat only if its score beats the
-	// incumbent's recent record (IncumbentScoresFn) by ChallengeMarginFn
-	// percent (see challengeWon). Same data as an ordinary run: one server.
-	// Scheduled runs only, never under a pin or Best-of (which is its own
-	// explorer). Nil -> never.
+	// incumbent's recent record (IncumbentScoresFn) - a bar derived from that
+	// record itself, see challengeWon. Same data as an ordinary run: one
+	// server. Scheduled runs only, never under a pin or Best-of (which is its
+	// own explorer). Nil -> never.
 	ChallengeFn func() bool
-	// ChallengeMarginFn is the bar a challenger must clear, in percent over
-	// the incumbent's median score. Nil -> challengeDefaultMargin.
-	ChallengeMarginFn func() int
 	// IncumbentScoresFn hands back a server's recent measured scores, newest
 	// first, at most ChallengeHistory of them, judged under the given test
 	// direction ("both"|"down"|"up"): a score is download-only, upload-only or
@@ -2289,7 +2286,18 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		// single accept-then-stall server (the ping and loss probes have no request
 		// timeout of their own) burn the whole window, so the other targets were
 		// never contacted - the exact failure best-of-N exists to survive.
-		sctx, scancel := context.WithTimeout(ctx, perServer)
+		// A single-server run carrying a FALLBACK target (a challenge: the rival,
+		// then the incumbent) was sized for one server, so the rival cannot have
+		// the whole window: an accept-then-stall rival would spend it and leave
+		// the incumbent a slice nothing can finish in - every scheduled run then
+		// fails on the same rival until it recovers, and the failed run writes no
+		// winner row, so the cadence stays due and re-picks it. The rival gets a
+		// best-of-sized slice; the fallback keeps the rest of the run's budget.
+		slice := perServer
+		if want <= 1 && len(targets) > 1 && i < len(targets)-1 && slice > bestOfServerTimeout {
+			slice = bestOfServerTimeout
+		}
+		sctx, scancel := context.WithTimeout(ctx, slice)
 		res, err := measureServer(o, sctx, srv, dir, retries)
 		scancel()
 		if err != nil {
@@ -2476,16 +2484,16 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		stats.Inc("speed.challenge")
 		scores := o.incumbentScores(o.challenged, dir)
 		score := resultScore(best, dir)
-		if won, med := challengeWon(score, scores, o.challengeMargin()); won {
+		if won, bar, med := challengeWon(score, scores); won {
 			winReason = WinReasonChallengerWon
 			stats.Inc("speed.challenge_won")
 			o.warnf("auto-select challenger took the seat", "server", best.Server, "server_id", best.ServerID,
 				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
-				"history", len(scores), "margin_pct", o.challengeMargin())
+				"bar", util.Round2(bar), "history", len(scores))
 		} else {
 			o.logf("auto-select challenger lost", "server", best.Server, "server_id", best.ServerID,
 				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
-				"history", len(scores), "margin_pct", o.challengeMargin())
+				"bar", util.Round2(bar), "history", len(scores))
 		}
 	case want <= 1 && lead != "":
 		winReason = lead // the head of the list was promoted there (see promoteIncumbent)
@@ -2873,9 +2881,10 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 		if lead == WinReasonChallenger {
 			// The incumbent rides along as the FALLBACK target, measured only if
 			// the rival fails (RunReason stops after the first measurement at
-			// want=1): a dead rival must cost one failed attempt, not the whole
-			// run - a run with no winner row leaves the cadence still due, so
-			// every following scheduled run would challenge the same dead rival.
+			// want=1, and bounds the rival's slice so a stall cannot spend the
+			// fallback's): a dead rival must cost one failed attempt, not the
+			// whole run - a run with no winner row leaves the cadence still due,
+			// so every following scheduled run would challenge the same rival.
 			for _, s := range ranked[1:] {
 				if s.ID == o.challenged {
 					targets = append(targets, s)
@@ -2957,21 +2966,17 @@ func firstRivalErr(targetIDs []string, errByID map[string]string, incumbent stri
 	return ""
 }
 
-func (o *Ookla) challengeMargin() int {
-	if o.ChallengeMarginFn == nil {
-		return challengeDefaultMargin
-	}
-	return o.ChallengeMarginFn()
-}
-
 // Challenge constants. ChallengeHistory is how many of the incumbent's recent
 // scores the verdict's median is over; challengeMinHistory is how many it
 // needs before a rival can win at all - below that the record is one or two
 // hours of one server, which is not a record.
 const (
-	ChallengeHistory       = 12
-	challengeMinHistory    = 3
-	challengeDefaultMargin = 15 // percent
+	ChallengeHistory    = 12
+	challengeMinHistory = 3
+	// challengeFloorPct is the least a challenger must beat the incumbent's
+	// median by, in percent, on a line whose own record is tight; a noisier
+	// record raises the bar to that record's good hours (see challengeWon).
+	challengeFloorPct = 15
 )
 
 // challengeIncumbent picks the run's target on a challenge run: the fastest
@@ -3023,27 +3028,38 @@ func challengeIncumbent(ranked ookla.Servers, incumbent string) (ookla.Servers, 
 	return ranked, 0, ""
 }
 
-// challengeWon is the challenge verdict: the rival's score against the median
-// of the incumbent's recent scores, which it must beat by margin percent. No
-// history, or too little (challengeMinHistory), and the incumbent keeps the
-// seat: an unverifiable win is not a win. Returns the median it judged
-// against (0 when there was none).
-func challengeWon(score float64, history []float64, marginPct int) (bool, float64) {
+// challengeWon is the challenge verdict: the rival's one score against a bar
+// derived from the incumbent's own recent record. The bar is the higher of
+// the record's median plus challengeFloorPct, and the record's SECOND-best
+// hour (its best, with fewer than five runs to go on) - what the incumbent
+// itself reaches on a good hour, with its single luckiest hour set aside so
+// one freak reading cannot make the seat unassailable. So on a tight wired
+// line the floor decides, and on a link whose runs swing by a fifth the rival
+// has to beat the incumbent's good hours, not its average, or one lucky hour
+// of the rival's would steal the seat and the next challenge would steal it
+// back. Nobody has to know their link's noise as a number: the record already
+// says it. No history, or too little (challengeMinHistory), and the incumbent
+// keeps the seat: an unverifiable win is not a win. Returns the bar and the
+// median it judged against (both 0 when there was none).
+func challengeWon(score float64, history []float64) (won bool, bar, med float64) {
 	if len(history) < challengeMinHistory || !(score > 0) {
-		return false, 0
+		return false, 0, 0
 	}
 	h := append([]float64(nil), history...)
 	sort.Float64s(h)
-	med := h[len(h)/2]
-	if len(h)%2 == 0 {
-		med = (h[len(h)/2-1] + h[len(h)/2]) / 2
+	n := len(h)
+	med = h[n/2]
+	if n%2 == 0 {
+		med = (h[n/2-1] + h[n/2]) / 2
 	}
-	if marginPct < 0 {
-		marginPct = 0
+	good := h[n-1]
+	if n >= 5 {
+		good = h[n-2]
 	}
-	// Integer-scaled so "exactly the bar" is a tie, not a win: 100*1.15 is
-	// 114.999... in binary and 115 beat it.
-	return score*100 > med*float64(100+marginPct), med
+	bar = math.Max(med*float64(100+challengeFloorPct)/100, good)
+	// Scaled so "exactly the bar" is a tie, not a win: 100*1.15 is 114.999...
+	// in binary and 115 beat it.
+	return score*100 > bar*100, bar, med
 }
 
 // rankMargin is the band within which two ranking pings are the same answer:
@@ -4948,6 +4964,18 @@ func ListOoklaServers(ctx context.Context, lat, lon float64) ([]ServerInfo, erro
 	return out, nil
 }
 
+// measuredKM is kmBetween for a listing row: never exactly 0, because 0 is
+// what "no distance" reads as downstream (a by-ID row), and a server sitting
+// on the very point a list is centred on - Ookla's one city-centre coordinate
+// shared by a dozen servers, when the list is centred on one of them - is
+// near, not unknown. A hundredth of a kilometre renders as "<1 km".
+func measuredKM(lat, lon, la, lo float64) float64 {
+	if d := kmBetween(lat, lon, la, lo); d > 0.01 {
+		return d
+	}
+	return 0.01
+}
+
 // listInfos converts a fetched list to picker rows, pairing by index with
 // servers. With a centre (lat/lon not both zero) each row's distance is
 // measured from it here, not taken from the catalogue: Ookla's API reports
@@ -4963,7 +4991,7 @@ func listInfos(servers ookla.Servers, lat, lon float64) []ServerInfo {
 		la, lo, ok := serverCoord(s)
 		dist := s.Distance
 		if centred && ok {
-			dist = kmBetween(lat, lon, la, lo)
+			dist = measuredKM(lat, lon, la, lo)
 		}
 		out = append(out, ServerInfo{
 			ID: s.ID, Sponsor: s.Sponsor, Name: s.Name,
