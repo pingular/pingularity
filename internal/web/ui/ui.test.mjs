@@ -270,8 +270,8 @@ test('engOf: legacy/empty engine reads as ookla', () => {
 });
 
 // --- iperf3 saved-server picker helpers ---
-const IP = new Function('esc', extract('function iperfAddrValid') + '\n' + extract('function iperfCardName') +
-  '\nreturn { iperfAddrValid, iperfCardName };')(s => String(s)); // esc stubbed to identity
+const IP = new Function('esc', extract('function iperfAddrValid') + '\n' + extract('function iperfRowName') +
+  '\nreturn { iperfAddrValid, iperfRowName };')(s => String(s)); // esc stubbed to identity
 
 test('iperfAddrValid: accepts host[:port], rejects empty/flag/whitespace', () => {
   assert.equal(IP.iperfAddrValid('10.0.0.5'), true);
@@ -284,10 +284,11 @@ test('iperfAddrValid: accepts host[:port], rejects empty/flag/whitespace', () =>
   assert.equal(IP.iperfAddrValid(null), false);
 });
 
-test('iperfCardName: "label - addr", bare addr, or a new-server placeholder', () => {
-  assert.equal(IP.iperfCardName({ label: 'Home NAS', addr: '10.0.0.5' }), 'Home NAS <span class="ca">- 10.0.0.5</span>');
-  assert.equal(IP.iperfCardName({ label: '', addr: '10.0.0.5' }), '10.0.0.5');
-  assert.match(IP.iperfCardName({ label: '', addr: '' }), /new server/);
+test('iperfRowName: "label · addr", bare addr, or a new-server placeholder, plus the bind source when set', () => {
+  assert.equal(IP.iperfRowName({ label: 'Home NAS', addr: '10.0.0.5' }), 'Home NAS<span class="fp-sub"> · 10.0.0.5</span>');
+  assert.equal(IP.iperfRowName({ label: '', addr: '10.0.0.5' }), '10.0.0.5');
+  assert.match(IP.iperfRowName({ label: '', addr: '' }), /new server/);
+  assert.equal(IP.iperfRowName({ label: '', addr: '10.0.0.5', bind: 'eth1' }), '10.0.0.5<span class="fp-sub"> · bind eth1</span>');
 });
 
 // --- per-server profile mapping ---
@@ -3883,6 +3884,100 @@ test('Ookla and iperf3 have their own tabs, and Engine heads the Speedtest tab',
     'in the one-column pane the engine row is a plain row again, or its toggle sits mid-line while every other control is at the edge');
   assert.doesNotMatch(html, /data-tab="server"/, 'no button, pane or selector still names the removed tab');
   assert.match(speed, /id="iperfMissingNote"/, 'the "iperf3 is not installed" note explains the Engine toggle, so it sits beside it');
+});
+
+test('the iperf3 tab is laid out like the Ookla tab: the knobs on top, the servers in a picker list below', () => {
+  const iperf = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="iperf">'), html.indexOf('<!-- /iperf3 pane -->'));
+  const at = needle => iperf.indexOf(needle);
+  assert.ok(at('class="tp-grid"') > 0 && at('class="tp-grid"') < at('id="iperfServerRow"'), 'the twelve knobs come first');
+  assert.ok(at('id="iperfServerRow"') < at('id="iperfEditor"'), 'the details open under the list, not above the knobs');
+  assert.doesNotMatch(iperf, /class="server-search fp-find"|iperfNewAddr|iperfCheckBtn/,
+    'nothing sits above the list: adding is its last row, and a row\u2019s own light does what Check did');
+  assert.match(iperf, /<div class="fp-list fp-kept ipl" id="iperfServerList">/, 'the servers use the picker\u2019s list frame and grow with their content');
+  const ed = iperf.slice(iperf.indexOf('id="iperfEditor"'));
+  assert.match(ed, /<div class="iperf-editor-foot">\s*<button class="btn danger sm" id="iperfEditRemove"[\s\S]*?id="iperfEditDone"/,
+    'Remove and Done close the details from the bottom right, in that order');
+  assert.ok(ed.indexOf('id="iperfEditRemove"') > ed.indexOf('id="setIperfRSAKey"'), 'after the last field, not above the first');
+  assert.match(html, /\.iperf-editor-foot\{display:flex;justify-content:flex-end;/, 'right-aligned, like Save and Discard below them');
+  assert.doesNotMatch(html, /iperfEditTitle|iperf-editor-head/, 'and the details carry no heading: the list already marks the row being edited');
+  assert.doesNotMatch(script, /iperfEditTitle/, 'nothing still writes one');
+  assert.doesNotMatch(html, /iperf-card|iperfPick|iperfCardHTML|\+ Add server/, 'the cards and their radios are gone');
+  const row = extract('function iperfRowHTML');
+  assert.match(row, /class="fp-btn\$\{on\?' on':''\}" type="button" data-act="pick"/, 'the row itself is the pick, like an Ookla row');
+  assert.match(row, /class="iperf-dot \$\{st\}" type="button" data-act="check"/, 'the status light still re-checks on click');
+  assert.match(row, /class="fp-star ipl-edit" type="button" data-act="edit"/, 'the pencil sits where the star does');
+  assert.match(row, /data-act="undo"/, 'a server marked for removal keeps its row with Undo');
+  const render = extract('function renderIperfServers');
+  assert.match(render, /<span>Server<\/span><span>IP<\/span><span>Auth<\/span><span>Status<\/span>/, 'the header names the columns');
+  const acts = script.slice(script.indexOf("$('iperfServerList').addEventListener('click'"), script.indexOf("$('iperfEditDone').addEventListener"));
+  assert.match(acts, /btn\.dataset\.act==='pick'/, 'picking is a row action');
+  assert.match(acts, /btn\.dataset\.act==='add'/, 'and so is adding one');
+  assert.match(html, /#serverRow \.fp-find\{/, 'the Ookla search bar keeps its own style, now the only one');
+  // Both sit between the list and the details as flex items, so while empty
+  // they cost their own height AND the column's gap.
+  assert.match(html, /#iperfMsg:empty\{display:none;\}/, 'the message line takes no room until there is a message');
+  assert.match(html, /#iperfServerRow \.warn-bubble:not\(\.show\)\{display:none;\}/, 'nor does the collapsed loopback bubble, whose borders still paint');
+});
+
+test('the iperf3 list owns its columns: the picker\u2019s later rules cannot take them back', () => {
+  // Both blocks style the same element (class="fp-list fp-kept ipl") and the
+  // picker's is declared LATER, so every ipl rule that redefines one of its
+  // properties has to carry both classes or silently lose the tie.
+  assert.match(html, /\.fp-list\.ipl\{--tracks:15px minmax\(0,1fr\) 44px 58px;--star-w:58px;--light-w:56px;\}/,
+    'the column tracks outrank .fp-list, or the list lays out with the Ookla picker\u2019s five');
+  assert.match(html, /@media \(max-width:560px\)\{\s*\.fp-list\.ipl\{--tracks:15px minmax\(0,1fr\) 44px;--star-w:58px;\}/,
+    'and so does the narrow step');
+  assert.match(html, /\.btn\.ipl-undo\{[^}]*background:transparent;border:1px solid var\(--line2\);color:var\(--muted\);\}/,
+    'Undo is an outline, not the accent-filled .btn: a row waiting to be removed must not be the loudest thing on the tab');
+  assert.doesNotMatch(html, /(?<!\.btn)\.ipl-undo\{/,
+    'and it names .btn too - a one-class rule loses the tie to .btn, which is declared later');
+  assert.doesNotMatch(html, /(?<!\.fp-list)\.ipl\{--tracks/, 'no one-class .ipl track rule is left to lose the tie');
+  // The picker hides its narrow columns BY POSITION; the iperf list's 5th
+  // header is Status and its 3rd is IP, so those rules must skip it.
+  assert.match(html, /\.fp-km,\.fp-list:not\(\.ipl\) \.fp-hdr>span:nth-child\(5\)\{display:none;\}/,
+    'the 760px rule must not hide the iperf list\u2019s Status header while its lights stay');
+  assert.match(html, /\.fp-id,\.fp-list:not\(\.ipl\) \.fp-hdr>span:nth-child\(3\)\{display:none;\}/,
+    'nor the 560px rule its IP header');
+  assert.match(html, /@media \(max-width:760px\)\{\s*\.fp-list:not\(\.ipl\)\{--tracks/, 'the picker\u2019s own tracks stay its own');
+});
+
+test('adding is the list\u2019s last row, and the row follows its details', () => {
+  const render = extract('function renderIperfServers');
+  assert.match(render, /<button class="ipl-add" type="button" data-act="add"/, 'the add row closes the list');
+  assert.match(script, /const IPL_PLUS='<svg[^']*stroke-width="1\.5"/, 'its glyph is stroked like the pencil, not a ring around a character');
+  assert.match(render, /<span class="ipl-plus" aria-hidden="true">'\+IPL_PLUS\+'/, 'and sits in the radio column, where the glyphs line up');
+  assert.match(render, /full\?' disabled title="Keeping '\+IPERF_MAX\+' servers already"':''/,
+    'and goes inert at the cap, saying why, rather than erroring after the click');
+  assert.match(render, /\+'<\/div>';/, 'it sits inside .fp-rows, so a scrolling list scrolls it too');
+  assert.doesNotMatch(render, /No servers saved yet/, 'an empty list needs no caption: the row it ends with says what to do');
+  assert.match(html, /\.ipl-add:first-child\{border-top:0;\}/, 'and then the header draws the only line above it');
+  const add = extract('function iperfAddServer');
+  assert.match(add, /newIperfServer\('',''\)/, 'the new server starts empty - the address is typed in the details');
+  assert.match(add, /iperfEditingId=sv\._id/, 'which open straight away');
+  assert.match(add, /\$\('setIperfAddr'\)\.focus/, 'with the address field focused');
+  assert.match(add, /if\(iperfServers\.length>=IPERF_MAX\) return;/, 'and a belt behind the disabled row');
+  const acts = script.slice(script.indexOf("$('iperfServerList').addEventListener('click'"), script.indexOf("$('iperfEditRemove')"));
+  assert.match(acts, /act==='add'\)\{ iperfAddServer\(\); return; \}/, 'the add row is handled before the code that expects a server id');
+  assert.match(html, /\.fp-row:has\(\+ \.ipl-add\)\{border-bottom:0;\}/, 'the row above it drops its rule so the two do not draw a double line');
+  // Every cell the details can change is repainted from one place, against the
+  // markup iperfRowHTML writes.
+  const paint = extract('function repaintIperfRow'), row = extract('function iperfRowHTML');
+  for (const sel of ['.fp-txt', '.ipl-auth', '.ipl-ip']) {
+    assert.ok(paint.includes(sel), `repaintIperfRow updates ${sel}`);
+    assert.ok(row.includes(sel.slice(1)), `and iperfRowHTML writes ${sel}`);
+  }
+  assert.match(paint, /\.ipl-row\[data-id="/, 'it finds the row the way the dot repaint does');
+  assert.match(extract('function refreshIperfDots'), /querySelectorAll\('\.ipl-row'\)/, 'and the lights follow the same class');
+  for (const id of ['setIperfAuth', 'setIperfIPVer', 'setIperfBind', 'setIperfLabel'])
+    assert.ok(script.includes(`$('${id}').addEventListener`), `${id} updates the row live`);
+});
+
+test('Remove marks the server for removal, and the status light is the only reachability check', () => {
+  const rm = script.slice(script.indexOf("$('iperfEditRemove').addEventListener"), script.indexOf("// The list's last row"));
+  assert.match(rm, /s\._del=true/, 'Remove marks the server, the row keeps its place with Undo, Save does the deleting');
+  assert.match(rm, /iperfEditingId=null/, 'and the details close');
+  assert.match(extract('function iperfRowHTML'), /data-act="check"/, 'every row can be re-checked from its light');
+  assert.doesNotMatch(script, /iperfCheckBtn|iperfNewAddr/, 'and nothing else offers to check an address');
 });
 
 test('each engine tab shows its whole contents whatever the engine is', () => {

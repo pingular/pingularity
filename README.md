@@ -1127,7 +1127,7 @@ Below that:
 > | **Cloudflare** (`/cdn-cgi/trace`) | a plain fetch, to learn the serving PoP | connection refresh |
 > | reverse DNS | router/host IPs, for names | connection refresh |
 > | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup and a small probe of each listed server's upload endpoint (remembered, so a repeat does not send it again); opening the Ookla tab can also cost one by-ID lookup and one name search first, to centre the list on the server your last automatic run used; for the picker's Auto button, the same selection a run performs - one list fetch per candidate city, a round of pings at every racer, then a round at the rest of the winning city's field (up to twelve), no transfer; for a server ID typed in Find, and for a saved pin the drawer has not yet checked this page load (at most twice per server), one by-ID lookup plus one small POST at that server's upload endpoint to learn whether it can still run a test, no transfer; and for the saved list's refresh button, one by-ID lookup, one endpoint probe and a round of pings at each kept server (up to twelve), no transfer | when a speedtest runs, when the Ookla settings tab is opened or a city is searched, when a server ID is typed in Find or a saved pin is first shown, on every Auto click, and on every refresh click in the saved list |
-> | your own **iperf3 server** (opt-in) | the test traffic itself - the TCP transfers, plus a short UDP pass for loss and jitter; or, for the status light in the settings drawer, one bare TCP handshake and nothing else | when an iperf3 speedtest runs, and when the drawer checks a saved server's status light - once per address while the drawer is open with iperf3 selected, plus whenever you click a server's dot or change its address |
+> | your own **iperf3 server** (opt-in) | the test traffic itself - the TCP transfers, plus a short UDP pass for loss and jitter; or, for the status light in the settings drawer, one bare TCP handshake and nothing else | when an iperf3 speedtest runs, and when the drawer checks a saved server's status light - once per address while the drawer is open with iperf3 selected, plus whenever you click a server's light or change its address |
 > | **nominatim.openstreetmap.org** | the city text you type | only when you search a city for a server |
 > | **update.pingularity.dev** | a version-check fetch (no identifiers) | daily, if the update check is on (until the first check succeeds: retried at 1m/5m/15m, then hourly) |
 > | your **alert webhook** (opt-in) | the alert text and its fields, to the URL you set | on an outage, a speed-threshold breach, a digest, or the Send test button |
@@ -1231,7 +1231,13 @@ and persist across restarts:
   rival server take the seat now and then has no knob here - see *Choosing an
   Ookla server*.) The engine itself (**Ookla** or
   **iperf3**) is chosen on the Speedtest tab; iperf3's servers and per-test
-  options live on their own **iperf3** tab. **Best of** (Ookla only, default 1 =
+  options live on their own **iperf3** tab, laid out the same way: the test
+  knobs on top, the saved servers below in the same kind of list (each row
+  shows the server, its IP version, whether it authenticates, and a status
+  light that re-checks it when clicked). The list's last row adds one: it puts
+  an empty server at the end and opens its details, where you type the address
+  like every other field. Adding, editing and removing all take effect when you
+  press Save, like every other setting in the drawer. **Best of** (Ookla only, default 1 =
   a single server, up to 16) is how many servers each scheduled or manual test
   measures, keeping only the best result (or every result, with **Discard
   losers** off). The round is your pinned server if

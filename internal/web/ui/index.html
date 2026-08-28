@@ -630,39 +630,92 @@
      treatment as the stall notice below it - a statement of fact, not a warning. */
   .log-trunc{font-size:11px;color:var(--muted);padding:2px 8px;opacity:.85;}
   .log-stall{margin:5px 2px 0;font-size:11.5px;color:var(--warn);}
-  /* iperf3 saved-server cards: a compact list (a dot picks the test target, Edit opens
-     the inline editor, x removes), plus the collapsible editor panel below it. */
-  .iperf-list{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;margin:6px 0 2px;}
-  .iperf-card{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg2);}
-  .iperf-card.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;}
-  /* Marked for deletion: dimmed with a strike through the name until Save (or Undo). */
-  /* Delete and Undo swap in place, so they share one width to keep the row from shifting. */
-  .iperf-card [data-act="rm"],.iperf-card [data-act="undo"]{min-width:63px;}
-  .iperf-card.pending-del{opacity:.5;}
-  .iperf-card.pending-del .iperf-card-name{text-decoration:line-through;}
-  .iperf-card.pending-del .iperf-card-pick,.iperf-card.pending-del .iperf-dot{visibility:hidden;}
-  .iperf-card-pick{display:flex;align-items:center;flex:none;cursor:pointer;}
-  .iperf-card-pick input{accent-color:var(--accent);cursor:pointer;margin:0;}
-  .iperf-card-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;}
-  .iperf-card-name .ca{color:var(--muted);}
-  .iperf-card .btn{flex:none;}
-  /* The toggle relabels Edit <-> Close, whose widths differ ~9px; a fixed width
-     keeps the dot and name from jumping sideways on every open/close. */
-  .iperf-card [data-act="edit"]{min-width:62px;}
-  /* Per-server status light: reachable / unreachable / checking / unknown. Click to recheck. */
+  /* ---- iperf3 servers: the Ookla picker's list, with this tab's own columns
+     (server, IP family, auth, status light, edit). --tracks sizes the button's
+     columns; the light and the pencil sit outside the button like the star.
+     EVERY rule here that redefines something .fp-list also sets carries BOTH
+     classes: the picker's own block is declared later in this sheet, so a
+     one-class `.ipl` loses the tie and its columns would silently be the
+     picker's five. Same reason the header rules below name nth-child. */
+  /* --star-w holds the pencil OR the Undo of a row waiting to be removed, so
+     it is sized for the wider of the two. */
+  .fp-list.ipl{--tracks:15px minmax(0,1fr) 44px 58px;--star-w:58px;--light-w:56px;}
+  .ipl .fp-hdr{grid-template-columns:var(--tracks) var(--light-w) var(--star-w);}
+  .ipl .fp-hdr span:nth-child(3),.ipl .fp-hdr span:nth-child(4){text-align:left;}
+  .ipl .fp-hdr span:nth-child(5){text-align:center;}
+  /* The header pads 12px on both sides; the row's button pads only its left,
+     the light and the pencil sitting flush right. Moving the row's right pad
+     from the button to the row puts the cells under their headers. */
+  .ipl .fp-row{grid-template-columns:1fr var(--light-w) var(--star-w);padding-right:12px;}
+  .ipl .fp-btn{padding-right:0;}
+  .ipl .ipl-ip{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:11.5px;color:var(--muted);}
+  .ipl .fp-badge.ok{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent);}
+  .ipl .iperf-dot{justify-self:center;}
+  .ipl .fp-btn:disabled{cursor:default;}
+  .ipl-row.pending-del .fp-btn,.ipl-row.pending-del .iperf-dot{opacity:.5;}
+  .ipl-row.pending-del .fp-txt{text-decoration:line-through;}
+  /* Quiet, like everything else in a row: the badges, the light and the pencil
+     are all outlines or glyphs, and the accent-filled .btn it started as read as
+     the loudest thing on the tab - for a row that is only waiting to be removed.
+     Same size as the badge beside it, so the column keeps its rhythm. */
+  .btn.ipl-undo{min-width:0;height:24px;padding:0 9px;font-size:11.5px;font-weight:600;justify-self:center;
+    background:transparent;border:1px solid var(--line2);color:var(--muted);}
+  .btn.ipl-undo:hover{filter:none;background:transparent;border-color:var(--accent);color:var(--accent);}
+  /* Adding is the last row of the list rather than a bar above it: on this tab
+     it happens once or twice ever (the cap is twelve), and a permanent
+     full-width control for that outweighed everything around it. Dashed, so it
+     reads as an invitation rather than a server - and the row above it drops
+     its own rule so the two do not draw a double line. */
+  .ipl-add{display:grid;grid-template-columns:15px minmax(0,1fr);gap:16px;align-items:center;
+    width:100%;height:var(--row-h);padding:0 12px;box-sizing:border-box;
+    border:0;border-top:1px dashed var(--line2);background:transparent;color:var(--muted);
+    font:inherit;font-size:13px;text-align:left;cursor:pointer;}
+  .fp-row:has(+ .ipl-add){border-bottom:0;}
+  /* With nothing saved the list is just its header and this row, and the
+     header already draws the line between them. */
+  .ipl-add:first-child{border-top:0;}
+  .ipl-add:hover:not(:disabled){background:var(--panel2);color:var(--fg);}
+  .ipl-add:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+  /* A stroked plus, the pencil's twin: same 1.5 stroke and 14px box, sitting in
+     the radio column so the glyphs down the left edge line up. A ringed one
+     read as a fourth, fuzzy radio. */
+  .ipl-plus{display:grid;place-items:center;width:14px;height:14px;color:var(--line2);}
+  .ipl-plus svg{display:block;width:14px;height:14px;}
+  .ipl-add:hover:not(:disabled) .ipl-plus{color:var(--accent);}
+  .ipl-add:disabled{cursor:default;opacity:.55;}
+  /* The two things under the list that are usually not there: the message line
+     (min-height reserves a line so a message appearing does not shift the
+     editor) and the loopback bubble (collapsed to max-height 0, but its 1px
+     borders still paint 2px). Both are flex items of #iperfServerRow, so each
+     also spends the column's 6px gap - 26px of nothing between the list and
+     the details. Taken out of the flow entirely while empty, which leaves the
+     same 12px below the list as above it. The bubble pops in rather than
+     unrolling here; it is a warning, and it earns its animation elsewhere. */
+  #iperfMsg:empty{display:none;}
+  #iperfServerRow .warn-bubble:not(.show){display:none;}
+  /* This list's own narrow step: the auth badge goes, header and cell together.
+     The picker's breakpoints below skip it (they drop columns it does not have,
+     and would hide these headers by POSITION - its 5th span is Status, not a
+     distance). */
+  @media (max-width:560px){
+    .fp-list.ipl{--tracks:15px minmax(0,1fr) 44px;--star-w:58px;}
+    .ipl .ipl-auth,.ipl .fp-hdr>span:nth-child(4){display:none;}
+  }
   .iperf-dot{flex:none;width:9px;height:9px;border-radius:50%;border:none;padding:0;cursor:pointer;background:var(--muted);opacity:.5;}
   .iperf-dot.on{background:var(--up);opacity:1;box-shadow:0 0 5px var(--up);}
   .iperf-dot.off{background:var(--down);opacity:1;}
   .iperf-dot.loading{background:var(--warn);opacity:1;animation:iperfpulse 1s ease-in-out infinite;}
   @keyframes iperfpulse{0%,100%{opacity:.3}50%{opacity:1}}
-  .iperf-card-empty{color:var(--muted);font-size:12.5px;padding:4px 2px;}
   .bad-input{border-color:var(--down)!important;}
   .bad-input:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--down) 16%,transparent)!important;}
-  .iperf-list-actions{grid-column:1/-1;margin:2px 0 4px;}
   .iperf-editor{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;border:1px solid var(--line2);border-radius:10px;
     padding:10px 12px;margin:2px 0 8px;background:color-mix(in srgb,var(--accent) 5%,transparent);}
-  .iperf-editor-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:2px;}
-  .iperf-editor-head .lbl{font-weight:600;}
+  /* The details close on their own buttons, at the end of the panel where the
+     eye lands after the last field - and where the drawer's own Save and
+     Discard sit. No heading above them: the list marks the row being edited
+     (its pencil brightens), so naming the server again over its own fields
+     was a line that said nothing new. */
+  .iperf-editor-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:2px;}
   /* Two-column editor layout: pairs of fields per row, and the RSA key (tall, left)
      beside the stacked username/password/padding (right) - much denser than one
      full-width field per row. */
@@ -686,6 +739,11 @@
   .ie-auth-cols{display:grid;grid-template-columns:1fr 1fr;gap:8px 18px;align-items:stretch;margin-top:8px;}
   .ie-rsa{display:flex;flex-direction:column;gap:4px;min-width:0;}
   .ie-rsa .ie-lbl{white-space:normal;}
+  /* Every property this shares with .srow-wide textarea (line ~723, LATER in
+     this sheet, same specificity) currently holds the same value, so nothing
+     is lost - but the later rule would win any disagreement. Change padding,
+     border or font here and it will silently do nothing: prefix the selector
+     (.ie-rsa is inside .srow-wide) the way .ie-grid .ie-field>select does. */
   .ie-rsa textarea{flex:1;width:100%;box-sizing:border-box;min-height:84px;background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:7px 9px;font-family:ui-monospace,monospace;font-size:12px;resize:vertical;}
   .ie-rsa textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
   .ie-creds{display:flex;flex-direction:column;gap:8px;min-width:0;}
@@ -880,12 +938,12 @@
      350px the fixed tracks left the name no width at all and rows showed only
      numbers. */
   @media (max-width:760px){
-    .fp-list{--tracks:15px minmax(0,1fr) 66px 64px;}
-    .fp-km,.fp-hdr>span:nth-child(5){display:none;}
+    .fp-list:not(.ipl){--tracks:15px minmax(0,1fr) 66px 64px;}
+    .fp-km,.fp-list:not(.ipl) .fp-hdr>span:nth-child(5){display:none;}
   }
   @media (max-width:560px){
-    .fp-list{--tracks:15px minmax(0,1fr) 64px;}
-    .fp-id,.fp-hdr>span:nth-child(3){display:none;}
+    .fp-list:not(.ipl){--tracks:15px minmax(0,1fr) 64px;}
+    .fp-id,.fp-list:not(.ipl) .fp-hdr>span:nth-child(3){display:none;}
   }
   .fp-star.full{opacity:.25;cursor:default;}
   .fp-star.full:hover{color:var(--line2);}
@@ -1610,7 +1668,6 @@
   html:not(.round) .card,
   html:not(.round) .login-box,
   html:not(.round) .coach,
-  html:not(.round) .iperf-card,
   html:not(.round) .iperf-editor,
   html:not(.round) .log-window,
   html:not(.round) .runs-wrap,
@@ -1878,70 +1935,6 @@
       <div class="tabpane tab-uniform" data-tab="iperf">
       <div class="sgroup">
         <div class="info-note hidden" id="iperfVersionNote"><span class="wi">ℹ&#xFE0E;</span>Detected <code id="iperfVersionText">iperf3</code> on this host. Authentication padding and the unambiguous bidirectional result need a recent build (3.17+ / 3.11+); an older iperf3 may reject some options.</div>
-        <div class="srow-wide" id="iperfServerRow">
-          <span class="lbl">iperf3 servers
-            <span class="info" tabindex="0" data-tip="Your saved 'iperf3 -s' servers.
-• Tests run against the selected one.
-• Edit changes its address and credentials.
-• Port defaults to 5201.">i</span></span>
-          <div class="iperf-list" id="iperfServerList"></div>
-          <div class="iperf-list-actions"><button class="btn sm" id="iperfAddBtn" type="button">+ Add server</button></div>
-          <span class="muted" id="iperfMsg" style="font-size:12px;min-height:1em"></span>
-          <!-- I1: never blocks Save - a loopback target is legitimate natively and the
-               operator may know better; the bubble only explains why it will refuse
-               connections from a bridged container. Toggled by updateIperfLoopbackWarn. -->
-          <div class="warn-bubble" id="iperfLoopbackWarn"><span class="wi">⚠&#xFE0E;</span><span><b id="iperfLoopbackName">A saved server</b> points at <b>localhost</b>, and this daemon runs in a <b>bridged container</b> - there, 127.0.0.1/localhost is the container itself, not the machine running your iperf3 server, so tests will fail with “connection refused”. Use the host's LAN IP (or <span class="mono">host.docker.internal</span> - built into Docker Desktop, and the canonical compose file maps it on Linux engines too), or run the container with host networking.</span></div>
-        </div>
-        <div class="srow-wide hidden iperf-editor" id="iperfEditor">
-          <div class="iperf-editor-head"><span class="lbl" id="iperfEditTitle">Edit server</span>
-            <button class="btn sm" id="iperfEditDone" type="button">Done</button></div>
-          <div class="ie-grid">
-            <label class="ie-field"><span class="ie-lbl">Label
-                <span class="info" tabindex="0" data-tip="A friendly name for this server, shown in the list and on each run. Optional.">i</span></span>
-              <input type="text" id="setIperfLabel" placeholder="optional name" maxlength="60" autocomplete="off"></label>
-            <label class="ie-field"><span class="ie-lbl">Address
-                <span class="info" tabindex="0" data-tip="The server's host or host:port. Editing updates this saved server in place.
-• Its saved password is tied to the old address - re-enter it after a change. Everything else carries over.
-• Port defaults to 5201.">i</span></span>
-              <input type="text" id="setIperfAddr" placeholder="host or host:port" maxlength="255" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
-            <label class="ie-field"><span class="ie-lbl">IP version
-                <span class="info" tabindex="0" data-tip="Force IPv4 or IPv6 when this server has both. Auto lets iperf3 choose.
-• Handy to compare the two paths, or to pin a known-good one.">i</span></span>
-              <select id="setIperfIPVer"><option value="auto">Auto</option><option value="4">IPv4</option><option value="6">IPv6</option></select></label>
-            <label class="ie-field"><span class="ie-lbl">Bind source
-                <span class="info" tabindex="0" data-tip="Which local source to test from, for hosts with more than one uplink. Blank = default route.
-• A source IP (e.g. 192.168.1.20, or 2001:db8::5) binds the socket to that address (--bind).
-• An interface name (e.g. eth0) binds to that device (--bind-dev, needs a recent iperf3 and usually root).">i</span></span>
-              <input type="text" id="setIperfBind" placeholder="source IP or interface" maxlength="255" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
-            <label class="ie-field"><span class="ie-lbl">Authentication
-                <span class="info" tabindex="0" data-tip="Use iperf3 RSA auth so only you can test a server that's exposed to the internet.
-• Set the server up with --rsa-private-key-path and --authorized-users-path.">i</span></span>
-              <span class="ctl"><input type="checkbox" id="setIperfAuth"><span class="unit"></span></span></label>
-          </div>
-          <div class="ie-auth-cols iperf-auth">
-            <label class="ie-rsa"><span class="ie-lbl">Server RSA public key
-                <span class="info" tabindex="0" data-tip="Paste the server's RSA public key (PEM).
-• Not secret: it's what encrypts your credentials.">i</span></span>
-              <textarea id="setIperfRSAKey" rows="6" spellcheck="false" placeholder="-----BEGIN PUBLIC KEY-----"></textarea></label>
-            <div class="ie-creds">
-              <label class="ie-field"><span class="ie-lbl">Username</span>
-                <input type="text" id="setIperfUsername" placeholder="iperf3 username" maxlength="120" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
-              <label class="ie-field"><span class="ie-lbl">Password
-                  <span class="info" tabindex="0" data-tip="Stored on this host, encrypted, and never shown to you again.
-• iperf3 needs it in the clear at test time, so it can't be hashed like your login. The key lives in pingularity.key, beside the database.
-• Never included in a backup export.
-• Leave it blank to keep the password already saved.">i</span></span>
-                <input type="password" id="setIperfPassword" placeholder="leave blank to keep" maxlength="255" autocomplete="new-password"></label>
-              <label class="ie-field"><span class="ie-lbl">Legacy RSA padding
-                  <span class="info" tabindex="0" data-tip="Forces the legacy RSA padding (--use-pkcs1-padding) on for this server.
-• Needed only for a pre-3.17 iperf3 server that requires PKCS#1 padding.
-• Your OWN iperf3 must be able to send it: the flag arrived in 3.17 and became server-only in 3.20, so only a local 3.17-3.19 build can use this.
-• There's no automatic fallback: without it, authentication to such a server fails outright - Pingularity never silently downgrades your padding.">i</span></span>
-                <span class="ctl"><input type="checkbox" id="setIperfPKCS1"><span class="unit"></span></span></label>
-              <div class="info-note hidden" id="iperfPKCS1Note"></div>
-            </div>
-          </div>
-        </div>
         <div class="tp-grid">
         <label class="srow"><span class="lbl">Test duration
           <span class="info" tabindex="0" data-tip="Seconds per direction for each transfer.
@@ -2011,6 +2004,71 @@
 • Raise it to sample loss on a fast link.
 • The probe's data isn't counted in the usage figure - at 1000 Mbps that's about 250 MB per test.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfUDPRate" min="0" max="10000" step="1"><span class="unit">Mbps</span></span></label>
+        </div>
+        <div class="srow-wide" id="iperfServerRow">
+          <span class="lbl hidden">iperf3 servers
+            <span class="info" tabindex="0" data-tip="Your saved 'iperf3 -s' servers.
+• Tests run against the selected one.
+• Edit changes its address and credentials.
+• Port defaults to 5201.">i</span></span>
+          <div class="fp-list fp-kept ipl" id="iperfServerList"></div>
+          <span class="muted" id="iperfMsg" style="font-size:12px;min-height:1em"></span>
+          <!-- I1: never blocks Save - a loopback target is legitimate natively and the
+               operator may know better; the bubble only explains why it will refuse
+               connections from a bridged container. Toggled by updateIperfLoopbackWarn. -->
+          <div class="warn-bubble" id="iperfLoopbackWarn"><span class="wi">⚠&#xFE0E;</span><span><b id="iperfLoopbackName">A saved server</b> points at <b>localhost</b>, and this daemon runs in a <b>bridged container</b> - there, 127.0.0.1/localhost is the container itself, not the machine running your iperf3 server, so tests will fail with “connection refused”. Use the host's LAN IP (or <span class="mono">host.docker.internal</span> - built into Docker Desktop, and the canonical compose file maps it on Linux engines too), or run the container with host networking.</span></div>
+        </div>
+        <div class="srow-wide hidden iperf-editor" id="iperfEditor">
+          <div class="ie-grid">
+            <label class="ie-field"><span class="ie-lbl">Label
+                <span class="info" tabindex="0" data-tip="A friendly name for this server, shown in the list and on each run. Optional.">i</span></span>
+              <input type="text" id="setIperfLabel" placeholder="optional name" maxlength="60" autocomplete="off"></label>
+            <label class="ie-field"><span class="ie-lbl">Address
+                <span class="info" tabindex="0" data-tip="The server's host or host:port. Editing updates this saved server in place.
+• Its saved password is tied to the old address - re-enter it after a change. Everything else carries over.
+• Port defaults to 5201.">i</span></span>
+              <input type="text" id="setIperfAddr" placeholder="host or host:port" maxlength="255" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
+            <label class="ie-field"><span class="ie-lbl">IP version
+                <span class="info" tabindex="0" data-tip="Force IPv4 or IPv6 when this server has both. Auto lets iperf3 choose.
+• Handy to compare the two paths, or to pin a known-good one.">i</span></span>
+              <select id="setIperfIPVer"><option value="auto">Auto</option><option value="4">IPv4</option><option value="6">IPv6</option></select></label>
+            <label class="ie-field"><span class="ie-lbl">Bind source
+                <span class="info" tabindex="0" data-tip="Which local source to test from, for hosts with more than one uplink. Blank = default route.
+• A source IP (e.g. 192.168.1.20, or 2001:db8::5) binds the socket to that address (--bind).
+• An interface name (e.g. eth0) binds to that device (--bind-dev, needs a recent iperf3 and usually root).">i</span></span>
+              <input type="text" id="setIperfBind" placeholder="source IP or interface" maxlength="255" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
+            <label class="ie-field"><span class="ie-lbl">Authentication
+                <span class="info" tabindex="0" data-tip="Use iperf3 RSA auth so only you can test a server that's exposed to the internet.
+• Set the server up with --rsa-private-key-path and --authorized-users-path.">i</span></span>
+              <span class="ctl"><input type="checkbox" id="setIperfAuth"><span class="unit"></span></span></label>
+          </div>
+          <div class="ie-auth-cols iperf-auth">
+            <label class="ie-rsa"><span class="ie-lbl">Server RSA public key
+                <span class="info" tabindex="0" data-tip="Paste the server's RSA public key (PEM).
+• Not secret: it's what encrypts your credentials.">i</span></span>
+              <textarea id="setIperfRSAKey" rows="6" spellcheck="false" placeholder="-----BEGIN PUBLIC KEY-----"></textarea></label>
+            <div class="ie-creds">
+              <label class="ie-field"><span class="ie-lbl">Username</span>
+                <input type="text" id="setIperfUsername" placeholder="iperf3 username" maxlength="120" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next"></label>
+              <label class="ie-field"><span class="ie-lbl">Password
+                  <span class="info" tabindex="0" data-tip="Stored on this host, encrypted, and never shown to you again.
+• iperf3 needs it in the clear at test time, so it can't be hashed like your login. The key lives in pingularity.key, beside the database.
+• Never included in a backup export.
+• Leave it blank to keep the password already saved.">i</span></span>
+                <input type="password" id="setIperfPassword" placeholder="leave blank to keep" maxlength="255" autocomplete="new-password"></label>
+              <label class="ie-field"><span class="ie-lbl">Legacy RSA padding
+                  <span class="info" tabindex="0" data-tip="Forces the legacy RSA padding (--use-pkcs1-padding) on for this server.
+• Needed only for a pre-3.17 iperf3 server that requires PKCS#1 padding.
+• Your OWN iperf3 must be able to send it: the flag arrived in 3.17 and became server-only in 3.20, so only a local 3.17-3.19 build can use this.
+• There's no automatic fallback: without it, authentication to such a server fails outright - Pingularity never silently downgrades your padding.">i</span></span>
+                <span class="ctl"><input type="checkbox" id="setIperfPKCS1"><span class="unit"></span></span></label>
+              <div class="info-note hidden" id="iperfPKCS1Note"></div>
+            </div>
+          </div>
+          <div class="iperf-editor-foot">
+            <button class="btn danger sm" id="iperfEditRemove" type="button" title="Remove this server on Save">Remove</button>
+            <button class="btn sm" id="iperfEditDone" type="button" title="Close these details; nothing is saved until you press Save">Done</button>
+          </div>
         </div>
       </div>
       </div><!-- /iperf3 pane -->
@@ -7916,6 +7974,7 @@ let iperfActiveId=null;              // _id of the test target (the picked dot)
 let iperfEditingId=null;             // _id of the server whose editor is open (null = none)
 let iperfLoadedId=null;              // _id currently loaded into the editor inputs (avoids clobbering unsaved edits on re-render)
 let iperfIdSeq=0; const nextIperfId=()=>++iperfIdSeq;
+const IPERF_MAX=12;                  // the cap on saved iperf3 servers (the backend's own)
 let iperfHealth={};                  // addr -> 'on'|'off'|'loading' (reachability for the status light; undefined = not yet checked)
 let iperfAvailable=true;             // is the iperf3 binary on PATH (from GET settings)? drives the "not installed" note
 let iperfVersion='';                 // detected iperf3 version string (from GET settings), "" if absent/unparseable; drives the version note
@@ -7934,7 +7993,7 @@ async function probeIperf(addr){
 // Repaint the dots in place (no full re-render, so an open editor / typing isn't disturbed).
 function refreshIperfDots(){
   const list=$('iperfServerList'); if(!list) return;
-  list.querySelectorAll('.iperf-card').forEach(card=>{
+  list.querySelectorAll('.ipl-row').forEach(card=>{
     const s=iperfServers.find(x=>x._id===+card.dataset.id), dot=card.querySelector('.iperf-dot');
     if(!s||!dot) return;
     const st=iperfHealth[s.addr]||'unknown';
@@ -7983,20 +8042,35 @@ function editingIperfServer(){ return iperfServers.find(s=>s._id===iperfEditingI
 // Lenient client check (the backend + tester validate strictly): non-empty, not
 // flag-shaped, no embedded whitespace. Good enough for instant feedback.
 function iperfAddrValid(a){ a=(a||'').trim(); return !!a && a[0]!=='-' && !/\s/.test(a); }
-// The card's display name: "label - addr" (label muted-suffixed), or a placeholder.
-function iperfCardName(s){
-  if(s.label) return `${esc(s.label)} <span class="ca">- ${esc(s.addr||'no address')}</span>`;
-  return s.addr ? esc(s.addr) : '<span class="ca">new server - add an address</span>';
+// The row's name: the label with the address muted after it (the Ookla rows'
+// sponsor · name shape), the bare address, or a placeholder for a new server;
+// plus the bind source when one is set, since it changes what the test measures.
+function iperfRowName(s){
+  let n = s.label ? `${esc(s.label)}<span class="fp-sub"> · ${esc(s.addr||'no address')}</span>`
+    : (s.addr ? esc(s.addr) : '<span class="fp-sub">new server - add an address</span>');
+  if(s.bind) n += `<span class="fp-sub"> · bind ${esc(s.bind)}</span>`;
+  return n;
 }
-function iperfCardHTML(s){
-  return `<div class="iperf-card${s._id===iperfActiveId?' active':''}${s._del?' pending-del':''}" data-id="${s._id}">`
-    +`<label class="iperf-card-pick" title="Use this server for tests"><input type="radio" name="iperfPick" data-id="${s._id}" aria-label="Use ${esc(s.label||s.addr||'new server')} for tests"${s._id===iperfActiveId?' checked':''}></label>`
-    +`<span class="iperf-card-name">${iperfCardName(s)}</span>`
-    +`<button class="iperf-dot ${iperfHealth[s.addr]||'unknown'}" type="button" data-act="check" data-id="${s._id}" title="${iperfDotTitle(iperfHealth[s.addr]||'unknown')}" aria-label="Server status"></button>`
-    +(s._del ? '' : `<button class="btn sm" type="button" data-act="edit" data-id="${s._id}">${s._id===iperfEditingId?'Close':'Edit'}</button>`)
+const IPL_PLUS='<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>';
+const IPL_PENCIL='<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M11.2 2.6l2.2 2.2L5.5 12.7 2.6 13.4l.7-2.9z"/><path d="M9.8 4l2.2 2.2"/></svg>';
+// One server as a picker row: the button picks it for tests (its radio marks the
+// choice), the status light re-checks it, and the pencil opens or closes its
+// details below the list. A server marked for removal keeps its row, struck
+// through, with Undo where the pencil was - the removal happens on Save.
+function iperfRowHTML(s){
+  const on=s._id===iperfActiveId, st=iperfHealth[s.addr]||'unknown', editing=s._id===iperfEditingId;
+  const who=esc(s.label||s.addr||'new server');
+  const ip=s.ipver==='4'?'v4':s.ipver==='6'?'v6':'auto';
+  return `<div class="fp-row ipl-row${s._del?' pending-del':''}" data-id="${s._id}">`
+    +`<button class="fp-btn${on?' on':''}" type="button" data-act="pick" data-id="${s._id}" aria-pressed="${on}" title="Use this server for tests" aria-label="Use ${who} for tests"${s._del?' disabled':''}>`
+    +`<span class="fp-radio"></span><span class="fp-name"><span class="fp-txt">${iperfRowName(s)}</span></span>`
+    +`<span class="ipl-ip" title="${ip==='auto'?'IP version: whichever iperf3 picks':'IPv'+ip.slice(1)+' only'}">${ip}</span>`
+    +`<span class="ipl-auth">${s.auth?'<span class="fp-badge ok" title="RSA authentication">RSA</span>':'<span class="fp-badge bad" title="No authentication">open</span>'}</span>`
+    +`</button>`
+    +`<button class="iperf-dot ${st}" type="button" data-act="check" data-id="${s._id}" title="${iperfDotTitle(st)}" aria-label="Server status"></button>`
     +(s._del
-      ? `<button class="btn sm" type="button" data-act="undo" data-id="${s._id}" title="Keep this server">Undo</button>`
-      : `<button class="btn danger sm" type="button" data-act="rm" data-id="${s._id}" title="Remove this server on Save">Delete</button>`)
+      ? `<button class="btn sm ipl-undo" type="button" data-act="undo" data-id="${s._id}" title="Keep this server">Undo</button>`
+      : `<button class="fp-star ipl-edit" type="button" data-act="edit" data-id="${s._id}" aria-pressed="${editing}" title="${editing?'Close the details':'Edit this server'}" aria-label="${editing?'Close':'Edit'} ${who}">${IPL_PENCIL}</button>`)
     +`</div>`;
 }
 function renderIperfServers(){
@@ -8007,9 +8081,12 @@ function renderIperfServers(){
     const live=iperfServers.filter(s=>!s._del);
     iperfActiveId = live.length?live[0]._id:null;
   }
-  list.innerHTML = iperfServers.length ? iperfServers.map(iperfCardHTML).join('')
-    : '<div class="iperf-card-empty">No servers saved yet - add one to run iperf3 tests.</div>';
-  $('iperfAddBtn').disabled = iperfServers.length>=12;
+  const full=iperfServers.length>=IPERF_MAX;
+  list.innerHTML = '<div class="fp-hdr"><span></span><span>Server</span><span>IP</span><span>Auth</span><span>Status</span><span></span></div>'
+    +'<div class="fp-rows">'+iperfServers.map(iperfRowHTML).join('')
+    +'<button class="ipl-add" type="button" data-act="add"'+(full?' disabled title="Keeping '+IPERF_MAX+' servers already"':'')
+      +'><span class="ipl-plus" aria-hidden="true">'+IPL_PLUS+'</span><span>Add a server</span></button>'
+    +'</div>';
   // The message under the list dies when its REASON dies, not when the editor
   // closes. Closing the editor over a renamed server does not un-orphan its
   // stored password: the rename is applied live, Done captures it, and the next
@@ -8044,7 +8121,6 @@ function renderIperfEditor(){
 }
 function loadIperfEditor(s){
   $('iperfMsg').textContent='';   // the address warning belongs to the edit that raised it
-  $('iperfEditTitle').textContent = (s.label||s.addr) ? 'Edit '+(s.label||s.addr) : 'New server';
   $('setIperfLabel').value=s.label||''; $('setIperfAddr').value=s.addr||'';
   $('setIperfIPVer').value=s.ipver||'auto'; $('setIperfBind').value=s.bind||'';
   $('setIperfAuth').checked=!!s.auth; $('setIperfUsername').value=s.username||'';
@@ -8068,45 +8144,81 @@ function openIperfEditor(id){
   iperfEditingId=id; renderIperfServers();
   $('iperfEditor').scrollIntoView({block:'nearest'}); $('setIperfAddr').focus({preventScroll:true});
 }
-// Card actions (delegated; cards are re-rendered): pick the test target, edit, remove.
+// Row actions (delegated; rows are re-rendered): pick the test target, re-check,
+// open the details, undo a removal.
 $('iperfServerList').addEventListener('click', e=>{
   const btn=e.target.closest('button[data-act]'); if(!btn) return;
+  if(btn.dataset.act==='add'){ iperfAddServer(); return; } // the last row, which names no server
   const id=+btn.dataset.id, idx=iperfServers.findIndex(s=>s._id===id); if(idx<0) return;
   if(btn.dataset.act==='edit') openIperfEditor(id);
   else if(btn.dataset.act==='check') probeIperf(iperfServers[idx].addr); // manual recheck
-  else if(btn.dataset.act==='rm'){ // mark for deletion on Save (reversible with Undo); actually removed by settingsBody's filter
-    iperfServers[idx]._del=true; if(iperfEditingId===id) iperfEditingId=null; renderIperfServers(); }
+  else if(btn.dataset.act==='pick'){
+    if(iperfServers[idx]._del) return;
+    iperfActiveId=id; renderIperfServers(); // refresh the active highlight
+    // The rebuild replaced the focused button; put keyboard focus back on the picked
+    // row (the same focus-after-rebuild courtesy the status pills and per-row deletes follow).
+    const nr=$('iperfServerList').querySelector('.fp-btn[data-id="'+id+'"]');
+    if(nr) nr.focus({preventScroll:true});
+  }
   else if(btn.dataset.act==='undo'){ delete iperfServers[idx]._del; renderIperfServers(); }
 });
-$('iperfServerList').addEventListener('change', e=>{
-  const r=e.target.closest('input[type=radio]'); if(!r) return;
-  iperfActiveId=+r.dataset.id; renderIperfServers(); // refresh the active highlight
-  // The rebuild replaced the focused radio; put keyboard focus back on the picked one
-  // (the same focus-after-rebuild courtesy the status pills and per-row deletes follow).
-  const nr=$('iperfServerList').querySelector('input[name=iperfPick][data-id="'+iperfActiveId+'"]');
-  if(nr) nr.focus({preventScroll:true});
+// Removal lives in the details, beside Done: marked for deletion on Save (the row
+// stays, struck through, with Undo); actually removed by settingsBody's filter.
+$('iperfEditRemove').addEventListener('click', ()=>{
+  const s=editingIperfServer(); if(!s) return;
+  s._del=true; iperfEditingId=null; renderIperfServers();
 });
-$('iperfAddBtn').addEventListener('click', ()=>{
-  if(iperfServers.length>=12){ $('iperfMsg').textContent='You can save at most 12 servers.'; return; }
+// The address box: Add saves a server at the typed address (or an empty one to
+// fill in below) and opens its details; Check tries one handshake and says what
+// it found, saving nothing. Enter in the box adds.
+// The list's last row: a new server with nothing in it yet, its details open at
+// the address field. There is no address box to type into first - the details
+// are where every other field is typed, and the row's own status light is what
+// says whether the address answers.
+function iperfAddServer(){
+  if(iperfServers.length>=IPERF_MAX) return; // the row is disabled at the cap; this is the belt
   captureIperfEditor();
   const sv=newIperfServer('',''); sv._id=nextIperfId(); iperfServers.push(sv);
   if(iperfActiveId==null) iperfActiveId=sv._id; // first server becomes the default target
   iperfEditingId=sv._id; iperfLoadedId=null; $('iperfMsg').textContent=''; iperfAddrOK();
   renderIperfServers();
-  $('iperfEditor').scrollIntoView({block:'nearest'}); $('setIperfAddr').focus({preventScroll:true});
-});
+  $('iperfEditor').scrollIntoView({block:'nearest'});
+  $('setIperfAddr').focus({preventScroll:true});
+}
 $('iperfEditDone').addEventListener('click', ()=>{ captureIperfEditor(); iperfEditingId=null; renderIperfServers(); });
+// The row follows the details while they are open: every cell the details can
+// change (auth badge, IP version, the bind suffix in the name) is repainted
+// here, so the list never shows a server as it was a moment ago.
+function repaintIperfRow(s){
+  const row=$('iperfServerList').querySelector('.ipl-row[data-id="'+s._id+'"]'); if(!row) return;
+  const n=row.querySelector('.fp-txt'); if(n) n.innerHTML=iperfRowName(s);
+  const a=row.querySelector('.ipl-auth');
+  if(a) a.innerHTML = s.auth?'<span class="fp-badge ok" title="RSA authentication">RSA</span>':'<span class="fp-badge bad" title="No authentication">open</span>';
+  const ip=row.querySelector('.ipl-ip');
+  if(ip){ const v=s.ipver==='4'?'v4':s.ipver==='6'?'v6':'auto';
+    ip.textContent=v; ip.title = v==='auto'?'IP version: whichever iperf3 picks':'IPv'+v.slice(1)+' only'; }
+}
+$('setIperfAuth').addEventListener('change', ()=>{
+  const s=editingIperfServer(); if(!s) return;
+  s.auth=$('setIperfAuth').checked; repaintIperfRow(s);
+});
+$('setIperfIPVer').addEventListener('change', ()=>{
+  const s=editingIperfServer(); if(!s) return;
+  s.ipver=$('setIperfIPVer').value; repaintIperfRow(s);
+});
+$('setIperfBind').addEventListener('input', ()=>{
+  const s=editingIperfServer(); if(!s) return;
+  s.bind=$('setIperfBind').value.trim(); repaintIperfRow(s);
+});
 // Re-gate on every tick. The toggle is left ENABLED when a saved server already
 // has the flag on, so it can be turned off on a build that cannot send it - but
 // the moment it is off, the reason to leave it enabled is gone: without this it
 // could be ticked straight back on, and the note would still read "turn this off".
 $('setIperfPKCS1').addEventListener('change', applyPKCS1Gate);
-// Renaming the open server's label: update its card live (don't reload the editor).
+// Renaming the open server's label: update its row live (don't reload the editor).
 $('setIperfLabel').addEventListener('input', ()=>{
   const s=editingIperfServer(); if(!s) return;
-  s.label=$('setIperfLabel').value.trim();
-  const n=$('iperfServerList').querySelector('.iperf-card[data-id="'+s._id+'"] .iperf-card-name');
-  if(n) n.innerHTML=iperfCardName(s);
+  s.label=$('setIperfLabel').value.trim(); repaintIperfRow(s);
 });
 // Editing the address updates this server's stored address in place (its _id is stable,
 // so active/editing pointers are unaffected). Applied on change (blur), and it warns when a
@@ -8131,7 +8243,7 @@ function iperfAddrOK(){
 function iperfAddrError(){
   const s=editingIperfServer(); if(!s) return '';           // editor closed -> nothing to validate
   const v=$('setIperfAddr').value.trim();
-  if(!v) return s.orig_addr ? 'Enter an address, or use Delete to remove this server.' : '';
+  if(!v) return s.orig_addr ? 'Enter an address, or use Remove to delete this server.' : '';
   if(!iperfAddrValid(v)) return 'Enter a valid host or host:port.';
   if(iperfServers.some(o=>o!==s && o.addr===v)) return 'That address is already used by another saved server.';
   return '';
@@ -8142,14 +8254,14 @@ $('setIperfAddr').addEventListener('change', ()=>{
   if(next===s.addr){ iperfAddrOK(); $('iperfMsg').textContent=''; return; }
   // Blanking a saved server would silently delete it (and its stored password) on save -
   // keep the model's last good address and make removal explicit via Delete.
-  if(!next && s.orig_addr){ iperfAddrBad('Enter an address, or use Delete to remove this server.'); return; }
+  if(!next && s.orig_addr){ iperfAddrBad('Enter an address, or use Remove to delete this server.'); return; }
   if(next && !iperfAddrValid(next)){ iperfAddrBad('Enter a valid host or host:port.'); return; }
   if(next && iperfServers.some(o=>o!==s && o.addr===next)){ iperfAddrBad('That address is already used by another saved server.'); return; }
   iperfAddrOK();
   delete iperfHealth[s.addr]; // drop the old address's stale reachability
   s.addr=next; $('iperfMsg').textContent='';
   updateIperfLoopbackWarn(); // the edit is applied live, so the warning must follow it live too
-  const n=$('iperfServerList').querySelector('.iperf-card[data-id="'+s._id+'"] .iperf-card-name'); if(n) n.innerHTML=iperfCardName(s);
+  repaintIperfRow(s);
   refreshIperfDots(); probeIperf(next); // re-check the new address (no-op when blank/invalid)
   // The saved password is keyed to the stored address (orig_addr); if we've moved off it
   // and no new password was typed, it can't follow - prompt for re-entry rather than lose
