@@ -3697,7 +3697,10 @@ function closeDrawer(){ const hadFocus=_drawer.contains(document.activeElement);
   // inert removes the collapsed drawer's controls from the tab order so keyboard
   // focus can't get stuck in the hidden pane; also reset the expanded state.
   _drawer.inert=true; $('gearBtn').setAttribute('aria-expanded','false');
-  $('serverCity').value=''; clearServerFieldError(); syncBlackout();
+  // The refused ID goes with the box that held it: it blocks the next Save on
+  // purpose, but the box is emptied here, so keeping it would refuse an
+  // unrelated Save later over a search the user has walked away from.
+  $('serverCity').value=''; serverPinRefused=''; clearServerFieldError(); syncBlackout();
   // inert just dropped focus to <body>; hand it back to the gear (as the
   // popovers refocus their trigger) so Escape doesn't restart the tab order.
   if(hadFocus) $('gearBtn').focus(); }
@@ -4436,7 +4439,8 @@ async function refreshStatus() {
   $('ver').textContent = s.version || '';
   applyUpdateUI(s.update);
   if(!powerPending) setPowerUI(!s.paused); // don't clobber the optimistic flip while a power POST is resolving
-  speedAvgDown = s.speed_avg_down_bytes||0; speedAvgUp = s.speed_avg_up_bytes||0; updateSpeedEstimate();
+  speedAvgDown = s.speed_avg_down_bytes||0; speedAvgUp = s.speed_avg_up_bytes||0;
+  speedAvgServers = Math.max(1, s.speed_avg_servers||1); updateSpeedEstimate();
 
   // Emoji dots are decorative (the text carries the state) - hide them from
   // screen readers so pills read as "IPv4 12.3 ms", not "green circle IPv4…".
@@ -4736,7 +4740,7 @@ function saveChartImage(kind){
     // repeats them as a band UNDER the charts - a PNG has no panel around it
     // to say what the lines average to. Latency has no such pills; only
     // speed does.
-    const segs=kind==='latency'?null:spdExportAvgSegments(spdAverages(spdData), spdAvgNote(spdSampled,spdTotal,spdData.length));
+    const segs=kind==='latency'?null:spdExportAvgSegments(spdAverages(spdData), spdAvgNote(spdSampled,spdTotal,spdRunCount(spdData)));
     const bandH=segs?Math.round(32*total):0;
     const out=document.createElement('canvas');
     out.width=w+pad*2; out.height=h+pad*2+bandH;
@@ -5343,6 +5347,11 @@ function pingMeasured(p){ return isNum(p.ping_ms) && p.ping_ms>0; }
 function spdAverages(rows){
   let dn=0, dc=0, up=0, uc=0, pg=0, pc=0;
   for(const p of rows||[]){
+    // A Best-of round's kept losers are CHARTED (they are real measurements)
+    // but they are not runs: the winner is the test's result, and averaging in
+    // the servers it beat understates download and flatters ping, because the
+    // winner is chosen on capacity discounted by ping.
+    if(p.round_ts) continue;
     // Per METRIC, never per row - see above.
     if(spMeasured(p,'down_mbps')){ dn+=p.down_mbps; dc++; }
     if(spMeasured(p,'up_mbps')){ up+=p.up_mbps; uc++; }
@@ -5396,12 +5405,16 @@ function setSpdAvg(id, name, txt, sampled, note){
 // range: the stride keeps every Nth run, so any periodic pattern in the data can
 // alias, and the pills would state the aliased figure as fact.
 let spdSampled=false, spdTotal=0;
+// How many of the charted rows are RUNS - the rows the averages are over. A
+// Best-of round's kept losers ride the same series (they are charted) but are
+// not runs, and the caption must count what the mean counted.
+const spdRunCount = rows => (rows||[]).reduce((n,p)=>n+(p.round_ts?0:1),0);
 function spdAvgNote(sampled,total,shown){
   return sampled ? ` (mean of the ${shown} runs charted, of ${total} in range)` : '';
 }
 function paintSpdAvgs(){
   const a=spdAverages(spdData);
-  const note=spdAvgNote(spdSampled,spdTotal,spdData.length);
+  const note=spdAvgNote(spdSampled,spdTotal,spdRunCount(spdData));
   setSpdAvg('spdAvgDn','average download',mbpsText(a.down),spdSampled,note);
   setSpdAvg('spdAvgUp','average upload',mbpsText(a.up),spdSampled,note);
   setSpdAvg('spdAvgPing','average ping',pingAvgText(a.ping),spdSampled,note);
@@ -7477,6 +7490,12 @@ function fpAdoptSaved(list){
   speedServers=(Array.isArray(list)?list:[])
     .map(s=>({id:String(s.id==null?'':s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'', lat:s.lat||0, lon:s.lon||0}))
     .filter(s=>s.id).slice(0, FP_MAX);
+  // These rows carry no pings - the settings payload has none - so the stored
+  // pings have to be fetched again even when the ID list is unchanged. Without
+  // this the loader's "already answered for this list" guard reads as "already
+  // filled in", and every Save, reopen or Discard blanks the Ping column until
+  // the user hits refresh or ten minutes pass.
+  fpStoredFor='';
   fpNote(speedServers);
   fpDraw();
   fpLoadStoredPings();
@@ -7547,11 +7566,17 @@ function fpToggleStar(id){
   const at=speedServers.findIndex(s=>s.id===id);
   if(at>=0){ speedServers.splice(at,1); fpDraw(); return; }
   if(speedServers.length>=FP_MAX) return;   // at the cap the star it was clicked on is already drawn inert
-  const b=fpBrowse.find(s=>s.id===id)||{};
-  // The coordinate comes from the browse listing, which carries the catalogue
-  // position for the server. The by-ID endpoint reports OUR position for a server
-  // on our own ISP and sends no coordinate here at all, so a by-ID row is kept
-  // without one - the 0,0 the settings layer reads as unknown.
+  // The browse listing first, then what the picker learned about this server
+  // earlier (fpKnown): the HELD row - the chosen server neither pane lists - is
+  // drawn with a working star but is by definition absent from fpBrowse, and
+  // starring it off the listing alone saved a nameless, coordinate-less row.
+  // The coordinate matters: main.go skips a starred server at 0,0 when it
+  // builds the race origins, so a blank one stops contributing its city.
+  const b=fpBrowse.find(s=>s.id===id)||fpKnown.get(id)||{};
+  // That coordinate is the catalogue position for the server. The by-ID
+  // endpoint reports OUR position for a server on our own ISP and sends no
+  // coordinate here at all, so a by-ID row is kept without one - the 0,0 the
+  // settings layer reads as unknown.
   speedServers.push({id:id, sponsor:b.sponsor||'', name:b.name||'', country:b.country||'', lat:b.lat||0, lon:b.lon||0});
   fpDraw();
 }
@@ -7773,7 +7798,6 @@ function updateCongestionHint(){
   note.classList.toggle('hidden', !congestionContainerHint(congestionAlgosList, iperfInContainer));
 }
 function applySettings(s){
-  savedBestOfN=Math.max(1, parseInt(s.speed_best_of_count)||1);
   if(s.defaults) defaultSettings=s.defaults;
   setFields(s);
   // Busy-defer reads the interface byte counters (Linux, macOS and Windows have
@@ -8560,7 +8584,13 @@ $('setSchedLatEnabled').addEventListener('change', ()=>{ updateSchedDisabled(); 
 $('setSchedSpeedEnabled').addEventListener('change', updateSchedDisabled);
 $('setWebhook').addEventListener('input', updateConflictWarnings);
 let speedAvgDown=0, speedAvgUp=0;
-let savedBestOfN=1; // the Best-of count in force when the recorded averages were measured (as saved; see applySettings)
+// How many servers the runs behind those averages actually measured (from the
+// daemon, which counts them in the selection reports). The settings' own
+// Best-of count cannot stand in for it: saving a new count changes what the
+// NEXT run costs, not what the recorded ones did, so the divisor would become
+// the numerator the moment the user pressed Save and the estimate would report
+// one round's bytes for a link about to carry N of them.
+let speedAvgServers=1;
 const EST_RUN_DOWN=200e6, EST_RUN_UP=120e6; // rough per-run fallback before any test has run
 function updateSpeedEstimate(){
   const el=$('speedDataEst'); if(!el) return;
@@ -8574,13 +8604,12 @@ function updateSpeedEstimate(){
   const pD=have?speedAvgDown:EST_RUN_DOWN, pU=have?speedAvgUp:EST_RUN_UP;
   // A Best-of round measures N servers per scheduled test. A RECORDED average
   // already covers a whole round - the run stores the round's volume (see
-  // totalBytes in ookla.go) - of the count that was SAVED when those tests
-  // ran; so it is taken back to one server and multiplied by the count in
-  // the box, which may differ from it (history built at one server, sixteen
-  // typed in: sixteen times, not the same). The single-server fallback
+  // totalBytes in ookla.go) - so it is taken back to one server by the number
+  // of servers those rounds MEASURED (speedAvgServers, counted by the daemon)
+  // and multiplied by the count in the box. The single-server fallback
   // constants, used before any test has run, are per server already.
   const n=Math.max(1, parseInt($('setSpeedBestOf').value)||1), bestOf=n>1;
-  const servers=n/(have?savedBestOfN:1);
+  const servers=n/(have?Math.max(1, speedAvgServers):1);
   const d=runs*pD*servers, u=runs*pU*servers, mo=(d+u)*30.44;
   $('speedDataEstText').innerHTML='At this interval, speedtests use roughly <b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day ('+Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?', '+n+' servers each':'')+').'+
     '<br><span class="sub">\u2248 '+bytesStr(mo)+'/month total \u00b7 '+(have?'based on your recent tests':'rough estimate until a test runs')+'.</span>';

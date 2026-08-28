@@ -4419,7 +4419,12 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 	sort.SliceStable(sorted, byDistanceThenEcho(sorted))
 	cand := sorted
 	if !all {
-		cand = autoCandidatesN(sorted, isp, want)
+		// A COPY, before anything is appended: trimToCap hands its pool back
+		// aliasing sorted's backing array on the under-cap path (see its own
+		// note), so seating a star below would write through into sorted -
+		// overwriting the very servers the reserves are drawn from, which is a
+		// replacement deleted silently.
+		cand = append(ookla.Servers(nil), autoCandidatesN(sorted, isp, want)...)
 		for _, s := range sorted {
 			if keep[s.ID] && !seatedIn(cand, s.ID) {
 				cand = append(cand, s)
@@ -4465,10 +4470,23 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 		pings := make([]*float64, len(set))
 		health := make([]endpointState, len(set))
 		var wg sync.WaitGroup
+		// Bounded like the race's own pings (racePingParallel) and the fallback
+		// sweep: this phase used to be capped by the candidate window it was
+		// handed, but a union round hands it every racer of every city - at the
+		// widest, a hundred-odd probe sets opened in one instant, each on a
+		// fresh keep-alive-less transport. That is what exhausts a small host's
+		// socket buffers.
+		slots := make(chan struct{}, racePingParallel)
 		for i, s := range set {
 			wg.Add(1)
 			go func(i int, s *ookla.Server) {
 				defer wg.Done()
+				select {
+				case slots <- struct{}{}:
+				case <-ctx.Done():
+					return // out of time: unprobed, which applyRankPing's zero value already means
+				}
+				defer func() { <-slots }()
 				// The per-sample callback is the only honest success signal: the
 				// library can return a nil error WITHOUT collecting a single sample
 				// (every measured echo failing at transport level after a good

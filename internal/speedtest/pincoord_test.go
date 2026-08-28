@@ -401,8 +401,13 @@ func TestASavedCoordinateOfZeroIsNoCoordinate(t *testing.T) {
 		if _, err := o.RunReason(context.Background(), "manual"); err != nil {
 			t.Fatalf("%s: pinned best-of run: %v", name, err)
 		}
-		if loc := registeredLocation("auto"); loc == nil || loc.Lat != 48.85 || loc.Lon != 2.35 {
-			t.Errorf("%s: centred on %v, want the searched city - the saved list had nothing usable", name, loc)
+		// The catalogue is stubbed empty, so the sponsor lookup recovers nothing
+		// either: with no coordinate from any source the run centres on the
+		// origin it raced, exactly as a pin with no saved list does. (This
+		// assertion named a city no stub in this file produces - 48.85,2.35 -
+		// and so had never passed since the test was written.)
+		if loc := registeredLocation("auto"); loc == nil || loc.Lat != 43.65 || loc.Lon != -79.38 {
+			t.Errorf("%s: centred on %v, want the raced origin - the saved list had nothing usable and the catalogue found nothing", name, loc)
 		}
 		// listCentre would refuse a 0,0 pair on its own, so the centre alone
 		// cannot tell whether savedCoord rejected it: the unrecovered warn and

@@ -227,6 +227,7 @@ type Server struct {
 	dataBytes int64
 	avgDownB  int64
 	avgUpB    int64
+	avgServB  float64
 	usage     store.DataUsage
 
 	// Per-collector health for the /metrics scrape itself (F4): cumulative read
@@ -258,7 +259,7 @@ const aggTTL = 30 * time.Second
 
 // aggregates returns the cached status figures (uptime ratios + speedtest data
 // totals/averages), recomputing only when the cache has expired.
-func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp int64, usage store.DataUsage) {
+func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp int64, avgServers float64, usage store.DataUsage) {
 	s.aggMu.Lock()
 	for {
 		fresh := !s.aggAt.IsZero() && time.Since(s.aggAt) < aggTTL
@@ -273,7 +274,7 @@ func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp in
 		// running the same full-table scans and delaying the first fill.
 		if (fresh || s.aggBusy) && !s.aggAt.IsZero() {
 			defer s.aggMu.Unlock()
-			return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+			return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.avgServB, s.usage
 		}
 		if s.aggBusy { // cold AND a recompute owns it: wait for it, then re-check
 			w := s.aggWait
@@ -310,6 +311,7 @@ func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp in
 	nUptime, e1 := s.store.UptimeWindows(scanCtx, now, s.settings.DowntimeRetention())
 	nUsage, e3 := s.store.SpeedDataUsage(scanCtx, now)
 	nAvgDown, nAvgUp, e2 := s.store.SpeedAvgBytes(scanCtx)
+	nAvgServers, e4 := s.store.SpeedAvgServers(scanCtx)
 	// The store has no logger, so time its aggregate scans here - a slow refresh is
 	// the closest thing to a slow-query signal an operator can watch at debug.
 	s.log.Debug("aggregate refresh", "dur_ms", util.Round1(util.DurMS(time.Since(now))))
@@ -320,14 +322,14 @@ func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp in
 	// stops a transient SpeedAvgBytes failure from stamping zero averages in for
 	// the whole TTL. Log it - a failing local DB would otherwise look like empty
 	// data.
-	s.aggOK = e1 == nil && e2 == nil && e3 == nil
-	if err := errors.Join(e1, e2, e3); err != nil {
+	s.aggOK = e1 == nil && e2 == nil && e3 == nil && e4 == nil
+	if err := errors.Join(e1, e2, e3, e4); err != nil {
 		s.log.Warn("aggregate refresh failed; serving previous values", "err", err)
 	} else {
 		s.uptime = nUptime
 		s.usage = nUsage
 		s.dataBytes = nUsage.All
-		s.avgDownB, s.avgUpB = nAvgDown, nAvgUp
+		s.avgDownB, s.avgUpB, s.avgServB = nAvgDown, nAvgUp, nAvgServers
 		// Publish the values either way (no staler than the cache they replace),
 		// but only mark the cache fresh if nothing invalidated it mid-scan - the
 		// scan may have read the events table before, say, an outage deletion.
@@ -335,7 +337,7 @@ func (s *Server) aggregates() (uptime store.Uptime, dataBytes, avgDown, avgUp in
 			s.aggAt = now
 		}
 	}
-	return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.usage
+	return s.uptime, s.dataBytes, s.avgDownB, s.avgUpB, s.avgServB, s.usage
 }
 
 // targetGrace is how far a target's newest sample may lag the newest round
@@ -1032,7 +1034,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	online, since := st.Online, st.Since
 	now := time.Now()
 
-	uptime, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
+	uptime, dataBytes, avgDownB, avgUpB, avgServB, usage := s.aggregates()
 	uptimeRatios, uptimeCoverage := uptimePayload(uptime)
 	targets, terr := s.store.LatestPerTarget(ctx, s.targetGrace())
 	if terr != nil {
@@ -1098,6 +1100,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"data_usage":           usage,                      // per-window breakdown (6h/24h/7d/30d/1y/all)
 		"speed_avg_down_bytes": avgDownB,                   // avg per-run download bytes (recent runs; 0 if none)
 		"speed_avg_up_bytes":   avgUpB,                     // avg per-run upload bytes
+		"speed_avg_servers":    avgServB,                   // avg servers a recent run measured: the divisor that takes those averages back to one server
 		"families":             st.Families,                // per-family (IPv4/IPv6) live state
 		"paused":               st.Paused,                  // monitoring stopped via the power button
 		"first_seen":           s.store.InstallBornAt(ctx), // stable per-install id; scopes the first-run coachmark
@@ -4588,7 +4591,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		targets = kept
 	}
 	aStart := time.Now()
-	uptime, dataBytes, avgDownB, avgUpB, usage := s.aggregates()
+	uptime, dataBytes, avgDownB, avgUpB, _, usage := s.aggregates()
 	aggDur := time.Since(aStart)
 	s.aggMu.Lock()
 	// Warmth alone is not health: once the cache filled a single time, aggAt
