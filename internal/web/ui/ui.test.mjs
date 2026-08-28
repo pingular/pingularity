@@ -1729,8 +1729,8 @@ test('the speed chart reads the thinning headers it is sent', () => {
     'refreshSpeedChart must read X-Sampled');
   assert.ok(/r\.headers\.get\('X-Total-Count'\)/.test(script),
     'refreshSpeedChart must read X-Total-Count');
-  assert.ok(/spdAvgNote\(spdSampled,\s*spdTotal,\s*spdData\.length\)/.test(script),
-    'paintSpdAvgs must pass the sampling state into the pill labels');
+  assert.ok(/spdAvgNote\(spdSampled,\s*spdTotal,\s*spdRunCount\(spdData\)\)/.test(script),
+    'paintSpdAvgs must pass the sampling state into the pill labels, over the run count the mean itself used');
 });
 
 // The average pill rounds to whole milliseconds. A mean over a window of runs does
@@ -3766,16 +3766,19 @@ test('Best of is a count, not a switch: a number box that drives the data estima
   assert.match(tagOf({round_ts: 1700000000, win_reason: 'score'}), /· round/, 'a round member is tagged as such, whatever else the row says');
   assert.match(tagOf({round_ts: 1700000000}), /round of T1700000000/, 'and the tag names the winner it belongs to');
   assert.match(script, /\['setSpeedDiscardLosers','speed_discard_losers','bool'\]/, 'Discard losers is a saved on/off');
-  assert.doesNotMatch(extract('function drawSpeedChart') + extract('function drawQualityChart') + extract('function spdAverages'), /round_ts|roundResults|roundMembers/,
-    'a kept loser is plotted like any other run: the chart draws the rows it is given');
+  assert.doesNotMatch(extract('function drawSpeedChart') + extract('function drawQualityChart'), /round_ts|roundResults|roundMembers/,
+    'a kept loser is PLOTTED like any other run: the charts draw the rows they are given, with no special mark');
+  assert.match(extract('function spdAverages'), /if\(p\.round_ts\) continue;/,
+    'but it is not a RUN, so the range averages leave it out - the pills say "average across the range" of tests');
   assert.match(extract('function runTip'), /Best-of round member/, 'hovering a member says what it is');
   const pane = html.slice(html.indexOf('<div class="tabpane tab-uniform" data-tab="ookla">'), html.indexOf('<!-- /ookla pane -->'));
   const pos = id => pane.indexOf('id="' + id + '"');
   assert.ok(pos('setSpeedDirection') < pos('setSpeedDiscardLosers') && pos('setSpeedDiscardLosers') < pos('setOoklaLoss'),
     'Discard losers opens the second row, right before the packet-loss probe');
   assert.doesNotMatch(script, /best[ -]of[ -]3\b/i, 'nothing the page says to the user names three: the round is whatever count is set');
-  assert.match(est, /const servers=n\/\(have\?savedBestOfN:1\);/, 'a recorded average is a round of the SAVED count, taken back to one server before the count in the box multiplies it');
-  assert.match(extract('function applySettings'), /savedBestOfN=Math\.max\(1, parseInt\(s\.speed_best_of_count\)\|\|1\);/, 'the saved count is remembered when settings load');
+  assert.match(est, /const servers=n\/\(have\?Math\.max\(1, speedAvgServers\):1\);/,
+    'a recorded average is a round of however many servers those runs MEASURED, taken back to one server before the count in the box multiplies it');
+
 });
 
 test('only the saved pane offers to re-measure', () => {
@@ -6002,4 +6005,132 @@ test('server list: searching a city moves the list without committing a scope', 
   const st = api.state();
   assert.equal(st.browseLoc, '43.7,-79.4', 'the list should follow the search');
   assert.equal(st.pendingServer, '', 'and a search must not silently unpin a chosen server');
+});
+
+// --- review fixes: proven failing before the change, passing after ---
+
+// A settings load rebuilds the kept list from the payload, which carries no
+// pings. The loader must refill them; its "already answered for this list"
+// guard remembered the REQUEST, not what came back, so the column went blank
+// and stayed blank.
+function driveStoredPings(pings) {
+  const calls = [];
+  const src = "let speedServers=[], serverTabSeen=true, FP_MAX=12;\n"
+    + 'function serverTabActive(){ return true; } function fpNote(){} function fpDraw(){}\n'
+    + script.match(/let fpStoredGen=0, fpStoredFor='';/)[0] + '\n'
+    + extract('async function fpLoadStoredPings') + '\n'
+    + extract('function fpAdoptSaved') + '\n'
+    + 'return { fpAdoptSaved, saved: () => speedServers };';
+  const api = new Function('fetch', 'encodeURIComponent', src)(
+    url => { calls.push(url); return Promise.resolve({ ok: true, json: () => Promise.resolve({ pings }) }); },
+    encodeURIComponent);
+  return { ...api, calls: () => calls };
+}
+
+test('the kept servers\u2019 pings come back after a settings load, not just the first one', async () => {
+  const p = driveStoredPings({ 1: 8.5, 2: 12 });
+  const list = [{ id: 1, sponsor: 'A' }, { id: 2, sponsor: 'B' }];
+  p.fpAdoptSaved(list);
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(p.calls().length, 1, 'the first load asks for the history pings');
+  assert.equal(p.saved()[0].ping, 8.5, 'and fills them in');
+
+  // Save, or reopening the drawer, adopts the same list again - rebuilt, so
+  // ping-less. This is the common case: a kept server is usually not in
+  // whatever browse listing the pane below holds, so nothing else refills it.
+  p.fpAdoptSaved(list);
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(p.calls().length, 2, 'fresh truth with no pings has to be asked for again');
+  assert.equal(p.saved()[0].ping, 8.5, 'or the Ping column reads \u2014 until the user hits refresh');
+});
+
+test('starring the held row keeps the server\u2019s name and coordinate', () => {
+  // The held row is the chosen server that neither pane lists - the picker
+  // rebuilds it from what it learned earlier. Starring it used to read the
+  // browse listing alone, which by definition does not hold it.
+  const p = drivePicker({ chosen: '1993' });
+  p.fpAdopt([SRV('1993', { sponsor: 'EBOX', name: 'Montreal, QC', country: 'CA', lat: 45.5, lon: -73.57 })]);
+  p.fpAdopt([SRV('77', { sponsor: 'Rogers', name: 'Toronto, ON', lat: 43.7, lon: -79.4 })]); // 1993 is now held, not listed
+  p.fpToggleStar('1993');
+  const kept = p.saved().find(s => s.id === '1993');
+  assert.ok(kept, 'the star took');
+  assert.equal(kept.sponsor, 'EBOX', 'and kept the name the row was showing a moment earlier');
+  assert.equal(kept.name, 'Montreal, QC');
+  assert.equal(kept.lat, 45.5, 'and its coordinate - without one the daemon cannot enter its city in the race, which is what starring is for');
+  assert.equal(kept.lon, -73.57);
+});
+
+test('closing the drawer retires a refused server ID', () => {
+  // The refusal blocks the next Save on purpose. It must not survive the
+  // drawer: the box it names is emptied on close, so a later Save would be
+  // refused over a search the user has already walked away from.
+  const els = { gearBtn: { setAttribute() {}, focus() {} }, serverCity: { value: 'x' } };
+  const drawer = { style: {}, classList: { remove() {} }, contains: () => false };
+  const src = "let serverPinRefused='47343', serverErrShown='';\n"
+    + 'function clearServerFieldError(){} function syncBlackout(){}\n'
+    + extract('function closeDrawer') + '\n'
+    + 'return { closeDrawer, refused: () => serverPinRefused };';
+  const api = new Function('$', '_drawer', 'document', src)(id => els[id], drawer, { activeElement: null });
+  api.closeDrawer();
+  assert.equal(api.refused(), '', 'a refusal the user closed the drawer on cannot block an unrelated Save later');
+});
+
+test('the range averages describe runs, not the servers a round rejected', () => {
+  const avg = new Function('spMeasured', 'pingMeasured', extract('function spdAverages') + '\nreturn spdAverages;')(
+    (p, k) => typeof p[k] === 'number', p => typeof p.ping_ms === 'number');
+  // One run of a Best-of round kept with Discard losers off: the winner and
+  // two servers it beat. The winner is what the test measured.
+  const rows = [
+    { down_mbps: 300, up_mbps: 30, ping_ms: 8 },
+    { down_mbps: 50, up_mbps: 5, ping_ms: 40, round_ts: 1 },
+    { down_mbps: 70, up_mbps: 7, ping_ms: 60, round_ts: 1 },
+  ];
+  assert.deepEqual(avg(rows), { down: 300, up: 30, ping: 8 },
+    'a loser is charted, but it is not a run: averaging it in understates download and flatters ping');
+  const count = new Function(script.match(/const spdRunCount = [^;]*;/)[0] + '\nreturn spdRunCount;')();
+  assert.equal(count(rows), 1, 'and the caption counts the same rows the average did, not the charted ones');
+  assert.match(script, /spdAvgNote\(spdSampled,spdTotal,spdRunCount\(spdData\)\)/, 'at both call sites');
+  assert.equal((script.match(/spdAvgNote\(spdSampled,spdTotal,spdRunCount\(spdData\)\)/g) || []).length, 2);
+});
+
+// The data estimate predicts what the LINK will carry: the recorded average is
+// a whole round's bytes at whatever count those rounds measured, so the count
+// the history was measured under is the divisor - and settings cannot supply
+// it, because saving a new count changes settings and not the history.
+function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins = '60' } = {}) {
+  const el = { classList: { add() {}, remove() {}, toggle() {} }, style: {} };
+  const text = { innerHTML: '' };
+  const els = {
+    speedDataEst: el, speedDataEstText: text,
+    setSpeedEngine: { checked: false }, setStEnabled: { checked: true },
+    setSpeed: { value: mins }, setSpeedBestOf: { value: box },
+  };
+  const src = `let speedAvgDown=${avgDown}, speedAvgUp=${avgUp}, speedAvgServers=${avgServers};\n`
+    + script.match(/const EST_RUN_DOWN=[^;]*;/)[0] + '\n'
+    + script.match(/const bytesStr = b => \{[\s\S]*?\n\};/)[0] + '\n'
+    + extract('function updateSpeedEstimate') + '\n'
+    + 'return updateSpeedEstimate;';
+  const run = new Function('$', src)(id => els[id]);
+  run();
+  return text.innerHTML;
+}
+
+test('the data estimate scales by the count the history was measured under, not the one just saved', () => {
+  const MB = 1e6;
+  // Twenty single-server runs of ~200 MB each are on record. The user types 8
+  // and saves: the link is about to carry eight times what it did, and that is
+  // what the only metered-data figure in the drawer has to say - before the
+  // click and after it.
+  const at8 = driveEstimate({ avgDown: 200 * MB, avgUp: 20 * MB, avgServers: 1, box: '8' });
+  assert.match(at8, /38\.4 GB down/, 'eight servers a run, on top of a one-server history');
+  // The mirror: history recorded at Best of 8, box back to 1.
+  const at1 = driveEstimate({ avgDown: 1600 * MB, avgUp: 160 * MB, avgServers: 8, box: '1' });
+  assert.match(at1, /4\.8 GB down/, 'and one server a run, on top of an eight-server history');
+  // Unchanged: the count in the box matches what the history measured.
+  const same = driveEstimate({ avgDown: 1600 * MB, avgUp: 160 * MB, avgServers: 8, box: '8' });
+  assert.match(same, /38\.4 GB down/, 'the recorded average, as measured');
+  // Before any test has run the fallback constants are per server already.
+  assert.match(driveEstimate({ box: '4' }), /19\.2 GB down/, 'no history: four times the single-server estimate');
+  assert.doesNotMatch(script, /savedBestOfN/, 'the settings-derived divisor is gone: it became the new count the moment it was saved');
+  assert.match(script, /speedAvgServers = Math\.max\(1, s\.speed_avg_servers\|\|1\)/, 'the divisor comes from the daemon, which counts what the runs measured');
 });

@@ -724,7 +724,12 @@ func fetchOriginPools(ctx context.Context, origins []Origin, isp string, poolSiz
 			for n < len(sorted) && (n < poolSize || sorted[n].Distance <= sorted[0].Distance+autoMarginKM) {
 				n++
 			}
-			pool := append(ookla.Servers(nil), trimToCap(sorted[:n], sorted[:n], isp, poolSize, poolISPMax(poolSize))...)
+			// The window is the POOL, but the whole fetched list is what the ISP
+			// guarantee may reach into: a Best-of round draws its field from these
+			// pools instead of from the run's own trim, so without the reach the
+			// subscriber's on-net box - the one a single-server run always seats,
+			// wherever it sits - is missing from every round.
+			pool := append(ookla.Servers(nil), trimToCap(sorted[:n], sorted, isp, poolSize, poolISPMax(poolSize))...)
 			// trimToCap's order is a seeding priority (ISP first); the lanes are
 			// distance order, because unionCityCandidates credits a server two
 			// cities both surfaced to the one that lists it earliest.

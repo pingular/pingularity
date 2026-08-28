@@ -4040,6 +4040,37 @@ func (s *Store) DeleteOutage(ctx context.Context, ts int64) (int64, error) {
 	return n, nil
 }
 
+// SpeedAvgServers is how many servers the recent runs actually measured, over
+// the same window and the same rows SpeedAvgBytes averages bytes across. It is
+// the divisor that takes a recorded round back to one server's worth, so the
+// data estimate can say what a round of a DIFFERENT size would cost. 1 when
+// nothing is recorded, and never below 1.
+//
+// Counted from the selection report (speed_servers.measured), because that is
+// the only place a round's size is written down: with losers discarded the
+// winner's row carries the whole round's bytes and says nothing about how many
+// servers produced them, and the Best-of SETTING cannot answer it either -
+// changing that changes what the next run will cost, not what the recorded
+// ones did. A run with no report (iperf3, or a row from before the reports
+// existed) counts as the one server it measured.
+func (s *Store) SpeedAvgServers(ctx context.Context) (float64, error) {
+	var avg float64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(AVG(n), 1) FROM (
+		  SELECT MAX(1, (SELECT COUNT(*) FROM speed_servers ss WHERE ss.run_ts = s.ts AND ss.measured = 1)) AS n
+		    FROM speed s
+		   WHERE `+speedIsResult+` AND download_bytes IS NOT NULL AND ts <= ?
+		   ORDER BY ts DESC LIMIT 20)`, currentHorizon(time.Now().Unix())).Scan(&avg)
+	if err != nil {
+		recordDBErr(err)
+		return 1, err
+	}
+	if !(avg >= 1) { // NULL/NaN/0 all mean "nothing to divide by"
+		return 1, nil
+	}
+	return avg, nil
+}
+
 // SpeedAvgBytes returns the average download and upload bytes per speedtest over
 // the most recent runs that recorded data volumes (0 when none) - used to
 // estimate ongoing data usage at a given interval. The error lets the caller

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -97,5 +98,49 @@ func TestRoundMembersAreHistoryNotTheResult(t *testing.T) {
 	}
 	if n, _ := st.SpeedCount(ctx); n != 1 {
 		t.Errorf("count %d after deleting the winner, want the old run alone", n)
+	}
+}
+
+// The data estimate needs to know how big the recorded rounds were, and the
+// Best-of setting cannot say: it describes the next run, not the ones already
+// measured. SpeedAvgServers counts them from the selection reports.
+func TestSpeedAvgServersCountsWhatTheRunsMeasured(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now().Unix() - 100
+	b := func(n int64) *int64 { return &n }
+	run := func(ts int64, measured int) {
+		if _, err := st.InsertSpeedTS(ctx, SpeedSample{TS: ts, DownMbps: 100, UpMbps: 10, PingMS: 9,
+			Server: "s", DownBytes: b(1000), UpBytes: b(100)}); err != nil {
+			t.Fatal(err)
+		}
+		rows := []SpeedServerRow{}
+		for i := 0; i < measured; i++ {
+			rows = append(rows, SpeedServerRow{RunTS: ts, ServerID: fmt.Sprint(i), Server: "S", RankOrder: int64(i), Measured: true})
+		}
+		rows = append(rows, SpeedServerRow{RunTS: ts, ServerID: "ranked-only", Server: "R", RankOrder: 9}) // ranked, never measured
+		if len(rows) > 0 {
+			if err := st.InsertSpeedServers(ctx, rows); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if avg, err := st.SpeedAvgServers(ctx); err != nil || avg != 1 {
+		t.Errorf("empty store: %v (%v), want 1 - nothing to divide by", avg, err)
+	}
+	run(now-60, 3) // a Best-of-3 round
+	run(now-30, 1) // a single-server run
+	avg, err := st.SpeedAvgServers(ctx)
+	if err != nil || avg != 2 {
+		t.Errorf("avg servers %v (%v), want 2: only the MEASURED rows count, not the ranked ones", avg, err)
+	}
+	// A run with no report at all (iperf3, or a row older than the reports)
+	// measured the one server it recorded.
+	if _, err := st.InsertSpeedTS(ctx, SpeedSample{TS: now, DownMbps: 100, UpMbps: 10, PingMS: 9,
+		Server: "iperf", Engine: "iperf3", DownBytes: b(1000), UpBytes: b(100)}); err != nil {
+		t.Fatal(err)
+	}
+	if avg, err = st.SpeedAvgServers(ctx); err != nil || avg != 5.0/3.0 {
+		t.Errorf("avg servers %v (%v), want (3+1+1)/3: a run without a report counts as one", avg, err)
 	}
 }
