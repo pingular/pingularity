@@ -702,6 +702,32 @@ func (p *program) run(ctx context.Context) {
 	tester.IncumbentFn = newIncumbentFn(p.store)
 	tester.ChallengeFn = newChallengeFn(p.store, set)
 	tester.IncumbentScoresFn = newIncumbentScoresFn(p.store)
+	// A server convicted of refusing every upload is excluded for hours, and
+	// that verdict costs a whole measurement turn to earn (the cheap GET health
+	// check cannot see the problem - see noteUploadRejection). Carry it across
+	// restarts, or every restart pays for it again: measured on 2026-08-28, a
+	// box that had restarted six minutes earlier spent 45 s of a Best-of round
+	// on a server it had already convicted.
+	if rows, err := p.store.ServerHealth(ctx); err != nil {
+		p.log.Warn("could not read the saved server exclusions; starting with none", "err", err)
+	} else if len(rows) > 0 {
+		out := make([]speedtest.ServerHealthRow, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, speedtest.ServerHealthRow{ServerID: r.ServerID, Expires: r.Expires, Fails: r.Fails})
+		}
+		speedtest.LoadServerHealth(out)
+		p.log.Debug("reloaded server exclusions", "servers", len(out))
+	}
+	// Called from a run when it convicts a server. Its own short deadline: the
+	// run is mid-round, and a slow write must not hold it up.
+	speedtest.PersistServerHealth = func(r speedtest.ServerHealthRow) {
+		wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.store.SaveServerHealth(wctx, store.ServerHealth{ServerID: r.ServerID, Expires: r.Expires, Fails: r.Fails}); err != nil {
+			p.log.Warn("could not save a server exclusion; it will be forgotten on restart", "server_id", r.ServerID, "err", err)
+		}
+	}
+
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer        // surface the live server during a run
 	tester.DirectionFn = set.SpeedDirection         // Ookla direction (per-engine; iperf3 has its own)

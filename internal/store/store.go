@@ -191,6 +191,20 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Servers convicted of refusing every speedtest upload, so the exclusion
+-- outlives a restart. The cheap health check is a GET of the server's latency
+-- file, which a host whose upload endpoint answers 500 to everything still
+-- passes - so that conviction costs a whole measurement turn to earn, and
+-- before this table every restart threw it away and paid again. Only
+-- convictions live here; verdicts the GET probe reaches on its own are one
+-- request to re-derive and are not worth storing. Rows are dropped once
+-- expired (see ServerHealth): the TTL is the server's second chance.
+CREATE TABLE IF NOT EXISTS server_health (
+    server_id TEXT PRIMARY KEY,
+    expires   INTEGER NOT NULL,   -- unix seconds; the exclusion stands until then
+    fails     INTEGER NOT NULL
+);
 `
 
 // Store wraps the database handle.
@@ -4038,6 +4052,55 @@ func (s *Store) DeleteOutage(ctx context.Context, ts int64) (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ServerHealth is one server's persisted upload conviction.
+type ServerHealth struct {
+	ServerID string
+	Expires  int64
+	Fails    int
+}
+
+// SaveServerHealth records (or refreshes) one server's conviction. Called from
+// a run, so it must not be slow or fatal: the caller logs and carries on.
+func (s *Store) SaveServerHealth(ctx context.Context, h ServerHealth) error {
+	if h.ServerID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO server_health (server_id, expires, fails) VALUES (?, ?, ?)`,
+		h.ServerID, h.Expires, h.Fails)
+	if err != nil {
+		recordDBErr(err)
+	}
+	return err
+}
+
+// ServerHealth returns the convictions still in force, dropping any that have
+// expired. Read once at startup, which is also the only sweep the table needs:
+// every row carries a TTL of hours, so it cannot grow beyond the servers
+// convicted inside one.
+func (s *Store) ServerHealth(ctx context.Context) ([]ServerHealth, error) {
+	now := time.Now().Unix()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM server_health WHERE expires <= ?`, now); err != nil {
+		recordDBErr(err) // a failed sweep is not a reason to skip the read
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT server_id, expires, fails FROM server_health WHERE expires > ?`, now)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ServerHealth
+	for rows.Next() {
+		var h ServerHealth
+		if err := rows.Scan(&h.ServerID, &h.Expires, &h.Fails); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // SpeedAvgServers is how many servers the recent runs actually measured, over

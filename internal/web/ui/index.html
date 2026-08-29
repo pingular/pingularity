@@ -663,17 +663,13 @@
   .btn.ipl-undo:hover{filter:none;background:transparent;border-color:var(--accent);color:var(--accent);}
   /* Adding is the last row of the list rather than a bar above it: on this tab
      it happens once or twice ever (the cap is twelve), and a permanent
-     full-width control for that outweighed everything around it. Dashed, so it
-     reads as an invitation rather than a server - and the row above it drops
-     its own rule so the two do not draw a double line. */
+     full-width control for that outweighed everything around it. It separates
+     with the same hairline every other row uses - the row above keeps its own
+     rule and this one draws none. */
   .ipl-add{display:grid;grid-template-columns:15px minmax(0,1fr);gap:16px;align-items:center;
     width:100%;height:var(--row-h);padding:0 12px;box-sizing:border-box;
-    border:0;border-top:1px dashed var(--line2);background:transparent;color:var(--muted);
+    border:0;background:transparent;color:var(--muted);
     font:inherit;font-size:13px;text-align:left;cursor:pointer;}
-  .fp-row:has(+ .ipl-add){border-bottom:0;}
-  /* With nothing saved the list is just its header and this row, and the
-     header already draws the line between them. */
-  .ipl-add:first-child{border-top:0;}
   .ipl-add:hover:not(:disabled){background:var(--panel2);color:var(--fg);}
   .ipl-add:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
   /* A stroked plus, the pencil's twin: same 1.5 stroke and 14px box, sitting in

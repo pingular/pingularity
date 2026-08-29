@@ -370,16 +370,20 @@ func TestRunBudgetCapsEachServer(t *testing.T) {
 
 func TestBestOfBudgetIsTheSumOfBoundedTurns(t *testing.T) {
 	// Whatever the retry setting, a best-of run's budget is its servers'
-	// bounded turns plus selection. Retries must not inflate it: the
-	// per-server bound already contains each attempt chain.
+	// bounded turns, plus selection, plus the settles between the turns.
+	// Retries must not inflate it: the per-server bound already contains each
+	// attempt chain.
+	round := func(n int) time.Duration {
+		return time.Duration(n)*bestOfServerTimeout + bestOfSelectionBudget + time.Duration(n-1)*bestOfServerSettle
+	}
 	for _, retries := range []int{0, 1, 2, 3} {
-		if _, total := runBudget(retries, bestOfServers); total != time.Duration(bestOfServers)*bestOfServerTimeout+bestOfSelectionBudget {
-			t.Errorf("retries=%d: total %v, want three bounded turns plus selection", retries, total)
+		if _, total := runBudget(retries, bestOfServers); total != round(bestOfServers) {
+			t.Errorf("retries=%d: total %v, want three bounded turns, selection and their settles", retries, total)
 		}
 	}
 	// A larger round gets a larger budget - a fixed ceiling starved the last
 	// servers of the round - and the largest allowed is still bounded.
-	if _, total := runBudget(1, maxBestOfServers); total != time.Duration(maxBestOfServers)*bestOfServerTimeout+bestOfSelectionBudget {
+	if _, total := runBudget(1, maxBestOfServers); total != round(maxBestOfServers) {
 		t.Fatalf("%d servers: got %v", maxBestOfServers, total)
 	}
 }
