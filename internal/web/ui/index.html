@@ -6143,7 +6143,11 @@ let runsBusy=false;
 let runsSeq=0; // only the newest in-flight runs poll repaints the table (see refreshStatus)
 async function loadRuns(){
   const my=++runsSeq;
-  let data; try{ data=await (await fetch(`api/speed/runs?limit=${runsPerPage}&offset=${(runsPage-1)*runsPerPage}`)).json(); }catch(e){ return; }
+  let data;
+  try{ const r=await fetch(`api/speed/runs?limit=${runsPerPage}&offset=${(runsPage-1)*runsPerPage}`);
+    if(!r.ok) throw 0;
+    data=await r.json();
+  }catch(e){ chartLoadFailed('runs table'); return false; }
   if(my!==runsSeq) return;
   const runs=data.runs||[]; runsTotal=data.total||0;
   if(runs.length===0 && runsPage>1){ runsPage--; return loadRuns(); } // page emptied (e.g. after delete)
@@ -6177,6 +6181,7 @@ async function loadRuns(){
     : `<tr><td class="muted" colspan="24">No runs recorded yet.</td></tr>`;
   updateRunsPager();
   applyRunHighlight(pinnedRunTs);
+  return true; // the page arrived - see runsGoTo/outagesGoTo
 }
 // Linking the speed/quality charts to the runs table: hovering a point
 // highlights its row (when the table is open), clicking one opens the table,
@@ -6235,8 +6240,17 @@ function updateRunsPager(){
   $('runsPrev').disabled = runsPage<=1;
   $('runsNext').disabled = runsPage>=pages;
 }
-$('runsPrev').addEventListener('click', ()=>{ if(runsPage>1){ runsPage--; loadRuns(); } });
-$('runsNext').addEventListener('click', ()=>{ if(runsPage < Math.ceil(runsTotal/runsPerPage)){ runsPage++; loadRuns(); } });
+// runsGoTo moves the pager only if the page it asks for actually arrives. The
+// counter used to move first and the load was allowed to fail in silence, so
+// the caption and the rows stayed on the old page while the counter had moved
+// on - and with only this endpoint failing there was no way back: Next's own
+// guard was already false and Prev was drawn disabled.
+async function runsGoTo(page){
+  const was=runsPage; runsPage=page;
+  if(!await loadRuns()) runsPage=was;
+}
+$('runsPrev').addEventListener('click', ()=>{ if(runsPage>1) runsGoTo(runsPage-1); });
+$('runsNext').addEventListener('click', ()=>{ if(runsPage < Math.ceil(runsTotal/runsPerPage)) runsGoTo(runsPage+1); });
 $('runsPerPage').addEventListener('change', ()=>{ runsPerPage=parseInt($('runsPerPage').value)||10; runsPage=1; loadRuns(); });
 // Per-row delete (delegated, since rows are re-rendered each load). Confirms,
 // then refreshes everything keyed off speed history: the table, the speed/
@@ -6245,7 +6259,12 @@ $('runsBody').addEventListener('click', async e=>{
   const btn=e.target.closest('.run-del');
   if(!btn){ const row=e.target.closest('tr[data-ts]'); if(row) focusRunOnChart(+row.dataset.ts); return; } // a plain row click selects the run on the chart
   const ts=+btn.dataset.ts; if(!ts) return;
-  if(!confirm('Delete this speedtest run? This cannot be undone.')) return;
+  // A Best-of round that kept its losers is several rows, and deleting the
+  // run's own row takes them all (the daemon cascades on round_ts). Say so:
+  // the count cannot be known before the click - the other servers may sit on
+  // a page that is not loaded - but the fact that they go is always true, and
+  // the toast below reports what actually went.
+  if(!confirm('Delete this speedtest run? Any other servers measured in the same round go with it. This cannot be undone.')) return;
   // Remember this button's row position: loadRuns() rebuilds the whole tbody, so
   // after the delete we put keyboard focus on the run that slid up into its place
   // (or the toggle if the page emptied) - same focus-after-rebuild courtesy the
@@ -6262,7 +6281,10 @@ $('runsBody').addEventListener('click', async e=>{
     (left[Math.min(idx,left.length-1)]||$('runsToggle')).focus();
     // role="status" toast: the vanished row is the only cue sighted users get;
     // this is what assistive tech hears (no aria-live on the tbody itself).
-    const tb=$('undoToast'); if(tb){ tb.textContent='Run deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
+    // The daemon reports every row it removed, so the toast can name a round
+    // rather than claim one run went when sixteen did.
+    let gone=1; try{ gone=+(await r.json()).deleted||1; }catch(e){}
+    const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : 'Run deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
   }catch(err){ btn.disabled=false; alert('Delete failed'); }
   finally{ runsBusy=false; }
 });
@@ -6377,7 +6399,11 @@ function evHighlighted(e){ return !!outageSelDay &&
 async function loadOutages(force){
   if(tileIdle('downtime', force)) return; // this table lives in the downtime tile
   const my=++outagesSeq;
-  let data; try{ data=await (await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`)).json(); }catch(e){ return; }
+  let data;
+  try{ const r=await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`);
+    if(!r.ok) throw 0;
+    data=await r.json();
+  }catch(e){ chartLoadFailed('outages list'); return false; }
   if(my!==outagesSeq) return;
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(force); } // page emptied
@@ -6388,6 +6414,7 @@ async function loadOutages(force){
         <td>${e.type==='up'&&e.has_duration?fmtDur(e.duration_s):'-'}</td></tr>`).join('')
     : '<tr><td class="muted" colspan="4">No events recorded yet.</td></tr>';
   updateOutagesPager();
+  return true; // the page arrived - see runsGoTo/outagesGoTo
 }
 // Per-outage delete (delegated - rows re-render each load). Every "Reconnected"
 // row gets the button (see outageDeletable): the outage's identity is its closing
@@ -6422,8 +6449,13 @@ function updateOutagesPager(){
   $('outagesPrev').disabled = outagesPage<=1;
   $('outagesNext').disabled = outagesPage>=pages;
 }
-$('outagesPrev').addEventListener('click', ()=>{ if(outagesPage>1){ outagesPage--; loadOutages(); } });
-$('outagesNext').addEventListener('click', ()=>{ if(outagesPage < Math.ceil(outagesTotal/outagesPerPage)){ outagesPage++; loadOutages(); } });
+// Same rule as runsGoTo: a page that did not load is not a page you are on.
+async function outagesGoTo(page){
+  const was=outagesPage; outagesPage=page;
+  if(!await loadOutages()) outagesPage=was;
+}
+$('outagesPrev').addEventListener('click', ()=>{ if(outagesPage>1) outagesGoTo(outagesPage-1); });
+$('outagesNext').addEventListener('click', ()=>{ if(outagesPage < Math.ceil(outagesTotal/outagesPerPage)) outagesGoTo(outagesPage+1); });
 $('outagesPerPage').addEventListener('change', ()=>{ outagesPerPage=parseInt($('outagesPerPage').value)||10; outagesPage=1; loadOutages(); });
 
 const fmtLocalDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -7851,7 +7883,13 @@ function applySettings(s){
   // Saved iperf3 server list + the active selection (loaded before updateEngineUI,
   // which renders the picker).
   iperfServers = (Array.isArray(s.iperf_servers) ? s.iperf_servers.map(mapIperfServer) : []).map(sv=>{ sv._id=nextIperfId(); return sv; });
-  iperfHealth={}; // re-probe reachability against the freshly-saved addresses
+  // Keep what we already know about addresses that are still here: this runs on
+  // every settings load, including the drawer's own reopen refetch, and wiping
+  // it made the tab probe all twelve servers a second time - the first dozen
+  // for nothing. An address that CHANGED has no entry, so it is probed; the
+  // light stays clickable for an on-demand recheck.
+  { const known={}; for(const sv of iperfServers) if(iperfHealth[sv.addr]!==undefined) known[sv.addr]=iperfHealth[sv.addr];
+    iperfHealth=known; }
   const act = iperfServers.find(sv=>sv.addr===(s.iperf_server||''));
   iperfActiveId = act ? act._id : (iperfServers.length?iperfServers[0]._id:null);
   iperfEditingId=null; iperfLoadedId=null; // start collapsed; nothing in the editor yet
@@ -8020,6 +8058,27 @@ let iperfLoadedId=null;              // _id currently loaded into the editor inp
 let iperfIdSeq=0; const nextIperfId=()=>++iperfIdSeq;
 const IPERF_MAX=12;                  // the cap on saved iperf3 servers (the backend's own)
 let iperfHealth={};                  // addr -> 'on'|'off'|'loading' (reachability for the status light; undefined = not yet checked)
+// Probes are QUEUED, not fired in a heap. A full list is twelve addresses, the
+// daemon holds each dial open for up to four seconds, and a browser gives one
+// origin six connections - so twelve at once starved the page's own polling and
+// left Save waiting behind reachability checks it does not need. Three at a
+// time keeps a connection free for everything else.
+const IPERF_PROBE_PARALLEL=3;
+let iperfProbeRunning=0; const iperfProbeWaiting=[];
+// probeIperfSoon marks the light as checking straight away (so a re-render does
+// not queue the same address twice) and joins the queue.
+function probeIperfSoon(addr){
+  if(!iperfAddrValid(addr) || iperfHealth[addr]==='loading') return;
+  iperfHealth[addr]='loading'; refreshIperfDots();
+  iperfProbeWaiting.push(addr); pumpIperfProbes();
+}
+function pumpIperfProbes(){
+  while(iperfProbeRunning < IPERF_PROBE_PARALLEL && iperfProbeWaiting.length){
+    const addr=iperfProbeWaiting.shift();
+    iperfProbeRunning++;
+    Promise.resolve(probeIperf(addr)).catch(()=>{}).then(()=>{ iperfProbeRunning--; pumpIperfProbes(); });
+  }
+}
 let iperfAvailable=true;             // is the iperf3 binary on PATH (from GET settings)? drives the "not installed" note
 let iperfVersion='';                 // detected iperf3 version string (from GET settings), "" if absent/unparseable; drives the version note
 let iperfInContainer=false;          // is the daemon containerized (from GET settings)? in Docker the missing-iperf3 fix is the -iperf image, not a package install
@@ -8149,7 +8208,7 @@ function renderIperfServers(){
   // and iperf3 is the engine (don't reach out to servers on a background page load). The
   // per-addr cache stops a re-render from re-probing.
   if($('setSpeedEngine').checked && _drawer.classList.contains('open'))
-    iperfServers.forEach(s=>{ if(iperfAddrValid(s.addr) && iperfHealth[s.addr]===undefined) probeIperf(s.addr); });
+    iperfServers.forEach(s=>{ if(iperfAddrValid(s.addr) && iperfHealth[s.addr]===undefined) probeIperfSoon(s.addr); });
   updateIperfLoopbackWarn(); // any list change can create or clear the loopback-in-container trap
   renderIperfEditor();
 }
@@ -8671,8 +8730,39 @@ function settingsBody(){
 let saveInFlight=false;
 // Marks the Save button as "this did not save". Text is optional: postAccess
 // has already put its own error on screen, and only the button is missing.
+// invalidNumberField is the first number input the BROWSER already judges out
+// of range - every one of them declares its own min/max in the markup, so this
+// asks the field rather than re-deriving the rule. Disabled fields are skipped:
+// they are not the user's to fix and are not posted.
+//
+// It exists because the fallbacks that read these fields are lenient by design
+// (getField's 'int'/'day' fall back rather than reject), so a negative number
+// did not bounce - it went in as a number nobody meant. -5 days of retention
+// became 0, which the daemon reads as KEEP FOREVER: the opposite of what was
+// typed, saved with a closing drawer and no message.
+function invalidNumberField(list){
+  for(const el of list||[]){
+    if(el && !el.disabled && typeof el.checkValidity === 'function' && !el.checkValidity()) return el;
+  }
+  return null;
+}
+// fieldName is what to call a control when refusing to save it: the row label
+// without its help glyph, falling back to the id.
+function fieldName(el){
+  const row = el.closest ? el.closest('.srow,.drow,.ie-field,.afield') : null;
+  const lbl = row ? row.querySelector('.lbl,.dname,.ie-lbl') : null;
+  const txt = lbl && lbl.firstChild ? (lbl.firstChild.textContent||'') : '';
+  return (txt || (el && el.id) || 'a field').replace(/\s+/g,' ').trim();
+}
 function saveFailed(text){
   if(text !== undefined) $('settingsMsg').textContent = text;
+  // A caller with nothing to add still has to clear "Saving…": it is the only
+  // thing on screen, and left standing it reads as a save still in progress,
+  // forever. That is exactly what happened with the daemon unreachable -
+  // postAccess returns false from its network catch WITHOUT writing a message,
+  // and this was called bare. A message another path already wrote is kept.
+  else if($('settingsMsg').textContent === 'Saving…')
+    $('settingsMsg').textContent = 'Could not reach the server - your changes were NOT saved. Try again.';
   $('saveSettings').classList.add('err');
 }
       $('saveSettings').addEventListener('click', async () => {
@@ -8734,6 +8824,17 @@ function saveFailed(text){
   // rather than silently disabling probing/speedtests behind an "on" toggle.
   for(const f of ['lat','speed']){ if($(SCHED_FEATS[f].en).checked && body['sched_'+f+'_windows'].every(w=>!w.days.includes('1'))){
     saveFailed('The '+(f==='lat'?'latency':'speedtest')+' schedule has no active days - pick a day or turn it off.'); return; } }
+  // A number outside its own declared range: refuse rather than post a value
+  // the field's reader will quietly turn into something else. Take the user to
+  // it, the way the server-address gates do.
+  { const bad=invalidNumberField(_drawer.querySelectorAll('input[type=number]'));
+    if(bad){
+      const pane=bad.closest('.tabpane');
+      if(pane && pane.dataset.tab) activateTab(pane.dataset.tab);
+      bad.focus();
+      saveFailed(fieldName(bad)+' is outside the range it allows'+(bad.min!==''?' (lowest '+bad.min+(bad.max!==''?', highest '+bad.max:'')+')':'')+' - fix it before saving.');
+      return;
+    } }
   const msg=$('settingsMsg'); msg.textContent='Saving…';
   try {
     // Apply access changes first - setting a password re-issues the session
@@ -8806,6 +8907,13 @@ $('resetSettings').addEventListener('click', () => {
   // greying by hand - otherwise the latency/speedtest sub-controls keep the
   // pre-reset disabled/grey state (busyDeferSupported is a host capability, unchanged).
   syncLatencyDeps(); syncSpeedDeps();
+  // The pin goes back to Auto HERE, not as a side effect of the list refetch:
+  // settingsBody reads #setServer, so leaving it set meant Save wrote the old
+  // pin straight back over the defaults it had just loaded - and pendingServer=''
+  // only says "no new pin is waiting", which is not the same thing. Done here
+  // rather than in the list refetch below, so the reset does not depend on
+  // Ookla answering.
+  $('setServer').value='';
   pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind(); serversLoaded=false; loadServers();   // back to the default list: a reset starts over
   fpAdoptSaved(d.speed_servers);   // the kept list rides outside FIELDS, like the iperf3 one below
   $('serverCity').value=''; clearServerFieldError(); // else leftover text re-searches on Save and overrides the reset to Auto

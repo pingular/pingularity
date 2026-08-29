@@ -92,9 +92,11 @@ func TestRoundMembersAreHistoryNotTheResult(t *testing.T) {
 	if n, _ := st.SpeedCount(ctx); n != 3 {
 		t.Errorf("count %d after deleting one member, want 3", n)
 	}
-	// Deleting the winner takes the rest of its round.
-	if n, err := st.DeleteSpeed(ctx, winTS); err != nil || n != 1 {
-		t.Errorf("delete the winner: %d rows counted (%v), want the winner's 1", n, err)
+	// Deleting the winner takes the rest of its round - and SAYS how many rows
+	// went, so the page can tell the operator what it just destroyed rather
+	// than reporting one deletion for a whole round.
+	if n, err := st.DeleteSpeed(ctx, winTS); err != nil || n != 2 {
+		t.Errorf("delete the winner: reported %d rows (%v), want 2 - the winner and the member still in its round", n, err)
 	}
 	if n, _ := st.SpeedCount(ctx); n != 1 {
 		t.Errorf("count %d after deleting the winner, want the old run alone", n)

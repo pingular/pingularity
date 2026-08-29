@@ -3892,8 +3892,11 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 	// One transaction with the run's selection report (speed_servers has no FK;
 	// the cascade is manual): a run deleted without its report rows would leave
-	// candidates explaining a run that no longer exists. The returned count
-	// stays the SPEED rows removed - the caller's "was there a run" signal.
+	// candidates explaining a run that no longer exists. The returned count is
+	// every SPEED row removed - the measurement plus the members of its round -
+	// so a caller can tell the operator what actually went, rather than
+	// reporting one deletion for a round of sixteen. Still the "was there a
+	// run" signal: it is only ever 0 when nothing matched.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		recordDBErr(err)
@@ -3923,7 +3926,8 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 	// run as their round (round_ts), and a member row without its round would
 	// be a measurement nothing explains. Deleting a member row alone (its own
 	// ts) takes just that row, like any other.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM speed WHERE round_ts = ?`, ts); err != nil {
+	members, err := tx.ExecContext(ctx, `DELETE FROM speed WHERE round_ts = ?`, ts)
+	if err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
@@ -3950,7 +3954,15 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 		recordDBErr(err)
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	m, err := members.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	return n + m, nil
 }
 
 // DeleteOutage removes one resolved outage. ts identifies it by its closing

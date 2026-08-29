@@ -5162,13 +5162,14 @@ function outagesDriver({ hidden = false, page = 1, pages = {} } = {}) {
   const api = new Function('fget', '$', 'evHighlighted', 'outageDeletable', 'TRASH_SVG', 'fmtTime', 'fmtDur',
     'updateOutagesPager', 'document', 'state',
     TILE_GATE + '\nlet outagesSeq = 0, outagesTotal = 0, outagesPerPage = 10, outagesPage = ' + page + ';\n'
+    + 'function chartLoadFailed(){}\n'
     + extract('async function loadOutages')
     + '\nreturn { loadOutages, seq: () => outagesSeq, page: () => outagesPage };')(
     async url => {
       const off = +(/offset=(\d+)/.exec(url) || [0, 0])[1];
       state.fetches.push(off);
       if (state.hold) await state.hold;
-      return { json: async () => ({ events: pages[off] || [], total: 1 }) };
+      return { ok: true, json: async () => ({ events: pages[off] || [], total: 1 }) };
     },
     () => events, () => false, () => false, '', () => 'T', () => '0s',
     () => {},
@@ -6162,4 +6163,129 @@ test('an open runs table follows results as they land', () => {
   const del = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
   assert.match(del, /runsBusy=true/, 'a delete marks the table busy for the window its fetch is in flight');
   assert.match(del, /runsBusy=false/, 'and clears it');
+});
+
+test('the delete confirm admits it may take a whole round, and the toast says how many went', () => {
+  const del = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
+  assert.match(del, /same round/i,
+    'one confirm that says "this run" while the cascade takes every server the round measured is a prompt that lies about what it destroys');
+  assert.match(del, /deleted/,
+    'and the toast reads the count back from the daemon rather than always saying one run went');
+  assert.match(del, /runs?'/, 'singular for a run, plural for a round');
+});
+
+test('Save refuses a number the browser already knows is out of range', () => {
+  // -5 days of retention was being saved as 0, which the daemon reads as KEEP
+  // FOREVER - the opposite of what was typed - and the drawer closed reporting
+  // success. Every one of these fields declares its own min/max in the markup,
+  // so the browser has already judged them.
+  const pick = new Function(extract('function invalidNumberField') + '\nreturn invalidNumberField;')();
+  const el = (ok, extra) => Object.assign({ checkValidity: () => ok, id: 'x' }, extra);
+  assert.equal(pick([el(true), el(true)]), null, 'all in range: nothing to stop');
+  assert.equal(pick([]), null);
+  assert.equal(pick(null), null);
+  const bad = el(false, { id: 'setRetention' });
+  assert.equal(pick([el(true), bad, el(true)]), bad, 'the first out-of-range field is the one to point at');
+  assert.equal(pick([el(false, { disabled: true })]), null, 'a disabled field is not the user\u2019s problem');
+
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener('click'"), script.indexOf("msg.textContent='Saving\u2026'"));
+  assert.match(save, /invalidNumberField/, 'the save handler consults it before it posts anything');
+  assert.match(save, /saveFailed\(/, 'and refuses with a message, the way its six other gates do');
+});
+
+test('Reset to defaults really unpins the server', () => {
+  const at = script.indexOf("$('resetSettings').addEventListener");
+  const reset = script.slice(at, at + 2500);
+  // pendingServer='' alone only says "no NEW pin is waiting" - the radio and
+  // #setServer keep the pin that was already saved, and settingsBody reads
+  // #setServer, so Save wrote the old pin straight back over the defaults.
+  assert.match(reset, /\$\('setServer'\)\.value=''/,
+    'the control Save actually reads has to go back to Auto, not just the pending-pin variable');
+  assert.ok(reset.indexOf("$('setServer').value=''") < reset.indexOf('loadServers()'),
+    'and before the async list refetch, so the reset does not depend on Ookla being reachable');
+});
+
+test('a save that fails always says so, even when the caller has nothing to add', () => {
+  const build = (msg) => {
+    const els = { settingsMsg: { textContent: msg }, saveSettings: { classList: { add(){ els.saveSettings.err = true; } } } };
+    const fn = new Function('$', extract('function saveFailed') + '\nreturn saveFailed;')(id => els[id]);
+    return { fn, els };
+  };
+  // postAccess returns false from its network catch WITHOUT writing a message,
+  // and saveFailed() was called with no argument - so "Saving..." stayed on
+  // screen forever while the drawer sat there looking busy.
+  let b = build('Saving\u2026'); b.fn();
+  assert.notEqual(b.els.settingsMsg.textContent, 'Saving\u2026', 'the spinner text cannot be the last word on a failure');
+  assert.match(b.els.settingsMsg.textContent, /not saved|could not reach/i, 'and it says what happened');
+  assert.equal(b.els.saveSettings.err, true, 'the button still reddens');
+  // A caller WITH something to say still wins.
+  b = build('Saving\u2026'); b.fn('server said no');
+  assert.equal(b.els.settingsMsg.textContent, 'server said no');
+  // A message another path already wrote is not trampled by the fallback.
+  b = build('address 1.2.3.4 is not reachable'); b.fn();
+  assert.equal(b.els.settingsMsg.textContent, 'address 1.2.3.4 is not reachable', 'postAccess\u2019s own error text survives');
+});
+
+test('a page that fails to load leaves the pager where it was, and says so', async () => {
+  // The handlers moved the counter first and let the load fail silently, so the
+  // caption and rows stayed on the old page while the counter had moved on -
+  // and with only that endpoint failing the pager could not be moved again:
+  // Next's own guard was already false and Prev was disabled.
+  const build = (ok) => {
+    const said = [];
+    const api = new Function('loadRuns', 'chartLoadFailed',
+      'let runsPage=1;\n' + extract('async function runsGoTo') +
+      '\nreturn { runsGoTo, page: () => runsPage, set: p => { runsPage = p; } };')(
+      async () => ok, w => said.push(w));
+    return { ...api, said };
+  };
+  let p = build(true); p.set(1); await p.runsGoTo(2);
+  assert.equal(p.page(), 2, 'a page that loads is a page you are on');
+  assert.equal(p.said.length, 0, 'and nothing is complained about');
+  p = build(false); p.set(1); await p.runsGoTo(2);
+  assert.equal(p.page(), 1, 'a page that does not load leaves you where you were');
+
+  // The saying-so lives in the loader, so opening the table on a dead daemon
+  // reports too, not just a pager click.
+  assert.match(extract('async function loadRuns'), /chartLoadFailed\('runs table'\)/,
+    'a failed load is said out loud, the way a failed chart load already is');
+  assert.match(extract('async function loadOutages'), /chartLoadFailed\('outages list'\)/, 'same for the outages list');
+
+  // Both loaders have to report the outcome for that to be possible.
+  assert.match(extract('async function loadRuns'), /return (true|false)/, 'loadRuns reports whether it loaded');
+  assert.match(extract('async function loadOutages'), /return (true|false)/, 'and so does loadOutages');
+  const handlers = script.slice(script.indexOf("$('runsPrev').addEventListener"), script.indexOf("$('runsPerPage').addEventListener"));
+  assert.match(handlers, /runsGoTo/, 'the runs pager goes through it');
+  const oh = script.slice(script.indexOf("$('outagesPrev').addEventListener"), script.indexOf("$('outagesPerPage').addEventListener"));
+  assert.match(oh, /outagesGoTo/, 'and so does the outages pager');
+});
+
+test('iperf3 reachability probes are queued, and a settings load does not throw away what it knows', async () => {
+  // Twelve servers meant twelve dials at once - and the drawer\u2019s own settings
+  // refetch wiped the results and did all twelve again, so opening the tab cost
+  // 24 four-second probes and Save queued behind them.
+  let running = 0, peak = 0; const release = [];
+  const api = new Function('iperfAddrValid', 'refreshIperfDots', 'probeIperf',
+    'let iperfHealth={};\n' + script.match(/const IPERF_PROBE_PARALLEL=[^;]*;/)[0] + '\n'
+    + 'let iperfProbeRunning=0; const iperfProbeWaiting=[];\n'
+    + extract('function pumpIperfProbes') + '\n' + extract('function probeIperfSoon') + '\n'
+    + 'return { probeIperfSoon, waiting: () => iperfProbeWaiting.length, health: () => iperfHealth };')(
+    () => true, () => {},
+    () => new Promise(res => { running++; peak = Math.max(peak, running); release.push(() => { running--; res(); }); }));
+  for (let i = 0; i < 12; i++) api.probeIperfSoon('h' + i + ':5201');
+  await new Promise(r => setTimeout(r, 0));
+  assert.ok(peak <= 4 && peak > 0, `peak ${peak} probes at once, want at most a handful - a browser gives one origin six connections and Save needs one`);
+  assert.equal(api.waiting(), 12 - peak, 'the rest wait their turn');
+  while (release.length) { release.shift()(); await new Promise(r => setTimeout(r, 0)); }
+  assert.ok(peak <= 4, 'and the queue never exceeds the cap as it drains');
+  // Re-asking for an address already in flight must not queue it twice.
+  const before = api.waiting();
+  api.probeIperfSoon('h0:5201');
+  assert.equal(api.waiting(), before, 'a re-render does not re-queue what is already being checked');
+
+  const apply = extract('function applySettings');
+  assert.doesNotMatch(apply, /iperfHealth=\{\};/,
+    'fresh truth must keep what it already knows about addresses that did not change, or the drawer probes everything twice');
+  assert.match(script, /iperfServers\.forEach\(s=>\{ if\(iperfAddrValid\(s\.addr\) && iperfHealth\[s\.addr\]===undefined\) probeIperfSoon\(s\.addr\); \}\)/,
+    'and the render queues rather than firing them all');
 });
