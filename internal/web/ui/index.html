@@ -4591,7 +4591,13 @@ async function refreshStatus() {
   // running=true still applies: it carries the server name once known.
   if(!(speedtestPending && !s.speedtest_running))
     setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_run_id);
-  if (s.speed) lastSpeedTs = s.speed.ts;
+  // A new run has landed. The SERVER name is not the signal - the incumbent
+  // rule keeps the same server run after run - so the timestamp is, and the
+  // poll already carries it.
+  if (s.speed && s.speed.ts !== lastSpeedTs){
+    lastSpeedTs = s.speed.ts;
+    runsFollowLive();
+  }
   // A run that actually completed after the error supersedes it.
   if (speedRunErr && s.speed && s.speed.ts > speedRunErrSince) speedRunErr='';
   if (!s.speedtest_running && !speedtestPending) {
@@ -6129,6 +6135,11 @@ const healthBadge = v => v===true ? '<span class="badge ok">healthy</span>'
   : v===false ? '<span class="badge bad">unhealthy</span>'
   : '<span class="muted" title="Not graded - set alert thresholds (Settings → Alerts) and future runs get a healthy/unhealthy verdict">-</span>';
 let runsPage=1, runsPerPage=10, runsTotal=0;
+// runsBusy: a delete is in flight. loadRuns() rebuilds the whole tbody, so a
+// refresh landing inside that window would move the row its focus-restore is
+// counting on. The confirm() before it blocks the thread, so only the fetch
+// needs covering.
+let runsBusy=false;
 let runsSeq=0; // only the newest in-flight runs poll repaints the table (see refreshStatus)
 async function loadRuns(){
   const my=++runsSeq;
@@ -6176,6 +6187,17 @@ function applyRunHighlight(ts){
   body.querySelectorAll('tr[data-ts]').forEach(tr=>tr.classList.toggle('run-hl', ts!=null && +tr.dataset.ts===+ts));
 }
 function runsOpen(){ return $('runsSection').style.display!=='none'; }
+// runsFollowLive keeps an open table current as results land - a scheduled run,
+// one started in another tab, or each server of a Best-of round that keeps its
+// losers. Deliberately narrow: nothing is fetched for a table nobody has open,
+// and nothing is rebuilt under someone who is reading it. Page 1 only, because
+// a new run pushes every row down a page - on the first page it simply appears
+// at the top, anywhere else the content would shift under the cursor. The
+// highlight survives: loadRuns re-applies pinnedRunTs after the rebuild.
+function runsFollowLive(){
+  if(!runsOpen() || runsPage!==1 || runsBusy) return;
+  loadRuns();
+}
 function setRunsOpen(open){
   $('runsSection').style.display = open ? '' : 'none';
   $('runsToggle').textContent = open ? 'Hide all runs ▴' : 'Show all runs ▾';
@@ -6230,6 +6252,7 @@ $('runsBody').addEventListener('click', async e=>{
   // latency target/family pills already follow. Lets you delete down the list.
   const idx=[...$('runsBody').querySelectorAll('.run-del')].indexOf(btn);
   btn.disabled=true;
+  runsBusy=true; // hold off the live refresh until this rebuild is ours
   try{
     const r=await fetch('api/speed/runs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ts})});
     if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); return; }
@@ -6241,6 +6264,7 @@ $('runsBody').addEventListener('click', async e=>{
     // this is what assistive tech hears (no aria-live on the tbody itself).
     const tb=$('undoToast'); if(tb){ tb.textContent='Run deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
   }catch(err){ btn.disabled=false; alert('Delete failed'); }
+  finally{ runsBusy=false; }
 });
 $('runsToggle').addEventListener('click', async () => {
   const open = !runsOpen();

@@ -6134,3 +6134,32 @@ test('the data estimate scales by the count the history was measured under, not 
   assert.doesNotMatch(script, /savedBestOfN/, 'the settings-derived divisor is gone: it became the new count the moment it was saved');
   assert.match(script, /speedAvgServers = Math\.max\(1, s\.speed_avg_servers\|\|1\)/, 'the divisor comes from the daemon, which counts what the runs measured');
 });
+
+// The runs table used to refresh only when opened, after a delete, or after a
+// manual RUN in this tab - so a table left open went stale for up to an hour
+// while scheduled runs (and a Best-of round's members) landed behind it.
+test('an open runs table follows results as they land', () => {
+  const calls = [];
+  const build = ({ open = true, page = 1, busy = false }) => new Function(
+    `let runsPage=${page}, runsBusy=${busy}; const calls=[];\n`
+    + `function runsOpen(){ return ${open}; } function loadRuns(){ calls.push(1); }\n`
+    + extract('function runsFollowLive')
+    + '\nreturn { runsFollowLive, calls };')();
+  let p = build({}); p.runsFollowLive();
+  assert.equal(p.calls.length, 1, 'open, on the first page, idle: the new row appears on its own');
+  p = build({ open: false }); p.runsFollowLive();
+  assert.equal(p.calls.length, 0, 'closed: no request for a table nobody is looking at');
+  p = build({ page: 3 }); p.runsFollowLive();
+  assert.equal(p.calls.length, 0, 'page 3: a new run pushes every row down a page, so it must not shuffle under the reader');
+  p = build({ busy: true }); p.runsFollowLive();
+  assert.equal(p.calls.length, 0, 'mid-delete: the rebuild would clobber the row the focus logic is counting on');
+
+  // The poll already knows when a run lands - it tracks the newest run's
+  // timestamp - and the SERVER name is not the signal: the incumbent rule
+  // keeps the same server run after run.
+  assert.match(script, /if \(s\.speed && s\.speed\.ts !== lastSpeedTs\)\{\s*lastSpeedTs = s\.speed\.ts;\s*runsFollowLive\(\);/,
+    'the status poll compares the newest run\u2019s ts before it stores it, and follows on a change');
+  const del = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
+  assert.match(del, /runsBusy=true/, 'a delete marks the table busy for the window its fetch is in flight');
+  assert.match(del, /runsBusy=false/, 'and clears it');
+});
