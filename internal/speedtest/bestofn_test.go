@@ -24,8 +24,11 @@ func TestRunBudgetScalesWithTheRound(t *testing.T) {
 		if per != bestOfServerTimeout {
 			t.Errorf("want=%d: per-server %v, want %v", want, per, bestOfServerTimeout)
 		}
-		if exp := time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget; total != exp {
-			t.Errorf("want=%d: total %v, want %v (N turns plus selection, uncapped)", want, total, exp)
+		// N turns, selection, and the N-1 settles between the turns - uncapped.
+		exp := time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget +
+			time.Duration(want-1)*bestOfServerSettle
+		if total != exp {
+			t.Errorf("want=%d: total %v, want %v (N turns, selection, and the settles between them)", want, total, exp)
 		}
 	}
 }

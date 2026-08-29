@@ -3953,7 +3953,6 @@ test('adding is the list\u2019s last row, and the row follows its details', () =
     'and goes inert at the cap, saying why, rather than erroring after the click');
   assert.match(render, /\+'<\/div>';/, 'it sits inside .fp-rows, so a scrolling list scrolls it too');
   assert.doesNotMatch(render, /No servers saved yet/, 'an empty list needs no caption: the row it ends with says what to do');
-  assert.match(html, /\.ipl-add:first-child\{border-top:0;\}/, 'and then the header draws the only line above it');
   const add = extract('function iperfAddServer');
   assert.match(add, /newIperfServer\('',''\)/, 'the new server starts empty - the address is typed in the details');
   assert.match(add, /iperfEditingId=sv\._id/, 'which open straight away');
@@ -3961,7 +3960,8 @@ test('adding is the list\u2019s last row, and the row follows its details', () =
   assert.match(add, /if\(iperfServers\.length>=IPERF_MAX\) return;/, 'and a belt behind the disabled row');
   const acts = script.slice(script.indexOf("$('iperfServerList').addEventListener('click'"), script.indexOf("$('iperfEditRemove')"));
   assert.match(acts, /act==='add'\)\{ iperfAddServer\(\); return; \}/, 'the add row is handled before the code that expects a server id');
-  assert.match(html, /\.fp-row:has\(\+ \.ipl-add\)\{border-bottom:0;\}/, 'the row above it drops its rule so the two do not draw a double line');
+  assert.doesNotMatch(html, /\.ipl-add\{[^}]*dashed/, 'it separates with the list\u2019s own hairline, not a dashed rule of its own');
+  assert.doesNotMatch(html, /\.fp-row:has\(\+ \.ipl-add\)/, 'so the row above keeps the border every other row draws');
   // Every cell the details can change is repainted from one place, against the
   // markup iperfRowHTML writes.
   const paint = extract('function repaintIperfRow'), row = extract('function iperfRowHTML');

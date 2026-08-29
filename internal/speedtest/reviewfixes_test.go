@@ -2,6 +2,7 @@ package speedtest
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -118,5 +119,172 @@ func TestRankingProbesAreBounded(t *testing.T) {
 	}
 	if peak == 0 {
 		t.Fatal("nothing was probed")
+	}
+}
+
+// swapFallbackMap gives a test the selection health cache to itself.
+func swapFallbackMap(t *testing.T) {
+	t.Helper()
+	fbMu.Lock()
+	saved := fbMap
+	fbMap = map[string]fallbackVerdict{}
+	fbMu.Unlock()
+	t.Cleanup(func() { fbMu.Lock(); fbMap = saved; fbMu.Unlock() })
+}
+
+// A server convicted of refusing every upload is excluded for twelve hours -
+// but the cache holding that is in-process, so a restart used to forget it and
+// the next round paid the whole failed turn again. The conviction is handed to
+// a sink the daemon can persist, and seeding it back restores the exclusion
+// without re-probing.
+func TestAnUploadConvictionOutlivesTheProcess(t *testing.T) {
+	swapFallbackMap(t)
+	var saved []ServerHealthRow
+	old := PersistServerHealth
+	PersistServerHealth = func(r ServerHealthRow) { saved = append(saved, r) }
+	t.Cleanup(func() { PersistServerHealth = old })
+
+	before := time.Now().Unix()
+	noteUploadRejection(&ookla.Server{ID: "16045", URL: "http://beanfield.example:8080/speedtest/upload.php"})
+	if len(saved) != 1 || saved[0].ServerID != "16045" {
+		t.Fatalf("handed the sink %+v, want one row for the convicted server", saved)
+	}
+	if saved[0].Expires < before+int64(fallbackTTL.Seconds())-5 {
+		t.Errorf("expires %d, want about twelve hours out", saved[0].Expires)
+	}
+
+	// The restart: a fresh cache, and the probe must not be consulted.
+	swapFallbackMap(t)
+	probes := 0
+	oldProbe := probeFallback
+	probeFallback = func(context.Context, *ookla.Server) endpointState { probes++; return endpointOK }
+	t.Cleanup(func() { probeFallback = oldProbe })
+	LoadServerHealth(saved)
+	if st := fallbackHealth(context.Background(), &ookla.Server{ID: "16045", URL: "http://beanfield.example:8080/speedtest/upload.php"}); st != endpointRetired {
+		t.Errorf("health %v after reloading the conviction, want retired - the round would seat it again", st)
+	}
+	if probes != 0 {
+		t.Errorf("%d probes: a reloaded conviction must stand on its own, not be re-derived from the GET that never sees the problem", probes)
+	}
+	// An expired row is not reloaded: the twelve hours are the second chance.
+	swapFallbackMap(t)
+	LoadServerHealth([]ServerHealthRow{{ServerID: "16045", Expires: time.Now().Add(-time.Minute).Unix(), Fails: fallbackStrikes}})
+	if st := fallbackHealth(context.Background(), &ookla.Server{ID: "16045", URL: "http://beanfield.example:8080/speedtest/upload.php"}); st != endpointOK {
+		t.Errorf("health %v from an expired conviction, want the probe's own answer", st)
+	}
+}
+
+// A server that answered every upload POST and accepted none answers the retry
+// the same way. Spending the second window proving it costs the round about
+// twenty seconds and the server a few hundred more doomed requests.
+func TestARefusedUploadIsNotRetried(t *testing.T) {
+	o := NewOokla()
+	if !o.uploadRetryable(errors.New("boom")) {
+		t.Error("no recorder: a failed upload is retried, as it always was")
+	}
+	o.upRec = &uploadRecorder{}
+	for i := 0; i < uploadRejectMinRefusals; i++ {
+		o.upRec.note(500, nil)
+	}
+	if o.uploadRetryable(errors.New("boom")) {
+		t.Error("every POST refused: the retry is another window spent on the same answer")
+	}
+	// A server that accepted anything, or failed transiently, keeps its retry.
+	o.upRec = &uploadRecorder{}
+	o.upRec.note(200, nil)
+	o.upRec.note(500, nil)
+	if !o.uploadRetryable(errors.New("boom")) {
+		t.Error("a server that accepted a chunk is not refusing")
+	}
+	o.upRec = &uploadRecorder{}
+	for i := 0; i < uploadRejectMinRefusals; i++ {
+		o.upRec.note(503, nil)
+	}
+	if !o.uploadRetryable(errors.New("boom")) {
+		t.Error("503 is transient by the recorder's own rule; the retry stands")
+	}
+}
+
+// A candidate that transferred nothing in either direction measured nothing.
+// Keeping it as a member of the round writes a history row with no data in it,
+// which reads as a broken test rather than as the broken server it was.
+func TestARoundMemberThatMeasuredNothingIsNotRecorded(t *testing.T) {
+	requireQuiet(t)
+	healthyEndpoints(t)
+	countingPing(t, map[string]time.Duration{"1": 5 * time.Millisecond, "2": 6 * time.Millisecond, "3": 7 * time.Millisecond})
+	stubServerList(t) // servers 1, 2, 3
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		if srv.ID == "3" { // the Beanfield shape: no error, no bytes, no speeds
+			return Result{Server: "S3", ServerID: "3", PingMS: 27}, nil
+		}
+		return Result{Server: "S" + srv.ID, ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 20, PingMS: 9,
+			DownloadBytes: 1000, UploadBytes: 200}, nil
+	})
+	o := NewOokla()
+	o.LossFn = func() bool { return false }
+	o.BestOfCountFn = func() int { return 3 }
+	o.DiscardLosersFn = func() bool { return false }
+	res, err := o.RunReason(context.Background(), "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range res.Losers {
+		if l.ServerID == "3" {
+			t.Errorf("the server that transferred nothing was kept as a round member: %+v", l)
+		}
+	}
+	if len(res.Losers) != 1 {
+		t.Errorf("%d members kept, want the one that actually measured something", len(res.Losers))
+	}
+	// It still belongs to the round's own record of what was tried.
+	if res.Selection == nil || len(res.Selection.Candidates) != 3 {
+		t.Errorf("the selection report must still list all three: %+v", res.Selection)
+	}
+}
+
+// A Best-of round measures its servers back to back. Each transfer saturates
+// the link, and the next server's turn should not start into whatever the last
+// one left behind - queues, lingering sockets, a shaper's recovery window.
+func TestBestOfRoundLetsTheLinkSettleBetweenServers(t *testing.T) {
+	requireQuiet(t)
+	healthyEndpoints(t)
+	defer func(d time.Duration) { bestOfServerSettle = d }(bestOfServerSettle)
+	bestOfServerSettle = 40 * time.Millisecond
+
+	countingPing(t, map[string]time.Duration{"1": 5 * time.Millisecond, "2": 6 * time.Millisecond, "3": 7 * time.Millisecond})
+	stubServerList(t) // servers 1, 2, 3
+	var at []time.Time
+	stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {
+		at = append(at, time.Now())
+		return Result{Server: "S" + srv.ID, ServerID: srv.ID, DownloadMbps: 100, UploadMbps: 20, PingMS: 9,
+			DownloadBytes: 1000, UploadBytes: 200}, nil
+	})
+	o := NewOokla()
+	o.LossFn = func() bool { return false }
+	o.BestOfCountFn = func() int { return 3 }
+	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if len(at) != 3 {
+		t.Fatalf("%d servers measured, want 3", len(at))
+	}
+	for i := 1; i < len(at); i++ {
+		if gap := at[i].Sub(at[i-1]); gap < bestOfServerSettle {
+			t.Errorf("server %d started %v after the last one, want at least %v of settle", i+1, gap, bestOfServerSettle)
+		}
+	}
+
+	// A single-server run has nothing to settle between: it must not pay it.
+	at = nil
+	o.BestOfCountFn = func() int { return 1 }
+	start := time.Now()
+	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if len(at) != 1 {
+		t.Fatalf("single: %d measured, want 1", len(at))
+	}
+	if el := time.Since(start); el >= bestOfServerSettle {
+		t.Errorf("single run spent %v, want no settle at all", el)
 	}
 }

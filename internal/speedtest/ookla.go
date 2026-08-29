@@ -1633,6 +1633,19 @@ func storeFallbackVerdictLocked(id string, v fallbackVerdict) {
 	fbMap[id] = v
 }
 
+// uploadRetryable is the upload's retry predicate. A failed window is normally
+// worth another turn (a stalled stream, a busy server), but one where the
+// server answered every POST and accepted none is not: it will answer the
+// retry the same way, and the second window costs the round ~20 seconds and
+// the server a few hundred more doomed requests. Measured in the field: 208
+// upload attempts, 195 of them HTTP 500, across two windows.
+//
+// This is the same evidence the conviction below acts on, read one step
+// earlier. The conviction still happens at the end of the phase.
+func (o *Ookla) uploadRetryable(error) bool {
+	return o.upRec == nil || !o.upRec.refusedByServer()
+}
+
 // noteUploadRejection records a run's own upload outcome in the selection
 // health cache. Selection judges a server's legacy bundle by GETting its
 // latency probe (fallbackHealth), and that proxy has a blind spot: a host
@@ -1664,15 +1677,56 @@ func noteUploadRejection(s *ookla.Server) (suspectOwnNetwork bool) {
 		return false
 	}
 	now := time.Now()
+	expires := now.Add(fallbackTTL)
 	fbMu.Lock()
 	storeFallbackVerdictLocked(s.ID, fallbackVerdict{
 		state:   endpointRetired,
-		expires: now.Add(fallbackTTL),
+		expires: expires,
 		fails:   fallbackStrikes,
 	})
 	suspectOwnNetwork = noteConvictionLocked(s.ID, now)
 	fbMu.Unlock()
+	// Outside the lock: the sink writes to the database, and fbMu is taken on
+	// the ranking's own hot path. A conviction costs a whole measurement turn
+	// to earn - the GET probe cannot see the problem - so it is the one verdict
+	// worth outliving the process. The probe's own verdicts are not persisted:
+	// re-deriving those costs a single GET.
+	if PersistServerHealth != nil {
+		PersistServerHealth(ServerHealthRow{ServerID: s.ID, Expires: expires.Unix(), Fails: fallbackStrikes})
+	}
 	return suspectOwnNetwork
+}
+
+// ServerHealthRow is one server's upload conviction as the daemon stores it.
+type ServerHealthRow struct {
+	ServerID string
+	Expires  int64 // unix seconds; the verdict stands until then
+	Fails    int
+}
+
+// PersistServerHealth receives every upload conviction so it can survive a
+// restart. nil (the default, and in tests) keeps them in memory only, which is
+// what the process did before: a restart forgot every conviction and the next
+// round paid the failed turn again.
+var PersistServerHealth func(ServerHealthRow)
+
+// LoadServerHealth seeds the selection health cache with convictions from a
+// previous process. Expired rows are ignored - the TTL is the designed second
+// chance, and reloading a lapsed one would deny it.
+func LoadServerHealth(rows []ServerHealthRow) {
+	now := time.Now()
+	fbMu.Lock()
+	defer fbMu.Unlock()
+	for _, r := range rows {
+		if r.ServerID == "" || r.Expires <= now.Unix() {
+			continue
+		}
+		storeFallbackVerdictLocked(r.ServerID, fallbackVerdict{
+			state:   endpointRetired,
+			expires: time.Unix(r.Expires, 0),
+			fails:   r.Fails,
+		})
+	}
 }
 
 // convictionWindow / convictionSuspectAt: DIFFERENT servers convicted in quick
@@ -2067,8 +2121,30 @@ func runBudget(retries, want int) (perServer, total time.Duration) {
 	if want <= 1 {
 		return total, total
 	}
-	return bestOfServerTimeout, time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget
+	// The settles between servers are time the round spends, so the budget
+	// carries them too - otherwise the sleeps come out of the last candidates'
+	// slices and leave them too short to finish in, which is the failure a
+	// Best-of round exists to route around.
+	return bestOfServerTimeout, time.Duration(want)*bestOfServerTimeout + bestOfSelectionBudget +
+		time.Duration(want-1)*bestOfServerSettle
 }
+
+// bestOfServerSettle is the pause between one server's turn and the next in a
+// Best-of round. The transfers saturate the link, and the next server should
+// not start into what the last one left behind: queues draining, sockets in
+// TIME_WAIT, a shaper's recovery window.
+//
+// Two seconds is chosen against what this link actually measures rather than
+// picked round: the loaded-latency figures put the queue itself at tens of
+// milliseconds (16 ms of upload bufferbloat at ~465 Mbps is under a megabyte
+// in flight), and iperfUploadSettle already treats 750 ms as enough between
+// two transfers to the SAME server. Two seconds is an order of magnitude over
+// the drain and comfortably under uploadRescueSettle's five, which is what
+// this package reserves for the case where something really is still draining.
+// It costs (N-1) x 2 s: four seconds at Best of 3, thirty at Best of 16.
+//
+// A var so tests can shrink it.
+var bestOfServerSettle = 2 * time.Second
 
 // errMeasurementNA: the library's transfers never return an error - a failed
 // transfer is signalled by a speed of -1 (N/A: measured 0 with >10% of chunk
@@ -2315,6 +2391,13 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	var firstErr error
 	var spentDown, spentUp int64 // real bytes moved by FAILED candidates (their Results are discarded)
 	for i, srv := range targets {
+		// Let the link settle before the next server's turn. Only in a round:
+		// a single-server run has nothing to settle between, and its fallback
+		// target (a challenge's incumbent) is only reached after a failure,
+		// which has drained already.
+		if i > 0 && want > 1 && !sleepCtx(ctx, bestOfServerSettle) {
+			break // cancelled mid-settle; what has been measured still counts
+		}
 		// Report the server now so the UI can show it during the run.
 		if o.OnServer != nil {
 			o.OnServer(serverLabel(srv))
@@ -2482,6 +2565,16 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	if keep {
 		for i, r := range results {
 			if i != win {
+				// A candidate that transferred nothing in either direction
+				// measured nothing - the library can return no error for a
+				// server that refuses every request - and a history row with
+				// no data in it reads as a broken TEST rather than the broken
+				// server it was. It stays in the selection report, which is
+				// the round's record of what was tried; the bytes it did spend
+				// ride the winner's usage row like any other candidate's.
+				if r.DownloadBytes <= 0 && r.UploadBytes <= 0 {
+					continue
+				}
 				// Held to what the round agrees on exactly as the winner is
 				// above: a loser's row lands in the same history, and a reading
 				// the round refused to believe must not reach it there either.
@@ -3857,7 +3950,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		// constant would clobber a caller that set its own (tests do).
 		attempt := 0
 		rescued := false
-		err = withRetryPred(ctx, retries, anyErr, func() error {
+		err = withRetryPred(ctx, retries, o.uploadRetryable, func() error {
 			attempt++
 			starved := false
 			if attempt > 1 && o.upRec != nil {

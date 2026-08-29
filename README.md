@@ -914,7 +914,11 @@ footer instead of selecting it, and typing its ID into Find lists it with the
 badge rather than pinning it (hover the badge for the reason). Such a server
 can still be starred, and a server that is already chosen keeps its radio
 even if it later earns the badge, so the picker never hides what the next run
-will use. Auto isn't just "nearest": every server that's effectively equidistant gets to race
+will use. That badge comes from a cheap check - fetching the server's latency
+file - which a host whose *upload* endpoint refuses everything still passes.
+Those only reveal themselves when a run tries them, so when one refuses every
+upload the daemon stops offering it to automatic selection for twelve hours,
+and remembers that across a restart. Auto isn't just "nearest": every server that's effectively equidistant gets to race
 (in a big city, a dozen providers all sit "0 km away" - one of each is pinged
 rather than an arbitrary few, and the same rule seeds each candidate city's
 six in the city race that picks the centre, with distance ties broken by the
@@ -1277,8 +1281,11 @@ and persist across restarts:
   winner won - stored next to the run (`GET /api/speed/runs/servers?ts=`) and
   summarised in the logs. Each server gets 90
   seconds before it is dropped and the next is tried, so a stalled server can't
-  hold up the round; a whole round budgets 90 seconds per server plus 90 seconds to pick them (a Best of 3 is
-  about six minutes of work; the largest round, 16, about 25). It costs roughly **N times
+  hold up the round. Between one server and the next it pauses two seconds, so
+  each turn starts on a settled link rather than into what the last transfer
+  left draining. A whole round budgets 90 seconds per server, 90 seconds to
+  pick them, and those pauses (a Best of 3 is about six minutes of work; the
+  largest round, 16, about 26). It costs roughly **N times
   the time and data** of a normal test, so only the runs worth being thorough
   about use it: the ones on your chosen interval, and the **RUN** button. The
   quick automatic tests - at startup, after a reconnect, and the while-degraded
