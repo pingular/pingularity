@@ -247,7 +247,18 @@
   .qs-two{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;}
   .qs-two .qs-rl{white-space:nowrap;}
   .qs-two>div:last-child{flex:1;min-width:0;}
-  .qs-them{display:flex;gap:10px;}
+  .qs-them{display:flex;gap:10px;flex-wrap:wrap;}
+  /* Nine swatches and the update-check consent do not fit one line on a phone.
+     Unwrapped, the row stayed 386px wide inside a 356px dialog and pushed the
+     consent control off the side of the screen: measured 2px wide at x=451 in a
+     390px viewport, with its label at 0px - invisible, unclickable, and posted
+     as agreed anyway. This is the only screen that asks for that consent, so it
+     is the half that must survive: the row wraps and the toggle gets its own
+     line under the swatches. */
+  @media (max-width:620px){
+    .qs-two{flex-wrap:wrap;gap:12px;}
+    .qs-two>div:last-child{flex:1 0 100%;}
+  }
   .qs-sw{width:34px;height:34px;border-radius:3px;border:1px solid var(--line2);cursor:pointer;flex:none;
     padding:0;background:none;}
   .qs-sw:hover{border-color:var(--accent);}
@@ -3582,13 +3593,20 @@ function setPowerUI(on){
   b.title = on ? 'Monitoring on - click to stop' : 'Monitoring stopped - click to start'; }
 let powerPending=false; // suppress the poller's setPowerUI while a power POST is in flight
 $('powerBtn').addEventListener('click', async () => {
-  const btn=$('powerBtn'); if(btn.disabled) return; btn.disabled=true; powerPending=true;
+  const btn=$('powerBtn'); if(btn.disabled) return;
+  // disabled blurs it, so remember whether it was the focused control and hand
+  // focus back when it is live again - otherwise Enter stops monitoring and
+  // there is nothing left to press to start it.
+  const hadFocus=document.activeElement===btn;
+  btn.disabled=true; powerPending=true;
   const want=!monitoring; setPowerUI(want); // optimistic: reflect intent now (also updates `monitoring` so a queued click can't desync)
   try { const r = await fetch('api/monitoring',{method:'POST',
       headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:want})});
     setPowerUI((await r.json()).enabled); refreshStatus();
   } catch(e){ setPowerUI(!want); } // revert the optimistic flip on failure
-  finally{ btn.disabled=false; powerPending=false; }
+  // refocus, not focus: the request can take seconds, and by then the reader may
+  // have tabbed on - it only restores when the disable is what took focus away.
+  finally{ btn.disabled=false; powerPending=false; if(hadFocus) refocus('#powerBtn'); }
 });
 const _drawer=$('drawer'), _drawerInner=document.querySelector('.drawer-inner');
 const _blackout=$('blackout'), _wrap=document.querySelector('.wrap');
@@ -3688,7 +3706,12 @@ function openDrawer(){
   syncDrawerHeight();
   syncBlackout();
 }
-function closeDrawer(){ const hadFocus=_drawer.contains(document.activeElement);
+function closeDrawer(hadFocus){
+  focusPending=null;   // nothing inside a closed drawer is a place to put the keyboard
+  // The caller may know better than we can: Save disables its own button first,
+  // which moves focus to <body> before we could have looked.
+  const told=hadFocus!==undefined;
+  if(!told) hadFocus=_drawer.contains(document.activeElement);
   _drawer.style.maxHeight='0px'; _drawer.classList.remove('open','scroll');
   // inert removes the collapsed drawer's controls from the tab order so keyboard
   // focus can't get stuck in the hidden pane; also reset the expanded state.
@@ -3699,7 +3722,13 @@ function closeDrawer(){ const hadFocus=_drawer.contains(document.activeElement);
   $('serverCity').value=''; serverPinRefused=''; clearServerFieldError(); syncBlackout();
   // inert just dropped focus to <body>; hand it back to the gear (as the
   // popovers refocus their trigger) so Escape doesn't restart the tab order.
-  if(hadFocus) $('gearBtn').focus(); }
+  // When the caller answered for us, that answer is seconds old - a save waits
+  // on a server search, the access POST and the settings POST - and in that gap
+  // the reader can Tab out of the drawer to the header, which is never inert.
+  // Taking the keyboard off what they chose is the same rudeness this whole
+  // change exists to stop, so only the ones who went nowhere get moved.
+  const at=document.activeElement;
+  if(hadFocus && !(told && at && at!==document.body && !_drawer.contains(at))) $('gearBtn').focus(); }
 window.addEventListener('resize', syncDrawerHeight); // recompute the viewport cap on resize
 // Close the drawer, honouring the unsaved-changes guard. Shared by the gear
 // button and the Escape key. No-op when already closed.
@@ -3907,6 +3936,10 @@ let _qsInerted=[];
 function qsClose(){
   $('qsDlg').hidden=true; $('qsDim').hidden=true;
   _qsInerted.forEach(el=>el.inert=false); _qsInerted=[]; // restore the page behind
+  // Hiding the dialog drops focus to <body>, and this is the first thing a new
+  // install sees: hand the keyboard to the settings gear, which is where
+  // anything they turned down is turned back on.
+  const gear=$('gearBtn'); if(gear) gear.focus({preventScroll:true});
   showCoach(); // the coach was deferred behind the dialog
 }
 function qsMark(){ // fire-and-forget: on failure the server just offers again next visit
@@ -4362,6 +4395,73 @@ const fget=(url,ms=15000,opts)=>fetch(url,{...opts,signal:AbortSignal.timeout(ms
 // Surface a failed panel refresh (network error, timeout, or non-2xx) instead of silently
 // leaving the previous data on screen under a possibly-changed range label. Reuses the undo
 // toast; callers gate on their sequence guard so only the newest in-flight request reports.
+// --- Keeping the keyboard where it was ------------------------------------
+// Every list, grid and pane on this page is redrawn wholesale, and two controls
+// disable themselves while they work. Both throw keyboard focus to <body>, so
+// an action taken ON a thing ejects the user to the top of the document - and
+// the runs table's own live refresh did it to them without being asked. These
+// two put focus back: focusMark reads a locator that survives the rebuild,
+// refocus applies it afterwards.
+//
+// The locator is the element's id when it has one, else the key its container
+// stamps on the row plus enough of the element to tell one control in that row
+// from another (the pick button from the star, the row from its delete).
+function focusMark(){
+  const el=document.activeElement;
+  if(!el || el===document.body || !el.tagName) return null;
+  if(el.id) return '#'+(window.CSS&&CSS.escape?CSS.escape(el.id):el.id);
+  for(const attr of ['data-day','data-pick','data-ts','data-star','data-id']){
+    const host=el.closest('['+attr+']');
+    if(!host) continue;
+    const v=host.getAttribute(attr);
+    if(v==null) continue;
+    let base='['+attr+'="'+(window.CSS&&CSS.escape?CSS.escape(v):v)+'"]';
+    // Scope it to the list it came from. The runs table and the outages table
+    // BOTH stamp data-ts on a .run-del button, so an unscoped locator can pick
+    // the other table's delete button - and the next Enter would destroy the
+    // wrong thing. The picker is the exception: starring a server MOVES its row
+    // from one pane to the other, so its rows must stay pane-free.
+    if(attr!=='data-pick' && attr!=='data-star'){
+      const box=host.closest('[id]');
+      if(box && box!==host && box.id) base='#'+(window.CSS&&CSS.escape?CSS.escape(box.id):box.id)+' '+base;
+    }
+    // Name the control, not just the row. The runs table stamps data-ts on BOTH
+    // the row and its delete button, and a bare [data-ts="..."] resolves to the
+    // row - which cannot take focus, so the keyboard went nowhere.
+    // className is an object on SVG elements, and a throw here would take the
+    // whole redraw down with it - this runs inside every rebuild.
+    const cls=(typeof el.className==='string'?el.className:'').split(' ').filter(Boolean)[0];
+    if(host===el) return cls ? base+'.'+cls : base;
+    return cls ? base+' .'+cls : base+' '+el.tagName.toLowerCase();
+  }
+  return null;
+}
+// var, not let: closeDrawer clears this and is defined 700 lines above, so a
+// call before this line is reached would be a ReferenceError that kills the
+// whole script rather than a stale mark.
+var focusPending=null;
+function refocus(sel){
+  // Only if the rebuild actually took focus. Several of these restore across an
+  // async reload, and in that gap the reader may have moved on themselves -
+  // pulling them back would be the same rudeness in the other direction.
+  const at=document.activeElement;
+  if(at && at!==document.body){ focusPending=null; return; }
+  const want=sel||focusPending; focusPending=null;
+  if(!want) return;
+  const el=document.querySelector(want);
+  if(!el || !el.focus) return;
+  // A control redrawn mid-action comes back DISABLED - the picker's ping
+  // refresh does exactly that while it measures - and focusing a disabled
+  // element is a silent no-op. Hold the mark and take it on the next redraw,
+  // when the control is live again.
+  if(el.disabled){ focusPending=want; return; }
+  // A held mark is consumed by whatever redraw comes next, and the next redraw
+  // may be a poll on the other side of the page. Only take it if the control is
+  // still on screen - a drawer closed in the meantime must not pull the
+  // keyboard back into it.
+  if(want!==sel && !(el.isConnected && el.getClientRects().length)){ return; }
+  el.focus({preventScroll:true});
+}
 function chartLoadFailed(what){ const tb=$('undoToast'); if(!tb) return; tb.textContent='Couldn’t load the '+what+' - showing the last data'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
 // A GET poller that hits the restore-reconcile window gets a 503 the server means
 // as "come back in a moment" (Retry-After:2, body "restoring a backup; try again
@@ -6201,7 +6301,21 @@ function runsOpen(){ return $('runsSection').style.display!=='none'; }
 // highlight survives: loadRuns re-applies pinnedRunTs after the rebuild.
 function runsFollowLive(){
   if(!runsOpen() || runsPage!==1 || runsBusy) return;
-  loadRuns();
+  // A refresh nobody asked for must not take the keyboard with it: loadRuns
+  // rebuilds the whole tbody, so without this a landing run ejects anyone
+  // reading the table - about once an hour, or once a server in a Best-of
+  // round that keeps its losers.
+  const body=$('runsBody'), had=body.contains(document.activeElement);
+  const mark=had ? focusMark() : null;
+  // Where it sat, as well as what it was: the run that just landed pushes the
+  // last row of the page off it, and then the mark resolves to nothing.
+  const idx=had ? [...body.querySelectorAll('.run-del')].indexOf(document.activeElement) : -1;
+  loadRuns().then(()=>{
+    refocus(mark);
+    if(idx<0 || (document.activeElement && document.activeElement!==document.body)) return;
+    const now=body.querySelectorAll('.run-del');
+    if(now.length) now[Math.min(idx, now.length-1)].focus({preventScroll:true});
+  });
 }
 function setRunsOpen(open){
   $('runsSection').style.display = open ? '' : 'none';
@@ -6359,7 +6473,7 @@ $('heatmap').addEventListener('click', async e=>{
   const cell=e.target.closest('.cell.ev'); if(!cell) return;
   outageSelDay = outageSelDay===cell.dataset.day ? null : cell.dataset.day; // re-click unpins
   outageSelTs=0;
-  drawHeatmap();
+  drawHeatmap();   // keeps the keyboard on the day it just redrew (see drawHeatmap)
   if(!outageSelDay){ loadOutages(); return; }
   setOutagesOpen(true);
   // No day-locate on the API, and it caps limit at 1000 - so page through in
@@ -6407,6 +6521,7 @@ async function loadOutages(force){
   if(my!==outagesSeq) return;
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(force); } // page emptied
+  const evMark=$('events').contains(document.activeElement) ? focusMark() : null;
   $('events').innerHTML = ev.length ? ev.map(e=>`
     <tr${evHighlighted(e)?' class="ev-hl"':''}><td class="act">${outageDeletable(e)?`<button class="run-del" type="button" data-ts="${e.ts}"${e.has_duration?` data-dur="${e.duration_s}"`:''} title="Delete this outage" aria-label="Delete this outage">${TRASH_SVG}</button>`:''}</td>
         <td>${fmtTime(e.ts)}</td>
@@ -6414,6 +6529,7 @@ async function loadOutages(force){
         <td>${e.type==='up'&&e.has_duration?fmtDur(e.duration_s):'-'}</td></tr>`).join('')
     : '<tr><td class="muted" colspan="4">No events recorded yet.</td></tr>';
   updateOutagesPager();
+  refocus(evMark);   // the 60s poll rebuilds this tbody under a still hand too
   return true; // the page arrived - see runsGoTo/outagesGoTo
 }
 // Per-outage delete (delegated - rows re-render each load). Every "Reconnected"
@@ -6505,6 +6621,11 @@ function drawHeatmap(){
   // mouseover delegate re-raises it the moment the pointer enters a cell again,
   // and a focus-raised one comes back on the next focusin.
   $('hmTip').hidden=true;
+  // The cell holding focus is about to be thrown away with the rest. Both ways
+  // in matter: the click handler calls this synchronously, and the 60s poll
+  // repaints under a still hand - which ejected a reader who had touched
+  // nothing at all.
+  const mark=el.contains(document.activeElement) ? focusMark() : null;
   el.innerHTML='';
   const today=new Date(); today.setHours(0,0,0,0);
   const start=new Date(today); start.setDate(start.getDate()-365); start.setDate(start.getDate()-start.getDay());
@@ -6603,6 +6724,7 @@ function drawHeatmap(){
   el.style.gridTemplateRows='repeat(7,1fr)';
   el.style.gridTemplateColumns=`repeat(${cols},1fr)`;
   el.style.aspectRatio=`${cols} / 7`;
+  refocus(mark);
 }
 
 // Instant heatmap tooltip via delegation on the (persistent) grid container, so
@@ -7523,8 +7645,15 @@ function fpFill(host, head, rows){
 function fpDraw(){
   const f=$('fpFav'), a=$('fpAll'); if(!f||!a) return;
   const p=fpPanes(fpBrowse, speedServers, fpHeldServer());
+  // ONE mark across BOTH panes, not one per pane: a star moves its row from one
+  // to the other, and the pane that LOSES it is filled first. Marking per pane
+  // meant the restore ran while the other pane still held its previous render,
+  // so the selector found nothing and un-starring dropped the keyboard - the
+  // "cannot be pressed twice" failure, in the one control that changes panes.
+  const mark=(f.contains(document.activeElement) || a.contains(document.activeElement)) ? focusMark() : null;
   fpFill(f, fpHeader(true), [fpAutoRow()].concat(p.kept.map(fpRow)));
   fpFill(a, fpHeader(false), p.rest.map(fpRow));
+  refocus(mark);
 }
 // fpAdopt takes the browse page. populateServers is the one place a fetched list
 // arrives, whatever asked for it, so the first load, Find and Auto all land here.
@@ -8769,6 +8898,9 @@ function saveFailed(text){
   // Ignore re-entrant clicks while a save is running: the access POST clears the password
   // field mid-flight, so a second overlapping save could submit a blank password.
   if(saveInFlight) return;
+  // Before the disable below blurs it: Discard and Escape both hand focus back
+  // to the gear, and Save closing the same drawer should too.
+  const drawerHadFocus=_drawer.contains(document.activeElement);
   saveInFlight=true; $('saveSettings').disabled=true; $('saveSettings').classList.remove('err');
   try {
   // If the city/ID box still has text, search it first so settingsBody() captures
@@ -8853,7 +8985,7 @@ function saveFailed(text){
       themeAtOpen=document.documentElement.dataset.theme; brightAtOpen=parseInt($('setBrightness').value)||100; fadeAtOpen=parseInt($('setFade').value)||100;
       await loadAccess();          // refresh password state / overlay / logout
       savedBody=formSnapshot();
-      msg.textContent=''; closeDrawer(); refreshStatus();
+      msg.textContent=''; closeDrawer(drawerHadFocus); refreshStatus();
       // I1, judged on the SAVED list (applySettings just re-baselined it): the save
       // went through - a loopback target is never a gate - but the drawer is closing
       // over the warn bubble, so the trap gets said out loud where the operator is.
@@ -8869,7 +9001,13 @@ function saveFailed(text){
     // so Discard isn't mistaken for "nothing was saved".
     else saveFailed((await r.text())+' (access/security settings, if changed, were already applied)');
   } catch(e){ saveFailed('failed'); }
-  } finally { saveInFlight=false; $('saveSettings').disabled=false; }
+  } finally { saveInFlight=false; $('saveSettings').disabled=false;
+    // A refused save re-enables this button, but the disable above had already
+    // blurred it - so the retry the message asks for started a screenful of
+    // tabs away. Only when the drawer is still open (a save that worked has
+    // closed it and handed focus to the gear) and only when nothing else took
+    // focus first - several of the gates put it on the field at fault.
+    if(_drawer.classList.contains('open')) refocus('#saveSettings'); }
 });
 
 // Discard: throw away unsaved edits (reload saved values) and close the drawer.
