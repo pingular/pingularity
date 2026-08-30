@@ -618,10 +618,12 @@ function driveHeatmap(rows, todayMs, tip = { hidden: true }) {
     + script.match(/const fmtLocalDate = [^;]*;/)[0] + '\n'
     + script.match(/const hmLevel = [^;]*;/)[0] + '\n'
     + script.match(/const HM_W=[^;]*;/)[0] + '\n'
-    + extract('function drawHeatmap');
+    + extract('function drawHeatmap')
+    + '\nfunction focusMark(){ return null; } function refocus(){}';
   const cells = [];
-  const grid = { innerHTML: '', style: {}, appendChild: c => cells.push(c) };
-  const doc = { createElement: () => ({ className: '', style: {}, dataset: {}, attrs: {},
+  const grid = { innerHTML: '', style: {}, appendChild: c => cells.push(c), contains: () => false };
+  const doc = { activeElement: null,
+    createElement: () => ({ className: '', style: {}, dataset: {}, attrs: {},
     classList: { add() {} }, setAttribute(k, v) { this.attrs[k] = v; } }) };
   class FrozenDate extends Date { constructor(...a) { a.length ? super(...a) : super(todayMs); } }
   new Function('ROWS', '$', 'document', 'Date', 'TC',
@@ -786,6 +788,9 @@ function driveHeatmapClick(day, events) {
     + extract('function hmDayRange') + '\n'
     + extract('function hmScanDay') + '\n'
     + extract('function evHighlighted') + '\n'
+    // The grid is redrawn under the activated cell, so the handler puts the
+    // keyboard back afterwards; the restoring itself is driven in the browser.
+    + 'function focusMark(){ return null; } function refocus(){}\n'
     + extract("$('heatmap').addEventListener('click'") + ');\n'
     + 'return { evHighlighted, state: () => ({ outageSelDay, outageSelTs, outagesPage }) };')(
     id => els[id], fget, () => {}, () => {}, async () => {});
@@ -3241,6 +3246,8 @@ function fpEl(tag) {
     innerHTML: '', title: '', type: '', scrollTop: 0, clientHeight: 0, scrollHeight: 0,
     listeners: {},
     appendChild(c) { c.parent = e; e.children.push(c); return c; },
+    // fpFill asks whether the pane holds the focused control before it redraws.
+    contains(n) { for (let x = n; x; x = x.parent) if (x === e) return true; return false; },
     setAttribute(k, v) { e.attrs[k] = String(v); },
     getAttribute(k) { return e.attrs[k]; },
     addEventListener(type, fn) { (e.listeners[type] = e.listeners[type] || []).push(fn); },
@@ -3280,6 +3287,9 @@ function drivePicker({ chosen = '', health = [] } = {}) {
     // their own tests above.
     + 'function applyPendingServer(){ $("setServer").value=pendingServer; }\n'
     + 'function updateScopeNote(){}\n'
+    // Focus restoration across the redraw is driven for real in the browser;
+    // here it only has to exist so fpFill can call it.
+    + 'function focusMark(){ return null; } function refocus(){}\n'
     // fpChoose retires an unverified-pin footer notice on a pick; the search
     // error machinery it consults is pinned by the driveServers tests.
     + 'let serverSearchFailed=false, serverErrShown=""; function clearServerFieldError(){}\n'
@@ -5158,11 +5168,12 @@ function heatmapDriver({ hidden = false } = {}) {
 }
 function outagesDriver({ hidden = false, page = 1, pages = {} } = {}) {
   const state = { fetches: [], hold: null };
-  const events = { innerHTML: '' };
+  const events = { innerHTML: '', contains: () => false };
   const api = new Function('fget', '$', 'evHighlighted', 'outageDeletable', 'TRASH_SVG', 'fmtTime', 'fmtDur',
     'updateOutagesPager', 'document', 'state',
     TILE_GATE + '\nlet outagesSeq = 0, outagesTotal = 0, outagesPerPage = 10, outagesPage = ' + page + ';\n'
     + 'function chartLoadFailed(){}\n'
+    + 'function focusMark(){ return null; } function refocus(){}\n'
     + extract('async function loadOutages')
     + '\nreturn { loadOutages, seq: () => outagesSeq, page: () => outagesPage };')(
     async url => {
@@ -6141,11 +6152,13 @@ test('the data estimate scales by the count the history was measured under, not 
 // while scheduled runs (and a Best-of round's members) landed behind it.
 test('an open runs table follows results as they land', () => {
   const calls = [];
-  const build = ({ open = true, page = 1, busy = false }) => new Function(
+  const build = ({ open = true, page = 1, busy = false }) => new Function('$', 'document',
     `let runsPage=${page}, runsBusy=${busy}; const calls=[];\n`
-    + `function runsOpen(){ return ${open}; } function loadRuns(){ calls.push(1); }\n`
+    + `function runsOpen(){ return ${open}; } function loadRuns(){ calls.push(1); return Promise.resolve(true); }\n`
+    + 'function focusMark(){ return null; } function refocus(){}\n'
     + extract('function runsFollowLive')
-    + '\nreturn { runsFollowLive, calls };')();
+    + '\nreturn { runsFollowLive, calls };')(
+      () => ({ contains: () => false, querySelectorAll: () => [] }), { activeElement: null });
   let p = build({}); p.runsFollowLive();
   assert.equal(p.calls.length, 1, 'open, on the first page, idle: the new row appears on its own');
   p = build({ open: false }); p.runsFollowLive();
@@ -6288,4 +6301,159 @@ test('iperf3 reachability probes are queued, and a settings load does not throw 
     'fresh truth must keep what it already knows about addresses that did not change, or the drawer probes everything twice');
   assert.match(script, /iperfServers\.forEach\(s=>\{ if\(iperfAddrValid\(s\.addr\) && iperfHealth\[s\.addr\]===undefined\) probeIperfSoon\(s\.addr\); \}\)/,
     'and the render queues rather than firing them all');
+});
+
+// --- keeping the keyboard where it was ---
+test('focusMark names the control, not just the row it sits in', () => {
+  const el = (o) => Object.assign({ tagName: 'BUTTON', className: '', id: '', attrs: {},
+    closest(sel){ const a = sel.replace(/[[\]]/g, '');
+      if (a === 'id') { for (let x = this; x; x = x.parent) if (x.id) return x; return null; }
+      return this.attrs[a] !== undefined ? this : (this.parent && this.parent.attrs[a] !== undefined ? this.parent : null); },
+    getAttribute(a){ return this.attrs[a]; } }, o);
+  const run = (active) => new Function('document', 'window',
+    extract('function focusMark') + '\nreturn focusMark;')({ activeElement: active, body: 'BODY' }, {})();
+
+  assert.equal(run('BODY'), null, 'nothing focused, nothing to restore');
+  assert.equal(run(el({ id: 'powerBtn' })), '#powerBtn', 'an id is the whole answer');
+  // The runs table stamps data-ts on the row AND its delete button; a bare
+  // attribute selector resolves to the row, which cannot take focus.
+  assert.equal(run(el({ className: 'run-del', attrs: { 'data-ts': '17' } })), '[data-ts="17"].run-del',
+    'the button, not the row it shares its key with');
+  assert.equal(run(el({ tagName: 'TR', attrs: { 'data-ts': '17' } })), '[data-ts="17"]', 'the row itself when the row is what had focus');
+  assert.equal(run(el({ className: 'cell ev', attrs: { 'data-day': '2026-08-26' } })), '[data-day="2026-08-26"].cell');
+  // The runs table and the outages table BOTH stamp data-ts on a .run-del
+  // button. Unscoped, a locator built in one can resolve inside the other - and
+  // the next Enter would delete the wrong thing.
+  assert.equal(run(el({ className: 'run-del', attrs: { 'data-ts': '17' }, parent: el({ id: 'runsBody' }) })),
+    '#runsBody [data-ts="17"].run-del', 'scoped to the list it came from');
+  assert.equal(run(el({ className: 'run-del', attrs: { 'data-ts': '17' }, parent: el({ id: 'events' }) })),
+    '#events [data-ts="17"].run-del', 'and the other table gets its own');
+  // The picker is the exception: starring a server moves its row from the
+  // browse pane to the saved one, so a pane-scoped locator would find nothing.
+  assert.equal(run(el({ className: 'fp-star', attrs: { 'data-star': '1993' }, parent: el({ id: 'fpAll' }) })),
+    '[data-star="1993"].fp-star', 'the picker\u2019s rows change panes - they stay pane-free');
+  // A control inside a keyed row: named by its own class, scoped to the row.
+  const row = el({ attrs: { 'data-pick': '1993' } });
+  assert.equal(run(el({ className: 'fp-btn on', parent: row })), '[data-pick="1993"] .fp-btn');
+  assert.equal(run(el({ className: '', tagName: 'INPUT', parent: row })), '[data-pick="1993"] input');
+  assert.equal(run(el({ className: 'loose' })), null, 'nothing to address it by');
+});
+
+test('restoring focus never takes it from somewhere the reader moved to', () => {
+  const mk = (active) => {
+    const found = { focus(){ found.got = true; } };
+    const fn = new Function('document', extract('function refocus') + '\nreturn refocus;')(
+      { activeElement: active, body: 'BODY', querySelector: () => found });
+    return { fn, found };
+  };
+  let m = mk('BODY'); m.fn('[data-ts="1"].run-del');
+  assert.equal(m.found.got, true, 'the rebuild dropped focus, so put it back');
+  m = mk(null); m.fn('[data-ts="1"].run-del');
+  assert.equal(m.found.got, true, 'nothing focused counts as lost too');
+  m = mk({ id: 'somewhereElse' }); m.fn('[data-ts="1"].run-del');
+  assert.notEqual(m.found.got, true, 'the reader moved on during the reload - leave them alone');
+  m = mk('BODY'); m.fn(null);
+  assert.notEqual(m.found.got, true, 'nothing was marked');
+});
+
+test('every redraw and every self-disabling control hands the keyboard back', () => {
+  // Each of these dropped focus to <body>, so an action taken ON a thing ejected
+  // the user to the top of the document - and the runs table, the heatmap and
+  // the outages list did it to them on a poll they never asked for.
+
+  // ONE mark across BOTH panes, in fpDraw. Marking inside fpFill looked right
+  // and was not: starring a server MOVES its row between the two panes, the
+  // pane losing the row is filled first, and its restore then ran while the
+  // other pane still held its previous render - so the selector found nothing.
+  assert.match(extract('function fpDraw'), /const mark=\(f\.contains\(document\.activeElement\) \|\| a\.contains\(document\.activeElement\)\)[\s\S]*fpFill\(f[\s\S]*fpFill\(a[\s\S]*refocus\(mark\)/,
+    'the picker marks once, fills both panes, then restores - a star crosses panes');
+  assert.doesNotMatch(extract('function fpFill'), /focusMark\(\)|refocus\(/,
+    'and the per-pane fill must not do it again, or the first pane restores against the second pane\u2019s stale rows');
+
+  assert.match(extract('function runsFollowLive'), /focusMark\(\)[\s\S]*loadRuns\(\)\.then/,
+    'the runs table: a landing run rebuilds the tbody');
+  assert.match(extract('function runsFollowLive'), /indexOf\(document\.activeElement\)[\s\S]*Math\.min\(idx, now\.length-1\)/,
+    'and keeps the POSITION as well: the run that just landed can push the marked row off the page entirely');
+
+  // Inside the redraw, not at the one call site that happened to be a click:
+  // both of these repaint on a 60s timer, which ejected a reader who had
+  // touched nothing at all.
+  assert.match(extract('function drawHeatmap'), /const mark=el\.contains\(document\.activeElement\)[\s\S]*refocus\(mark\)/,
+    'the heatmap marks inside the redraw, so the poll is covered as well as the click');
+  assert.match(extract('async function loadOutages'), /const evMark=[\s\S]*refocus\(evMark\)/,
+    'the outages list likewise - its own 60s poll rebuilds every row');
+  const heat = script.slice(script.indexOf("$('heatmap').addEventListener('click'"), script.indexOf("$('heatmap').addEventListener('click'") + 900);
+  assert.doesNotMatch(heat, /focusMark\(\)/,
+    'and the click site no longer needs its own pair');
+
+  const power = script.slice(script.indexOf("$('powerBtn').addEventListener"), script.indexOf("const _drawer="));
+  assert.match(power, /const hadFocus=document\.activeElement===btn/, 'the power button disables itself, which blurs it');
+  assert.match(power, /if\(hadFocus\) refocus\('#powerBtn'\)/,
+    'and hands it back through refocus, not focus: the request can take seconds, and by then the reader may have tabbed on');
+  assert.match(extract('function qsClose'), /gear\.focus/, 'Quick Setup is the first thing a new install sees; hiding it must not strand the keyboard');
+  // Save disables its button before closeDrawer could see where focus was, so
+  // it tells closeDrawer instead - Discard and Escape already do the right thing.
+  assert.match(script, /const drawerHadFocus=_drawer\.contains\(document\.activeElement\);/);
+  assert.match(script, /closeDrawer\(drawerHadFocus\)/);
+  assert.match(extract('function closeDrawer'), /if\(!told\) hadFocus=_drawer\.contains\(document\.activeElement\)/,
+    'and closeDrawer still works out its own answer for every other caller');
+  // A told answer is seconds old (a save waits on a server search and two
+  // POSTs) and the header is never inert, so the reader can be somewhere real
+  // by the time it closes.
+  assert.match(extract('function closeDrawer'), /if\(hadFocus && !\(told && at && at!==document\.body && !_drawer\.contains\(at\)\)\) \$\('gearBtn'\)\.focus\(\)/,
+    'a save that took seconds must not pull the keyboard off whatever the reader moved to');
+  // A REFUSED save re-enables the button and leaves the drawer open - but the
+  // disable had already blurred it, so the retry the message asks for started a
+  // screenful of tabs away.
+  assert.match(script, /saveInFlight=false; \$\('saveSettings'\)\.disabled=false;[\s\S]{0,400}?if\(_drawer\.classList\.contains\('open'\)\) refocus\('#saveSettings'\)/,
+    'a save that was refused puts the keyboard back on the button the message is about');
+});
+
+test('a control that comes back disabled keeps its claim until it is live again', () => {
+  // The picker\u2019s ping refresh redraws the list with its own button DISABLED
+  // while it measures. focus() on a disabled element is a silent no-op, so the
+  // restore was thrown away and the reader was left on <body> for the whole
+  // measurement - the one case where the redraw takes the longest.
+  const mk = () => {
+    const btn = { disabled: true, isConnected: true, getClientRects: () => [1], focus(){ btn.got = true; } };
+    const doc = { activeElement: 'BODY', body: 'BODY', querySelector: () => btn };
+    const fn = new Function('document', extract('var focusPending=null;\nfunction refocus') + '\nreturn refocus;')(doc);
+    return { fn, btn, doc };
+  };
+  let m = mk();
+  m.fn('#fpRefreshPings');
+  assert.notEqual(m.btn.got, true, 'still measuring: nothing to focus yet');
+  m.btn.disabled = false;
+  m.fn(null);                       // the redraw that follows, with no mark of its own
+  assert.equal(m.btn.got, true, 'the button is live again, so the held claim is taken');
+  m.btn.got = false; m.fn(null);
+  assert.notEqual(m.btn.got, true, 'and taken once - a held mark is not sticky');
+
+  // A held mark is taken by whatever redraw comes next - which may be a poll on
+  // the other side of the page, long after the drawer holding the control was
+  // closed. Off screen is not a place to put the keyboard.
+  m = mk();
+  m.fn('#fpRefreshPings');
+  m.btn.disabled = false; m.btn.getClientRects = () => [];
+  m.fn(null);
+  assert.notEqual(m.btn.got, true, 'the control is no longer on screen - drop the claim');
+
+  // Held only while the reader has not moved on themselves.
+  m = mk();
+  m.fn('#fpRefreshPings');
+  m.doc.activeElement = { id: 'elsewhere' };
+  m.btn.disabled = false;
+  m.fn(null);
+  assert.notEqual(m.btn.got, true, 'they tabbed away while it measured - drop the claim, do not yank them back');
+});
+
+test('Quick Setup\u2019s update-check consent survives a phone screen', () => {
+  // Nine theme swatches and the consent control shared one unwrapped row, 386px
+  // wide inside a 356px dialog - so on a fresh install at 390px the toggle
+  // measured 2px at x=451, entirely off screen, while the dialog posted
+  // update_check:true regardless. It is the only screen that asks.
+  assert.match(html, /@media \(max-width:620px\)\{\s*\.qs-two\{flex-wrap:wrap;gap:12px;\}\s*\.qs-two>div:last-child\{flex:1 0 100%;\}/,
+    'the row wraps below the breakpoint, giving the consent its own line');
+  assert.match(html, /\.qs-them\{display:flex;gap:10px;flex-wrap:wrap;\}/,
+    'and the swatch strip wraps rather than clipping its last theme');
 });
