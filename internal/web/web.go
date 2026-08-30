@@ -1302,9 +1302,19 @@ func (s *Server) handleSpeedHistory(w http.ResponseWriter, r *http.Request) {
 	// every existing consumer. Without it a thinned response is indistinguishable
 	// from a complete one: a client totalling bytes or counting runs off a 1500-
 	// point array covering 40,000 runs is wrong and has no way to know.
+	sampled := len(hist) < total
 	w.Header().Set("X-Total-Count", strconv.Itoa(total))
 	w.Header().Set("X-Returned-Count", strconv.Itoa(len(hist)))
-	w.Header().Set("X-Sampled", strconv.FormatBool(len(hist) < total))
+	w.Header().Set("X-Sampled", strconv.FormatBool(sampled))
+	// X-Total-Runs is what the client's caveat actually needs: the count above
+	// includes the other servers a Best-of round measured, and the client counts
+	// only runs - so comparing them described a coverage that was never true.
+	// Only when it is going to be used: it is one more query on a polled path.
+	if sampled {
+		if runs, err := s.store.SpeedRunCount(r.Context(), since, until); err == nil {
+			w.Header().Set("X-Total-Runs", strconv.Itoa(runs))
+		}
+	}
 	writeJSON(w, hist)
 }
 
@@ -1530,7 +1540,14 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 		// round_of: the winner's timestamp on a row that was measured in a
 		// Best-of round and did not win it (Discard losers off); blank on a
 		// test's own result. Appended at the end like the two before it.
-		"round_of"})
+		"round_of",
+		// The Centre column, which the table shows and the file could not: why
+		// this run's server was the one measured, and how its centre was chosen.
+		// Without them the export cannot answer the question that column exists
+		// to answer, though it already carries round_of - the other half of the
+		// same Best-of story. Appended at the end, like everything before them,
+		// so consumers indexing by position keep working.
+		"win_reason", "race_outcome", "race_winner_label", "race_winner_ms", "race_racers"})
 	// Stream newest-first straight from a descending row iterator (no whole-history
 	// slice), flushing per row so back-pressure from a slow client bounds memory and
 	// the write deadline keeps advancing only while bytes actually move.
@@ -1560,6 +1577,8 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// backup can implant arbitrary text in these TEXT columns.
 			csvSafe(sp.IPFamily), csvSafe(sp.UDPDirection),
 			roundOf(sp.RoundTS),
+			sp.WinReason, sp.RaceOutcome, sp.RaceWinnerLabel,
+			fptr(sp.RaceWinnerMS), iptr(sp.RaceRacers),
 		})
 		cw.Flush()
 		bump()

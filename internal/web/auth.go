@@ -1122,13 +1122,18 @@ func (s *Server) requireStepUp(w http.ResponseWriter, r *http.Request, currentPa
 	if !s.settings.AuthActive() {
 		return false, true
 	}
-	refuse := func(why string) {
+	// The two refusals say DIFFERENT things. They used to share one sentence, so
+	// mistyping the password produced the message for leaving the field empty -
+	// pointing the operator at a field that visibly had text in it. This is a
+	// step-up on a session that is already authenticated, so naming which of the
+	// two happened tells an attacker nothing they did not already have.
+	refuse := func(why, msg string) {
 		stats.Inc("web.stepup_fail")
 		s.log.Warn("access change refused: "+why, "user", capForLog(s.settings.AuthUser()), "ip", clientIP(r))
-		http.Error(w, "current password is required to change access settings", http.StatusForbidden)
+		http.Error(w, msg, http.StatusForbidden)
 	}
 	if currentPassword == "" {
-		refuse("current password missing") // not a guess - no budget spent
+		refuse("current password missing", "current password is required to change access settings") // not a guess - no budget spent
 		return false, false
 	}
 	key := s.limiterKey(r)
@@ -1149,7 +1154,7 @@ func (s *Server) requireStepUp(w http.ResponseWriter, r *http.Request, currentPa
 		return true, true
 	}
 	s.logins.releaseFail(key)
-	refuse("current password wrong")
+	refuse("current password wrong", "current password is incorrect")
 	return false, false
 }
 

@@ -2197,7 +2197,7 @@
         <label class="srow"><span class="lbl">Max packet loss
           <span class="info" tabindex="0" data-tip="Flag a speedtest as unhealthy when measured packet loss exceeds this. 0 = no threshold. Runs that didn't measure loss are never flagged.">i</span></span>
           <span class="ctl"><input type="number" id="setThreshLoss" min="0" max="100" step="any"><span class="unit">%</span></span></label>
-        <div class="warn-bubble" id="lossProbeWarn"><span class="wi">⚠&#xFE0E;</span><span>The <b>loss probe</b> is off for the selected engine, so packet loss is never measured - this threshold <b>will never fire</b>. Turn the probe back on in the <b>Server</b> tab.</span></div>
+        <div class="warn-bubble" id="lossProbeWarn"><span class="wi">⚠&#xFE0E;</span><span>The <b>loss probe</b> is off for the selected engine, so packet loss is never measured - this threshold <b>will never fire</b>. Turn the probe back on in the <b id="lossProbeWarnTab">Ookla</b> tab.</span></div>
       </div>
       <div class="sgroup">
         <h3>Notifications</h3>
@@ -4181,6 +4181,8 @@ let dnsShown = lsGet('dnsHidden') !== '1'; // whether the DNS line shows on the 
 // daemon stops answering - the pill was a dead control in exactly the moment a
 // reader is most likely to press it (see showDataPop).
 let lastDataUsage=null;
+function dataWindowLabel(){ return dataWindow==='all' ? 'all time'
+  : (dataWindow==='custom' ? fmtWin(dataCustomMins) : dataWindow==='24h' ? '1d' : dataWindow); }
 function dataBarValue(s){ const du=s.data_usage||{};
   lastDataUsage={'24h':du['24h']!=null?du['24h']:null,'7d':du['7d']!=null?du['7d']:null,
     all:du.all!=null?du.all:(s.data_used_bytes!=null?s.data_used_bytes:null)};
@@ -4693,7 +4695,7 @@ async function refreshStatus() {
     : `<span class="pill stat-up" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('uptimePop').hidden}" aria-label="${upAria}" title="${upTitle}">${pulseIco} ${upTxt}</span>`;
   const statPills = dnsPill+upPill+
     `<span class="pill stat-rt">${clockIco} ${fmtDur(s.runtime_seconds)}</span>`+
-    `<span class="pill stat-data" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('dataPop').hidden}" aria-label="Speedtest data used ${bytesStr(dataBarValue(s))}, open usage breakdown" title="Click for usage breakdown by window">${dot('⇅')} ${bytesStr(dataBarValue(s))}</span>`;
+    `<span class="pill stat-data" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('dataPop').hidden}" aria-label="Speedtest data used ${bytesStr(dataBarValue(s))} over ${dataWindowLabel()}, open usage breakdown" title="Speedtest data used over ${dataWindowLabel()} - click for the breakdown by window">${dot('⇅')} ${bytesStr(dataBarValue(s))}</span>`;
   $('families').innerHTML = famPills + statPills;
   // preventScroll: this restores focus after a background poll re-renders the pills;
   // a plain focus() would scroll the pill into view and yank the viewport back to it
@@ -4883,7 +4885,7 @@ function saveChartImage(kind){
     // repeats them as a band UNDER the charts - a PNG has no panel around it
     // to say what the lines average to. Latency has no such pills; only
     // speed does.
-    const segs=kind==='latency'?null:spdExportAvgSegments(spdAverages(spdData), spdAvgNote(spdSampled,spdTotal,spdRunCount(spdData)));
+    const segs=kind==='latency'?null:spdExportAvgSegments(spdAverages(spdData), spdAvgNote(spdSampled, spdTotalRuns||spdTotal, spdRunCount(spdData)));
     const bandH=segs?Math.round(32*total):0;
     const out=document.createElement('canvas');
     out.width=w+pad*2; out.height=h+pad*2+bandH;
@@ -5129,7 +5131,14 @@ function latEmptyMsg(){
   return 'No latency data in this range';
 }
 function speedEmptyMsg(){
-  if(speedRange.kind==='win') return 'No speedtests yet, run one or turn on automatic to start populating';
+  // "yet" and "run one" are only true when the history is genuinely empty. On a
+  // window that merely has nothing in it - beside a caption naming the last run
+  // and a table listing thousands - the remedy is to widen the window.
+  // lastSpeedTs is the newest run the status poll has seen: non-zero means this
+  // install has history, whatever this window happens to hold.
+  if(speedRange.kind==='win') return lastSpeedTs
+    ? 'No speedtests in the last '+fmtWin(speedRange.mins)
+    : 'No speedtests yet, run one or turn on automatic to start populating';
   const cap=retCapMins.speed;
   if(cap>0 && speedRange.to && speedRange.to*1000 < Date.now()-cap*60000)
     return 'No speedtests in this range - it is older than the history kept';
@@ -5547,7 +5556,7 @@ function setSpdAvg(id, name, txt, sampled, note){
 // refreshSpeedChart). A mean over a positional sample is not the mean of the
 // range: the stride keeps every Nth run, so any periodic pattern in the data can
 // alias, and the pills would state the aliased figure as fact.
-let spdSampled=false, spdTotal=0;
+let spdSampled=false, spdTotal=0, spdTotalRuns=0;
 // How many of the charted rows are RUNS - the rows the averages are over. A
 // Best-of round's kept losers ride the same series (they are charted) but are
 // not runs, and the caption must count what the mean counted.
@@ -5557,7 +5566,7 @@ function spdAvgNote(sampled,total,shown){
 }
 function paintSpdAvgs(){
   const a=spdAverages(spdData);
-  const note=spdAvgNote(spdSampled,spdTotal,spdRunCount(spdData));
+  const note=spdAvgNote(spdSampled, spdTotalRuns||spdTotal, spdRunCount(spdData));
   setSpdAvg('spdAvgDn','average download',mbpsText(a.down),spdSampled,note);
   setSpdAvg('spdAvgUp','average upload',mbpsText(a.up),spdSampled,note);
   setSpdAvg('spdAvgPing','average ping',pingAvgText(a.ping),spdSampled,note);
@@ -5904,7 +5913,7 @@ async function refreshSpeedChart(force){
   if(force){ speedLoadedFor=''; speedLoadedLive=false; }
   if(!force && !live && speedLoadedFor===q && !speedLoadedLive) return;
   const my=++speedSeq; let d;
-  let sampled=false, total=0;
+  let sampled=false, total=0, totalRuns=0;
   try{
     const r=await fget('api/speed?'+q);
     if(!r.ok){
@@ -5921,11 +5930,17 @@ async function refreshSpeedChart(force){
     // mean is not (see spdSampled).
     sampled = r.headers.get('X-Sampled')==='true';
     total = parseInt(r.headers.get('X-Total-Count')||'0',10)||0;
+    // The caveat compares runs with runs. X-Total-Count includes the other
+    // servers a Best-of round measured, which the charted count deliberately
+    // does not - so on the shipped settings it made the mean's coverage look
+    // about three times worse than it is. Fall back to the row count when the
+    // daemon is older than this header.
+    totalRuns = parseInt(r.headers.get('X-Total-Runs')||'0',10)||0;
     d=await r.json()||[];
   }
   catch(e){ if(my===speedSeq) chartLoadFailed('speed chart'); return; }
   if(my!==speedSeq) return;
-  speedLoadedFor=q; speedLoadedLive=live; spdData=d; spdSampled=sampled; spdTotal=total;
+  speedLoadedFor=q; speedLoadedLive=live; spdData=d; spdSampled=sampled; spdTotal=total; spdTotalRuns=totalRuns;
   drawSpeedChart(spdData); drawQualityChart(spdData); drawBloatChart(spdData); paintSpdAvgs();
   syncSpeedPanel(true);
 }
@@ -8251,9 +8266,14 @@ $('setIperfUDP').addEventListener('change', updateUdpRateRow);
 // loss threshold can never be breached, so the alert would sit there looking armed
 // while silently never firing - say so instead.
 function updateLossProbeWarn(){
-  const probeOn = $('setSpeedEngine').checked ? $('setIperfUDP').checked : $('setOoklaLoss').checked;
+  const iperf = $('setSpeedEngine').checked;
+  const probeOn = iperf ? $('setIperfUDP').checked : $('setOoklaLoss').checked;
   const thresh = parseFloat($('setThreshLoss').value)||0;
   $('lossProbeWarn').classList.toggle('show', thresh>0 && !probeOn);
+  // Name the tab that actually holds the toggle. It said "Server", which was
+  // this drawer's tab before it split into Ookla and iperf3 - so the one
+  // instruction the warning gives pointed at a tab that does not exist.
+  const t=$('lossProbeWarnTab'); if(t) t.textContent = iperf ? 'iperf3' : 'Ookla';
 }
 ['setIperfUDP','setOoklaLoss','setThreshLoss'].forEach(id=>{
   $(id).addEventListener('change', updateLossProbeWarn);
@@ -8826,7 +8846,10 @@ $('importBtn').addEventListener('click', async ()=>{
         let m='Import failed: '+e.error;
         if(e.partial && e.committed){
           const c2=Object.entries(e.committed).filter(([,v])=>v>0).map(([k,v])=>k+': '+v);
-          m+=' — partially applied'+(c2.length?' ('+c2.join(', ')+')':'')+'. The destination is in a mixed state.';
+          // Only when something actually landed. With every count zero this told the
+    // operator to go and audit a database the import never touched.
+    m += c2.length ? (' — partially applied ('+c2.join(', ')+'). The destination is in a mixed state.')
+                   : ' — nothing was applied.';
         }
         if(Array.isArray(e.warnings) && e.warnings.length) m+=' Warning: '+e.warnings.join(' · ');
         msg.textContent=m;

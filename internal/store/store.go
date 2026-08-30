@@ -3771,6 +3771,28 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 	return out, len(all), rows2.Err()
 }
 
+// SpeedRunCount counts the RUNS in a window - rows that are a run in their own
+// right, not the other servers a Best-of round measured. The chart's sampling
+// caveat needs it: it compares the runs it charted against the runs in range,
+// and the total that drives X-Sampled counts every row, members included. With
+// the shipped Best-of settings roughly two thirds of rows are members, so
+// comparing one against the other understated the mean's coverage about
+// threefold - on the very number the caveat exists to qualify.
+func (s *Store) SpeedRunCount(ctx context.Context, since, until time.Time) (int, error) {
+	q := `SELECT COUNT(*) FROM speed WHERE ` + speedNotFailed + ` AND round_ts IS NULL AND ts >= ?`
+	args := []any{since.Unix()}
+	if !until.IsZero() {
+		q += ` AND ts < ?`
+		args = append(args, until.Unix())
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		recordDBErr(err)
+		return 0, err
+	}
+	return n, nil
+}
+
 // SpeedHistoryRange returns speedtests in [since, until), oldest first. A zero
 // until means "up to the present" (see speedWindow), which is what every caller
 // outside the chart wants. The interval is half-open so a run stamped exactly on

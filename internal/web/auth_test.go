@@ -1752,3 +1752,43 @@ func TestQuickSetupRetryIdempotentAfterAuthEnabled(t *testing.T) {
 		t.Errorf("cookieless retry after auth enabled: %d, want 200 (idempotent no-op, not a guard 401)", w.Code)
 	}
 }
+
+// A mistyped password and a missing one are different problems, and the message
+// has to say which. They shared one sentence - "current password is required to
+// change access settings" - so mistyping it pointed the operator at a field that
+// visibly had text in it, reading as though the field were being ignored.
+func TestStepUpTellsAWrongPasswordFromAMissingOne(t *testing.T) {
+	stats.ResetForTest()
+	s := newTestServer(t)
+	setPassword(t, s, "admin", "secret")
+
+	try := func(pass string) (int, string) {
+		r := httptest.NewRequest("POST", "/api/access", nil)
+		r.RemoteAddr = "10.0.0.9:12345"
+		w := httptest.NewRecorder()
+		s.requireStepUp(w, r, pass)
+		return w.Code, strings.TrimSpace(w.Body.String())
+	}
+
+	code, missing := try("")
+	if code != http.StatusForbidden || !strings.Contains(missing, "required") {
+		t.Fatalf("empty password: %d %q, want 403 naming what is required", code, missing)
+	}
+	code, wrong := try("not-the-password")
+	if code != http.StatusForbidden {
+		t.Fatalf("wrong password: got %d, want 403", code)
+	}
+	if wrong == missing {
+		t.Errorf("a wrong password reports %q - the same words as leaving the field empty, which contradicts what is on screen", wrong)
+	}
+	if !strings.Contains(wrong, "incorrect") {
+		t.Errorf("wrong password says %q, want it to say the password is incorrect", wrong)
+	}
+	// The right one still passes, so the split did not break the gate itself.
+	r := httptest.NewRequest("POST", "/api/access", nil)
+	r.RemoteAddr = "10.0.0.9:12345"
+	w := httptest.NewRecorder()
+	if verified, ok := s.requireStepUp(w, r, "secret"); !verified || !ok {
+		t.Errorf("the correct password was refused (verified=%v ok=%v, %d)", verified, ok, w.Code)
+	}
+}

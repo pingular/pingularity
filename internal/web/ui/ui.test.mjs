@@ -1734,7 +1734,7 @@ test('the speed chart reads the thinning headers it is sent', () => {
     'refreshSpeedChart must read X-Sampled');
   assert.ok(/r\.headers\.get\('X-Total-Count'\)/.test(script),
     'refreshSpeedChart must read X-Total-Count');
-  assert.ok(/spdAvgNote\(spdSampled,\s*spdTotal,\s*spdRunCount\(spdData\)\)/.test(script),
+  assert.ok(/spdAvgNote\(spdSampled, spdTotalRuns\|\|spdTotal, spdRunCount\(spdData\)\)/.test(script),
     'paintSpdAvgs must pass the sampling state into the pill labels, over the run count the mean itself used');
 });
 
@@ -6108,8 +6108,14 @@ test('the range averages describe runs, not the servers a round rejected', () =>
     'a loser is charted, but it is not a run: averaging it in understates download and flatters ping');
   const count = new Function(script.match(/const spdRunCount = [^;]*;/)[0] + '\nreturn spdRunCount;')();
   assert.equal(count(rows), 1, 'and the caption counts the same rows the average did, not the charted ones');
-  assert.match(script, /spdAvgNote\(spdSampled,spdTotal,spdRunCount\(spdData\)\)/, 'at both call sites');
-  assert.equal((script.match(/spdAvgNote\(spdSampled,spdTotal,spdRunCount\(spdData\)\)/g) || []).length, 2);
+  // The denominator is the RUNS in range, not every row: X-Total-Count counts
+  // the other servers a Best-of round measured, and the numerator deliberately
+  // does not, so comparing them understated the mean's coverage about
+  // threefold. spdTotal is the fallback for a daemon older than the header.
+  assert.match(script, /spdAvgNote\(spdSampled, spdTotalRuns\|\|spdTotal, spdRunCount\(spdData\)\)/, 'at both call sites');
+  assert.equal((script.match(/spdAvgNote\(spdSampled, spdTotalRuns\|\|spdTotal, spdRunCount\(spdData\)\)/g) || []).length, 2);
+  assert.match(script, /totalRuns = parseInt\(r\.headers\.get\('X-Total-Runs'\)\|\|'0',10\)\|\|0;/,
+    'and it comes from the daemon, which is the only place that can count them');
 });
 
 // The data estimate predicts what the LINK will carry: the recorded average is
@@ -6557,4 +6563,40 @@ test('Save refuses a blank schedule time rather than saving midnight', () => {
   assert.match(save, /querySelectorAll\('\.win-from,\.win-to'\)\]\.find\(i=>!i\.value\)/,
     "timeToMin('') is 0, so clearing the end time turned 09:00-17:00 into 09:00-00:00 and Save reported success");
   assert.match(save, /activateTab\('schedule'\); blank\.focus\(\);/, 'and points at the field, as its neighbours do');
+});
+
+// --- batch D: text that told the reader something untrue -------------------
+test('the loss-probe warning names a tab that exists, and the right one', () => {
+  assert.doesNotMatch(html, /Turn the probe back on in the <b>Server<\/b> tab/,
+    'the Server tab split into Ookla and iperf3 - the warning kept sending people to a tab that is gone');
+  assert.match(extract('function updateLossProbeWarn'), /t\.textContent = iperf \? 'iperf3' : 'Ookla'/,
+    'and it already knows which engine it is warning about, so it can name the tab that holds the toggle');
+  const tabs = [...html.matchAll(/data-tab="([a-z0-9]+)"/g)].map(m => m[1]);
+  assert.ok(tabs.includes('ookla') && tabs.includes('iperf'), 'both named tabs are real');
+  assert.ok(!tabs.includes('server'), 'and the one it used to name is not');
+});
+
+test('an import that committed nothing does not claim a mixed state', () => {
+  const src = script.slice(script.indexOf("let m='Import failed: '"), script.indexOf("let m='Import failed: '") + 500);
+  assert.match(src, /c2\.length \? \(' — partially applied/,
+    'with every count zero this sent an operator to audit a database the import never touched');
+  assert.match(src, /: ' — nothing was applied\.'/);
+});
+
+test('an empty window says the window is empty, not the install', () => {
+  assert.match(extract('function speedEmptyMsg'), /lastSpeedTs\s*\?\s*'No speedtests in the last '\+fmtWin\(speedRange\.mins\)/,
+    '"run one or turn on automatic" appeared beside a caption naming the last run and a table listing thousands');
+  assert.match(extract('function speedEmptyMsg'), /'No speedtests yet, run one or turn on automatic/,
+    'and a genuinely empty install still gets the advice that is true for it');
+});
+
+test('the data pill names the window its number is for', () => {
+  assert.match(script, /aria-label="Speedtest data used \$\{bytesStr\(dataBarValue\(s\)\)\} over \$\{dataWindowLabel\(\)\}/,
+    '930 MB over 12h and 930 MB all-time read identically once the popover closed - the uptime pill beside it already says "over 7d"');
+  const f = new Function('dataWindow', 'dataCustomMins', 'fmtWin',
+    extract('function dataWindowLabel') + '\nreturn dataWindowLabel;');
+  assert.equal(f('all', 0, () => '')(), 'all time');
+  assert.equal(f('24h', 0, () => '')(), '1d');
+  assert.equal(f('7d', 0, () => '')(), '7d');
+  assert.equal(f('custom', 720, m => m + 'm')(), '720m');
 });
