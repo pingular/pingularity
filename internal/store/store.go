@@ -3718,6 +3718,16 @@ func (s *Store) SpeedHistoryBudget(ctx context.Context, since, until time.Time, 
 			rows.Close()
 			return nil, 0, err
 		}
+		// DISTINCT seconds, because that is what pass 2 can return: it collapses
+		// same-second rows with GROUP BY. Counting them separately here made
+		// `total` one higher than the rows delivered, and the caller reads that
+		// gap as "this window was thinned" - so a single legacy collision
+		// anywhere in range put a dashed "sampled" border and a mean-of caveat
+		// on every average, in a window that was never thinned at all. The query
+		// is ORDER BY ts, so neighbours are the only possible duplicates.
+		if len(all) > 0 && all[len(all)-1] == ts {
+			continue
+		}
 		all = append(all, ts)
 	}
 	rows.Close()
@@ -3913,8 +3923,20 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 	//
 	// So a row that names a DIFFERENT run is left alone. A row naming this one, or
 	// naming none at all (every measurement), is the run being deleted.
+	// One row, by rowid. The uniqueness this method's comment asserts is real for
+	// anything the daemon writes (InsertSpeedTS allocates the first free second
+	// atomically, losers included), but it is NOT enforced by the schema, and a
+	// database restored from an import - or written before that allocation
+	// existed - can hold two runs on one second. Keyed on ts alone this
+	// statement deleted both, behind a confirm that says "this run" and a toast
+	// that says one went. Deleting exactly what was named is the promise the UI
+	// makes; the round and accounting cascades below are keyed correctly already.
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM speed WHERE ts = ? AND (usage_run_ts IS NULL OR usage_run_ts = ?)`, ts, ts)
+		`DELETE FROM speed WHERE rowid IN (
+		     SELECT rowid FROM speed
+		      WHERE ts = ? AND (usage_run_ts IS NULL OR usage_run_ts = ?)
+		      ORDER BY (usage_run_ts IS NULL) DESC, rowid
+		      LIMIT 1)`, ts, ts)
 	if err != nil {
 		recordDBErr(err)
 		return 0, err

@@ -4033,8 +4033,9 @@ test('the code that named the Server tab follows it to the Ookla and iperf3 tabs
   assert.doesNotMatch(script, /activateTab\('server'\)|dataset\.tab==='server'|name==='server'/, 'nothing still names the removed tab');
   const start = script.indexOf("$('saveSettings').addEventListener");
   const save = script.slice(start, script.indexOf("$('discardSettings')", start));
-  assert.equal((save.match(/activateTab\('iperf'\)/g) || []).length, 2,
-    'a bad iperf3 address and an orphaned password both send the user to the iperf3 tab');
+  assert.equal((save.match(/activateTab\('iperf'\)/g) || []).length, 3,
+    'a bad iperf3 address, an orphaned password AND "the engine needs a server" all send the user to the iperf3 tab - ' +
+    'a refusal that names a tab has to open it, or the reader is told to fix something they cannot see');
   const restore = extract('function restoreDrawerPlace');
   assert.match(restore, /if\(want==='server'\) want='ookla'/, 'a drawer place saved before the split reopens on the Ookla half');
 });
@@ -4939,19 +4940,25 @@ test('a hidden connection tile fetches nothing, and a forced refresh still lands
 
 // Restoring a tile has to REFETCH: redrawCharts paints from the latPoints /
 // spdData / hmData caches, and a tile hidden at PAGE LOAD has never filled them.
-function driveRefreshSection(id, { outages = 'block' } = {}) {
+function driveRefreshSection(id, { outages = 'block', runs = 'block' } = {}) {
   const calls = [];
-  new Function('refreshChart', 'refreshSpeedChart', 'refreshNetinfo', 'refreshHeatmap', 'loadOutages', '$',
+  new Function('refreshChart', 'refreshSpeedChart', 'refreshNetinfo', 'refreshHeatmap', 'loadOutages', 'loadRuns', '$',
     extract('function refreshSection') + '\nreturn refreshSection;')(
     f => calls.push(['latency', f]), f => calls.push(['speed', f]), f => calls.push(['connection', f]),
-    f => calls.push(['heatmap', f]), f => calls.push(['outages', f]),
-    () => ({ style: { display: outages } }))(id);
+    f => calls.push(['heatmap', f]), f => calls.push(['outages', f]), f => calls.push(['runs', f]),
+    id => ({ style: { display: id === 'runsSection' ? runs : outages } }))(id);
   return calls;
 }
 
 test('restoring a tile refetches it, and the connection tile refetches with the cheap GET', () => {
   assert.deepEqual(driveRefreshSection('latency'), [['latency', undefined]]);
-  assert.deepEqual(driveRefreshSection('speed'), [['speed', undefined]]);
+  // The speed tile's TABLE too, the way the downtime tile's has always been:
+  // nothing is fetched while a tile is hidden, so an open runs table comes back
+  // as old as the moment it was hidden. force, because this runs while the tile
+  // is still flagged hidden and the gate would otherwise refuse.
+  assert.deepEqual(driveRefreshSection('speed'), [['speed', undefined], ['runs', true]]);
+  assert.deepEqual(driveRefreshSection('speed', { runs: 'none' }), [['speed', undefined]],
+    'a collapsed runs table must not be loaded just because its tile came back');
   assert.deepEqual(driveRefreshSection('downtime'), [['heatmap', undefined], ['outages', undefined]]);
   assert.deepEqual(driveRefreshSection('downtime', { outages: 'none' }), [['heatmap', undefined]],
     'a collapsed outage table must not be loaded just because its tile came back');
@@ -6456,4 +6463,98 @@ test('Quick Setup\u2019s update-check consent survives a phone screen', () => {
     'the row wraps below the breakpoint, giving the consent its own line');
   assert.match(html, /\.qs-them\{display:flex;gap:10px;flex-wrap:wrap;\}/,
     'and the swatch strip wraps rather than clipping its last theme');
+});
+
+// --- batch C: wrong-state and dead controls -------------------------------
+test('a list that could not be loaded says so, and its pager stops offering pages', () => {
+  const fake = () => {
+    const el = (id) => ({ id, innerHTML: '', textContent: '', disabled: false,
+      querySelector: () => null });
+    const nodes = { runsBody: el('runsBody'), runsPageInfo: el('runsPageInfo'),
+      runsPrev: el('runsPrev'), runsNext: el('runsNext') };
+    const fn = new Function('$', extract('function listLoadFailed') + '\nreturn listLoadFailed;')(id => nodes[id]);
+    return { fn, nodes };
+  };
+  let f = fake();
+  f.fn('runsBody', 'runsPageInfo', ['runsPrev', 'runsNext'], 24, 'runs');
+  assert.match(f.nodes.runsBody.innerHTML, /Couldn’t load the runs/,
+    'an empty table reads as "there is nothing here", which is a different claim from "I could not ask"');
+  assert.equal(f.nodes.runsPageInfo.textContent, 'Not loaded');
+  assert.ok(f.nodes.runsPrev.disabled && f.nodes.runsNext.disabled, 'a pager that cannot page must not offer to');
+
+  // Good rows already on screen are left alone: stale beats empty, and the
+  // toast already reports the failure.
+  f = fake();
+  f.nodes.runsBody.querySelector = () => ({});
+  f.nodes.runsBody.innerHTML = '<tr data-ts="1">real row</tr>';
+  f.fn('runsBody', 'runsPageInfo', ['runsPrev', 'runsNext'], 24, 'runs');
+  assert.match(f.nodes.runsBody.innerHTML, /real row/, 'a failed refresh over good data must not wipe it');
+});
+
+test('a pin is dropped only when the run it names has actually gone', () => {
+  const mk = (data, pin) => {
+    const calls = [];
+    const api = new Function('spdData', 'pinnedRunTs', 'clearSelection',
+      extract('function pinPlotted') + '\n' + extract('function dropGhostPin') +
+      '\nreturn { pinPlotted, dropGhostPin };')(data, pin, () => calls.push(1));
+    return Object.assign(api, { calls });
+  };
+  // It was on the chart and now it is not: a round member cascade-deleted with
+  // its winner, or a row pruned by retention.
+  let m = mk([{ ts: 10 }, { ts: 30 }], 20);
+  m.dropGhostPin(true);
+  assert.equal(m.calls.length, 1, 'the cursor would keep being drawn over a hole with no row to explain it');
+  // The deleted run was the NEWEST, so the pin sits beyond the last surviving
+  // point rather than inside a gap - guessing from the range missed this.
+  m = mk([{ ts: 10 }, { ts: 20 }], 30);
+  m.dropGhostPin(true);
+  assert.equal(m.calls.length, 1);
+  // Still there: nothing to do.
+  m = mk([{ ts: 10 }, { ts: 20 }], 20);
+  m.dropGhostPin(true);
+  assert.equal(m.calls.length, 0);
+  // Never plotted in the first place (the window moved away from it): leave it.
+  m = mk([{ ts: 10 }, { ts: 20 }], 99);
+  m.dropGhostPin(false);
+  assert.equal(m.calls.length, 0, 'a window change must not throw away a still-valid pin');
+});
+
+test('the runs table behaves like its sibling: gated when hidden, polled while shown', () => {
+  assert.match(extract('async function loadRuns'), /if\(tileIdle\('speed', force\)\) return false;/,
+    'it rebuilt itself behind a hidden tile, which the outages table has always refused to do');
+  assert.match(script, /setInterval\(\(\)=>\{ if\(!document\.hidden\) runsFollowLive\(\); \}, 60000\);/,
+    'following the newest run catches every insert and no delete - a run removed elsewhere sat there as a ghost');
+  const del = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
+  assert.match(del, /sel && !sel\.isCollapsed/,
+    'a mouseup that ended a text selection is not a row click - copying a value pinned the run and replaced the chart window');
+  assert.match(del, /gone===0 \? 'That run was already gone'/,
+    'deleting nothing must not report that something went');
+});
+
+test('a row queued for removal is not a server you can still collide with', () => {
+  assert.match(extract('function iperfAddrError'), /o!==s && !o\._del && o\.addr===v/,
+    'the ordinary "retire this box, add its replacement at the same address" edit was hard-blocked by the row it replaces');
+  assert.match(script, /iperfServers\.some\(o=>o!==s && !o\._del && o\.addr===next\)/, 'and the same check as you type');
+  assert.match(script, /const need = \$\('setSpeedEngine'\)\.checked && !iperfServers\.some\(s=>!s\._del\)/,
+    'with every row marked for removal the list is empty as far as Save is concerned, so the hint has to appear');
+  assert.match(script, /s\._delWasTarget = \(iperfActiveId===s\._id\)/,
+    'Undo has to give back the test target Remove moved, not just the row');
+});
+
+test('controls that cannot act say so instead of doing nothing', () => {
+  assert.match(extract('function syncWinRm'), /add\.disabled = rows\.length>=MAX_WINDOWS/,
+    '"+ Add window" silently did nothing at the cap');
+  assert.match(script, /function syncDiscardLosersDep\(\)\{\s*setDep\('setSpeedDiscardLosers', \(parseInt\(\$\('setSpeedBestOf'\)\.value\)\|\|1\) > 1\);/,
+    'Discard losers stayed live at Best of 1, where its own tooltip says it does nothing');
+  assert.match(html, /\.chart-save\[hidden\]\{display:none;\}/,
+    'display:inline-flex outranks the UA [hidden] rule, so the hidden save-image button stayed clickable');
+  assert.match(script, /capped \? \('Keep '\+s\.sponsor\+' - keeping '\+FP_MAX\+' servers already'\)/,
+    'aria-label outranks title, so at the cap the star told assistive tech it does something it will not do');
+});
+
+test('Save refuses a blank schedule time rather than saving midnight', () => {
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"), script.indexOf("msg.textContent='Saving…'"));
+  assert.match(save, /querySelectorAll\('\.win-from,\.win-to'\)\]\.find\(i=>!i\.value\)/,
+    "timeToMin('') is 0, so clearing the end time turned 09:00-17:00 into 09:00-00:00 and Save reported success");
+  assert.match(save, /activateTab\('schedule'\); blank\.focus\(\);/, 'and points at the field, as its neighbours do');
 });
