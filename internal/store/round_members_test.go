@@ -266,3 +266,40 @@ func TestASharedSecondIsNotASampledWindow(t *testing.T) {
 		t.Errorf("returned %d rows, want the 15 distinct seconds", len(rows))
 	}
 }
+
+// The chart's sampling caveat compares the runs it charted against the runs in
+// range. The total that drives X-Sampled counts every row, round members
+// included, so comparing one against the other described a coverage that was
+// never true - with the shipped Best-of settings, off by about threefold.
+func TestSpeedRunCountCountsRunsNotRoundMembers(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	ins := func(ts int64, round *int64) {
+		if _, err := st.db.ExecContext(ctx,
+			`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id, round_ts) VALUES (?,?,?,?,?,?,?)`,
+			ts, 100.0, 20.0, 9.0, "srv", "1", round); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 4; i++ { // four runs, each with two losers kept
+		w := now - int64(i)*600
+		ins(w, nil)
+		ins(w-1, &w)
+		ins(w-2, &w)
+	}
+	runs, err := st.SpeedRunCount(ctx, time.Unix(now-86400, 0), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs != 4 {
+		t.Errorf("counted %d, want the 4 runs - the other 8 rows are the servers those rounds measured", runs)
+	}
+	_, total, err := st.SpeedHistoryBudget(ctx, time.Unix(now-86400, 0), time.Time{}, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 12 {
+		t.Errorf("the row total is %d, want all 12 - it is what decides whether the window was thinned", total)
+	}
+}
