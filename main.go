@@ -738,6 +738,16 @@ func (p *program) run(ctx context.Context) {
 		}
 	}
 
+	// Called from a run that measured a previously convicted server without
+	// being refused. Same short deadline as the write above, for the same reason.
+	speedtest.ForgetServerHealth = func(id string) {
+		wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.store.ForgetServerHealth(wctx, id); err != nil {
+			p.log.Warn("could not clear a server exclusion after a good run; it will come back on restart", "server_id", id, "err", err)
+		}
+	}
+
 	sched := speedtest.NewScheduler(tester, p.store, p.cfg.SpeedtestInterval, p.log)
 	tester.OnServer = sched.SetCurrentServer        // surface the live server during a run
 	tester.DirectionFn = set.SpeedDirection         // Ookla direction (per-engine; iperf3 has its own)

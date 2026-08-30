@@ -676,3 +676,70 @@ func TestAProbeLandingAfterAConvictionCannotUndoIt(t *testing.T) {
 		t.Errorf("the landing probe shortened a %v exclusion to %v", fallbackTTL3, d.Round(time.Minute))
 	}
 }
+
+// A run that MEASURES the upload endpoint without being refused is the strongest
+// evidence there is that the fault is gone - the GET probe cannot see this
+// endpoint at all. So it clears the run's record, and the next bad day starts at
+// the bottom rung. But not while the exclusion is standing: a server is only
+// measured during its own bench because someone pinned it, and a pin must not
+// become a way to erase a conviction.
+func TestAGoodRunClearsTheRecordOnceTheBenchHasLapsed(t *testing.T) {
+	srv := &ookla.Server{ID: "16045", URL: "http://x.example/upload.php"}
+	var forgotten []string
+	oldForget := ForgetServerHealth
+	ForgetServerHealth = func(id string) { forgotten = append(forgotten, id) }
+	t.Cleanup(func() { ForgetServerHealth = oldForget })
+	oldPersist := PersistServerHealth
+	PersistServerHealth = func(ServerHealthRow) {}
+	t.Cleanup(func() { PersistServerHealth = oldPersist })
+
+	// Standing exclusion: a pinned server measured mid-bench changes nothing.
+	swapFallbackMap(t)
+	noteUploadRejection(srv)
+	noteUploadAccepted(srv)
+	fbMu.Lock()
+	v := fbMap[srv.ID]
+	fbMu.Unlock()
+	if v.runFails != fallbackStrikes || v.state != endpointRetired {
+		t.Errorf("a run during the bench cleared the record (%d strikes, %v) - a pin would erase any conviction", v.runFails, v.state)
+	}
+	if len(forgotten) != 0 {
+		t.Errorf("and it reached the database: %v", forgotten)
+	}
+
+	// Lapsed: the server is back on merit, and this is the evidence it deserves.
+	fbMu.Lock()
+	v = fbMap[srv.ID]
+	v.expires = time.Now().Add(-time.Minute)
+	fbMap[srv.ID] = v
+	fbMu.Unlock()
+	noteUploadAccepted(srv)
+	fbMu.Lock()
+	v = fbMap[srv.ID]
+	fbMu.Unlock()
+	if v.runFails != 0 || !v.forget.IsZero() {
+		t.Errorf("after a measured upload the record still reads %d strikes (forget %v)", v.runFails, v.forget)
+	}
+	if len(forgotten) != 1 || forgotten[0] != srv.ID {
+		t.Errorf("the stored row was not dropped: %v - a restart would charge the server again", forgotten)
+	}
+
+	// And the ladder really did start over.
+	got, _ := noteUploadRejection(srv)
+	if got.Round(time.Hour) != fallbackTTL {
+		t.Errorf("the next conviction cost %v, want the bottom rung %v", got.Round(time.Hour), fallbackTTL)
+	}
+
+	// The GET probe's own strikes are not this run's to clear.
+	swapFallbackMap(t)
+	fbMu.Lock()
+	fbMap[srv.ID] = fallbackVerdict{state: endpointOK, expires: time.Now().Add(time.Hour), probeFails: 1, runFails: 2, forget: time.Now().Add(HealthMemory)}
+	fbMu.Unlock()
+	noteUploadAccepted(srv)
+	fbMu.Lock()
+	v = fbMap[srv.ID]
+	fbMu.Unlock()
+	if v.probeFails != 1 {
+		t.Errorf("the run cleared the probe's strikes too (probeFails=%d) - each judge clears its own record", v.probeFails)
+	}
+}
