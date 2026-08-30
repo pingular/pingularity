@@ -4089,6 +4089,22 @@ func (s *Store) SaveServerHealth(ctx context.Context, h ServerHealth) error {
 	return err
 }
 
+// ForgetServerHealth drops one server's conviction outright. Called when a run
+// has MEASURED that server's upload endpoint without being refused, which is
+// the one piece of evidence strong enough to say the fault is gone - see
+// noteUploadAccepted. Leaving the row would let the next restart read it back
+// and charge the server for a fault it has since been measured not to have.
+func (s *Store) ForgetServerHealth(ctx context.Context, serverID string) error {
+	if serverID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM server_health WHERE server_id = ?`, serverID)
+	if err != nil {
+		recordDBErr(err)
+	}
+	return err
+}
+
 // ServerHealth returns every conviction worth remembering: the ones still in
 // force, and the ones that have lapsed within `keep`. The caller decides what
 // a lapsed row means - here it is only retention, and rows older than `keep`

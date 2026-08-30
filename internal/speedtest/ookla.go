@@ -1806,6 +1806,42 @@ func noteUploadRejection(s *ookla.Server) (excludedFor time.Duration, suspectOwn
 	return expires.Sub(now), suspectOwnNetwork
 }
 
+// noteUploadAccepted is the conviction's counterpart: a run measured this
+// server's upload endpoint and was not refused, which is the strongest evidence
+// there is that the fault is gone - far stronger than the GET probe, which
+// cannot see this endpoint at all. So it clears the run's record, and the next
+// bad day starts at the bottom rung instead of part-way up the ladder.
+//
+// Only the RUN's record: the GET probe's strikes are its own business, the same
+// separation the two counters exist to keep.
+//
+// And never while the exclusion is STANDING. A server is only measured during
+// its own bench if the operator pinned it, and letting that clear the record
+// would make a pin a way to erase a conviction the daemon paid a measurement
+// turn to earn. Once the bench has lapsed the server is back on merit, and this
+// is simply the evidence it deserves.
+func noteUploadAccepted(s *ookla.Server) {
+	if s == nil || s.ID == "" {
+		return
+	}
+	now := time.Now()
+	fbMu.Lock()
+	v, ok := fbMap[s.ID]
+	if !ok || v.runFails == 0 || (v.state == endpointRetired && now.Before(v.expires)) {
+		fbMu.Unlock()
+		return
+	}
+	v.runFails, v.forget = 0, time.Time{}
+	fbMap[s.ID] = v
+	fbMu.Unlock()
+	// Outside the lock, like the conviction's own write: the record has to go
+	// from the database too, or the next restart reads it back and the server
+	// answers again for a fault it has since been measured not to have.
+	if ForgetServerHealth != nil {
+		ForgetServerHealth(s.ID)
+	}
+}
+
 // ServerHealthRow is one server's upload conviction as the daemon stores it.
 type ServerHealthRow struct {
 	ServerID string
@@ -1818,6 +1854,10 @@ type ServerHealthRow struct {
 // what the process did before: a restart forgot every conviction and the next
 // round paid the failed turn again.
 var PersistServerHealth func(ServerHealthRow)
+
+// ForgetServerHealth drops a server's stored conviction (see
+// noteUploadAccepted). nil keeps the clearing in memory only.
+var ForgetServerHealth func(serverID string)
 
 // LoadServerHealth seeds the selection health cache with convictions from a
 // previous process. A row still in force is reinstated as the exclusion it is.
@@ -4273,6 +4313,13 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		extraUp, upBytes = upBytes, 0
 	} else {
 		upMbps = srv.ULSpeed.Mbps()
+		// The upload measured and the server accepted it: whatever this server
+		// was once convicted of, it is not doing it now (see noteUploadAccepted).
+		// Guarded like the conviction is - an aborted run proves nothing either
+		// way, and no bytes is not a measurement.
+		if ctx.Err() == nil && upBytes > 0 {
+			noteUploadAccepted(srv)
+		}
 	}
 
 	// Packet loss needs its own UDP pass; it stays nil when the user turns it
