@@ -83,7 +83,7 @@ func TestUploadRedirectDoesNotExcludeServer(t *testing.T) {
 func TestSelectionReadsTheRejectionVerdict(t *testing.T) {
 	s := &ookla.Server{ID: "reject-feedback-selection", URL: "http://198.51.100.7:8080/speedtest/upload.php"}
 	fbMu.Lock()
-	fbMap[s.ID] = fallbackVerdict{state: endpointRetired, expires: time.Now().Add(fallbackTTL), fails: fallbackStrikes}
+	fbMap[s.ID] = fallbackVerdict{state: endpointRetired, expires: time.Now().Add(fallbackTTL), runFails: fallbackStrikes}
 	fbMu.Unlock()
 	t.Cleanup(func() {
 		fbMu.Lock()
@@ -109,7 +109,7 @@ func TestSelectionReadsTheRejectionVerdict(t *testing.T) {
 func TestRejectionVerdictExpiresAndGetReadmits(t *testing.T) {
 	s := &ookla.Server{ID: "reject-feedback-expiry", URL: "http://198.51.100.8:8080/speedtest/upload.php"}
 	fbMu.Lock()
-	fbMap[s.ID] = fallbackVerdict{state: endpointRetired, expires: time.Now().Add(-time.Second), fails: fallbackStrikes}
+	fbMap[s.ID] = fallbackVerdict{state: endpointRetired, expires: time.Now().Add(-time.Second), runFails: fallbackStrikes}
 	fbMu.Unlock()
 	t.Cleanup(func() {
 		fbMu.Lock()
@@ -222,7 +222,7 @@ func TestProbeCannotClobberAStandingConviction(t *testing.T) {
 
 	convict := func(expires time.Time) {
 		fbMu.Lock()
-		fbMap[id] = fallbackVerdict{state: endpointRetired, expires: expires, fails: fallbackStrikes}
+		fbMap[id] = fallbackVerdict{state: endpointRetired, expires: expires, runFails: fallbackStrikes}
 		fbMu.Unlock()
 	}
 	stateOf := func() endpointState {
@@ -249,7 +249,7 @@ func TestProbeCannotClobberAStandingConviction(t *testing.T) {
 	// A fresh conviction refreshes it.
 	fresh := time.Now().Add(fallbackTTL + time.Hour)
 	fbMu.Lock()
-	storeFallbackVerdictLocked(id, fallbackVerdict{state: endpointRetired, expires: fresh, fails: fallbackStrikes})
+	storeFallbackVerdictLocked(id, fallbackVerdict{state: endpointRetired, expires: fresh, runFails: fallbackStrikes})
 	fbMu.Unlock()
 	fbMu.Lock()
 	gotExp := fbMap[id].expires
@@ -290,17 +290,17 @@ func TestConvictionBurstSuspectsOwnNetwork(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanup("burst-a", "burst-b", "burst-c") })
 
-	if noteUploadRejection(&ookla.Server{ID: "burst-a", URL: "http://198.51.100.10/u"}) {
+	if _, suspect := noteUploadRejection(&ookla.Server{ID: "burst-a", URL: "http://198.51.100.10/u"}); suspect {
 		t.Fatal("one conviction must not suspect the client's network")
 	}
 	// The same server re-convicted is still ONE server.
-	if noteUploadRejection(&ookla.Server{ID: "burst-a", URL: "http://198.51.100.10/u"}) {
+	if _, suspect := noteUploadRejection(&ookla.Server{ID: "burst-a", URL: "http://198.51.100.10/u"}); suspect {
 		t.Fatal("re-convicting the same server is not a burst")
 	}
-	if noteUploadRejection(&ookla.Server{ID: "burst-b", URL: "http://198.51.100.11/u"}) {
+	if _, suspect := noteUploadRejection(&ookla.Server{ID: "burst-b", URL: "http://198.51.100.11/u"}); suspect {
 		t.Fatal("two distinct servers are below the burst bar")
 	}
-	if !noteUploadRejection(&ookla.Server{ID: "burst-c", URL: "http://198.51.100.12/u"}) {
+	if _, suspect := noteUploadRejection(&ookla.Server{ID: "burst-c", URL: "http://198.51.100.12/u"}); !suspect {
 		t.Fatal("three DIFFERENT servers refusing uploads inside the window is the client-network signature and must be named")
 	}
 }

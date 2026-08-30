@@ -198,8 +198,9 @@ CREATE TABLE IF NOT EXISTS settings (
 -- passes - so that conviction costs a whole measurement turn to earn, and
 -- before this table every restart threw it away and paid again. Only
 -- convictions live here; verdicts the GET probe reaches on its own are one
--- request to re-derive and are not worth storing. Rows are dropped once
--- expired (see ServerHealth): the TTL is the server's second chance.
+-- request to re-derive and are not worth storing. An expired row is kept for a
+-- while longer (see ServerHealth): the TTL is the server's second chance, but
+-- how many chances it has already had decides how long the NEXT one lasts.
 CREATE TABLE IF NOT EXISTS server_health (
     server_id TEXT PRIMARY KEY,
     expires   INTEGER NOT NULL,   -- unix seconds; the exclusion stands until then
@@ -4088,17 +4089,20 @@ func (s *Store) SaveServerHealth(ctx context.Context, h ServerHealth) error {
 	return err
 }
 
-// ServerHealth returns the convictions still in force, dropping any that have
-// expired. Read once at startup, which is also the only sweep the table needs:
-// every row carries a TTL of hours, so it cannot grow beyond the servers
+// ServerHealth returns every conviction worth remembering: the ones still in
+// force, and the ones that have lapsed within `keep`. The caller decides what
+// a lapsed row means - here it is only retention, and rows older than `keep`
+// are swept. Read once at startup, which is also the only sweep the table
+// needs: nothing is kept beyond `keep`, so it cannot grow past the servers
 // convicted inside one.
-func (s *Store) ServerHealth(ctx context.Context) ([]ServerHealth, error) {
+func (s *Store) ServerHealth(ctx context.Context, keep time.Duration) ([]ServerHealth, error) {
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM server_health WHERE expires <= ?`, now); err != nil {
+	cutoff := now - int64(keep.Seconds())
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM server_health WHERE expires <= ?`, cutoff); err != nil {
 		recordDBErr(err) // a failed sweep is not a reason to skip the read
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT server_id, expires, fails FROM server_health WHERE expires > ?`, now)
+		`SELECT server_id, expires, fails FROM server_health WHERE expires > ?`, cutoff)
 	if err != nil {
 		recordDBErr(err)
 		return nil, err

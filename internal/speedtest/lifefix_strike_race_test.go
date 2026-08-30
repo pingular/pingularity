@@ -69,8 +69,8 @@ func TestFallbackHealthSerializesConcurrentProbes(t *testing.T) {
 	if got := probes.Load(); got != 1 {
 		t.Fatalf("first burst ran %d probes for one server ID, want 1 - concurrent callers must wait and reuse the in-flight result", got)
 	}
-	if v := verdict(); v.fails != 1 {
-		t.Fatalf("after one failing burst fails=%d, want 1", v.fails)
+	if v := verdict(); v.probeFails != 1 {
+		t.Fatalf("after one failing burst probe strikes=%d, want 1", v.probeFails)
 	}
 
 	// Expire the first-strike hold; the next concurrent burst is the second
@@ -85,7 +85,7 @@ func TestFallbackHealthSerializesConcurrentProbes(t *testing.T) {
 	if got := probes.Load(); got != 2 {
 		t.Fatalf("second burst brought the probe total to %d, want 2", got)
 	}
-	if v := verdict(); v.fails != fallbackStrikes || v.state != endpointRetired {
+	if v := verdict(); v.probeFails != fallbackStrikes || v.state != endpointRetired {
 		t.Fatalf("verdict = %+v, want retired with %d consecutive strikes", v, fallbackStrikes)
 	}
 	fbMu.Lock()
