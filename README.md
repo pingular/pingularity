@@ -918,7 +918,12 @@ will use. That badge comes from a cheap check - fetching the server's latency
 file - which a host whose *upload* endpoint refuses everything still passes.
 Those only reveal themselves when a run tries them, so when one refuses every
 upload the daemon stops offering it to automatic selection for twelve hours,
-and remembers that across a restart. Auto isn't just "nearest": every server that's effectively equidistant gets to race
+and remembers that across a restart. A server that comes back and refuses
+everything again earns a longer rest each time - twelve hours, then a day,
+then three - because re-admitting a still-broken server costs a whole
+measurement turn to rediscover. It is never permanent: a repaired server is
+back within three days on its own, and one that has behaved for a week starts
+over at twelve hours. Auto isn't just "nearest": every server that's effectively equidistant gets to race
 (in a big city, a dozen providers all sit "0 km away" - one of each is pinged
 rather than an arbitrary few, and the same rule seeds each candidate city's
 six in the city race that picks the centre, with distance ties broken by the

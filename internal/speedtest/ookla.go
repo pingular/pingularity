@@ -615,7 +615,30 @@ const uploadRescueSettle = 5 * time.Second
 type fallbackVerdict struct {
 	state   endpointState
 	expires time.Time
-	fails   int // consecutive definite failures; see fallbackHealth
+	// TWO counters, because they are two kinds of evidence and neither may
+	// stand in for the other. They were one field, and that field was read by
+	// both judges: a server carrying two run strikes met a single 503 on
+	// latency.txt, the probe read 2+1=3, sailed past the two-strike rule below
+	// and retired a REPAIRED server for 24 hours - on one response the code
+	// itself calls indistinguishable from a maintenance window. It ran the
+	// other way too: two transient 5xx made a server's FIRST upload conviction
+	// 24h instead of 12h.
+	//
+	// probeFails: consecutive failures of the GET probe. A clean GET clears
+	// them - for what the GET can see, that is real evidence of repair.
+	probeFails int
+	// runFails: upload convictions a RUN earned. The GET fetches latency.txt,
+	// which a server with a dead upload endpoint serves perfectly, so an OK
+	// from it is not evidence these are cured and must not clear them. Zeroing
+	// them on it wiped the record moments before the next conviction read it -
+	// selection probes every candidate right before seating one - and the
+	// escalation ladder never left its bottom rung.
+	runFails int
+	// forget is when runFails stop counting. Their memory has to end somewhere
+	// (a server repaired months ago must not answer for the old fault), and the
+	// GET can never be the thing that ends it. Every read of runFails is gated
+	// on this - a count the window has released is not evidence.
+	forget time.Time
 }
 
 // probeDialGuard refuses to connect anywhere a speedtest server has no business
@@ -1480,8 +1503,18 @@ const probeDrainCap = 4 << 10
 const (
 	// fallbackTTL: a missing component is stable, but an operator CAN install it,
 	// so this expires rather than being permanent. Long enough that a scheduled
-	// run never re-probes the same server twice in a day.
+	// run never re-probes the same server twice in a day. It is the FIRST
+	// exclusion only - see retiredTTL for what a server earns by failing again.
 	fallbackTTL = 12 * time.Hour
+	// fallbackTTL2 / fallbackTTL3: a server that fails, serves its exclusion and
+	// fails again is not having a bad moment - it is broken in a way an operator
+	// has not fixed in half a day. Re-admitting it every 12h costs a measurement
+	// turn each time (a Best-of round spent ~45 s on one convicted server before
+	// convictions were persisted at all), so the second chance gets cheaper the
+	// less it is deserved. Still not permanent: a server that is repaired is
+	// back within three days without anyone touching this install.
+	fallbackTTL2 = 24 * time.Hour
+	fallbackTTL3 = 72 * time.Hour
 	// fallbackUnknownTTL: a probe that failed at transport level proves nothing
 	// about the endpoint - retry it soon rather than trusting the non-answer.
 	fallbackUnknownTTL = 10 * time.Minute
@@ -1501,6 +1534,28 @@ const (
 	// cycling through many servers must not grow it forever.
 	fallbackMapCap = 512
 )
+
+// HealthMemory is how long a LAPSED conviction still counts against a server.
+// The escalation below is worthless without it: a 12h exclusion that runs out
+// overnight is forgotten by the next restart, and a server that has failed
+// every day for a week keeps being re-admitted on the first rung. Long enough
+// to see a repeat offender across days, short enough that a server which has
+// behaved for a week starts over.
+const HealthMemory = 7 * 24 * time.Hour
+
+// retiredTTL is how long THIS exclusion lasts, given how many consecutive
+// definite failures the server has now recorded. fails counts strikes, so the
+// first retirement arrives at fallbackStrikes.
+func retiredTTL(fails int) time.Duration {
+	switch {
+	case fails <= fallbackStrikes:
+		return fallbackTTL
+	case fails == fallbackStrikes+1:
+		return fallbackTTL2
+	default:
+		return fallbackTTL3
+	}
+}
 
 // fbFlight is one in-flight fallback probe. It exists because the expiry
 // check, fails snapshot and network probe cannot all run under fbMu, and
@@ -1535,9 +1590,13 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 	}
 	now := time.Now()
 	fbMu.Lock()
-	prevFails := 0
+	prevProbe, prevRun := 0, 0
+	var prevForget time.Time
 	if v, ok := fbMap[s.ID]; ok {
-		prevFails = v.fails
+		prevProbe = v.probeFails
+		if v.runFails > 0 && now.Before(v.forget) { // released counts are not evidence
+			prevRun, prevForget = v.runFails, v.forget
+		}
 		if now.Before(v.expires) {
 			fbMu.Unlock()
 			return v.state
@@ -1574,20 +1633,41 @@ var fallbackHealth = func(ctx context.Context, s *ookla.Server) endpointState {
 	// 12h exclusion on one bad moment removes a healthy server for half a day.
 	// Two consecutive strikes are required, the same rule plState uses for the
 	// loss probe; the first is held briefly so the retry happens soon.
-	fails := 0
+	// The run's strikes ride along untouched - this probe cannot see what earned
+	// them, so it neither clears them nor counts them. Only THIS judge's own
+	// record decides what this judge does.
+	probeFails, runFails, forget := 0, prevRun, prevForget
 	ttl := fallbackTTL
 	switch st {
 	case endpointRetired:
-		fails = prevFails + 1
-		if fails < fallbackStrikes {
+		probeFails = prevProbe + 1
+		if probeFails < fallbackStrikes {
 			st, ttl = endpointUnknown, fallbackUnknownTTL
+		} else {
+			ttl = retiredTTL(probeFails) // longer for a server that has been here before
 		}
 	case endpointUnknown:
-		fails = prevFails // a probe that never landed is not a strike either way
+		probeFails = prevProbe // a probe that never landed is not a strike either way
 		ttl = fallbackUnknownTTL
 	}
 	fbMu.Lock()
-	storeFallbackVerdictLocked(s.ID, fallbackVerdict{state: st, expires: now.Add(ttl), fails: fails})
+	// Re-read before writing: this probe let go of the lock to cross the
+	// network, and a run can have convicted the server in that gap. The
+	// snapshot above is then stale, and writing it blind would hand back the
+	// escalation - and the exclusion - that the conviction had just earned.
+	if cur, ok := fbMap[s.ID]; ok {
+		// Gated on the window like every other read of it: this re-read exists to
+		// pick up a conviction that landed while we were on the network, not to
+		// resurrect a count the window has already released.
+		if cur.runFails > runFails && now.Before(cur.forget) {
+			runFails, forget = cur.runFails, cur.forget
+		}
+		if cur.state == endpointRetired && cur.expires.After(now.Add(ttl)) {
+			st, ttl = endpointRetired, cur.expires.Sub(now) // never shorten a standing exclusion
+		}
+	}
+	storeFallbackVerdictLocked(s.ID, fallbackVerdict{
+		state: st, expires: now.Add(ttl), probeFails: probeFails, runFails: runFails, forget: forget})
 	delete(fbProbing, s.ID)
 	fl.st = st
 	close(fl.done)
@@ -1622,8 +1702,19 @@ func storeFallbackVerdictLocked(id string, v fallbackVerdict) {
 		}
 		// Then evict until there is room. A single eviction per insert holds the
 		// steady state, but cannot recover if the map is ever ALREADY over cap,
-		// so drain rather than nudge.
-		for k := range fbMap {
+		// so drain rather than nudge. Standing exclusions go LAST: dropping one
+		// re-admits a server the daemon has already paid a measurement turn to
+		// convict, and the re-conviction starts back at the bottom rung.
+		for k, v := range fbMap {
+			if len(fbMap) < fallbackMapCap {
+				break
+			}
+			if v.state == endpointRetired && now.Before(v.expires) {
+				continue
+			}
+			delete(fbMap, k)
+		}
+		for k := range fbMap { // still over: nothing left to spare
 			if len(fbMap) < fallbackMapCap {
 				break
 			}
@@ -1672,17 +1763,35 @@ func (o *Ookla) uploadRetryable(error) bool {
 // and overwrite the verdict with OK - selection and runs are sequential per
 // scheduler, so the window is a real race but a rare one, and the next failed
 // run re-convicts. Not worth entangling run teardown with probe ownership.
-func noteUploadRejection(s *ookla.Server) (suspectOwnNetwork bool) {
+func noteUploadRejection(s *ookla.Server) (excludedFor time.Duration, suspectOwnNetwork bool) {
 	if s == nil || s.ID == "" {
-		return false
+		return 0, false
 	}
 	now := time.Now()
-	expires := now.Add(fallbackTTL)
 	fbMu.Lock()
+	// A run's conviction is worth at least the two strikes the GET probe needs,
+	// and one more than whatever this server already had - so a server convicted
+	// again after serving its exclusion climbs the ladder rather than resetting
+	// to the bottom rung every time. A lapsed verdict keeps its count for
+	// HealthMemory (see LoadServerHealth), which is what makes that stick across
+	// a restart.
+	// Only the RUN's own record counts here. Counting the GET probe's strikes
+	// would make two transient 5xx turn a server's first conviction into a
+	// 24-hour one, and the probe never saw the thing being convicted.
+	fails, probeFails := fallbackStrikes, 0
+	if v, ok := fbMap[s.ID]; ok {
+		probeFails = v.probeFails
+		if v.runFails > 0 && now.Before(v.forget) && v.runFails+1 > fails {
+			fails = v.runFails + 1 // released counts are not evidence
+		}
+	}
+	expires := now.Add(retiredTTL(fails))
 	storeFallbackVerdictLocked(s.ID, fallbackVerdict{
-		state:   endpointRetired,
-		expires: expires,
-		fails:   fallbackStrikes,
+		state:      endpointRetired,
+		expires:    expires,
+		probeFails: probeFails,
+		runFails:   fails, // only a run can see this, so only a run may clear it
+		forget:     expires.Add(HealthMemory),
 	})
 	suspectOwnNetwork = noteConvictionLocked(s.ID, now)
 	fbMu.Unlock()
@@ -1692,9 +1801,9 @@ func noteUploadRejection(s *ookla.Server) (suspectOwnNetwork bool) {
 	// worth outliving the process. The probe's own verdicts are not persisted:
 	// re-deriving those costs a single GET.
 	if PersistServerHealth != nil {
-		PersistServerHealth(ServerHealthRow{ServerID: s.ID, Expires: expires.Unix(), Fails: fallbackStrikes})
+		PersistServerHealth(ServerHealthRow{ServerID: s.ID, Expires: expires.Unix(), Fails: fails})
 	}
-	return suspectOwnNetwork
+	return expires.Sub(now), suspectOwnNetwork
 }
 
 // ServerHealthRow is one server's upload conviction as the daemon stores it.
@@ -1711,23 +1820,54 @@ type ServerHealthRow struct {
 var PersistServerHealth func(ServerHealthRow)
 
 // LoadServerHealth seeds the selection health cache with convictions from a
-// previous process. Expired rows are ignored - the TTL is the designed second
-// chance, and reloading a lapsed one would deny it.
+// previous process. A row still in force is reinstated as the exclusion it is.
+// A LAPSED one is not - the TTL is the designed second chance and reloading it
+// as an exclusion would deny it - but its strike count is kept for
+// HealthMemory, with the expiry it already served. That entry excludes nobody:
+// it sits in the map purely so the next conviction knows this server has been
+// here before and hands it the longer exclusion (see retiredTTL). Without it
+// the ladder resets at every restart, which for a 12h rung means most nights.
 func LoadServerHealth(rows []ServerHealthRow) {
 	now := time.Now()
 	fbMu.Lock()
 	defer fbMu.Unlock()
+	// Exclusions still in force go in FIRST. The cache is capped, and the cap
+	// evicts expired entries before anything else - so a reload big enough to
+	// hit it spends the room on the servers that must not be seated, and drops
+	// history, which only costs a repeat offender one rung.
 	for _, r := range rows {
-		if r.ServerID == "" || r.Expires <= now.Unix() {
+		if r.ServerID == "" || !now.Before(time.Unix(r.Expires, 0)) {
+			continue
+		}
+		exp := time.Unix(r.Expires, 0)
+		storeFallbackVerdictLocked(r.ServerID, fallbackVerdict{
+			state:    endpointRetired,
+			expires:  exp,
+			runFails: r.Fails, // every persisted row is a run's conviction
+			forget:   exp.Add(HealthMemory),
+		})
+	}
+	for _, r := range rows {
+		if r.ServerID == "" || r.Fails <= 0 {
+			continue
+		}
+		exp := time.Unix(r.Expires, 0)
+		if now.Before(exp) || now.Sub(exp) >= HealthMemory {
 			continue
 		}
 		storeFallbackVerdictLocked(r.ServerID, fallbackVerdict{
-			state:   endpointRetired,
-			expires: time.Unix(r.Expires, 0),
-			fails:   r.Fails,
+			state:    endpointUnknown, // expired: history, not an exclusion
+			expires:  exp,
+			runFails: r.Fails,
+			forget:   exp.Add(HealthMemory),
 		})
 	}
 }
+
+// InForce reports whether this row is still an exclusion rather than the
+// memory of one. Both are reloaded (see LoadServerHealth); only the first
+// keeps a server out of a round.
+func (r ServerHealthRow) InForce() bool { return time.Now().Before(time.Unix(r.Expires, 0)) }
 
 // convictionWindow / convictionSuspectAt: DIFFERENT servers convicted in quick
 // succession indict the CLIENT's network, not the servers. A corporate
@@ -4071,9 +4211,12 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			// aborted-run edge the floor exists to rule out - the same guard
 			// the partial-keep below applies.
 			if ctx.Err() == nil && o.upRec != nil && o.upRec.refusedByServer() {
-				suspect := noteUploadRejection(srv)
+				excludedFor, suspect := noteUploadRejection(srv)
+				// The length is the ladder's, not a constant: a server that has
+				// been here before is out for a day or three, and a log that
+				// always said twelve hours sent the operator back too early.
 				o.logf("excluding server whose upload endpoint refused every request",
-					"server", serverLabel(srv), "for", fallbackTTL.String())
+					"server", serverLabel(srv), "for", excludedFor.String())
 				stats.Inc("speed.upload_rejected_server_excluded")
 				if suspect {
 					o.warnf("several different servers have refused every upload in a row - a firewall or proxy on YOUR network may be filtering upload POSTs (each server is retried after its exclusion expires)",

@@ -149,35 +149,56 @@ func TestSpeedAvgServersCountsWhatTheRunsMeasured(t *testing.T) {
 
 // The upload conviction has to outlive the process that earned it: the cheap
 // health probe cannot see a server whose upload endpoint refuses everything,
-// so re-learning it costs a whole measurement turn.
+// so re-learning it costs a whole measurement turn. A LAPSED conviction
+// outlives it too, for `keep`: it excludes nobody, but how many chances a
+// server has already had decides how long its next exclusion runs.
 func TestServerHealthOutlivesTheProcess(t *testing.T) {
 	st := open(t)
 	ctx := context.Background()
+	const keep = 7 * 24 * time.Hour
 	now := time.Now().Unix()
-	if rows, err := st.ServerHealth(ctx); err != nil || len(rows) != 0 {
+	if rows, err := st.ServerHealth(ctx, keep); err != nil || len(rows) != 0 {
 		t.Fatalf("fresh store: %v (%v), want none", rows, err)
 	}
 	if err := st.SaveServerHealth(ctx, ServerHealth{ServerID: "16045", Expires: now + 12*3600, Fails: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveServerHealth(ctx, ServerHealth{ServerID: "expired", Expires: now - 60, Fails: 2}); err != nil {
+	if err := st.SaveServerHealth(ctx, ServerHealth{ServerID: "lapsed", Expires: now - 60, Fails: 2}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := st.ServerHealth(ctx)
-	if err != nil || len(rows) != 1 || rows[0].ServerID != "16045" || rows[0].Fails != 2 {
-		t.Fatalf("read back %+v (%v), want the live conviction alone - the lapsed one is the server's second chance", rows, err)
+	if err := st.SaveServerHealth(ctx, ServerHealth{ServerID: "ancient", Expires: now - int64(keep.Seconds()) - 60, Fails: 3}); err != nil {
+		t.Fatal(err)
 	}
-	// The sweep is not just a filter: the lapsed row is gone from the table.
+	rows, err := st.ServerHealth(ctx, keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]ServerHealth{}
+	for _, r := range rows {
+		got[r.ServerID] = r
+	}
+	if len(got) != 2 || got["16045"].Fails != 2 || got["lapsed"].Fails != 2 {
+		t.Fatalf("read back %+v, want the live conviction AND the recently lapsed one - the count is what escalates the next exclusion", rows)
+	}
+	if _, ok := got["ancient"]; ok {
+		t.Errorf("a conviction older than keep is not evidence of anything: %+v", rows)
+	}
+	// The sweep is not just a filter: the ancient row is gone from the table.
 	var n int
-	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM server_health`).Scan(&n); err != nil || n != 1 {
-		t.Errorf("%d rows left (%v), want the expired one dropped", n, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM server_health`).Scan(&n); err != nil || n != 2 {
+		t.Errorf("%d rows left (%v), want only the one past keep dropped", n, err)
 	}
 	// A re-conviction refreshes rather than duplicating.
 	if err := st.SaveServerHealth(ctx, ServerHealth{ServerID: "16045", Expires: now + 24*3600, Fails: 3}); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ = st.ServerHealth(ctx)
-	if len(rows) != 1 || rows[0].Expires != now+24*3600 || rows[0].Fails != 3 {
-		t.Errorf("after a second conviction: %+v, want one refreshed row", rows)
+	rows, _ = st.ServerHealth(ctx, keep)
+	for _, r := range rows {
+		if r.ServerID == "16045" && (r.Expires != now+24*3600 || r.Fails != 3) {
+			t.Errorf("after a second conviction: %+v, want one refreshed row", r)
+		}
+	}
+	if len(rows) != 2 {
+		t.Errorf("after a second conviction: %d rows, want the same two", len(rows))
 	}
 }

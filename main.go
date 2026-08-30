@@ -708,7 +708,7 @@ func (p *program) run(ctx context.Context) {
 	// restarts, or every restart pays for it again: measured on 2026-08-28, a
 	// box that had restarted six minutes earlier spent 45 s of a Best-of round
 	// on a server it had already convicted.
-	if rows, err := p.store.ServerHealth(ctx); err != nil {
+	if rows, err := p.store.ServerHealth(ctx, speedtest.HealthMemory); err != nil {
 		p.log.Warn("could not read the saved server exclusions; starting with none", "err", err)
 	} else if len(rows) > 0 {
 		out := make([]speedtest.ServerHealthRow, 0, len(rows))
@@ -716,7 +716,17 @@ func (p *program) run(ctx context.Context) {
 			out = append(out, speedtest.ServerHealthRow{ServerID: r.ServerID, Expires: r.Expires, Fails: r.Fails})
 		}
 		speedtest.LoadServerHealth(out)
-		p.log.Debug("reloaded server exclusions", "servers", len(out))
+		// Two different things come back: exclusions that still stand, and the
+		// memory of lapsed ones, which excludes nobody and only decides how long
+		// the NEXT exclusion runs. Counting them together read as more servers
+		// being kept out than actually were.
+		inForce := 0
+		for _, r := range out {
+			if r.InForce() {
+				inForce++
+			}
+		}
+		p.log.Debug("reloaded server exclusions", "in_force", inForce, "remembered", len(out)-inForce)
 	}
 	// Called from a run when it convicts a server. Its own short deadline: the
 	// run is mid-round, and a slow write must not hold it up.
