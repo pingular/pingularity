@@ -1136,6 +1136,10 @@
   .chart-save:hover{opacity:1;border-color:var(--accent);color:var(--accent);}
   /* 13px matches the drag handle's glyph beside it and .conn-refresh's in the top corner. */
   .chart-save svg{display:block;width:13px;height:13px;}
+  /* display:inline-flex above outranks the UA's [hidden] rule, so the button
+     stayed on screen and clickable after the panel hid it - the same trap
+     .info.conn-off[hidden] already spells out. */
+  .chart-save[hidden]{display:none;}
   .chart-save[disabled]{opacity:.25;cursor:default;}
   /* The trailing cluster - info, save, window picker, and the Live button when
      it is present. Its own tighter gap; the header's 10px still spaces the
@@ -2466,7 +2470,7 @@ Applies live and persists.">i</span></span>
         <button class="btn" id="saveSettings">Save</button>
         <button class="btn ghost" id="discardSettings" type="button">Discard</button>
         <span class="muted" id="settingsMsg"></span>
-        <button class="btn ghost" id="resetSettings" type="button">Reset to defaults</button>
+        <button class="btn ghost" id="resetSettings" type="button" title="Puts every setting back to how it shipped, except your access and security settings - those are left alone">Reset to defaults</button>
         <button class="btn ghost" id="resetLayout" type="button">Reset tiles</button>
       </div>
     </div>
@@ -3040,7 +3044,12 @@ function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
       o.addEventListener('click', ()=>{ close(); btn.focus(); });
       pop.appendChild(o);
     }
-    const items=[...presets];
+    // Offer nothing the retention cap will quietly shorten: picking "1 year"
+    // with 30 days kept looked like it worked and silently became 30 days.
+    // The window in force is kept on the list whatever its length, so a stored
+    // longer one still shows while it is still what you are looking at.
+    const lim=(typeof cap==='function') ? cap() : 0;
+    const items=[...presets].filter(p=>!lim || p[0]<=lim || (sel.kind==='win' && p[0]===sel.mins));
     if(sel.kind==='win' && !items.some(p=>p[0]===sel.mins)){ items.push([sel.mins,fmtWin(sel.mins)]); items.sort((a,b)=>a[0]-b[0]); }
     for(const [m,l] of items){
       const on = sel.kind==='win' && m===sel.mins;
@@ -3474,7 +3483,12 @@ function tileIdle(name, force){ return !force && sectionHidden(name); }
 // POSTs on the daemon.
 function refreshSection(id){
   if(id==='latency') refreshChart();
-  else if(id==='speed') refreshSpeedChart();
+  else if(id==='speed'){ refreshSpeedChart();
+    // Its table too, exactly as the downtime branch below does: nothing is
+    // fetched while the tile is hidden, so what is on screen is as old as the
+    // moment it was hidden. force, because this runs while the tile is being
+    // unhidden and the gate would otherwise still read it as idle.
+    if($('runsSection').style.display!=='none') loadRuns(true); }
   else if(id==='connection') refreshNetinfo();
   else if(id==='downtime'){ refreshHeatmap(); if($('outagesSection').style.display!=='none') loadOutages(); }
 }
@@ -4163,15 +4177,34 @@ let dataCustomBytes=0;
 // clicking their pills); excluded from the MIN only, not from outage detection.
 let latExcluded; try{ const a=JSON.parse(lsGet('latExcluded')||'[]'); latExcluded=new Set(Array.isArray(a)?a:[]); }catch(_){ latExcluded=new Set(); } // corrupt JSON must not brick the whole script
 let dnsShown = lsGet('dnsHidden') !== '1'; // whether the DNS line shows on the latency chart (toggled via its pill)
+// The last poll's usage figures, kept for the popover to fall back on when the
+// daemon stops answering - the pill was a dead control in exactly the moment a
+// reader is most likely to press it (see showDataPop).
+let lastDataUsage=null;
 function dataBarValue(s){ const du=s.data_usage||{};
+  lastDataUsage={'24h':du['24h']!=null?du['24h']:null,'7d':du['7d']!=null?du['7d']:null,
+    all:du.all!=null?du.all:(s.data_used_bytes!=null?s.data_used_bytes:null)};
   if(dataWindow==='custom'){ if(s.data_used_custom!=null) dataCustomBytes=s.data_used_custom; return dataCustomBytes; }
   return dataWindow==='all' ? (du.all!=null?du.all:(s.data_used_bytes||0)) : (du[dataWindow]||0); }
 async function showDataPop(anchor){
-  hideUptimePop(); // only one stats popover open at a time
+  // Opening takes a round trip, and until it lands the popover is still flagged
+  // hidden - so a second press read as "open it" and the pill would not close,
+  // firing another request each time. This flag is the truthful answer to "is
+  // it open or on its way", set before the await and cleared however we leave.
+  dataPopOpening=true;
   // Ask for the custom window's volume too (?dataMins) so its row is accurate
   // even when custom isn't the active window - otherwise it falls back to a stale
   // or zero cached value (shows "0 B" after a reload or after switching away).
-  let u; try{ u=await (await fetch('api/speed/usage'+(dataCustomMins>0?'?dataMins='+dataCustomMins:''))).json(); }catch(e){ return; }
+  let u;
+  try{ u=await (await fetch('api/speed/usage'+(dataCustomMins>0?'?dataMins='+dataCustomMins:''))).json(); }
+  catch(e){
+    // The daemon is unreachable. Falling out here made the pill a dead control -
+    // pressed, and nothing happened at all. The page already holds the last
+    // poll's figures, so show those and say what they are.
+    u=Object.assign({'24h':null,'7d':null,all:null}, lastDataUsage||{}, {custom:dataCustomBytes, stale:true});
+  }
+  if(!dataPopOpening) return;   // closed again while we were waiting
+  dataPopOpening=false;
   const pop=$('dataPop');
   const rows=[['24h',u['24h']],['7d',u['7d']],['all',u.all]];
   const lbl={'24h':'1d','7d':'7d','all':'All time'};
@@ -4187,6 +4220,13 @@ async function showDataPop(anchor){
     const m=parseDur(inp.value);
     if(m>=1) chooseDataCustom(m); else inp.select();
   });
+  if(u && u.stale) pop.insertAdjacentHTML('beforeend',
+    '<div class="row muted" style="justify-content:center">from the last successful check</div>');
+  // Only now is there a replacement to put in its place. Tearing the other
+  // popover down before the request meant a slow answer left NEITHER on screen -
+  // measured at 2.8 seconds - and a failed one left the reader with nothing at
+  // all, having closed what they were reading.
+  hideUptimePop(); // only one stats popover open at a time
   pop.hidden=false;
   anchor.setAttribute('aria-expanded','true'); // only after the popover actually shows (fetch above can return early)
   const r=anchor.getBoundingClientRect();
@@ -4201,8 +4241,9 @@ function chooseDataCustom(mins){
 }
 // Close the data popover and clear the trigger pill's expanded state. The pill is
 // re-rendered each poll, so query it live rather than capturing a stale node.
-function hideDataPop(){ $('dataPop').hidden=true; const p=$('families').querySelector('.stat-data'); if(p) p.setAttribute('aria-expanded','false'); }
-function toggleDataPop(pill){ if($('dataPop').hidden) showDataPop(pill); else hideDataPop(); } // showDataPop sets aria-expanded once it actually opens
+function hideDataPop(){ dataPopOpening=false; $('dataPop').hidden=true; const p=$('families').querySelector('.stat-data'); if(p) p.setAttribute('aria-expanded','false'); }
+let dataPopOpening=false; // see showDataPop: hidden is not the same as closed
+function toggleDataPop(pill){ if($('dataPop').hidden && !dataPopOpening) showDataPop(pill); else hideDataPop(); } // showDataPop sets aria-expanded once it actually opens
 $('families').addEventListener('click', e=>{
   const pill=e.target.closest('.stat-data'); if(!pill) return;
   e.stopPropagation();
@@ -5930,7 +5971,10 @@ function syncSpeedPanel(fresh){
     // An empty span blanks the cards rather than leaving the previous window
     // numbers sitting above an empty chart.
     if(last) setSpeedTiles(last);
-    else for(const id of ['dl','ul','sp_ping','sp_jitter','sp_loss','sp_bloat_dn','sp_bloat_up']) $(id).textContent='-';
+    else { for(const id of ['dl','ul','sp_ping','sp_jitter','sp_loss','sp_bloat_dn','sp_bloat_up']) $(id).textContent='-';
+    // and the two tooltips that describe HOW those numbers were measured: left
+    // standing over a dash they describe a measurement that isn't on screen.
+    $('sp_jitter').title = $('sp_loss').title = ''; }
     $('speedWhen').classList.remove('run-err');
     $('speedWhen').textContent = !fresh ? 'loading range…'
       : last ? (last.server?last.server+' · ':'')+'last in range '+fmtTime(last.ts)
@@ -6071,6 +6115,18 @@ $('speedChart').addEventListener('touchmove', touchPt(spdHoverAt), {passive:true
 $('speedChart').addEventListener('mouseleave', ()=>{ linkHover(-1); $('chartTip').hidden=true; });
 // Click a point on either chart to open the runs table on that run's row.
 // Clear the pinned run selection: its persistent cursor line and the runs-table row highlight.
+// A pin can outlive the run it names: deleting a Best-of result takes its round
+// MEMBERS with it, so the pin the reader put on a member survives a delete they
+// made on the winner. The cursor then keeps being drawn over a hole in the data,
+// at a run with no row anywhere to explain it, until they happen to click
+// elsewhere.
+// pinPlotted is taken BEFORE the reload and checked after: "it was on the chart
+// and now it is not" is exact, where guessing from the range is not - the
+// deleted run may have been the newest, which leaves the pin beyond the last
+// surviving point rather than inside a gap. A pin that was never plotted (the
+// window moved away from it) is left alone either way.
+function pinPlotted(){ return pinnedRunTs!=null && spdData.some(p=>p.ts===+pinnedRunTs); }
+function dropGhostPin(was){ if(was && !pinPlotted()) clearSelection(); }
 function clearSelection(){ if(pinnedRunTs==null) return; pinnedRunTs=null; applyRunHighlight(null); redrawSpd(); redrawQ(); redrawBloat(); }
 function chartClickAt(plot){ return e=>{
   const p=plot; if(!p||!p.points.length) return;
@@ -6241,16 +6297,21 @@ let runsPage=1, runsPerPage=10, runsTotal=0;
 // needs covering.
 let runsBusy=false;
 let runsSeq=0; // only the newest in-flight runs poll repaints the table (see refreshStatus)
-async function loadRuns(){
+async function loadRuns(force){
+  // Behind a hidden tile there is nobody to read the rebuild - the sibling
+  // outages table has refused this since it was written. Callers that change
+  // the data (a delete, an import, a restore) or that the reader drove (paging,
+  // opening the table) pass force, exactly as loadOutages's callers do.
+  if(tileIdle('speed', force)) return false;
   const my=++runsSeq;
   let data;
   try{ const r=await fetch(`api/speed/runs?limit=${runsPerPage}&offset=${(runsPage-1)*runsPerPage}`);
     if(!r.ok) throw 0;
     data=await r.json();
-  }catch(e){ chartLoadFailed('runs table'); return false; }
+  }catch(e){ chartLoadFailed('runs table'); listLoadFailed('runsBody', 'runsPageInfo', ['runsPrev','runsNext'], 24, 'runs'); return false; }
   if(my!==runsSeq) return;
   const runs=data.runs||[]; runsTotal=data.total||0;
-  if(runs.length===0 && runsPage>1){ runsPage--; return loadRuns(); } // page emptied (e.g. after delete)
+  if(runs.length===0 && runsPage>1){ runsPage--; return loadRuns(force); } // page emptied (e.g. after delete)
   $('runsBody').innerHTML = runs.length ? runs.map(r=>`
     <tr data-ts="${r.ts}">
       <td class="act"><button class="run-del" type="button" data-ts="${r.ts}" title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
@@ -6347,6 +6408,23 @@ function focusRunOnChart(ts){
   else speedPicker.set({kind:'range', from:+ts-43200, to:+ts+43200}); // a bounded (frozen) range - NOT the orphan 'span' kind, which no parser/Live/reload path consumes, leaving live tiles over a past chart. fires refreshSpeedChart
   $('speedChart').scrollIntoView({behavior:'smooth', block:'center'});
 }
+// A table opened while the daemon is unreachable used to render as an EMPTY
+// one - the runs table with nothing but its 24 column headers, the outages
+// table still showing its shipped "No events recorded yet." - with Prev and
+// Next left enabled and dead. Both read as "there is nothing here", which is a
+// different and much worse claim than "I could not ask".
+// Only when the table has no rows of its own: a background refresh that fails
+// over good data leaves the data alone (the toast already reports it), because
+// stale rows beat no rows.
+function listLoadFailed(bodyId, infoId, btnIds, cols, what){
+  const body=$(bodyId); if(!body) return;
+  if(!body.querySelector('tr[data-ts], tr td.act button')){
+    body.innerHTML='<tr><td class="muted" colspan="'+cols+'">Couldn\u2019t load the '+what+
+      ' - the server didn\u2019t answer. It will fill in when the connection is back.</td></tr>';
+  }
+  const info=$(infoId); if(info) info.textContent='Not loaded';
+  btnIds.forEach(id=>{ const b=$(id); if(b) b.disabled=true; });
+}
 function updateRunsPager(){
   const pages=Math.max(1, Math.ceil(runsTotal/runsPerPage));
   if(runsPage>pages) runsPage=pages;
@@ -6361,7 +6439,7 @@ function updateRunsPager(){
 // guard was already false and Prev was drawn disabled.
 async function runsGoTo(page){
   const was=runsPage; runsPage=page;
-  if(!await loadRuns()) runsPage=was;
+  if(!await loadRuns(true)) runsPage=was;
 }
 $('runsPrev').addEventListener('click', ()=>{ if(runsPage>1) runsGoTo(runsPage-1); });
 $('runsNext').addEventListener('click', ()=>{ if(runsPage < Math.ceil(runsTotal/runsPerPage)) runsGoTo(runsPage+1); });
@@ -6371,7 +6449,15 @@ $('runsPerPage').addEventListener('change', ()=>{ runsPerPage=parseInt($('runsPe
 // quality/bloat charts, and the status cards (the deleted run may be the latest).
 $('runsBody').addEventListener('click', async e=>{
   const btn=e.target.closest('.run-del');
-  if(!btn){ const row=e.target.closest('tr[data-ts]'); if(row) focusRunOnChart(+row.dataset.ts); return; } // a plain row click selects the run on the chart
+  if(!btn){
+    // A mouseup that ended a text selection is not a row click. Copying a
+    // server ID, an IP or a timestamp out of this table is an obvious thing to
+    // do, and it was pinning the run, replacing the chart window with a frozen
+    // day either side of it, and scrolling the page to the chart - so the
+    // window the reader had chosen was gone and the copy cost them their place.
+    const sel=window.getSelection && window.getSelection();
+    if(sel && !sel.isCollapsed && sel.toString().trim()) return;
+    const row=e.target.closest('tr[data-ts]'); if(row) focusRunOnChart(+row.dataset.ts); return; } // a plain row click selects the run on the chart
   const ts=+btn.dataset.ts; if(!ts) return;
   // A Best-of round that kept its losers is several rows, and deleting the
   // run's own row takes them all (the daemon cascades on round_ts). Say so:
@@ -6390,22 +6476,26 @@ $('runsBody').addEventListener('click', async e=>{
     const r=await fetch('api/speed/runs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ts})});
     if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); return; }
     if(pinnedRunTs===ts) pinnedRunTs=null;
-    await loadRuns(); refreshSpeedChart(true); refreshStatus();
+    const wasPlotted=pinPlotted();
+    await loadRuns(true); await refreshSpeedChart(true); dropGhostPin(wasPlotted); refreshStatus();
     const left=$('runsBody').querySelectorAll('.run-del');
     (left[Math.min(idx,left.length-1)]||$('runsToggle')).focus();
     // role="status" toast: the vanished row is the only cue sighted users get;
     // this is what assistive tech hears (no aria-live on the tbody itself).
     // The daemon reports every row it removed, so the toast can name a round
     // rather than claim one run went when sixteen did.
-    let gone=1; try{ gone=+(await r.json()).deleted||1; }catch(e){}
-    const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : 'Run deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
+    // The daemon reports what it actually removed. Zero means the run was
+    // already gone - saying "Run deleted" there told the reader they had just
+    // done something they had not.
+    let gone=1; try{ const d=await r.json(); gone=(d && typeof d.deleted==='number') ? d.deleted : 1; }catch(e){}
+    const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : (gone===0 ? 'That run was already gone' : 'Run deleted'); tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
   }catch(err){ btn.disabled=false; alert('Delete failed'); }
   finally{ runsBusy=false; }
 });
 $('runsToggle').addEventListener('click', async () => {
   const open = !runsOpen();
   setRunsOpen(open);
-  if(open) await loadRuns();
+  if(open) await loadRuns(true);
 });
 // Recent outages live under the Downtime heatmap, hidden until toggled open,
 // paginated like the speed runs table (via /api/events).
@@ -6517,7 +6607,7 @@ async function loadOutages(force){
   try{ const r=await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`);
     if(!r.ok) throw 0;
     data=await r.json();
-  }catch(e){ chartLoadFailed('outages list'); return false; }
+  }catch(e){ chartLoadFailed('outages list'); listLoadFailed('events', 'outagesPageInfo', ['outagesPrev','outagesNext'], 4, 'events'); return false; }
   if(my!==outagesSeq) return;
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(force); } // page emptied
@@ -7601,8 +7691,15 @@ function fpRow(s){
   h.dataset.star=s.id; h.setAttribute('aria-pressed', String(kept));
   // At the cap the remaining stars go inert rather than disappearing: the row is
   // still worth reading, and the title says why the star will not take.
-  if(!kept && speedServers.length>=FP_MAX){ h.classList.add('full'); h.title='Keeping '+FP_MAX+' servers already'; }
-  h.setAttribute('aria-label',(kept?'Remove ':'Keep ')+s.sponsor);
+  const capped = !kept && speedServers.length>=FP_MAX;
+  if(capped){ h.classList.add('full'); h.title='Keeping '+FP_MAX+' servers already'; }
+  // aria-label outranks title, so a plain "Keep <sponsor>" told assistive tech
+  // this button does something it will not do - and pressing it did nothing at
+  // all, with the reason visible only as a mouse tooltip. Name the reason, and
+  // say the control is unavailable.
+  h.setAttribute('aria-label', capped ? ('Keep '+s.sponsor+' - keeping '+FP_MAX+' servers already')
+                                      : (kept?'Remove ':'Keep ')+s.sponsor);
+  if(capped) h.setAttribute('aria-disabled','true');
   h.innerHTML=kept?STAR_ON:STAR_OFF;
   w.appendChild(h);
   return w;
@@ -7913,10 +8010,15 @@ function setFields(s){
   if(s.server_now_unix) schedServerSkewMs = (s.server_now_unix*1000 + (s.server_tz_offset_min||0)*60000) - Date.now();
   $('setSchedLatEnabled').checked=!!s.sched_lat_enabled; $('setSchedSpeedEnabled').checked=!!s.sched_speed_enabled;
   renderWindows('lat', s.sched_lat_windows||[]); renderWindows('speed', s.sched_speed_windows||[]);
-  updateSchedDisabled(); updateConflictWarnings(); updateSpeedEstimate();
+  updateSchedDisabled(); updateConflictWarnings(); updateSpeedEstimate(); syncDiscardLosersDep();
 }
 // setDep greys + disables a control that depends on another being on. Informational only:
 // the saved value is preserved and takes effect again once the parent is back on.
+// Best of 1 measures one server, so there are no losers to discard or keep -
+// the checkbox's own tooltip said as much while the checkbox stayed live.
+function syncDiscardLosersDep(){
+  setDep('setSpeedDiscardLosers', (parseInt($('setSpeedBestOf').value)||1) > 1);
+}
 function setDep(fieldId, on){
   const f=$(fieldId); f.disabled=!on;
   const row=f.closest('.srow'); if(row) row.classList.toggle('dep-off', !on);
@@ -8330,7 +8432,9 @@ function renderIperfServers(){
   const orphan=iperfPwOrphan();
   if(orphan) $('iperfMsg').textContent='You changed '+(orphan.label||orphan.orig_addr)+"'s address - the saved password is stored under the old one, so re-enter it (or change the address back) before saving.";
   else if(iperfEditingId==null) $('iperfMsg').textContent='';
-  const need = $('setSpeedEngine').checked && !iperfServers.length;
+  // Live rows only: with every row marked for removal the list is empty as far
+  // as Save is concerned, so the hint that a server is needed has to appear.
+  const need = $('setSpeedEngine').checked && !iperfServers.some(s=>!s._del);
   if(need) $('iperfMsg').textContent='Add a server to run iperf3 tests.';
   else if($('iperfMsg').textContent==='Add a server to run iperf3 tests.') $('iperfMsg').textContent='';
   // Check reachability for any not-yet-probed server, but only while the drawer is open
@@ -8392,12 +8496,21 @@ $('iperfServerList').addEventListener('click', e=>{
     const nr=$('iperfServerList').querySelector('.fp-btn[data-id="'+id+'"]');
     if(nr) nr.focus({preventScroll:true});
   }
-  else if(btn.dataset.act==='undo'){ delete iperfServers[idx]._del; renderIperfServers(); }
+  else if(btn.dataset.act==='undo'){
+    // Undo means undo. Removing the row that was the test target moved the
+    // target to whatever was left (the live-target guard in
+    // renderIperfServers), and clearing _del alone left it there - so the
+    // server came back but the tests were still pointed somewhere else.
+    const s=iperfServers[idx]; delete s._del;
+    if(s._delWasTarget){ iperfActiveId=s._id; delete s._delWasTarget; }
+    renderIperfServers();
+  }
 });
 // Removal lives in the details, beside Done: marked for deletion on Save (the row
 // stays, struck through, with Undo); actually removed by settingsBody's filter.
 $('iperfEditRemove').addEventListener('click', ()=>{
   const s=editingIperfServer(); if(!s) return;
+  s._delWasTarget = (iperfActiveId===s._id); // so Undo can put the target back
   s._del=true; iperfEditingId=null; renderIperfServers();
 });
 // The address box: Add saves a server at the typed address (or an empty one to
@@ -8477,7 +8590,12 @@ function iperfAddrError(){
   const v=$('setIperfAddr').value.trim();
   if(!v) return s.orig_addr ? 'Enter an address, or use Remove to delete this server.' : '';
   if(!iperfAddrValid(v)) return 'Enter a valid host or host:port.';
-  if(iperfServers.some(o=>o!==s && o.addr===v)) return 'That address is already used by another saved server.';
+  // Not a row already marked for removal: settingsBody drops those before it
+  // posts, so there is no duplicate to prevent - and refusing anyway blocked
+  // the ordinary "retire this box, add its replacement at the same address"
+  // edit, with Save hard-refusing while the row it named sat visibly struck
+  // through offering Undo. Every other consumer of this list already skips them.
+  if(iperfServers.some(o=>o!==s && !o._del && o.addr===v)) return 'That address is already used by another saved server.';
   return '';
 }
 $('setIperfAddr').addEventListener('change', ()=>{
@@ -8488,7 +8606,7 @@ $('setIperfAddr').addEventListener('change', ()=>{
   // keep the model's last good address and make removal explicit via Delete.
   if(!next && s.orig_addr){ iperfAddrBad('Enter an address, or use Remove to delete this server.'); return; }
   if(next && !iperfAddrValid(next)){ iperfAddrBad('Enter a valid host or host:port.'); return; }
-  if(next && iperfServers.some(o=>o!==s && o.addr===next)){ iperfAddrBad('That address is already used by another saved server.'); return; }
+  if(next && iperfServers.some(o=>o!==s && !o._del && o.addr===next)){ iperfAddrBad('That address is already used by another saved server.'); return; }
   iperfAddrOK();
   delete iperfHealth[s.addr]; // drop the old address's stale reachability
   s.addr=next; $('iperfMsg').textContent='';
@@ -8534,7 +8652,13 @@ function renderWindows(feat,windows){ const c=$(SCHED_FEATS[feat].cont); c.inner
 // An enabled schedule always keeps at least one window, so the last row's delete
 // button can't do anything - don't show it rather than leave a dead control.
 function syncWinRm(feat){ const rows=$(SCHED_FEATS[feat].cont).querySelectorAll('.sched-win');
-  rows.forEach(r=> r.querySelector('.win-rm').classList.toggle('hidden', rows.length<2)); }
+  rows.forEach(r=> r.querySelector('.win-rm').classList.toggle('hidden', rows.length<2));
+  // The add button at the cap: it silently did nothing, with no hint that a
+  // limit existed. This runs on every add, remove and re-render, which is
+  // exactly when the count changes.
+  const add=document.querySelector('.add-win[data-feat="'+feat+'"]');
+  if(add){ add.disabled = rows.length>=MAX_WINDOWS;
+    add.title = add.disabled ? ('Keeping '+MAX_WINDOWS+' windows already') : ''; } }
 function collectWindows(feat){ return [...$(SCHED_FEATS[feat].cont).querySelectorAll('.sched-win')].map(row=>{
   let days=''; row.querySelectorAll('.days .day').forEach(b=> days+=b.classList.contains('on')?'1':'0');
   return { days, start:timeToMin(row.querySelector('.win-from').value), end:timeToMin(row.querySelector('.win-to').value) }; })
@@ -8830,8 +8954,8 @@ $('setSpeed').addEventListener('input', updateSpeedEstimate);
 $('setStEnabled').addEventListener('change', updateSpeedEstimate);
 // The estimate changes with the server count, and so does the scope note - it
 // only mentions the companion servers while the count is above one.
-$('setSpeedBestOf').addEventListener('input', ()=>{ updateSpeedEstimate(); updateScopeNote(); });
-$('setSpeedBestOf').addEventListener('change', ()=>{ updateSpeedEstimate(); updateScopeNote(); });
+$('setSpeedBestOf').addEventListener('input', ()=>{ updateSpeedEstimate(); updateScopeNote(); syncDiscardLosersDep(); });
+$('setSpeedBestOf').addEventListener('change', ()=>{ updateSpeedEstimate(); updateScopeNote(); syncDiscardLosersDep(); });
 
 function settingsBody(){
   // Fold the open editor (IP version, bind, auth + creds) back onto its server before
@@ -8920,7 +9044,12 @@ function saveFailed(text){
   // Don't save the old scope under a failed search - but an emptied box means the
   // user gave up on that query (Auto location's programmatic clear included), so it
   // no longer blocks. The failed text is kept in the box, so "fix" is followable.
-  if(serverSearchFailed && $('serverCity').value.trim()){ saveFailed('Could not find that server/city - fix the search or clear the box before saving.'); return; }
+  if(serverSearchFailed && $('serverCity').value.trim()){
+    // Claim the message, so editing the box clears it. Without this the red
+    // outline went on the first keystroke and the refusal stayed in the footer,
+    // still blocking a Save it no longer described.
+    serverErrShown='Could not find that server/city - fix the search or clear the box before saving.';
+    saveFailed(serverErrShown); return; }
   // Same rule for a bad iperf3 address: block rather than save around it, otherwise the
   // save reports success while that field silently kept its old value.
   const addrErr=iperfAddrError();
@@ -8949,8 +9078,23 @@ function saveFailed(text){
   // iperf3 with no valid server set would fail every run ("no iperf3 server set") - block
   // the save and point the user at the fix rather than persist a broken engine.
   if(body.speed_engine==='iperf3' && !body.iperf_server){
+    activateTab('iperf'); // where the message is asking them to do something, as its two neighbours do
     saveFailed('The iperf3 engine needs a server - add one with a host:port and pick it as the test target before saving.');
     return;
+  }
+  // A blank time is not midnight. timeToMin('') returns 0, so clearing the "to"
+  // field turned 09:00-17:00 into 09:00-00:00 and Save reported success - the
+  // window on screen still read blank, and the schedule it saved was a
+  // different one. Refuse and point at the field, as every other gate does.
+  for(const f of ['lat','speed']){
+    if(!$(SCHED_FEATS[f].en).checked) continue;
+    const blank=[...$(SCHED_FEATS[f].cont).querySelectorAll('.win-from,.win-to')].find(i=>!i.value);
+    if(blank){
+      activateTab('schedule'); blank.focus();
+      saveFailed('A '+(f==='lat'?'latency':'speedtest')+' schedule window has no '+(blank.classList.contains('win-from')?'start':'end')+
+        ' time - fill it in, or remove the window, before saving.');
+      return;
+    }
   }
   // An enabled schedule whose windows have no active days never runs - block it
   // rather than silently disabling probing/speedtests behind an "on" toggle.
@@ -9063,6 +9207,14 @@ $('resetSettings').addEventListener('click', () => {
   iperfActiveId = da ? da._id : (iperfServers.length?iperfServers[0]._id:null);
   iperfEditingId=null; iperfLoadedId=null;
   iperfWanted = (d.speed_engine==='iperf3');
+  // Appearance rides outside FIELDS too, and a button that says "Reset to
+  // defaults" while leaving the theme, brightness, fade, width and corners
+  // exactly as they were is not describing what it does. These are live
+  // previews until Save, like every other appearance change.
+  applyTheme('retro'); $('setBrightness').value=100; applyBrightness(100);
+  $('setFade').value=100; applyFade(100);
+  $('setWide').checked=false; applyWide(false, true);
+  applyCorners(false); // sets the checkbox itself
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable; updateEngineUI();
   $('settingsMsg').textContent='Defaults loaded - click Save to apply.';
 });
@@ -9830,6 +9982,13 @@ setInterval(vis(refreshHeatmap), 60000);
 setInterval(vis(refreshNetinfo), 60000);
 // Outages are infrequent; refresh on the same slow cadence, only while shown.
 setInterval(()=>{ if(!document.hidden && $('outagesSection').style.display!=='none') loadOutages(); }, 60000);
+// The runs table on the same cadence, for the same reason. Following the newest
+// run's timestamp catches every INSERT and no DELETE: a run removed in another
+// tab, or pruned by retention, sat there as a ghost row indefinitely - and its
+// delete button reported success for a run that had been gone for minutes.
+// runsFollowLive holds still for a reader who has paged back or is mid-delete,
+// and keeps the keyboard where it was.
+setInterval(()=>{ if(!document.hidden) runsFollowLive(); }, 60000);
 // Repaint from cache at the new canvas size - the data doesn't change with the
 // window, and resize fires continuously during a drag (no refetch storm).
 window.addEventListener('resize', redrawCharts);

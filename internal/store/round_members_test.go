@@ -202,3 +202,67 @@ func TestServerHealthOutlivesTheProcess(t *testing.T) {
 		t.Errorf("after a second conviction: %d rows, want the same two", len(rows))
 	}
 }
+
+// Two runs can share a second in a database that was imported, or written
+// before InsertSpeedTS allocated the first FREE second. The UI's confirm names
+// one run and its toast reports one, so exactly one has to go - keyed on ts
+// alone, this statement destroyed every row on that second.
+func TestDeletingOneRunLeavesTheOtherRunThatSecond(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	const ts = 1787926012
+	for _, id := range []string{"58956", "1993"} {
+		if _, err := st.db.ExecContext(ctx,
+			`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id) VALUES (?,?,?,?,?,?)`,
+			ts, 100.0, 20.0, 9.0, "srv "+id, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := st.DeleteSpeed(ctx, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE ts = ?`, ts).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || left != 1 {
+		t.Errorf("deleted %d rows leaving %d on that second, want exactly one deleted and one left - the confirm said 'this run'", n, left)
+	}
+	// The one still there is a real run, not a husk: deleting it works too.
+	if n2, err := st.DeleteSpeed(ctx, ts); err != nil || n2 != 1 {
+		t.Errorf("second delete removed %d (%v), want the remaining run", n2, err)
+	}
+}
+
+// A window under budget was never thinned, so nothing may tell the dashboard it
+// was: `total` has to count what the query can actually return, and pass 2
+// collapses same-second rows. One legacy collision put a dashed "sampled"
+// border and a "mean of N charted, of M in range" caveat on every average.
+func TestASharedSecondIsNotASampledWindow(t *testing.T) {
+	st := open(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	ins := func(ts int64, id string) {
+		if _, err := st.db.ExecContext(ctx,
+			`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id) VALUES (?,?,?,?,?,?)`,
+			ts, 100.0, 20.0, 9.0, "srv "+id, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 15; i++ {
+		ins(now-int64(i)*600, "a")
+	}
+	ins(now-5*600, "b") // the collision: two runs, one second
+
+	rows, total, err := st.SpeedHistoryBudget(ctx, time.Unix(now-86400, 0), time.Time{}, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != len(rows) {
+		t.Errorf("%d rows returned against a total of %d under a 1500 budget: the dashboard reads that gap as thinning and labels every average a sample", len(rows), total)
+	}
+	if len(rows) != 15 {
+		t.Errorf("returned %d rows, want the 15 distinct seconds", len(rows))
+	}
+}
