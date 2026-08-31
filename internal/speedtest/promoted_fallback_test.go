@@ -50,8 +50,8 @@ func TestPromotedIncumbentThatFailsFallsBackToTheFastestRanked(t *testing.T) {
 		t.Errorf("recorded %s, want the fallback 1", res.ServerID)
 	}
 	w := winnerRow(res)
-	if w.WinReason != winReasonFastestRank {
-		t.Errorf("reason %q, want fastest_ranked - an \"incumbent\" tag on a different server would teach the next run's lookup a seat nobody measured", w.WinReason)
+	if w.WinReason != WinReasonFallback {
+		t.Errorf("reason %q, want fallback - an \"incumbent\" tag on a different server would teach the next run's lookup a seat nobody measured, and \"fastest\" would claim it pinged fastest when it did not", w.WinReason)
 	}
 	if !w.Selected {
 		t.Error("the fallback winner must be marked Selected in the report")
@@ -337,15 +337,15 @@ func TestTheOnNetPromotionAlsoCarriesAFallback(t *testing.T) {
 	if len(measured) != 2 || measured[0] != "2" || measured[1] != "1" {
 		t.Errorf("measured %v, want the on-net head first, then the fastest ranked as its fallback", measured)
 	}
-	if w := winnerRow(res); res.ServerID != "1" || w.WinReason != winReasonFastestRank {
-		t.Errorf("recorded %s reason %q, want the fallback 1 as fastest_ranked", res.ServerID, w.WinReason)
+	if w := winnerRow(res); res.ServerID != "1" || w.WinReason != WinReasonFallback {
+		t.Errorf("recorded %s reason %q, want the fallback 1 tagged fallback", res.ServerID, w.WinReason)
 	}
 }
 
 // speed.bestof_candidate_failed answers one question - is a dead nearby server
 // degrading rounds that otherwise succeed - so it counts a failed candidate of
 // a REAL round only. A want=1 run's failed head is the run failing (the
-// scheduler's speed.fail.* has it, and promoted_failed/challenge_failed say
+// scheduler's speed.fail.* has it, and head_failed/challenge_failed say
 // why), and a round that could only find one candidate is the same event. Both
 // conjuncts are load-bearing; neither was pinned.
 func TestTheCandidateCounterCountsRoundsWithAFieldOnly(t *testing.T) {
@@ -370,7 +370,7 @@ func TestTheCandidateCounterCountsRoundsWithAFieldOnly(t *testing.T) {
 	if got := stats.Lifetime().Counters["speed.bestof_candidate_failed"] - before; got != 0 {
 		t.Errorf("a want=1 run's failed head moved the round counter by %d, want 0: it is not a round", got)
 	}
-	if got := stats.Lifetime().Counters["speed.promoted_failed"]; got == 0 {
+	if got := stats.Lifetime().Counters["speed.head_failed"]; got == 0 {
 		t.Error("the promoted head's own counter did not move, so nothing recorded why the seat changed")
 	}
 }

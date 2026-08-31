@@ -54,7 +54,7 @@ type CandidateReport struct {
 	CappedDirection      string  // direction(s) the implausibility guard held to the middle for THIS row: "down", "up", "down,up", or ""
 	Score                float64 // roundScore(res, dir, round) - what bestIndex compared
 	Winner               bool
-	WinReason            string // score | ping_bootstrap | favourite | fastest_ranked | incumbent | on_net | challenger | challenger_won | challenger_failed | pinned | pinned_bestof | pinned_companion
+	WinReason            string // score | ping_bootstrap | favourite | fastest_ranked | fallback | incumbent | on_net | challenger | challenger_won | challenger_failed | pinned | pinned_bestof | pinned_companion
 }
 
 // Win reasons. "fastest_ranked", not "only candidate": a want=1 auto run ranks
@@ -89,6 +89,13 @@ const (
 	// Exported for the runs table's tag: an automatic Best-of round in which
 	// one of the user's starred servers scored highest.
 	WinReasonFavourite = "favourite"
+	// The server the run led with could not be measured, so the next ranked
+	// one that answered its ping was, and this is its result. Its own reason
+	// rather than fastest_ranked: the winner did NOT ping fastest, and the
+	// runs table's tag for fastest_ranked says exactly that. Nothing skips it
+	// the way a lost challenge is skipped - the server that answered is the
+	// one the next run should lead with, which is what ends the failure.
+	WinReasonFallback = "fallback"
 )
 
 // ChallengeRun reports whether a persisted win reason names a challenge run,

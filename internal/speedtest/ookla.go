@@ -2644,7 +2644,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			// a prologue that outran it (an unbounded list fetch) leaves the
 			// head what remains rather than a dead context, which would fail it
 			// without dialling it and migrate the seat off a server nobody
-			// contacted, with speed.promoted_failed blaming it.
+			// contacted, with speed.head_failed blaming it.
 			if left := time.Until(headBound); left > 0 && left < slice {
 				slice = left
 			}
@@ -2669,7 +2669,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			// Best-of rounds with a field only: a failure that IS the run
 			// failing - a want=1 target, or the lone candidate a round could
 			// find - is already counted by the scheduler's speed.fail.*, and
-			// its own promoted_failed / challenge_failed counter tells the
+			// its own head_failed / challenge_failed counter tells the
 			// rest. Moving two counters for one event would bury the question
 			// this one answers: is a dead nearby server silently degrading
 			// rounds that otherwise succeed? Both conjuncts are load-bearing -
@@ -2926,16 +2926,22 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
 				"bar", util.Round2(bar), "history", len(scores))
 		}
-	case want <= 1 && lead != "" && best.ServerID != targetIDs[0]:
-		// The promoted head could not be measured and its fallback - the
-		// fastest ranked candidate - was. Stamp what the winner IS, not what
-		// the head was promoted for: an "incumbent" tag on a different server
-		// would teach the next run's incumbent lookup a seat nobody measured,
-		// while fastest_ranked hands the seat to the server that answered.
-		winReason = winReasonFastestRank
-		stats.Inc("speed.promoted_failed")
-		o.warnf("auto-select promoted server could not be measured; the fastest ranked was measured instead",
-			"promoted_id", targetIDs[0], "promoted_reason", lead, "promoted_err", errByID[targetIDs[0]])
+	case want <= 1 && best.ServerID != targetIDs[0]:
+		// The head could not be measured and its fallback - the next ranked
+		// candidate that answered - was. Stamp what the winner IS, not what the
+		// head was: an "incumbent" tag on a different server would teach the
+		// next run's incumbent lookup a seat nobody measured, and
+		// fastest_ranked would claim this server pinged fastest when it did
+		// not. Its own reason, which the lookup still learns, is what ends the
+		// run of failures.
+		winReason = WinReasonFallback
+		stats.Inc("speed.head_failed")
+		headReason := lead
+		if headReason == "" {
+			headReason = winReasonFastestRank // it led on ping alone
+		}
+		o.warnf("auto-select head could not be measured; the next ranked server was measured instead",
+			"head_id", targetIDs[0], "head_reason", headReason, "head_err", errByID[targetIDs[0]])
 	case want <= 1 && lead != "":
 		winReason = lead // the head of the list was promoted there (see promoteIncumbent)
 	case want <= 1:
@@ -3339,18 +3345,45 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 					break
 				}
 			}
-		}
-		if lead == winReasonIncumbent || lead == winReasonOnNet {
-			// A promoted head gets the same insurance as a challenge rival: the
-			// fastest ranked candidate (ranked[1] - promoteIncumbent moved the
-			// old head there, and only promotes past a positive-latency head)
-			// rides as the FALLBACK target. Without it, a promoted incumbent
-			// that answers pings but cannot move bytes fails the whole run, the
-			// failed run writes no winner row, the incumbent lookup keeps naming
-			// the same server, and every following scheduled run re-promotes and
-			// re-measures it alone - a persistent failure no conviction covers
-			// (fallbackHealth only GETs latency.txt).
-			targets = append(targets, ranked[1])
+		} else if id == "" {
+			// Every other unpinned single-server run gets the same insurance:
+			// the next ranked candidate rides as the FALLBACK target. Without
+			// it, a head that answers pings but cannot move bytes fails the
+			// whole run, the failed run writes no winner row, so the next run
+			// learns nothing, ranks the same server first and fails the same
+			// way - hourly, with no alert (alerts need a successful
+			// measurement), until someone notices the history stopped. No
+			// conviction covers it either: fallbackHealth only GETs
+			// latency.txt, so a server that serves that file and nothing else
+			// stays healthy forever.
+			//
+			// Not only for a PROMOTED head, which was the narrower version of
+			// this: a dead server that is also the fastest to ping is never
+			// promoted - it is already the head - so the case that needs the
+			// insurance most had none. A pin is excluded because the pin is the
+			// user's answer to this question, and measuring something else
+			// would be answering a different one.
+			//
+			// It costs nothing when the head works: RunReason stops after the
+			// first success at want=1. When it does not, the run pays one extra
+			// measurement once - the fallback's win is recorded, so the seat
+			// moves to the server that answered and the dead one is not ranked
+			// first again - as long as it pings within promoteIncumbent's band
+			// of the dead one. Outside that band the seat cannot be promoted
+			// past a faster-pinging server, so the wasted attempt repeats until
+			// the head recovers or its ping falls back; the run still records a
+			// real measurement every time, where before it recorded nothing.
+			//
+			// The first candidate that ANSWERED its ping, not simply the next
+			// one: nowhere else in selection does an unanswered server displace
+			// one that answered, and spending the fallback's whole window on a
+			// server that did not even reply is the worse of the two bets.
+			for _, s := range ranked[1:] {
+				if s.Latency > 0 {
+					targets = append(targets, s)
+					break
+				}
+			}
 		}
 		chosen := make(map[string]bool, len(targets))
 		for _, s := range targets {

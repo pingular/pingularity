@@ -948,12 +948,20 @@ like with like instead of flipping between equivalent servers, while a server
 that has gone bad loses its seat the run it goes bad, because the seat is
 re-pinged every run rather than remembered - and an incumbent the winning
 city's list does not carry is not pinged at all, and loses the seat the same
-way. A seat that still *pings* well but can no longer be **measured** - it
+way. A server that still *pings* well but can no longer be **measured** - it
 answers, then moves no bytes - is the one case pinging cannot see, and a
 failed run records no winner for the next run to learn from, so it would hold
-the seat indefinitely: the fastest ranked candidate rides behind a promoted
-server as a fallback, is measured when the promotion fails, and takes the seat
-itself (win reason `fastest_ranked`, counter `speed.promoted_failed`). Ping alone
+its place indefinitely, hourly, with nothing to alert you: the next ranked
+candidate rides behind whichever server an automatic run leads with, is
+measured when that one cannot be, and takes the place itself (win reason
+`fallback`, counter `speed.head_failed`). The run after it leads with the
+server that answered, so the failure usually costs one wasted attempt and no
+more - though only while that server pings within the same hair of the fastest
+that the paragraph above describes. Further out it cannot be preferred over a
+faster-pinging server, so the wasted attempt repeats each run until the broken
+one recovers or slows down; either way a real measurement is now recorded every
+time, where before there was none. A pinned server has no fallback: the pin is
+your answer to this question. Ping alone
 never learns whether a rival is *faster* to transfer, so after every twelve
 automatic tests (any unpinned Ookla run counts; the challenge itself lands on
 the next *scheduled* single-server run, and with **Best of** above 1 it never
@@ -1743,9 +1751,9 @@ self-describing):
   challenger (`speed.challenge` - every challenge attempt, whether or not the
   rival could be measured; `speed.challenge_won` - attempts where the rival
   took the seat; `speed.challenge_failed` - attempts where the rival could not
-  be measured and the incumbent was measured instead; `speed.promoted_failed` -
-  runs where a promoted server could not be measured and the fastest ranked was
-  measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
+  be measured and the incumbent was measured instead; `speed.head_failed` -
+  runs where the server the run led with could not be measured and the next
+  ranked one was measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
   destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
 restore refused rather than silently dropped), the /metrics self-disclosures
 (`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's
@@ -1992,7 +2000,7 @@ and `-d '{…}'` where a body is listed below.
   was ranked, raced, measured, or failed - each with its own numbers, the
   capacity the round believed, any direction it refused to believe, and the
   rule that made the winner win (`win_reason` on the winner row:
-  `fastest_ranked`, `incumbent`, `on_net`, `challenger`, `challenger_won`,
+  `fastest_ranked`, `fallback`, `incumbent`, `on_net`, `challenger`, `challenger_won`,
   `challenger_failed`, `pinned`, and for Best-of rounds `score`, `favourite`
   (a starred server scored highest), `ping_bootstrap`, `pinned_bestof`,
   `pinned_companion` - the same value the runs table shows as the muted tag). `404` only when no such run exists; a run
