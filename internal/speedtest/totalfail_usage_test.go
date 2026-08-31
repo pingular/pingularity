@@ -24,7 +24,9 @@ import (
 func TestRunReasonTotalFailureCarriesSpentBytes(t *testing.T) {
 	requireQuiet(t)
 	stubServerList(t)
+	attempts := 0
 	stubMeasure(t, func(_ *Ookla, _ context.Context, _ *ookla.Server, _ string, _ int) (Result, error) {
+		attempts++
 		return Result{DownloadBytes: 111, UploadBytes: 222}, errors.New("download: dead server")
 	})
 
@@ -33,9 +35,15 @@ func TestRunReasonTotalFailureCarriesSpentBytes(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the run to fail - every candidate failed")
 	}
-	if res.DownloadBytes != 111 || res.UploadBytes != 222 {
-		t.Fatalf("total-failure Result carries %d/%d bytes, want the injected 111/222 - the spent traffic vanished",
-			res.DownloadBytes, res.UploadBytes)
+	// Every attempt's traffic, not one attempt's: an unpinned single-server run
+	// carries a fallback target, so a total failure is two dead servers and the
+	// bill is what both of them spent.
+	if attempts == 0 {
+		t.Fatal("nothing was measured at all")
+	}
+	if want := int64(111 * attempts); res.DownloadBytes != want || res.UploadBytes != want*2 {
+		t.Fatalf("total-failure Result carries %d/%d bytes after %d attempts, want %d/%d - the spent traffic vanished",
+			res.DownloadBytes, res.UploadBytes, attempts, want, want*2)
 	}
 	// The engine names itself on this exit like it does on every other one: the
 	// usage row this Result becomes carries an engine column, and an iperf3

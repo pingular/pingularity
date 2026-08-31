@@ -3614,7 +3614,7 @@ test('the runs table says why each run\u2019s server was the one measured', () =
   assert.match(winTag({ win_reason: 'challenger_won' }), /· challenger won</, 'a seat change reads as one');
   assert.match(winTag({ win_reason: 'pinned_companion' }), /· companion</);
   assert.equal(winTag({ win_reason: '<b>' }), ' <span class="muted">· &lt;b&gt;</span>', 'an unknown reason is shown escaped, not hidden');
-  for (const reason of ['fastest_ranked', 'incumbent', 'on_net', 'challenger', 'challenger_won', 'challenger_failed', 'score', 'ping_bootstrap', 'pinned', 'pinned_bestof', 'pinned_companion'])
+  for (const reason of ['fastest_ranked', 'fallback', 'incumbent', 'on_net', 'challenger', 'challenger_won', 'challenger_failed', 'score', 'ping_bootstrap', 'pinned', 'pinned_bestof', 'pinned_companion'])
     assert.ok(new RegExp('\\b' + reason + ':\\[').test(script), reason + ' (a win reason the daemon writes) has a label');
   assert.match(script, /\$\{esc\(r\.server\)\}\$\{winTag\(r\)\}/, 'the tag sits right after the server name');
 });
@@ -6651,4 +6651,67 @@ test('an int field typed in scientific notation saves its value, not its mantiss
   assert.equal(SF.getField('spd', 'min', 60), 10 * 60);
   els.spd.value = 'garbage';                       // still falls back
   assert.equal(SF.getField('spd', 'min', 60), 60 * 60);
+});
+
+test('every settings control carries a name a screen reader can announce', () => {
+  // Measured in a browser: seven controls announced as a bare "spin button" or
+  // "slider" with nothing to say WHICH one - the three Stored-data "Keep for"
+  // boxes (announced identically, and one of them empties your history), the
+  // two Appearance sliders, and the two chart-customization ones. Their labels
+  // sat BESIDE them rather than wrapping them, which reads fine and ties
+  // nothing. The schedule window's From/To times were nameless too, and are
+  // built by JS rather than written in the markup - which is why this checks
+  // the script's own templates as well as the static drawer.
+  //
+  // A control is named if a <label> wraps it, or aria-label/aria-labelledby
+  // says so - or, weakly, if a placeholder stands in: the browser falls back
+  // to it, so those fields do announce something, even though the text
+  // vanishes the moment you type. That weaker bar is deliberate; raising it is
+  // a separate pass over the login, Quick Setup and webhook fields. This
+  // cannot catch a name that computes to something USELESS (the settings rows
+  // fold their whole help paragraph into the name, measured in a browser and
+  // not fixed here) - only one that computes to nothing.
+  const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
+  const open = html.indexOf('<div class="drawer"'), close = html.indexOf('<div class="wrap">');
+  assert.ok(open > 0 && close > open,
+    'the drawer/wrap anchors moved: this test would silently check nothing');
+  const regions = [
+    ['drawer', html.slice(open, close)],
+    // Controls the drawer builds at runtime (schedule windows, iperf3 rows,
+    // the server picker): they never appear in the static markup, so scanning
+    // it alone left them unguarded - and two of them were nameless.
+    ['script', script],
+  ];
+  const unnamed = [];
+  for (const [region, text] of regions) {
+    for (const m of text.matchAll(/<(input|select|textarea)\b[^>]*>/g)) {
+      const tag = m[0];
+      // Real markup here always quotes its attributes; an unquoted match is
+      // prose inside a comment ("<input type=color>", explaining the picker).
+      if (!tag.includes('"')) continue;
+      const type = (tag.match(/type="([a-z]+)"/) || [, 'text'])[1];
+      if (type === 'hidden') continue;
+      // #setServer is display:none and driven by the picker - it is where
+      // speed_server_id lives for settingsBody/formSnapshot, not something a
+      // user operates (see the comment above it in index.html). Naming it
+      // would advertise a control that is not there.
+      if (/id="setServer"/.test(tag)) continue;
+      const named = [/aria-label="([^"]+)"/, /aria-labelledby="([^"]+)"/, /placeholder="([^"]+)"/]
+        .map(re => (tag.match(re) || [])[1]).filter(v => v && v.trim());
+      // A referenced id has to EXIST: dropping the id off a label leaves the
+      // attribute behind and the control silently nameless, which is the half
+      // of this fix most likely to be lost to a later edit.
+      const ref = (tag.match(/aria-labelledby="([^"]+)"/) || [])[1];
+      if (ref && !ref.trim().split(/\s+/).every(t => ids.has(t))) {
+        unnamed.push(`${(tag.match(/id="([^"]+)"/) || [, tag.slice(0, 40)])[1]} (aria-labelledby points at a missing id: ${ref})`);
+        continue;
+      }
+      if (named.length) continue;
+      // Wrapped by a <label> that opened before it and has not closed yet?
+      const before = text.slice(0, m.index);
+      if ((before.match(/<label\b/g) || []).length > (before.match(/<\/label>/g) || []).length) continue;
+      unnamed.push(`${(tag.match(/id="([^"]+)"|class="([^"]+)"/) || [, tag.slice(0, 40)]).slice(1).find(Boolean)} [${region}]`);
+    }
+  }
+  assert.deepEqual(unnamed, [], `controls with no accessible name: ${unnamed.join(', ')}`);
 });

@@ -2114,21 +2114,21 @@
         <div class="dtable">
           <div class="dtable-head"><span>Dataset</span><span>Keep for</span><span></span></div>
           <div class="drow">
-            <span class="dname">Latency
+            <span class="dname" id="dnameLatency">Latency
               <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest. Delete now clears all three.">i</span></span>
-            <span class="ctl"><input type="number" id="setRetention" step="1" min="0"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setRetention" step="1" min="0" aria-labelledby="dnameLatency"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delLatency" type="button">Delete now</button>
           </div>
           <div class="drow">
-            <span class="dname">Speed
+            <span class="dname" id="dnameSpeed">Speed
               <span class="info" tabindex="0" data-tip="Speedtest history. Tests are infrequent, so a long window is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setSpeedRet" step="1" min="0"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setSpeedRet" step="1" min="0" aria-labelledby="dnameSpeed"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delSpeed" type="button">Delete now</button>
           </div>
           <div class="drow">
-            <span class="dname">Downtime
+            <span class="dname" id="dnameDowntime">Downtime
               <span class="info" tabindex="0" data-tip="Outage history - it feeds the downtime heatmap, the outages list and the uptime figure. Outages are tiny, so a long window like 365 is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setDowntime" step="1" min="0"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setDowntime" step="1" min="0" aria-labelledby="dnameDowntime"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delDowntime" type="button">Delete now</button>
           </div>
         </div>
@@ -2316,13 +2316,13 @@
         </div>
         <div class="bright-pair">
           <div class="bright-row">
-            <span class="lbl">Brightness</span>
-            <input type="range" id="setBrightness" min="40" max="100" step="1" value="100">
+            <span class="lbl" id="lblBrightness">Brightness</span>
+            <input type="range" id="setBrightness" min="40" max="100" step="1" value="100" aria-labelledby="lblBrightness">
             <span class="bright-val" id="brightVal">100%</span>
           </div>
           <div class="bright-row">
-            <span class="lbl">Fade</span>
-            <input type="range" id="setFade" min="40" max="100" step="1" value="100">
+            <span class="lbl" id="lblFade">Fade</span>
+            <input type="range" id="setFade" min="40" max="100" step="1" value="100" aria-labelledby="lblFade">
             <span class="bright-val" id="fadeVal">100%</span>
           </div>
         </div>
@@ -2398,8 +2398,8 @@
           <label class="viz-c"><input type="color" data-viz="axis" aria-label="Labels colour"><span>Labels</span></label>
         </div>
         <div class="bright-pair">
-          <div class="bright-row"><span class="lbl">Line thickness</span><input type="range" id="vizLw" min="1" max="4" step="1" value="2"><span class="bright-val" id="vizLwVal">2px</span></div>
-          <div class="bright-row"><span class="lbl">Area fill<span class="info" tabindex="0" data-tip="The shaded gradient under the latency, download, upload and bufferbloat lines. Drag to 0% to turn it off.">i</span></span><input type="range" id="vizFill" min="0" max="60" step="1" value="28"><span class="bright-val" id="vizFillVal">28%</span></div>
+          <div class="bright-row"><span class="lbl" id="lblVizLw">Line thickness</span><input type="range" id="vizLw" aria-labelledby="lblVizLw" min="1" max="4" step="1" value="2"><span class="bright-val" id="vizLwVal">2px</span></div>
+          <div class="bright-row"><span class="lbl" id="lblVizFill">Area fill<span class="info" tabindex="0" data-tip="The shaded gradient under the latency, download, upload and bufferbloat lines. Drag to 0% to turn it off.">i</span></span><input type="range" id="vizFill" min="0" max="60" step="1" value="28" aria-labelledby="lblVizFill"><span class="bright-val" id="vizFillVal">28%</span></div>
         </div>
         <div class="viz-sub">Thresholds and labels</div>
         <div class="thr-toggles">
@@ -6264,6 +6264,7 @@ const bytesStr = b => { if(typeof b!=='number' || !isFinite(b)) return '-';
 // without a selection report (old history, imports, iperf3) carry nothing.
 const WIN_TAGS={
   fastest_ranked:['fastest','Pinged fastest of the candidates this run'],
+  fallback:['fallback','The server this run led with could not be measured, so the next one that answered was measured instead'],
   incumbent:['incumbent','The server the previous test measured, kept because it still pinged within a hair of the fastest'],
   on_net:['on-net','Your ISP\u2019s own server, preferred within a hair of the fastest'],
   challenger:['challenger','A challenge run: the incumbent\u2019s strongest rival was measured and did not beat its record'],
@@ -8673,7 +8674,7 @@ function winRow(w){ const days=(w&&w.days&&w.days.length===7)?w.days:ALL_DAYS;
   const el=document.createElement('div'); el.className='sched-win';
   el.innerHTML=`<div class="days">${dayBtns(days)}</div>`
     +`<div class="win-presets"><button class="chip" type="button" data-preset="weekdays">Weekdays</button><button class="chip" type="button" data-preset="weekends">Weekends</button><button class="chip" type="button" data-preset="all">Every day</button><button class="chip" type="button" data-preset="always">24/7</button><button class="chip" type="button" data-preset="clear" title="Reset this row">Clear</button></div>`
-    +`<div class="window" title="Set both times the same to cover the whole day"><span>From</span><input type="time" class="win-from" value="${minToTime(w?w.start:0)}"><span>to</span><input type="time" class="win-to" value="${minToTime(w?w.end:0)}"></div>`
+    +`<div class="window" title="Set both times the same to cover the whole day"><span>From</span><input type="time" class="win-from" aria-label="Window start time" value="${minToTime(w?w.start:0)}"><span>to</span><input type="time" class="win-to" aria-label="Window end time" value="${minToTime(w?w.end:0)}"></div>`
     +`<button class="win-rm" type="button" title="Remove window" aria-label="Remove window">${TRASH_SVG}</button>`;
   return el; }
 function renderWindows(feat,windows){ const c=$(SCHED_FEATS[feat].cont); c.innerHTML='';
