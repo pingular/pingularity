@@ -174,14 +174,19 @@ func TestPickServersLeadsWithTheIncumbent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || targets[0].ID != "B" || lead != winReasonIncumbent {
-		t.Fatalf("targets %v lead %q; want the incumbent B leading with reason %q", fbIDs(targets), lead, winReasonIncumbent)
+	// The fastest ranked candidate rides behind the promoted head as the
+	// FALLBACK target (same insurance the challenge rival gets): measured only
+	// if the head fails, so a promoted server that cannot move bytes costs one
+	// slice, not the run - and not every following run (a failed run writes no
+	// winner row, so the lookup would re-promote it forever).
+	if len(targets) != 2 || targets[0].ID != "B" || targets[1].ID != "A" || lead != winReasonIncumbent {
+		t.Fatalf("targets %v lead %q; want the incumbent B leading with reason %q and A as the fallback", fbIDs(targets), lead, winReasonIncumbent)
 	}
-	// The report keeps the PING order and marks the promoted row as the one
-	// measured: "#1 A 9ms, #2 B 10ms (selected, incumbent)".
-	if sel[0].ServerID != "A" || sel[0].Selected || sel[0].RankOrder != 1 ||
+	// The report keeps the PING order and marks both targets, like the
+	// challenge fallback: "#1 A 9ms (selected), #2 B 10ms (selected, incumbent)".
+	if sel[0].ServerID != "A" || !sel[0].Selected || sel[0].RankOrder != 1 ||
 		sel[1].ServerID != "B" || !sel[1].Selected || sel[1].RankOrder != 2 {
-		t.Errorf("the selection report must keep ping order and mark the promoted row: %+v", sel)
+		t.Errorf("the selection report must keep ping order and mark the promoted row and its fallback: %+v", sel)
 	}
 	o.IncumbentFn = func() string { return "A" }
 	targets, _, lead, _ = o.pickServers(context.Background(), nil, ookla.Servers{srv("A", 1), srv("B", 1)}, "", 1, nil)

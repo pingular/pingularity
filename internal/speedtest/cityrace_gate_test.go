@@ -123,28 +123,34 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 		reason string
 		want   int
 		races  bool
+		// An unpinned single-server run also carries fallbackBudget, for the
+		// fallback target pickServers may seat behind its head. Like the race
+		// allowance it is added ON TOP, and only a fallback may spend it (the
+		// head's slice is held to the deadline minus this), so a run that
+		// seats none still finishes inside the base budget.
+		fallback bool
 	}{
 		{"auto run races and is allowed for it",
-			func(o *Ookla) { o.OriginsFn = origins }, "", 1, true},
+			func(o *Ookla) { o.OriginsFn = origins }, "", 1, true, true},
 		{"pinned without best-of never races",
 			func(o *Ookla) {
 				o.OriginsFn = origins
 				o.ServerIDFn = func() string { return "2" }
-			}, "", 1, false},
+			}, "", 1, false, false},
 		{"no origins wired: nothing to race",
-			func(o *Ookla) {}, "", 1, false},
+			func(o *Ookla) {}, "", 1, false, true},
 		// Not a boot transient: with connection-info lookups off, every auto run
 		// on the box is this one, so granting it the allowance would loosen the
 		// deadline of every run forever for a race that short-circuits.
 		{"origins wired but nothing anchored: the race decides nothing",
 			func(o *Ookla) {
 				o.OriginsFn = func() []Origin { return []Origin{{Kind: "geo", Label: "your connection"}} }
-			}, "", 1, false},
+			}, "", 1, false, true},
 		{"best-of pays for the race too",
 			func(o *Ookla) {
 				o.OriginsFn = origins
 				o.BestOfCountFn = func() int { return 3 }
-			}, "manual", bestOfServers, true},
+			}, "manual", bestOfServers, true, false},
 	}
 	for _, c := range cases {
 		o := NewOokla()
@@ -161,14 +167,17 @@ func TestRunBudgetCarriesTheRaceWhenTheRunMustMeasureItsCentre(t *testing.T) {
 		if c.races {
 			want += cityRaceBudget
 		}
+		if c.fallback {
+			want += fallbackBudget
+		}
 		got := runDeadline.Sub(start)
 		// Everything between start and the deadline is stubbed, so the window is
 		// tight on purpose: at 10s of slack a third of the allowance could go
 		// missing and this would still pass.
 		if got > want+time.Second || got < want-time.Second {
-			t.Errorf("%s: run deadline is %v out, want ~%v (base %v, race allowance %v). "+
-				"Too small and the race is being spent from the measurement's budget",
-				c.name, got.Round(time.Second), want, base, c.races)
+			t.Errorf("%s: run deadline is %v out, want ~%v (base %v, race allowance %v, fallback allowance %v). "+
+				"Too small and the race or the fallback is being spent from the measurement's budget",
+				c.name, got.Round(time.Second), want, base, c.races, c.fallback)
 		}
 	}
 }

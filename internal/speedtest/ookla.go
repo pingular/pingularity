@@ -2285,6 +2285,19 @@ func ooklaRunTimeout(retries int) time.Duration {
 // test off would turn a usable result into no data at all.
 const bestOfServerTimeout = 90 * time.Second
 
+// fallbackBudget is the extra window a single-server run carries when it may
+// end up measuring a FALLBACK target behind its head (pickServers: a
+// challenge's incumbent behind the rival, the fastest ranked behind a promoted
+// head). Added on top of the run's budget rather than carved out of it, for
+// the same reason cityRaceBudget is: runBudget's arithmetic is exact, so at
+// want=1 the head's own slice already equals the whole budget - taking the
+// fallback's window out of that would cut a slow-but-working head off inside
+// the retry envelope ooklaRunTimeout was sized for, and migrate the seat on a
+// transient. Only a fallback may spend it (see the head's slice, which is held
+// to the run deadline minus this), so a run that seats no fallback finishes
+// within the same window it did before the allowance existed.
+const fallbackBudget = bestOfServerTimeout
+
 // bestOfSelectionBudget covers the parts of a best-of run that happen once
 // regardless of server count: the server-list fetch and the candidate ping race.
 const bestOfSelectionBudget = 90 * time.Second
@@ -2410,9 +2423,30 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// happen at all: runBudget cannot see the pin.
 	id := o.serverID()
 	origins := o.candidateOrigins()
+	// A challenge is a scheduled, unpinned, single-server run's business: a
+	// manual run is the user asking about their line now, and Best-of already
+	// explores. Decided here, once, so the budget, pickServers and the verdict
+	// all agree - and before the budget, because a challenge run always carries
+	// a fallback.
+	o.challenge = reason == "scheduled" && id == "" && want <= 1 && o.ChallengeFn != nil && o.ChallengeFn()
 	perServer, total := runBudget(retries, want)
 	if o.mayRaceCities(id, want, origins) {
 		total += cityRaceBudget
+	}
+	// An unpinned single-server run may seat a fallback behind its head (see
+	// fallbackBudget). "May", not "will": the head is not chosen until
+	// pickServers, and a ceiling nobody spends costs nothing.
+	//
+	// headBound is where the run's OWN budget ends, before the reserve - the
+	// deadline the head would have had if no fallback could ride. Kept as an
+	// absolute time rather than derived from the ctx later, because the ctx
+	// deadline is the EARLIER of this budget and the caller's: deducting the
+	// reserve from a caller's shorter deadline would take back a window that
+	// never included the reserve in the first place.
+	var headBound time.Time
+	if want <= 1 && id == "" {
+		headBound = time.Now().Add(total)
+		total += fallbackBudget
 	}
 	ctx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
@@ -2457,10 +2491,6 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	o.raced = nil
 	o.unionRound = false
 	o.favourites = nil
-	// A challenge is a scheduled, unpinned, single-server run's business: a
-	// manual run is the user asking about their line now, and Best-of already
-	// explores. Decided here, once, so pickServers and the verdict agree.
-	o.challenge = reason == "scheduled" && id == "" && want <= 1 && o.ChallengeFn != nil && o.ChallengeFn()
 	o.challenged = ""
 	o.dir = dir
 	if lat, lon, label, ok := listCentre(id, want, pinned); ok {
@@ -2586,15 +2616,41 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		// single accept-then-stall server (the ping and loss probes have no request
 		// timeout of their own) burn the whole window, so the other targets were
 		// never contacted - the exact failure best-of-N exists to survive.
-		// A single-server run carrying a FALLBACK target (a challenge: the rival,
-		// then the incumbent) was sized for one server, so the rival cannot have
-		// the whole window: an accept-then-stall rival would spend it and leave
-		// the incumbent a slice nothing can finish in - every scheduled run then
-		// fails on the same rival until it recovers, and the failed run writes no
-		// winner row, so the cadence stays due and re-picks it. The rival gets a
-		// best-of-sized slice; the fallback keeps the rest of the run's budget.
+		// A challenge RIVAL is the run's gamble, not its primary: an
+		// accept-then-stall rival would spend the whole window and leave the
+		// incumbent behind it a slice nothing can finish in - every scheduled
+		// run then fails on the same rival until it recovers, and the failed
+		// run writes no winner row, so the cadence stays due and re-picks it.
+		// It gets one best-of-sized slice; the incumbent keeps the rest.
+		//
+		// A PROMOTED head is the primary, so it is not squeezed: it keeps the
+		// window it had before a fallback rode behind it, and the fallback is
+		// paid for by fallbackBudget on top.
+		//
+		// The head is held to the run deadline MINUS that reserve rather than
+		// to perServer, because at want=1 perServer IS the whole budget and a
+		// slice measured from the head's own start would re-spend the prologue
+		// (the list fetch and the ping race, already paid out of the same ctx)
+		// - leaving the fallback the reserve minus the prologue, which a slow
+		// selection can drive to nothing. Subtracting it here also keeps a run
+		// that never seats a fallback bounded exactly where it was before the
+		// allowance existed: the head cannot spend a reserve only a fallback
+		// is allowed to spend.
 		slice := perServer
-		if want <= 1 && len(targets) > 1 && i < len(targets)-1 && slice > bestOfServerTimeout {
+		if !headBound.IsZero() && i == 0 {
+			// The head runs to the end of the run's own budget and no further,
+			// so whatever it does with its turn, the reserve behind it is still
+			// there for the fallback. Only while some of that budget is left:
+			// a prologue that outran it (an unbounded list fetch) leaves the
+			// head what remains rather than a dead context, which would fail it
+			// without dialling it and migrate the seat off a server nobody
+			// contacted, with speed.promoted_failed blaming it.
+			if left := time.Until(headBound); left > 0 && left < slice {
+				slice = left
+			}
+		}
+		if want <= 1 && len(targets) > 1 && i < len(targets)-1 &&
+			lead == WinReasonChallenger && slice > bestOfServerTimeout {
 			slice = bestOfServerTimeout
 		}
 		sctx, scancel := context.WithTimeout(ctx, slice)
@@ -2610,13 +2666,16 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 			// success sum and this are disjoint; no double count).
 			spentDown += res.DownloadBytes
 			spentUp += res.UploadBytes
-			// Best-of rounds only: a failed want=1 target IS the run failing,
-			// and the scheduler's speed.fail.* already counts that - moving
-			// both counters for one event would bury the question this one
-			// answers (is a dead nearby server silently degrading rounds that
-			// otherwise succeed?). Within a round it counts every failed
-			// candidate, whether or not the round survives them.
-			if len(targets) > 1 {
+			// Best-of rounds with a field only: a failure that IS the run
+			// failing - a want=1 target, or the lone candidate a round could
+			// find - is already counted by the scheduler's speed.fail.*, and
+			// its own promoted_failed / challenge_failed counter tells the
+			// rest. Moving two counters for one event would bury the question
+			// this one answers: is a dead nearby server silently degrading
+			// rounds that otherwise succeed? Both conjuncts are load-bearing -
+			// want>1 excludes a want=1 run carrying a fallback, len(targets)>1
+			// excludes a round that found only one candidate.
+			if want > 1 && len(targets) > 1 {
 				stats.Inc("speed.bestof_candidate_failed")
 			}
 			// A dead server (or one that ate its own slice) shouldn't sink the run
@@ -2821,6 +2880,41 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		stats.Inc("speed.challenge")
 		scores := o.incumbentScores(o.challenged, dir)
 		score := resultScore(best, dir)
+		// A challenge is ONE reading with no round to disbelieve it against
+		// (implausibleDirections needs three same-round results), so the
+		// incumbent's recent record stands in for the field: a score more than
+		// challengeBelieveFactor above the record's GOOD hour is artefact - the
+		// buffer-and-ack upload class implausibleFactor documents measures 4-6x
+		// the line - not a rival that many times better on the same line, and
+		// is judged as the record's median (the same cap-to-the-middle
+		// believableCapacity applies in a round), which can never clear the
+		// bar. Without this, an inflating endpoint takes the seat, its figures
+		// become the line's hourly history, and every future rival is judged
+		// against the artefact record. Keyed to the good hour, not the median:
+		// the record is the line THROUGH the incumbent, which may itself be the
+		// degraded thing - a seat whose port congested while its ping stayed in
+		// the promotion band drags its median down with it, and a median-keyed
+		// cap blocked every honest rival forever where pre-cap code self-healed
+		// on the first challenge. The good hour is what the line has actually
+		// shown it can do here, and 3x that sits strictly above the bar
+		// (bar = max(med*1.15, good)) for every record, so a winnable band
+		// always exists. The residual is bounded and deliberate: a seat whose
+		// throughput collapses by MORE than this factor still cannot be
+		// unseated by a challenge, because no single reading distinguishes
+		// that from an artefact. Under-reporting a line through a degraded
+		// seat is the lesser harm - believing an inflating server instead
+		// writes numbers the link never carried into the record everything
+		// afterwards is judged against. The stored rows keep the raw reading: the report must
+		// say what was measured, and a lost challenge's row seeds no seat and
+		// no bar of the INCUMBENT's - if the rival later earns a seat honestly,
+		// the one raw row rides its own record, where it only ever raises the
+		// bar rivals must clear against it.
+		if good := historyGood(scores); good > 0 && score > good*challengeBelieveFactor {
+			o.warnf("auto-select challenger's score is not believed; judged as the incumbent's median instead",
+				"server", best.Server, "server_id", best.ServerID, "score", util.Round2(score),
+				"incumbent_good_hour", util.Round2(good), "factor", challengeBelieveFactor)
+			score = historyMedian(scores)
+		}
 		if won, bar, med := challengeWon(score, scores); won {
 			winReason = WinReasonChallengerWon
 			stats.Inc("speed.challenge_won")
@@ -2832,6 +2926,16 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 				"score", util.Round2(score), "incumbent_id", o.challenged, "incumbent_median", util.Round2(med),
 				"bar", util.Round2(bar), "history", len(scores))
 		}
+	case want <= 1 && lead != "" && best.ServerID != targetIDs[0]:
+		// The promoted head could not be measured and its fallback - the
+		// fastest ranked candidate - was. Stamp what the winner IS, not what
+		// the head was promoted for: an "incumbent" tag on a different server
+		// would teach the next run's incumbent lookup a seat nobody measured,
+		// while fastest_ranked hands the seat to the server that answered.
+		winReason = winReasonFastestRank
+		stats.Inc("speed.promoted_failed")
+		o.warnf("auto-select promoted server could not be measured; the fastest ranked was measured instead",
+			"promoted_id", targetIDs[0], "promoted_reason", lead, "promoted_err", errByID[targetIDs[0]])
 	case want <= 1 && lead != "":
 		winReason = lead // the head of the list was promoted there (see promoteIncumbent)
 	case want <= 1:
@@ -3236,6 +3340,18 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 				}
 			}
 		}
+		if lead == winReasonIncumbent || lead == winReasonOnNet {
+			// A promoted head gets the same insurance as a challenge rival: the
+			// fastest ranked candidate (ranked[1] - promoteIncumbent moved the
+			// old head there, and only promotes past a positive-latency head)
+			// rides as the FALLBACK target. Without it, a promoted incumbent
+			// that answers pings but cannot move bytes fails the whole run, the
+			// failed run writes no winner row, the incumbent lookup keeps naming
+			// the same server, and every following scheduled run re-promotes and
+			// re-measures it alone - a persistent failure no conviction covers
+			// (fallbackHealth only GETs latency.txt).
+			targets = append(targets, ranked[1])
+		}
 		chosen := make(map[string]bool, len(targets))
 		for _, s := range targets {
 			chosen[s.ID] = true
@@ -3427,6 +3543,16 @@ const (
 	// median by, in percent, on a line whose own record is tight; a noisier
 	// record raises the bar to that record's good hours (see challengeWon).
 	challengeFloorPct = 15
+	// How far above the incumbent record's GOOD hour (historyGood - the same
+	// second-best-hour statistic the bar uses) a challenger's single reading
+	// may go before it stops being a measurement of this line and is judged
+	// as the record's median instead (see the cap in RunReason's verdict).
+	// Wider than the same-round implausibleFactor (2.0): a round's members
+	// measure the same minutes, while the record spans hours of link noise
+	// and the seat itself may be the degraded thing - and the artefact class
+	// this exists to catch measures 4-6x the line, so 3x still catches it
+	// even against a record dragged low by a half-collapsed incumbent.
+	challengeBelieveFactor = 3.0
 )
 
 // challengeIncumbent picks the run's target on a challenge run: the fastest
@@ -3495,21 +3621,44 @@ func challengeWon(score float64, history []float64) (won bool, bar, med float64)
 	if len(history) < challengeMinHistory || !(score > 0) {
 		return false, 0, 0
 	}
-	h := append([]float64(nil), history...)
-	sort.Float64s(h)
-	n := len(h)
-	med = h[n/2]
-	if n%2 == 0 {
-		med = (h[n/2-1] + h[n/2]) / 2
-	}
-	good := h[n-1]
-	if n >= 5 {
-		good = h[n-2]
-	}
+	med = historyMedian(history)
+	good := historyGood(history)
 	bar = math.Max(med*float64(100+challengeFloorPct)/100, good)
 	// Scaled so "exactly the bar" is a tie, not a win: 100*1.15 is 114.999...
 	// in binary and 115 beat it.
 	return score*100 > bar*100, bar, med
+}
+
+// historyMedian is the middle of a score record, or 0 with no record. Every
+// challenge read of the record's middle goes through this one definition.
+func historyMedian(history []float64) float64 {
+	if len(history) == 0 {
+		return 0
+	}
+	h := append([]float64(nil), history...)
+	sort.Float64s(h)
+	n := len(h)
+	if n%2 == 0 {
+		return (h[n/2-1] + h[n/2]) / 2
+	}
+	return h[n/2]
+}
+
+// historyGood is a record's good hour: its best, or its second-best once
+// there are five to go on, so one freak reading cannot speak for the line.
+// The bar (challengeWon) and the believability cap share this definition -
+// the cap must sit strictly above the bar for every record, and it does
+// exactly because both read the same statistic.
+func historyGood(history []float64) float64 {
+	if len(history) == 0 {
+		return 0
+	}
+	h := append([]float64(nil), history...)
+	sort.Float64s(h)
+	if n := len(h); n >= 5 {
+		return h[n-2]
+	}
+	return h[len(h)-1]
 }
 
 // rankMargin is the band within which two ranking pings are the same answer:

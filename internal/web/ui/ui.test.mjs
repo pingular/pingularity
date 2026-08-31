@@ -314,7 +314,8 @@ test('seriesGapSec: 3x the median point spacing; Infinity when unknowable', () =
 // --- settings form field mapping ---
 // Stub $ with a per-id object store so set/getField run without a DOM.
 const els = {};
-const SF = new Function('$', extract('const secOrig') + '\n' + extract('function setField') + '\n' + extract('function getField') +
+const SF = new Function('$', extract('const secOrig') + '\n' + extract('function setField') + '\n' +
+  extract('function intOf') + '\n' + extract('function getField') +
   '\nreturn { setField, getField };')(id => els[id] || (els[id] = {}));
 
 test('set/getField: an unedited min/day field round-trips its exact seconds', () => {
@@ -3766,7 +3767,12 @@ test('Best of is a count, not a switch: a number box that drives the data estima
   assert.match(script, /\['setSpeedBestOf','speed_best_of_count','int',1\]/, 'saved as the count; blank falls back to one server');
   assert.doesNotMatch(script, /'speed_best_of','bool'/, 'the on/off descriptor is gone');
   const est = extract('function updateSpeedEstimate');
-  assert.match(est, /const n=Math\.max\(1, parseInt\(\$\('setSpeedBestOf'\)\.value\)\|\|1\), bestOf=n>1;/, 'the estimate multiplies by the count');
+  assert.match(est, /const n=Math\.max\(1, intOf\(\$\('setSpeedBestOf'\)\.value\)\|\|1\), bestOf=n>1;/,
+    'the estimate multiplies by the count, read the same way Save reads it (intOf, not parseInt: they disagreed on "1e1")');
+  assert.match(est, /const min=Math\.max\(1, intOf\(\$\('setSpeed'\)\.value\)\|\|60\);/,
+    'and prices the interval the same way');
+  assert.match(extract('function updateScopeNote'), /intOf\(\$\('setSpeedBestOf'\)\.value\)/,
+    'as does the scope note - every reader of a box agrees with what Save writes for it');
   assert.match(est, /el\.classList\.toggle\('warn', n>4\);/, 'and turns amber above four');
   assert.match(html, /\.info-note\.warn\{/, 'the amber style exists');
   const tags = script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0];
@@ -6133,6 +6139,7 @@ function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins
   const src = `let speedAvgDown=${avgDown}, speedAvgUp=${avgUp}, speedAvgServers=${avgServers};\n`
     + script.match(/const EST_RUN_DOWN=[^;]*;/)[0] + '\n'
     + script.match(/const bytesStr = b => \{[\s\S]*?\n\};/)[0] + '\n'
+    + extract('function intOf') + '\n'
     + extract('function updateSpeedEstimate') + '\n'
     + 'return updateSpeedEstimate;';
   const run = new Function('$', src)(id => els[id]);
@@ -6550,7 +6557,7 @@ test('a row queued for removal is not a server you can still collide with', () =
 test('controls that cannot act say so instead of doing nothing', () => {
   assert.match(extract('function syncWinRm'), /add\.disabled = rows\.length>=MAX_WINDOWS/,
     '"+ Add window" silently did nothing at the cap');
-  assert.match(script, /function syncDiscardLosersDep\(\)\{\s*setDep\('setSpeedDiscardLosers', \(parseInt\(\$\('setSpeedBestOf'\)\.value\)\|\|1\) > 1\);/,
+  assert.match(script, /function syncDiscardLosersDep\(\)\{\s*setDep\('setSpeedDiscardLosers', \(intOf\(\$\('setSpeedBestOf'\)\.value\)\|\|1\) > 1\);/,
     'Discard losers stayed live at Best of 1, where its own tooltip says it does nothing');
   assert.match(html, /\.chart-save\[hidden\]\{display:none;\}/,
     'display:inline-flex outranks the UA [hidden] rule, so the hidden save-image button stayed clickable');
@@ -6599,4 +6606,49 @@ test('the data pill names the window its number is for', () => {
   assert.equal(f('24h', 0, () => '')(), '1d');
   assert.equal(f('7d', 0, () => '')(), '7d');
   assert.equal(f('custom', 720, m => m + 'm')(), '720m');
+});
+
+test('number inputs never declare a step coarser than the daemon accepts', () => {
+  // The daemon stores these as plain integers (settings atoi + clamp), so any
+  // integer in range is a legal STORED value - including one saved by an old
+  // build or the API. A step above 1 makes the BROWSER judge such a value
+  // invalid (validity.stepMismatch), and the save gate (invalidNumberField ->
+  // checkValidity) then refuses to save the whole drawer over a field the
+  // user never touched: iperf window 1000 KB, stored legal, blocked every
+  // Save with an out-of-range message until it was retyped as a multiple of
+  // the step. The spinner nicety is not worth an unsavable drawer.
+  // Matched by attribute PRESENCE, not by attribute order: keyed to
+  // `type="number"` coming first, the same step="64" defect walks back in
+  // behind a reordered tag with this test still green.
+  // Quoted or not: HTML allows step=64, and a pin that only sees step="64"
+  // lets the exact defect back in behind an unquoted attribute.
+  const steps = [...html.matchAll(/<input\b[^>]*\bstep=("[^"]*"|'[^']*'|[^\s>]+)[^>]*>/g)]
+    .filter(m => /\btype="number"/.test(m[0])).map(m => m[1].replace(/^["']|["']$/g, ''));
+  assert.ok(steps.length >= 10, `expected the drawer's number inputs, found ${steps.length}`);
+  for (const s of steps) {
+    assert.ok(s === '1' || s === 'any', `step="${s}" declares a contract the daemon does not have`);
+  }
+});
+
+test('an int field typed in scientific notation saves its value, not its mantissa', () => {
+  // "1e3" is valid floating-point syntax, so a number input accepts it and -
+  // with step=1, since 1000 is a whole number in range - checkValidity passes.
+  // parseInt("1e3") is 1: an iperf window typed as 1e3 KB saved as 1 KB. Under
+  // the old step=64 it was blocked by stepMismatch purely by accident.
+  els.win = { value: '1e3' };
+  assert.equal(SF.getField('win', 'int', 4), 1000);
+  els.win.value = '';                              // blank still falls back
+  assert.equal(SF.getField('win', 'int', 4), 4);
+  els.win.value = 'garbage';
+  assert.equal(SF.getField('win', 'int', 4), 4);
+  els.win.value = '0';                             // 0 is a legal value, not a fallback
+  assert.equal(SF.getField('win', 'int', 4), 0);
+  // Every whole-number kind shares the rule: a retention typed as 1e2 days
+  // saving 1 day would prune almost the whole history.
+  els.ret = { value: '1e2' };
+  assert.equal(SF.getField('ret', 'day'), 100 * 86400);
+  els.spd = { value: '1e1' };
+  assert.equal(SF.getField('spd', 'min', 60), 10 * 60);
+  els.spd.value = 'garbage';                       // still falls back
+  assert.equal(SF.getField('spd', 'min', 60), 60 * 60);
 });
