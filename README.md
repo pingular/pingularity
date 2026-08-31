@@ -948,7 +948,12 @@ like with like instead of flipping between equivalent servers, while a server
 that has gone bad loses its seat the run it goes bad, because the seat is
 re-pinged every run rather than remembered - and an incumbent the winning
 city's list does not carry is not pinged at all, and loses the seat the same
-way. Ping alone
+way. A seat that still *pings* well but can no longer be **measured** - it
+answers, then moves no bytes - is the one case pinging cannot see, and a
+failed run records no winner for the next run to learn from, so it would hold
+the seat indefinitely: the fastest ranked candidate rides behind a promoted
+server as a fallback, is measured when the promotion fails, and takes the seat
+itself (win reason `fastest_ranked`, counter `speed.promoted_failed`). Ping alone
 never learns whether a rival is *faster* to transfer, so after every twelve
 automatic tests (any unpinned Ookla run counts; the challenge itself lands on
 the next *scheduled* single-server run, and with **Best of** above 1 it never
@@ -960,7 +965,14 @@ their second-best hour if that is higher. So on a steady wired line the rival
 needs a clear 15 % win; on a link whose runs swing by a fifth it has to beat
 what the incumbent itself reaches on a good hour, or one lucky hour would
 steal the seat and the next challenge would steal it back - nobody has to
-know their link's noise as a number, the record already says it. A fresh seat
+know their link's noise as a number, the record already says it. A score that
+lands more than three times the incumbent's good hour is not treated as a win
+at all: one reading has no round to be disbelieved against, and a server that
+buffers and acknowledges an upload without delivering it can report several
+times the line - so it is judged as the record's median instead and keeps the
+seat where it is. The reading itself is still recorded as the test's result;
+what the daemon declines to do is hand a seat to a number the line cannot
+carry. A fresh seat
 needs three runs of record before it is challenged at all, and changing the
 test direction starts that record afresh. There is nothing to set: the
 cadence is `speed_challenge_every` on the settings API (default 12; 0 turns
@@ -1731,7 +1743,9 @@ self-describing):
   challenger (`speed.challenge` - every challenge attempt, whether or not the
   rival could be measured; `speed.challenge_won` - attempts where the rival
   took the seat; `speed.challenge_failed` - attempts where the rival could not
-  be measured and the incumbent was measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
+  be measured and the incumbent was measured instead; `speed.promoted_failed` -
+  runs where a promoted server could not be measured and the fastest ranked was
+  measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
   destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
 restore refused rather than silently dropped), the /metrics self-disclosures
 (`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's

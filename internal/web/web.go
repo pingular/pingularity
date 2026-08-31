@@ -1577,7 +1577,9 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// backup can implant arbitrary text in these TEXT columns.
 			csvSafe(sp.IPFamily), csvSafe(sp.UDPDirection),
 			roundOf(sp.RoundTS),
-			sp.WinReason, sp.RaceOutcome, sp.RaceWinnerLabel,
+			// csvSafe despite the closed win-reason/outcome vocabularies: all
+			// three are TEXT columns a crafted backup can implant formulas in.
+			csvSafe(sp.WinReason), csvSafe(sp.RaceOutcome), csvSafe(sp.RaceWinnerLabel),
 			fptr(sp.RaceWinnerMS), iptr(sp.RaceRacers),
 		})
 		cw.Flush()

@@ -1110,6 +1110,10 @@ func seedKnownCounters() {
 		// The auto-select challenger: runs that measured the incumbent's rival
 		// instead of the incumbent, and how many of those took the seat.
 		"speed.challenge", "speed.challenge_won", "speed.challenge_failed",
+		// A promoted server (the incumbent, or the ISP's own box) that could
+		// not be measured, so the run fell back to the fastest ranked - the
+		// signal that a seat is being held by something that no longer works.
+		"speed.promoted_failed",
 		"speed.pin_coord_unrecovered",
 		// A pause span that crossed a clock correction and was refused rather than
 		// recorded: expected once on an RTC-less boot, never in steady state.

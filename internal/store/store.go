@@ -2843,10 +2843,14 @@ type SpeedSample struct {
 	// nil on every row that is a run's own result. See speedIsResult.
 	RoundTS *int64 `json:"round_ts,omitempty"`
 	// WinReason is why the run's server was the one measured - the winner
-	// row's win_reason from the selection report (speed_servers), copied onto
-	// the listing by the web layer for the runs table's benefit (see
-	// WinReasonsFor). DISPLAY ONLY: never stored on the speed row, never
-	// exported, empty on every read but the runs listing.
+	// row's win_reason from the selection report (speed_servers). Never stored
+	// on the speed row: every reader RESOLVES it, so a new one must too, or the
+	// column it fills reads empty. Two do - the runs listing, through
+	// WinReasonsFor (one query per page), and the CSV export, through
+	// SpeedHistoryDescFunc's own subquery (the streaming shape has nowhere to
+	// batch a page). Empty on every other read. Free text out of the DB, so a
+	// reader that writes it into a document escapes it: the export runs it
+	// through csvSafe.
 	WinReason string `json:"win_reason,omitempty"`
 	// UDPDirection is which way the UDP loss/jitter probe sampled ("down"/"up");
 	// empty when loss/jitter went unmeasured or the row predates the field. Loss
@@ -2951,7 +2955,9 @@ func ptrFinite(n sql.NullFloat64) *float64 {
 	return &v
 }
 
-func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
+// extra receives any columns a caller appended after speedCols in its own
+// query (SpeedHistoryDescFunc's win_reason), in the same order.
+func scanSpeed(sc interface{ Scan(...any) error }, extra ...any) (SpeedSample, error) {
 	var sp SpeedSample
 	// Every float column scans through NullFloat64 and is sanitized: a non-finite
 	// measurement (a sub-ms speedtest sample can divide to NaN/±Inf) lands in the
@@ -2962,12 +2968,12 @@ func scanSpeed(sc interface{ Scan(...any) error }) (SpeedSample, error) {
 	var down, up, ping sql.NullFloat64
 	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest, raceMS, raceLat, raceLon sql.NullFloat64
 	var healthy, downB, upB, failed, racers, roundTS sql.NullInt64
-	err := sc.Scan(&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
+	err := sc.Scan(append([]any{&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
 		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
 		&sp.IPFamily, &sp.UDPDirection, &failed,
-		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon, &roundTS)
+		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon, &roundTS}, extra...)...)
 	if roundTS.Valid {
 		v := roundTS.Int64
 		sp.RoundTS = &v
@@ -3857,16 +3863,26 @@ func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, b
 // at O(1) memory over a full history instead of building the entire slice. fn is
 // called per row; returning an error stops the scan and propagates it.
 func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) error) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC`)
+	// The scalar subquery resolves each row's win_reason from its selection
+	// report (winner row of speed_servers, walked via idx_speed_servers_ts) so
+	// the CSV can carry the same value the JSON listing shows - the streaming
+	// shape leaves nowhere to batch a WinReasonsFor page the way the listing
+	// does. LIMIT 1 because a crafted import can hold two winner rows for one
+	// run, and a scalar subquery must not turn that into a duplicated CSV row.
+	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+`,
+		COALESCE((SELECT ss.win_reason FROM speed_servers ss WHERE ss.run_ts = speed.ts AND ss.winner = 1 LIMIT 1), '')
+		FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		sp, err := scanSpeed(rows)
+		var winReason string
+		sp, err := scanSpeed(rows, &winReason)
 		if err != nil {
 			return err
 		}
+		sp.WinReason = winReason
 		if err := fn(sp); err != nil {
 			return err
 		}

@@ -1961,7 +1961,7 @@
           <span class="info" tabindex="0" data-tip="TCP window / socket-buffer size (-w).
 • 0 = auto.
 • Raise it to unlock speed on high-latency, long-distance links where the default window caps the rate.">i</span></span>
-          <span class="ctl"><input type="number" id="setIperfWindow" min="0" max="65536" step="64"><span class="unit">KB</span></span></label>
+          <span class="ctl"><input type="number" id="setIperfWindow" min="0" max="65536" step="1"><span class="unit">KB</span></span></label>
         <label class="srow"><span class="lbl">Warm-up
           <span class="info" tabindex="0" data-tip="Seconds to discard at the start of each transfer (TCP slow-start), for steadier numbers.
 • 0 = off.">i</span></span>
@@ -7265,7 +7265,7 @@ function updateScopeNote(){
   // A Best-of round keeps the chosen server and adds companions: the starred
   // servers, then the fastest-pinging from around the pinned server - so say
   // so, because "Using X." alone reads as though X is the only thing measured.
-  const bestOfN = Math.max(1, parseInt($('setSpeedBestOf').value)||1), bestOf = bestOfN>1;
+  const bestOfN = Math.max(1, intOf($('setSpeedBestOf').value)||1), bestOf = bestOfN>1;
   if(sel.value){
     const o=sel.selectedOptions[0];
     let t='Using '+esc(o?o.textContent:'server '+sel.value)+'.';
@@ -8000,15 +8000,24 @@ function setField(id,kind,v){ switch(kind){
   case 'float': $(id).value=v||0; break;
   case 'text': $(id).value=v||''; break;
   default: { const el=$(id); el.value=v; if(el.tagName==='SELECT'&&el.selectedIndex<0&&el.options.length) el.selectedIndex=0; } } }
+// intOf reads a number input as a whole number, or NaN when it holds nothing
+// usable. Number, not parseInt: "1e3" is valid floating-point syntax that a
+// number input accepts and checkValidity passes (1000 being a whole number in
+// range), while parseInt reads it as its MANTISSA - an iperf window typed as
+// 1e3 KB saved as 1 KB, a retention of 1e2 days as 1 day = prune almost
+// everything. One definition for every whole-number field kind below, because
+// three copies of a rule this subtle is how they drift apart.
+function intOf(v){ const s=String(v==null?'':v).trim(), n=Number(s);
+  return s===''||!Number.isFinite(n)?NaN:Math.trunc(n); }
 function getField(id,kind,fb){ switch(kind){
   case 'bool': return $(id).checked;
   // 0 is a legal value (e.g. Retries "0 = no retry") - only an unparsable
   // (empty/garbage) input falls back.
-  case 'int': { const n=parseInt($(id).value); return Number.isNaN(n)?(fb||0):n; }
-  case 'min': { const o=secOrig[id], n=parseInt($(id).value);
+  case 'int': { const n=intOf($(id).value); return Number.isNaN(n)?(fb||0):n; }
+  case 'min': { const o=secOrig[id], n=intOf($(id).value);
     if(o && n===o.shown) return o.raw;
     return (n||fb||0)*60; }
-  case 'day': { const o=secOrig[id], n=parseInt($(id).value);
+  case 'day': { const o=secOrig[id], n=intOf($(id).value);
     if(o && n===o.shown) return o.raw;
     return (n||0)*86400; }
   case 'float': return parseFloat($(id).value)||0;
@@ -8032,7 +8041,7 @@ function setFields(s){
 // Best of 1 measures one server, so there are no losers to discard or keep -
 // the checkbox's own tooltip said as much while the checkbox stayed live.
 function syncDiscardLosersDep(){
-  setDep('setSpeedDiscardLosers', (parseInt($('setSpeedBestOf').value)||1) > 1);
+  setDep('setSpeedDiscardLosers', (intOf($('setSpeedBestOf').value)||1) > 1);
 }
 function setDep(fieldId, on){
   const f=$(fieldId); f.disabled=!on;
@@ -8953,7 +8962,7 @@ function updateSpeedEstimate(){
   // tests a LAN link, so hide it there rather than mislead.
   if($('setSpeedEngine').checked){ el.classList.add('hidden'); return; }
   if(!$('setStEnabled').checked){ el.classList.add('hidden'); return; }
-  const min=Math.max(1, parseInt($('setSpeed').value)||60);
+  const min=Math.max(1, intOf($('setSpeed').value)||60);
   const runs=86400/(min*60);
   const have=speedAvgDown>0||speedAvgUp>0;
   const pD=have?speedAvgDown:EST_RUN_DOWN, pU=have?speedAvgUp:EST_RUN_UP;
@@ -8963,7 +8972,7 @@ function updateSpeedEstimate(){
   // of servers those rounds MEASURED (speedAvgServers, counted by the daemon)
   // and multiplied by the count in the box. The single-server fallback
   // constants, used before any test has run, are per server already.
-  const n=Math.max(1, parseInt($('setSpeedBestOf').value)||1), bestOf=n>1;
+  const n=Math.max(1, intOf($('setSpeedBestOf').value)||1), bestOf=n>1;
   const servers=n/(have?Math.max(1, speedAvgServers):1);
   const d=runs*pD*servers, u=runs*pU*servers, mo=(d+u)*30.44;
   $('speedDataEstText').innerHTML='At this interval, speedtests use roughly <b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day ('+Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?', '+n+' servers each':'')+').'+
