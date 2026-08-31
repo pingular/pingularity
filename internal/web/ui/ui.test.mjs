@@ -3035,7 +3035,10 @@ test('Quick Setup markup and decline semantics', () => {
 test('unticking the legacy-padding toggle re-locks it and drops the stale note', () => {
   const els = {
     setIperfPKCS1: { checked: true, disabled: false, closest: () => ({ classList: { toggle() {} } }) },
-    iperfPKCS1Note: { textContent: '', classList: { add() {}, remove() {} } },
+    // The note writes into an inner span now: textContent on the bubble itself
+    // would take the glyph with it, and this was the only note rendering bare.
+    iperfPKCS1Note: { classList: { add() {}, remove() {} } },
+    iperfPKCS1Text: { textContent: '' },
   };
   const gate = new Function('$', 'iperfVersion',
     extract('function iperfVerNum') + '\n' + extract('function pkcs1FlagUsable') + '\n'
@@ -3044,12 +3047,12 @@ test('unticking the legacy-padding toggle re-locks it and drops the stale note',
 
   gate();  // a server saved with the flag on, opened on a 3.21 host
   assert.equal(els.setIperfPKCS1.disabled, false, 'a saved-on flag must stay clearable');
-  assert.match(els.iperfPKCS1Note.textContent, /^Turn this off/);
+  assert.match(els.iperfPKCS1Text.textContent, /^Turn this off/);
 
   els.setIperfPKCS1.checked = false;  // the operator unticks it; the change listener re-gates
   gate();
   assert.equal(els.setIperfPKCS1.disabled, true, 'once off, it must not be tickable again');
-  assert.match(els.iperfPKCS1Note.textContent, /^Unavailable/,
+  assert.match(els.iperfPKCS1Text.textContent, /^Unavailable/,
     'the note must stop telling the operator to turn off a flag that is already off');
 });
 
@@ -3773,7 +3776,9 @@ test('Best of is a count, not a switch: a number box that drives the data estima
     'and prices the interval the same way');
   assert.match(extract('function updateScopeNote'), /intOf\(\$\('setSpeedBestOf'\)\.value\)/,
     'as does the scope note - every reader of a box agrees with what Save writes for it');
-  assert.match(est, /el\.classList\.toggle\('warn', n>4\);/, 'and turns amber above four');
+  assert.match(est, /const heavy = n>4;/, 'and marks a heavy round above four servers');
+  assert.match(est, /wi\.textContent = heavy \? '\\u26A0\\uFE0E' : '\\u2248'/,
+    'with the GLYPH, not the tint: several themes put --warn within 1.03:1 of --accent, so a recoloured fill says nothing');
   assert.match(html, /\.info-note\.warn\{/, 'the amber style exists');
   const tags = script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0];
   assert.match(tags, /favourite:\['favourite'/, 'a starred server winning a round has its own tag');
@@ -6129,7 +6134,8 @@ test('the range averages describe runs, not the servers a round rejected', () =>
 // the history was measured under is the divisor - and settings cannot supply
 // it, because saving a new count changes settings and not the history.
 function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins = '60' } = {}) {
-  const el = { classList: { add() {}, remove() {}, toggle() {} }, style: {} };
+  const wi = { textContent: '' };
+  const el = { classList: { add() {}, remove() {}, toggle() {} }, style: {}, querySelector: () => wi };
   const text = { innerHTML: '' };
   const els = {
     speedDataEst: el, speedDataEstText: text,
@@ -6144,7 +6150,7 @@ function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins
     + 'return updateSpeedEstimate;';
   const run = new Function('$', src)(id => els[id]);
   run();
-  return text.innerHTML;
+  return wi.textContent + text.innerHTML;
 }
 
 test('the data estimate scales by the count the history was measured under, not the one just saved', () => {

@@ -778,7 +778,7 @@
   .server-select.loading select{opacity:.55;}
   .server-select .sel-spin{position:absolute;right:30px;top:50%;margin-top:-6px;display:none;pointer-events:none;}
   .server-select.loading .sel-spin{display:inline-block;}
-  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning */ .warn-bubble b{color:var(--accent);font-weight:600;} .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note.warn{background:color-mix(in srgb,#e0a030 14%,transparent);border-color:color-mix(in srgb,#e0a030 55%,transparent);} .info-note.warn .wi{color:#e0a030;} .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:var(--muted);font-size:11.5px;}
+  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning */ .warn-bubble b{color:color-mix(in srgb,var(--accent) 55%,var(--fg));font-weight:650;} /* mixed toward the foreground: raw accent ON an accent tint is the same hue twice, which read 3.05:1 in solarized - dimmer than the body text it emphasises */ .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note.warn{background:color-mix(in srgb,var(--warn) 14%,transparent);border-color:color-mix(in srgb,var(--warn) 55%,transparent);} .info-note.warn .wi{color:var(--warn);} .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:color-mix(in srgb,var(--muted) 75%,var(--fg));font-size:11.5px;} /* at 11.5px plain --muted measured 4.30-4.49:1 on the tint in retro, cyber, slate and ember */
   .server-search input{flex:1;background:var(--bg2);color:var(--fg);border:1px solid var(--line2);
     border-radius:8px;padding:7px 9px;font:inherit;}
   .server-search input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
@@ -1666,10 +1666,12 @@
   .url-copy:hover{border-color:var(--accent);color:var(--accent);}
   .url-copy.done{border-color:var(--up);color:var(--up);}
   .url-if{font-size:11.5px;color:var(--muted);}
-  /* Above the shared .warn-bubble cap: these two are the longest of them, and the
+  /* Above the shared .warn-bubble cap: these are the longest of them, and the
      bubble hides its overflow, so at that cap the sentence naming the remedy is
-     the part that is clipped. */
-  #netNoAuthWarn.show,#qsNoAuthWarn.show{max-height:300px;}
+     the part that is clipped. Measured at 340px wide, iperfLoopbackWarn - the
+     longest of the three - stood 208px tall against the 160px cap, losing
+     exactly the line that says what to do about it. */
+  #netNoAuthWarn.show,#qsNoAuthWarn.show,#iperfLoopbackWarn.show{max-height:300px;}
   /* FLAT-CORNERS: in Flat mode (default, no .round) square every rounded corner
      across the whole UI - buttons, toggle pills, fields, selects, dropdowns,
      tooltips, chips, badges, swatches, status marks - to a hair of softening
@@ -1866,7 +1868,7 @@
 • Available on Linux, macOS, and Windows.">i</span></span>
           <span class="ctl"><input type="number" id="setBusyMbps" min="0" max="10000" step="any"><span class="unit">Mbps</span></span></label>
         <div class="info-note hidden" id="speedDataEst"><span class="wi">≈</span><span id="speedDataEstText"></span></div>
-        <div class="info-note hidden" id="busyOsNote"><span class="wi">ℹ&#xFE0E;</span>Skip-when-busy needs to read the network interface's byte counters. This host's operating system doesn't offer them, so the option has no effect here.</div>
+        <div class="info-note hidden" id="busyOsNote"><span class="wi">ℹ&#xFE0E;</span>This host's OS doesn't expose interface byte counters, so <b>Skip when busy</b> has no effect here.</div>
       </div>
       </div><!-- /speedtest pane -->
       <div class="tabpane tab-uniform" data-tab="ookla">
@@ -1946,7 +1948,10 @@
       </div><!-- /ookla pane -->
       <div class="tabpane tab-uniform" data-tab="iperf">
       <div class="sgroup">
-        <div class="info-note hidden" id="iperfVersionNote"><span class="wi">ℹ&#xFE0E;</span>Detected <code id="iperfVersionText">iperf3</code> on this host. Authentication padding and the unambiguous bidirectional result need a recent build (3.17+ / 3.11+); an older iperf3 may reject some options.</div>
+        <!-- Filled entirely by updateIperfVersionNote (glyph included) before it is
+             ever shown, and which build is short of what depends on the version
+             found: a hand-written copy of one branch here could only drift. -->
+        <div class="info-note hidden" id="iperfVersionNote"></div>
         <div class="tp-grid">
         <label class="srow"><span class="lbl">Test duration
           <span class="info" tabindex="0" data-tip="Seconds per direction for each transfer.
@@ -1992,7 +1997,7 @@
 • Auto = system default.">i</span></span>
           <span class="ctl"><select id="setIperfCongestion"><option value="">Auto</option></select><span class="unit"></span></span></label>
         <!-- Shown by updateCongestionHint alone. -->
-        <div class="info-note hidden" id="congestionContainerNote"><span class="wi">ℹ&#xFE0E;</span><span class="sub">No suggestions: this daemon runs in a container, which cannot see the host's allowed-algorithm list (it lives in the host's network namespace). A saved algorithm is still passed to iperf3 unchanged.</span></div>
+        <div class="info-note hidden" id="congestionContainerNote"><span class="wi">ℹ&#xFE0E;</span>No suggestions: this daemon is in a container and can't read the host's allowed-algorithm list. A saved algorithm is still used.</div>
         <label class="srow"><span class="lbl">DSCP marking
           <span class="info" tabindex="0" data-tip="DSCP value (--dscp) on test packets.
 • 0-63, or a name like ef, cs5, af11.
@@ -2028,7 +2033,7 @@
           <!-- I1: never blocks Save - a loopback target is legitimate natively and the
                operator may know better; the bubble only explains why it will refuse
                connections from a bridged container. Toggled by updateIperfLoopbackWarn. -->
-          <div class="warn-bubble" id="iperfLoopbackWarn"><span class="wi">⚠&#xFE0E;</span><span><b id="iperfLoopbackName">A saved server</b> points at <b>localhost</b>, and this daemon runs in a <b>bridged container</b> - there, 127.0.0.1/localhost is the container itself, not the machine running your iperf3 server, so tests will fail with “connection refused”. Use the host's LAN IP (or <span class="mono">host.docker.internal</span> - built into Docker Desktop, and the canonical compose file maps it on Linux engines too), or run the container with host networking.</span></div>
+          <div class="warn-bubble" id="iperfLoopbackWarn"><span class="wi">⚠&#xFE0E;</span><span><b id="iperfLoopbackName">A saved server</b> points at <b>localhost</b>, and this daemon runs in a <b>bridged container</b> - there, that's the container itself, not the machine running your iperf3 server, so tests will fail with “connection refused”. Use the host's LAN IP (or <span class="mono">host.docker.internal</span> - built into Docker Desktop, and the canonical compose file maps it on Linux engines too), or run the container with host networking.</span></div>
         </div>
         <div class="srow-wide hidden iperf-editor" id="iperfEditor">
           <div class="ie-grid">
@@ -2074,7 +2079,7 @@
 • Your OWN iperf3 must be able to send it: the flag arrived in 3.17 and became server-only in 3.20, so only a local 3.17-3.19 build can use this.
 • There's no automatic fallback: without it, authentication to such a server fails outright - Pingularity never silently downgrades your padding.">i</span></span>
                 <span class="ctl"><input type="checkbox" id="setIperfPKCS1"><span class="unit"></span></span></label>
-              <div class="info-note hidden" id="iperfPKCS1Note"></div>
+              <div class="info-note hidden" id="iperfPKCS1Note"><span class="wi">&#8505;&#xFE0E;</span><span id="iperfPKCS1Text"></span></div>
             </div>
           </div>
           <div class="iperf-editor-foot">
@@ -2091,7 +2096,7 @@
           <span class="info" tabindex="0" data-tip="Probe latency only inside the windows below; off = probe 24/7. Outages outside the windows aren't detected or alerted.">i</span>
         </span>
           <span class="ctl"><input type="checkbox" id="setSchedLatEnabled"><span class="unit"></span></span></label>
-        <div class="warn-bubble" id="schedWarn"><span class="wi">⚠&#xFE0E;</span><span>A notification <b>webhook</b> is configured, but latency probing pauses outside these windows - outages during the off-hours <b>won’t be detected or alerted</b>.<span id="schedWarnGap"></span></span></div>
+        <div class="warn-bubble" id="schedWarn"><span class="wi">⚠&#xFE0E;</span><span>A <b>webhook</b> is configured, but outages outside these windows <b>won’t be detected or alerted</b>.<span id="schedWarnGap"></span></span></div>
         <div class="sched-wins" id="schedLatWindows"></div>
         <div class="sched-acts"><button class="add-win" type="button" data-feat="lat">+ Add window</button></div>
         <div class="cov" id="schedLatCov"></div>
@@ -2198,11 +2203,11 @@
         <label class="srow"><span class="lbl">Max packet loss
           <span class="info" tabindex="0" data-tip="Flag a speedtest as unhealthy when measured packet loss exceeds this. 0 = no threshold. Runs that didn't measure loss are never flagged.">i</span></span>
           <span class="ctl"><input type="number" id="setThreshLoss" min="0" max="100" step="any"><span class="unit">%</span></span></label>
-        <div class="warn-bubble" id="lossProbeWarn"><span class="wi">⚠&#xFE0E;</span><span>The <b>loss probe</b> is off for the selected engine, so packet loss is never measured - this threshold <b>will never fire</b>. Turn the probe back on in the <b id="lossProbeWarnTab">Ookla</b> tab.</span></div>
+        <div class="warn-bubble" id="lossProbeWarn"><span class="wi">⚠&#xFE0E;</span><span>The <b>loss probe</b> is off for the selected engine, so this threshold <b>will never fire</b>. Turn it on in the <b id="lossProbeWarnTab">Ookla</b> tab.</span></div>
       </div>
       <div class="sgroup">
         <h3>Notifications</h3>
-        <div class="warn-bubble" id="notifyWarn"><span class="wi">⚠&#xFE0E;</span><span>A monitoring <b>schedule</b> is enabled: the link isn’t probed outside the scheduled windows, so outages there <b>won’t be detected or alerted</b>. Check the <b>Schedule</b> tab if you expect round-the-clock alerts.</span></div>
+        <div class="warn-bubble" id="notifyWarn"><span class="wi">⚠&#xFE0E;</span><span>A monitoring <b>schedule</b> is on: outages outside its windows <b>won’t be detected or alerted</b>. Check the <b>Schedule</b> tab if you expect round-the-clock alerts.</span></div>
         <div class="srow-wide srow-inline">
           <span class="lbl">Heartbeat URL
             <span class="info" tabindex="0" data-tip="Pingularity pings this URL every minute while monitoring is on. A watchdog like Healthchecks.io alerts you if Pingularity or the whole host goes silent.
@@ -8219,8 +8224,11 @@ function applyPKCS1Gate(){
   const st = pkcs1BoxState(iperfVerNum(), iperfVersion, box.checked);
   box.disabled = st.disabled;
   box.closest('.ie-field')?.classList.toggle('dep-off', st.disabled);
-  if(st.note){ pn.textContent = st.note; pn.classList.remove('hidden'); }
-  else { pn.classList.add('hidden'); pn.textContent=''; }
+  // Into the inner span, not the bubble: textContent on the bubble itself would
+  // take the glyph with it, and this was the only .info-note rendering without one.
+  const pt=$('iperfPKCS1Text');
+  if(st.note){ pt.textContent = st.note; pn.classList.remove('hidden'); }
+  else { pn.classList.add('hidden'); pt.textContent=''; }
 }
 function updateEngineUI(){
   const iperf = $('setSpeedEngine').checked;
@@ -8230,8 +8238,8 @@ function updateEngineUI(){
   // the package, but the default container image is distroless (no package manager), so
   // there the fix is the -iperf image variant. Set the note text before showing it.
   $('iperfMissingNote').innerHTML = '<span class="wi">&#8505;&#xFE0E;</span>' + (iperfInContainer
-    ? 'This image doesn’t include <code>iperf3</code>. Switch to the <code>-iperf</code> image variant (<code>ghcr.io/pingular/pingularity:latest-iperf</code>) to enable it.'
-    : 'iperf3 isn’t installed on this host. Install the <code>iperf3</code> package first. Works best on Linux.');
+    ? 'This image has no <code>iperf3</code> - use the <code>-iperf</code> variant (<code>ghcr.io/pingular/pingularity:latest-iperf</code>).'
+    : 'iperf3 isn’t installed on this host - install the <code>iperf3</code> package.');
   $('iperfMissingNote').classList.toggle('hidden', !(iperfWanted && !iperfAvailable));
   // Show the detected iperf3 version (and its capability caveat) when the engine is
   // selected and installed - presence on PATH isn't the same as a capable build.
@@ -8245,7 +8253,7 @@ function updateEngineUI(){
       const lacks=oldBidir
         ? 'predates the unambiguous bidirectional result (3.11+) and the current authentication padding (3.17+)'
         : 'predates the current authentication padding (3.17+)';
-      note.innerHTML='<span class="wi">&#8505;&#xFE0E;</span>Detected <code>iperf3 '+esc(iperfVersion)+'</code> on this host - it '+lacks+', so some options may be rejected. A newer build is recommended.';
+      note.innerHTML='<span class="wi">&#8505;&#xFE0E;</span>Detected <code>iperf3 '+esc(iperfVersion)+'</code> - it '+lacks+', so some options may be rejected.';
       note.classList.remove('hidden');
     } else { note.classList.add('hidden'); }
     // The legacy-padding toggle is only usable on a LOCAL iperf3 in [3.17, 3.20):
@@ -8977,11 +8985,22 @@ function updateSpeedEstimate(){
   const n=Math.max(1, intOf($('setSpeedBestOf').value)||1), bestOf=n>1;
   const servers=n/(have?Math.max(1, speedAvgServers):1);
   const d=runs*pD*servers, u=runs*pU*servers, mo=(d+u)*30.44;
-  $('speedDataEstText').innerHTML='At this interval, speedtests use roughly <b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day ('+Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?', '+n+' servers each':'')+').'+
-    '<br><span class="sub">\u2248 '+bytesStr(mo)+'/month total \u00b7 '+(have?'based on your recent tests':'rough estimate until a test runs')+'.</span>';
-  // Above four servers a round is a serious amount of data on a metered link;
-  // the note turns amber so the figure cannot be missed.
-  el.classList.toggle('warn', n>4);
+  // One line: the two figures that decide anything (a day, a month), then the
+  // arithmetic behind them so a changed interval or server count visibly moves
+  // it. The leading ~ already says "approximate", so nothing else needs to;
+  // only a figure with no measurements behind it is worth calling out.
+  $('speedDataEstText').innerHTML='<b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day, <b>'+bytesStr(mo)+'/month</b> \u00b7 '+
+    Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?' \u00d7 '+n+' servers':'')+(have?'':' \u00b7 not yet measured');
+  // Above four servers a round is a serious amount of data on a metered link.
+  // The GLYPH says so, not the tint: several themes put --warn close enough to
+  // --accent that the warn fill and the ordinary fill are the same colour to
+  // the eye (measured: 1.03:1 apart on retro, slate and parchment), which is
+  // exactly why the house rule next to .warn-bubble .wi puts the meaning in the
+  // mark rather than the hue.
+  const heavy = n>4;
+  el.classList.toggle('warn', heavy);
+  const wi = el.querySelector('.wi');
+  if(wi) wi.textContent = heavy ? '\u26A0\uFE0E' : '\u2248';
   el.style.width='100%'; el.classList.remove('hidden');
 }
 $('setSpeed').addEventListener('input', updateSpeedEstimate);
