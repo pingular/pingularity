@@ -976,7 +976,7 @@
      selected marks - hiding them would misreport what a run will use. */
   .fp-btn.bad.on .fp-name{opacity:1;}
   .drawer-actions{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;
-    border-top:1px solid var(--line);padding-top:16px;margin-top:4px;}
+    padding-top:16px;margin-top:4px;}
   /* The message takes whatever space the buttons leave and wraps inside it, which
      also keeps the buttons pinned right when it is empty. Sized to its own text it
      overflowed the row instead, pushing Reset tiles onto a line of its own. */
@@ -1395,13 +1395,14 @@
   .data-card{margin-bottom:2px;}
   .data-card+.data-card{margin-top:26px;padding-top:22px;border-top:1px solid var(--line);} /* stacked cards on the merged Data tab read as distinct sections */
   /* Wide screens: the two Data-tab cards are each half-width content, so sit
-     them side by side (vertical rule between) instead of stacking them over a
-     mostly-empty pane. Narrow screens keep the stacked layout above. */
+     them side by side instead of stacking them over a mostly-empty pane. The
+     column gap separates them; no rule is drawn. Narrow screens keep the
+     stacked layout above. */
   @media(min-width:980px){
     /* Cap Stored data at 320px (its intrinsic content runs a touch wider) and give
        Backup & restore the remainder (room for the chips + buttons). */
     .tabpane[data-tab="retention"].active{display:grid;grid-template-columns:fit-content(320px) 1fr;column-gap:48px;align-items:start;}
-    .tabpane[data-tab="retention"] .data-card+.data-card{margin-top:0;padding-top:0;border-top:none;border-left:1px solid var(--line);padding-left:48px;height:100%;box-sizing:border-box;}
+    .tabpane[data-tab="retention"] .data-card+.data-card{margin-top:0;padding-top:0;border-top:none;padding-left:48px;height:100%;box-sizing:border-box;}
   }
   .data-card-h{margin:2px 0 10px;}
   .data-card-h h3{grid-column:auto;margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);}
