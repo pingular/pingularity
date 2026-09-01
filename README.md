@@ -15,6 +15,36 @@ is the same thing on synthetic data, with a badge to say so:
 
 ![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), the Speed panel - seven stat tiles over three stacked charts - the "Lowest round-trip across anchors" latency chart with its DNS line and clickable anchor pills, and a year-long downtime heatmap](https://raw.githubusercontent.com/pingular/pingularity/main/docs/dashboard.png)
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Install](#install)
+  - [Linux](#linux)
+  - [macOS](#macos)
+  - [Windows](#windows)
+  - [Docker](#docker)
+  - [Updating](#updating)
+- [Run in the background (systemd / launchd / Windows service)](#run-in-the-background-systemd--launchd--windows-service)
+- [Architecture](#architecture)
+- [Speedtests](#speedtests)
+  - [iperf3 in a container](#iperf3-in-a-container)
+  - [Scheduling and triggers](#scheduling-and-triggers)
+  - [Choosing an Ookla server](#choosing-an-ookla-server)
+- [Dashboard](#dashboard)
+- [Commands & flags](#commands--flags)
+- [Metrics](#metrics)
+- [HTTP API](#http-api)
+- [How it works](#how-it-works)
+- [Design notes](#design-notes)
+
+The last four are summarised here and written out in full beside the code, in
+[`docs/`](docs/):
+
+- [Commands & flags](docs/cli.md) - every subcommand, flag and environment variable
+- [Metrics](docs/metrics.md) - every metric, the health endpoints, scraping and alert rules
+- [HTTP API](docs/api.md) - every endpoint and the rules they share
+- [Security model](docs/security-model.md) - the trust boundary and the reasoning behind the defaults
+
 ## Quick start
 
 ```bash
@@ -656,7 +686,7 @@ unmeasurable one. Missing is stored as missing rather than as a zero, so charts
 and thresholds can tell "not measured" from "measured, and it was bad". A run
 that failed outright isn't a measurement at all: it is kept only as a flagged
 data-usage row, which every measurement view filters out (see the data-usage
-bullet under [Metrics](#metrics-optional)).
+bullet under [Metrics](docs/metrics.md)).
 
 The **ping** shown is the engine's own number, a mean over ten samples, so it
 keeps matching what speedtest.net would report. A mean has no defence against an
@@ -1035,7 +1065,7 @@ you the traffic, so on a metered link the number has to include them. What it is
 not is a wire total: protocol framing, retransmits, the warm-up seconds an engine
 throws away, and the UDP loss probe all move bytes that nothing counts, which
 makes this a measured lower bound rather than a bill (the exclusions are listed
-in full under [Metrics](#metrics-optional)). On a default install - the Ookla
+in full under [Metrics](docs/metrics.md)). On a default install - the Ookla
 engine, with its five-second packet-loss probe - the uncounted part is overhead
 plus that one short probe, so the figure runs a few percent light and no more.
 It only becomes worth budgeting around on an install deliberately pointed at
@@ -1469,702 +1499,43 @@ it has no UI setting.
 
 ## Commands & flags
 
-```
-pingularity [run] [flags]    monitor + serve the UI (default)
-pingularity install [flags]  install as a service and start it (flags are persisted)
-pingularity start|stop       start / stop the installed service
-pingularity restart|status   restart / show status
-pingularity uninstall [-y]   remove the service (data untouched)
-pingularity reset-auth       clear the password + disable auth (recovery)
-pingularity healthz          probe a running instance's /healthz; exit 0 = healthy
-                             (-addr host:port, default 127.0.0.1:9000)
-pingularity version          print version
-```
+`pingularity` runs the monitor and serves the UI by default; the other
+subcommands install and control it as a service, print the version, or probe a
+running instance's health. Flags cover the listen address and access mode, the
+database path, probe interval and sensitivity, speedtest scheduling, and how long
+each kind of history is kept. Only `-access` has an environment-variable form
+(`PINGULARITY_ACCESS`), which is how a container sets it - `PINGULARITY_OPTS` is
+expanded by the systemd unit and is ignored everywhere else.
 
-Flags only **seed** the initial values - almost everything is adjustable live in
-the settings drawer afterward and persists across restarts. A value you **save**
-in the UI is persisted even when it equals what a flag currently supplies, and
-wins from then on - removing the flag later keeps what you saved. Fields you
-never save keep following the flag (or the shipped default) - but note that
-**Save writes the whole drawer**: the settings form submits every field it holds,
-so the first save from the UI pins every one of them a flag had moved off the
-shipped default, not just the field you edited. Access, logging, the update check
-and the power toggle aren't part of that form and are unaffected.
+**→ [docs/cli.md](docs/cli.md)** - every subcommand and flag, with its
+default and what changing it costs.
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket). Port `0` is refused: it asks the OS for a random port, which nothing can then find - not a bookmark, not a scrape target, not the container health check, which runs as its own process and cannot discover it |
-| `-access` | `local` | who may open the dashboard: `local` (loopback only) or `network` (reachable from the LAN - set a login). A container that publishes a port needs `network` (or `PINGULARITY_ACCESS=network`), or the published port returns 403. Also settable in the UI - but unlike every other flag here, an explicitly passed `-access` / `PINGULARITY_ACCESS` re-asserts itself at **every** start, overwriting a disagreeing saved choice in either direction (and logging that it did), so while it stays in your unit or compose file a change made in the UI is undone at the next restart. Drop it to let the UI choice stick |
-| `-db` | per-OS ([details](#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
-| `-interval` | `5s` | time between probe rounds, `1s`-`1h` (a value saved in the UI takes precedence) |
-| `-timeout` | `3s` | per-target dial timeout, `1s`-`30s` (a value saved in the UI takes precedence) |
-| `-down-after` / `-up-after` | `2` / `1` | consecutive rounds to confirm down / up (1-10) |
-| `-latency` | `true` | probe latency/connectivity at all (`-latency=false` = speedtest-only mode: no probe rounds, so no outage detection, no outage alerts, no DNS line, and no reconnect or while-degraded speedtests - the probe round is what triggers those) |
-| `-ipv4` | `auto` | IPv4 probing: `auto` \| `on` \| `off` (`auto` = only while the host has an IPv4 address) |
-| `-ipv6` | `auto` | IPv6 probing: `auto` \| `on` \| `off` (live) |
-| `-speedtest` | `false` | run scheduled speedtests (startup + interval); opt-in. On-reconnect tests are governed separately by `-speedtest-on-reconnect`, the while-degraded trigger by its own UI toggle |
-| `-speedtest-interval` | `1h` | time between scheduled speedtests, `1m`-`24h` |
-| `-speedtest-on-reconnect` | `true` | speedtest after a reconnect (at most one per `-speedtest-interval`, and never more often than once per 15m) |
-| `-retain` / `-retain-speed` / `-retain-downtime` | `720h` (30 days) / `8760h` (1 year) / `8760h` | prune windows in Go duration units (`0` = keep forever) |
-| `-allow-host` | *(none)* | extra `Host` header values the DNS-rebinding guard accepts - only needed behind a reverse proxy on a public domain |
-| `-trusted-proxy` | *(none)* | proxy IPs/CIDRs whose `X-Forwarded-For` identifies the real client, so one visitor's failed logins can't rate-limit everyone behind the proxy |
-| `-metrics-token` | *(none)* | optional read-only token a scraper presents to `/metrics` (Bearer or Basic password) instead of the admin login, so Prometheus needn't hold an account that can change settings; only consulted when Require login is on |
-| `-quick-setup` | `prompt` | headless first-run: `skip` starts monitoring immediately and never shows the browser Quick Setup dialog; `prompt` leaves it for a first visit. Passed **explicitly**, `prompt` is authoritative: monitoring flags on the same command line then only configure values and no longer count as consent, so the dialog still gates monitoring |
+## Metrics
 
-Out-of-range numeric flags are rejected at startup (and at `pingularity
-install`) rather than silently adjusted - as are a fractional duration
-(`-interval`, `-timeout`, `-speedtest-interval` and the `-retain*` windows take
-whole seconds), a retention window over `87600h` (10 years; use `0` for forever),
-an unrecognised value for `-ipv4` / `-ipv6` / `-access` / `-quick-setup`, and a
-stray positional argument (`pingularity install run -listen :9000` fails rather
-than quietly dropping the flags).
+Pingularity serves a Prometheus endpoint at `GET /metrics`, for people who
+already run a Prometheus/Grafana stack - nothing external is required, and the
+dashboard is fully standalone. It is a passive **pull** endpoint, behind the same
+access guard as the dashboard, with an optional read-only token
+(`-metrics-token`) for scrapers. It publishes the current link state, latency
+histograms, the last speedtest's numbers, outage counters, speedtest failures by
+stage, and worker health - enough to alert on a wedged prober, a failing
+schedule, or a link that is up but slow. Beside it sit `/healthz` and `/readyz`,
+answered ahead of the access guard so a container probe needs no credentials.
 
-> **Headless installs:** a genuinely fresh install waits (monitoring paused) for
-> a first-run consent - either the browser **Quick Setup** dialog or an explicit
-> flag - so it does not start probing until someone has said to, or until the
-> offer lapses: left unanswered, the hold releases 48h after first launch and
-> monitoring starts with the defaults in the table above (which include
-> `-speedtest-on-reconnect`, on by default, so a later link flap can run a full
-> speedtest). The daemon prints that fallback on stdout at boot, so a headless
-> install has it in its own log. Passing any monitoring flag (`-speedtest`,
-> `-speedtest-interval`, `-latency`, `-interval`) counts as that consent -
-> unless you explicitly pass `-quick-setup=prompt` alongside them, which keeps
-> the dialog in charge and makes those flags configure values only. If you only
-> tune other knobs (say `-timeout` or `-ipv6`) pass `-quick-setup=skip` so the
-> service starts monitoring at boot instead of holding for the dialog.
-
-## Metrics (optional)
-
-> **Grafana users:** there is an official importable dashboard (latency
-> heatmap, speed/bufferbloat history, outage annotations, a multi-instance
-> fleet view) and a ready-made alert-rules file - see
-> [docs.pingularity.dev/grafana](https://docs.pingularity.dev/grafana/).
-
-A Prometheus endpoint is exposed at `GET /metrics` if you already run a
-Prometheus/Grafana stack and want to scrape Pingularity - but nothing external is
-required; the built-in dashboard is fully standalone. `/metrics` is a passive
-**pull** endpoint - nothing scrapes it for you, and it hands data out only in
-answer to a scrape. It is not the whole story of what leaves the box, though:
-measurements *are* pushed on the paths you configure yourself - alerts and the
-periodic digest carry figures to your alert webhook, and the heartbeat pings its
-URL (see the outbound-calls table above).
-
-`GET /metrics` exposes (every gauge has a `# HELP` line in the output, so it's
-self-describing):
-
-- `pingularity_build_info{version,goversion}` - constant 1, build version and Go
-  toolchain in the labels
-- `pingularity_runtime_seconds` - process uptime
-- `pingularity_up` - overall connectivity (1/0)
-- `pingularity_latency_seconds` - headline latency: lowest across the anchors that
-  answered (your base internet latency); absent when nothing answered
-- `pingularity_monitoring_paused` - 1 while monitoring is not running: stopped via
-  the power button, or a fresh install still holding for its first-run Quick Setup
-  answer (`quick_setup_pending` in `/api/status` tells those two apart). Stored
-  gauges freeze and the live per-family/DNS series go absent while paused
-- `pingularity_probing_active` - 1 while probe rounds are actually running:
-  the "can I trust the data" signal. It goes 0 for every way rounds can stop -
-  the power button, the latency toggle, a closed schedule window, all
-  address families switched off, or that same first-run hold - while
-  `pingularity_up` and
-  `_state_since_timestamp_seconds` hold their last values
-- `pingularity_state_since_timestamp_seconds` - when the current up/down state began
-- `pingularity_current_outage_seconds` - length of the outage in progress; absent
-  while online, and absent while probing is paused (paused time is excluded from the
-  outage the monitor finally records, so the live value would otherwise run ahead of
-  history). Use `_state_since_timestamp_seconds` to see when the outage began
-- `pingularity_family_up{family}` / `pingularity_family_latency_seconds{family}` /
-  `pingularity_family_state_since_timestamp_seconds{family}` - per-address-family
-  connectivity, latency (only while that family is up), and when that family's
-  current state began - so "how long has IPv6 alone been down" is answerable.
-  All three go absent (not frozen) while probing isn't running
-- `pingularity_target_latency_seconds{target}` / `pingularity_target_up{target}` -
-  per anchor; the latency line appears only for a successful probe (a down target
-  has no reading, not a misleading 0)
-- `pingularity_target_last_probe_timestamp_seconds{target}` /
-  `pingularity_probe_last_round_timestamp_seconds` - per-target and overall probe
-  freshness. `target_up` deliberately holds its last value while paused, so a
-  timestamp that stops advancing is how you tell a frozen reading from a live one
-- `pingularity_probe_latency_seconds` / `pingularity_dns_latency_seconds` /
-  `pingularity_series_query_seconds` - **histograms** (`_bucket{le}` + `_sum` +
-  `_count`) of anchor RTT, DNS resolve-time, and how long a chart aggregate took,
-  so `histogram_quantile()` gives real p95/p99 and catches spikes that fall
-  between scrapes - which the last-value latency gauges lose. Each appears
-  once it has recorded something, so the chart-query one is absent until a
-  dashboard or an `/api/series` call has run a query. Its buckets are deliberately
-  wider than the two latency ones - out to a minute rather than five seconds -
-  because a re-scan of the samples table on slow hardware runs well past where
-  latency stops being interesting
-- `pingularity_dns_up` / `pingularity_dns_resolve_seconds` - the DNS-resolution
-  probe (the chart's second line): whether a cache-busted lookup succeeded and how
-  long it took, via the host's own resolver. Present only while the probe is
-  actually running and has produced a result (in short: while
-  `pingularity_probing_active` is 1, the DNS toggle is on, and the first lookup
-  has answered) - a probe that isn't running, or hasn't resolved yet, reads as
-  absent, not a fake 0
-- `pingularity_uptime_ratio{window}` - up-fraction over `6h`, `24h`, `7d`, `30d`,
-  `1y`, and `all`. This is **observed** downtime / **observed** time: paused,
-  scheduled-off, families-off, and process-down wall time is excluded from the
-  denominator (it's neither up nor down), so it can't inflate uptime. Two small
-  gaps are deliberately *not* booked, and so stay in the denominator (and are
-  normally credited as up): a restart that took **2 minutes or less**, and a
-  suspend/freeze shorter than **one probe interval plus 10 minutes** - below
-  that, a gap can't be told apart from ordinary scheduler overshoot, and the
-  error is bounded and self-limiting where a spurious unobserved row would not
-  be. A window that
-  observed **nothing** is omitted entirely rather than published as a misleading
-  100%. Each window is also clamped to the outage-retention horizon, so it can't
-  reach past where the downtime events behind it were pruned.
-- `pingularity_uptime_coverage_ratio{window}` - the fraction of each window that was
-  actually observed (0..1). A low value means the window was mostly paused/unobserved
-  and its `uptime_ratio` is thin evidence; `0` means the ratio is absent.
-- `pingularity_uptime_since_timestamp_seconds` - the earliest time the uptime figures
-  can vouch for (later of first observation and the retention horizon); the `all`
-  window reaches back only to here
-- `pingularity_speed_last_run_timestamp_seconds` - freshness anchor for the speed
-  gauges; `pingularity_speed_info{engine}` names the backend (ookla / iperf3)
-- `pingularity_speed_next_run_timestamp_seconds` - when the next scheduled
-  speedtest is due (absent when scheduled tests are off); pairs with the last-run
-  timestamp to catch a wedged scheduler before the next run would even land
-- `pingularity_speed_download_mbps` / `_upload_mbps` / `_ping_ms` / `_jitter_ms` /
-  `_packet_loss_percent` - the last run (loss only when measured). These use the
-  dashboard's human units (ms, Mbit/s, %) so the numbers match the UI and speedtest
-  sites. For Prometheus base-unit conventions, the same values are also emitted as
-  `pingularity_speed_download_bytes_per_second` / `_upload_bytes_per_second` /
-  `pingularity_speed_ping_seconds` / `pingularity_speed_packet_loss_ratio` (0..1) -
-  use whichever your dashboards expect, but don't mix the two unit systems in one
-  expression
-- `pingularity_speed_ping_best_ms` - on **Ookla** runs, the **fastest** of the
-  ping samples `_ping_ms` averages. There the engine reports a mean over ten
-  samples, so one stalled handshake moves it several-fold; this is the floor
-  beneath it. Alert on this one to mean "the link really is far", and watch the
-  **gap** between the two to spot a lossy path. Absent on iperf3 runs, which do
-  sample the server themselves - up to five bare TCP handshakes - but report the
-  **median** of those as `_ping_ms` and record no floor beside it
-- `pingularity_speed_healthy` - 1/0, did the last run pass your configured
-  thresholds (lets alerting reuse the in-app verdict instead of re-encoding it);
-  **absent** when no thresholds are configured *or* when the run couldn't measure
-  something a threshold covers. A check that never ran is not a check that
-  passed, so those runs get no verdict rather than a green one - alert on
-  `absent()` if a silently unjudged run matters to you
-- `pingularity_speed_idle_latency_ms` / `pingularity_speed_loaded_latency_ms{direction}`
-  (+ `_p95_ms`) - latency idle vs under load; **loaded minus idle is bufferbloat**.
-  Present only when the engine measured them
-- `pingularity_speed_data_used_bytes` (total within retention),
-  `pingularity_speed_data_used_window_bytes{window}` (per `6h`/`24h`/`7d`/`30d`/`1y`
-  window - the total is non-monotonic under pruning, so metered-link budgets
-  should use these), `pingularity_speed_last_run_bytes{direction}` (what the
-  last run itself consumed), and `pingularity_speed_avg_run_bytes{direction}`.
-  Treat all of these as a **measured lower bound on wire usage, not a bill**:
-  they count the payload the engine reports moving, so they exclude warm-up
-  traffic, the UDP loss/jitter probe, TCP/TLS/IP overhead, and retransmits. A
-  run that failed or was aborted partway still contributes the bytes its
-  engine had counted by then, but bytes an engine never got to count - and a
-  run cut short by daemon shutdown - are lost. On a metered link, budget with
-  headroom above these numbers rather than against them. That failed run is
-  kept as an accounting row, **flagged** as one: the totals and windows above
-  count its bytes, while every view that means "a measurement" filters it out -
-  it is not in the runs table, the charts, or `latest`, so it can't become the
-  last run, and it gets no healthy/unhealthy verdict. `avg_run_bytes` skips it
-  too, on purpose: that average projects what the *next* run will cost, and a
-  run that died partway spent a fraction of a full one, so counting it would
-  predict a bill no schedule produces
-- `pingularity_process_start_time_seconds` - process start (the Prometheus-conventional
-  form; `pingularity_runtime_seconds` kept for compatibility)
-- `pingularity_goroutines` / `pingularity_memory_heap_bytes` / `_memory_sys_bytes` /
-  `pingularity_gc_cycles_total` / `pingularity_gomaxprocs` / `pingularity_open_fds`
-  (Unix) - process self-health: leak and GC trends, and an FD-leak early warning
-- `pingularity_db_bytes` - on-disk database size incl. WAL/SHM (watch your retention)
-- `pingularity_disk_free_bytes` - free space on the filesystem holding the
-  database, where the platform supports it - an early disk-full warning long
-  before writes start failing
-- `pingularity_update_available` - 1 when a newer release has been seen, 0 when
-  not; `pingularity_update_check_timestamp_seconds` - when the release feed was
-  last polled **successfully**. Both are absent unless the daily update check is
-  on, and the timestamp stays absent until the first poll succeeds (a `0` would
-  read as 1970-stale). So `time() - pingularity_update_check_timestamp_seconds >
-  172800` is "this box can't reach the feed" - the firewalled-install signature -
-  and a week of `pingularity_update_available == 1` is an upgrade nobody noticed
-- `pingularity_worker_up{worker}` / `pingularity_worker_restarts_total{worker}` -
-  per background worker (`scheduler`, `pruner`, `netinfo`, `update-check`,
-  `heartbeat`, `digest`, and `settings-retry` when a failed settings load armed
-  it): `up` is 1 while its loop runs and 0 once it dies - gives up after
-  repeated panics, or the process shuts down. A one-shot worker that COMPLETES
-  its job (settings-retry succeeding) removes its series instead of reporting
-  0, so `worker_up == 0` alerts match only real deaths; `restarts_total`
-  climbing means it's thrashing
-- `pingularity_stat{stat="monitor.pending_events"}` (a gauge) /
-  `pingularity_stat_total{stat="monitor.event_dropped"}` - the outage-persistence
-  retry queue's depth (0 = healthy) and a counter of transitions dropped for good
-  when the DB stayed unwritable past the buffer cap (each drop leaves a gap in
-  uptime history). `pending_events` is a depth, not a counter, so it is not seeded
-  at startup: the series appears the first time an event has to be queued
-- `pingularity_metrics_data_valid` - **1 only when every store read on this scrape
-  succeeded**; 0 when any failed (so a DB outage that would otherwise be a silent
-  `200` with missing/stale series is directly alertable). Paired with
-  `pingularity_metrics_collector_success{collector}` / `_errors_total{collector}` /
-  `_duration_seconds{collector}` / `_last_success_timestamp_seconds{collector}` for
-  the `targets` / `aggregates` / `speed` / `uptime_floor` reads (`aggregates`
-  tracks the LAST refresh attempt, so a store that fails after the cache once
-  warmed still reads 0)
-- **Well-named families** (Prometheus-conventional, one quantity + labels each,
-  emitted alongside the generic `stat_total` below): `pingularity_probe_rounds_total`,
-  `pingularity_probe_failures_total{reason}`, `pingularity_dns_attempts_total`,
-  `pingularity_dns_failures_total{reason}`, `pingularity_outages_total`,
-  `pingularity_outage_duration_seconds_total`, `pingularity_speed_runs_total{trigger}`,
-  `pingularity_speed_failures_total{stage}`, `pingularity_notification_deliveries_total{destination}`
-  / `_failures_total{destination}` / `_blocked_total{destination}` /
-  `pingularity_notification_delivery_duration_seconds{destination}` (a
-  `_sum`/`_count` summary in seconds, so `rate(_sum)/rate(_count)` is "the webhook
-  got slow"),
-  `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`,
-  `pingularity_database_prune_duration_seconds_total`,
-  `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
-  `pingularity_probe_blips_total`, `pingularity_login_failures_total`,
-  `pingularity_rate_limit_trips_total`, and the chart-aggregate cache accounting:
-  `pingularity_series_cache_hits_total`, `pingularity_series_cache_expired_total`,
-  `pingularity_series_cache_new_total`, `pingularity_series_cache_empty_total`,
-  `pingularity_series_bypass_total` and `pingularity_series_queries_total`. Every
-  chart request books exactly one cache outcome - hit, expired, new, empty or
-  bypass - and every one of them but the hit goes on to run an aggregate, so
-  `queries = new + empty + expired + bypass` is an identity you can check on the
-  wire. A bypass is a sub-minute bucket, which skips the cache entirely. None of
-  the six carries a window or bucket-width label, on purpose: one series each,
-  rather than one per range the dashboard offers. They were readable all along as
-  `pingularity_stat_total{stat="series.…"}` - the named families just make them
-  findable
-- `pingularity_stat_total{stat}` / `pingularity_stat{stat}` - the internal
-  **operational** registry, keyed by a `stat` label. These are two families: the
-  **counters** `pingularity_stat_total{stat}` (monotonic totals + float sums;
-  query with `rate()` / `increase()`) and the **gauges** `pingularity_stat{stat}`
-  (point-in-time values: high-water marks like `monitor.blip_streak_max`, the
-  probe/DNS freshness timestamps, and the per-worker `worker.<name>.up` flags -
-  so the family is present on every install from boot). Together they
-  cover probe rounds (`monitor.rounds` - the liveness denominator - and
-  `monitor.bad_rounds`), the probe-failure taxonomy (`probe.fail.<class>` -
-  timeout/refused/dns/…), the DNS-resolve failure taxonomy (`dns.fail.<class>`),
-  family flaps, IPv4-only vs IPv6-only downtime (`monitor.v4_only_down_s` /
-  `monitor.v6_only_down_s`), brownouts (`monitor.degraded_episodes`), pause
-  accounting (`monitor.pauses` / `monitor.paused_s` - why gauges froze),
-  speedtest **runs by trigger** (`speed.run.<trigger>`) and **failures by
-  stage** (`speed.fail.<stage>` - server_fetch/ping/download/…), exit-discovery
-  traces and geo lookups (`netinfo.trace_ok` / `netinfo.trace_fail` /
-  `netinfo.ipmap_*`, and `netinfo.cymru_fallback` - a Team Cymru lookup answered
-  by a public resolver rather than your own; it climbs for every lookup during
-  the minute your resolver is being bypassed after one failure, not once per
-  failure), the auto city race
-  (`speed.cityrace_decided` / `_silent` / `_unanchored`, and
-  `speed.cityrace_field_reused` - runs that ranked the race's own list and
-  pings instead of fetching again; every decided race should), the auto-select
-  challenger (`speed.challenge` - every challenge attempt, whether or not the
-  rival could be measured; `speed.challenge_won` - attempts where the rival
-  took the seat; `speed.challenge_failed` - attempts where the rival could not
-  be measured and the incumbent was measured instead; `speed.head_failed` -
-  runs where the server the run led with could not be measured and the next
-  ranked one was measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
-  destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
-restore refused rather than silently dropped), the /metrics self-disclosures
-(`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's
-sign that the target-series view was truncated or a normalized label collided),
-notification-queue loss (`notify.outage_dropped`), and security signals
-(`web.login_fail`, `web.stepup_fail`,
-  `web.limiter_trips`). Always-on and monotonic. Product-usage counters (which
-  settings change, dashboard loads) are **not recorded at all** - those
-  emitters were removed; the `promStat` allowlist stays only as a guard so a
-  future product counter can't leak onto `/metrics`.
-
-### Health endpoints
-
-Two unauthenticated liveness/readiness probes for a load balancer or orchestrator
-(they expose no data, just a verdict, and bypass the DNS-rebinding guard, the
-local-only filter, and auth so a bare-IP health check from an LB reaches them):
-
-- `GET /healthz` - liveness: `200 ok` while the process serves. No dependency
-  checks, so a transient DB hiccup can't trigger a restart loop.
-- `GET /readyz` - readiness: `200 ready` once the store answers and the first status
-  aggregate is warm; `503` otherwise, so an LB holds traffic until the daemon is warm.
-  It also reports `503` when the daemon could not read its settings at startup - in
-  that state it refuses every other route, `/metrics` and the dashboard included,
-  rather than serve with access control it can't apply. `/healthz` keeps answering
-  `200` throughout, so the container images' baked-in health check still reads
-  `(healthy)` there: a whole-instance `503` beside a healthy `/healthz` means "check
-  the log, then reload or restart", not "still warming up".
-
-`pingularity healthz [-addr host:port]` probes `/healthz` from the command
-line and reports by exit code (0 = answered `200`; anything else prints a
-one-line reason). It exists for environments with no curl - it is what the
-container images' baked-in `HEALTHCHECK` runs (see [Docker](#docker)).
-
-### Scraping it
-
-**Step zero for a remote Prometheus:** flip **Network access** on first - it
-starts off on every install that never chose otherwise, containers included,
-and until then every scrape from another machine gets `403`. Use
-the Access tab, or start with `-access network` / `-e
-PINGULARITY_ACCESS=network`. (A Prometheus on the same host scraping
-`127.0.0.1:9000` needs nothing. A container upgraded from 0.61 or earlier needs
-the same opt-in as any other install - it is not grandfathered into network
-access, see [Docker](#docker).)
-
-A minimal job (scrape by IP so the DNS-rebinding guard doesn't get in the way -
-see the gotchas below):
-
-```yaml
-scrape_configs:
-  - job_name: pingularity
-    scrape_interval: 30s
-    static_configs:
-      - targets: ["192.168.1.10:9000"]   # the host running Pingularity
-```
-
-Three access controls can turn a scrape into a `401`/`403`:
-
-- **Network access still off?** (the default on every fresh install) - remote
-  scrapes get `403`. Enable it in the Access tab, or run the scraper on the
-  same host.
-
-- **Login enabled?** `/metrics` then sits behind auth, and scrapes get `401`.
-  Either add the admin credentials as HTTP Basic, or (better) start Pingularity with
-  `-metrics-token=<token>` and give the scraper a read-only token that can't change
-  settings:
-
-  ```yaml
-      # admin credentials …
-      basic_auth:
-        username: admin
-        password: your-password
-      # … or a read-only token (with -metrics-token):
-      authorization:
-        credentials: your-metrics-token
-  ```
-
-- **Scraping by a public hostname?** The always-on DNS-rebinding guard rejects a
-  `Host` header that's a public domain with `403`. IP targets and `*.local`/
-  `*.lan`/etc. pass automatically; for a real domain, start Pingularity with
-  `-allow-host=pinger.example.com`.
-
-Starter queries and alerts against the operational series:
-
-```promql
-# Link down right now. Put for: 2m on the alert rule rather than widening the
-# query: min_over_time(pingularity_up[2m]) == 0 only says "some sample in the last
-# 2m was down", so one missed round pages as a two-minute outage. The
-# probing_active conjunct keeps a deliberate pause quiet - pingularity_up holds its
-# last value whenever rounds stop, so a bare == 0 would page forever.
-pingularity_up == 0 and pingularity_probing_active == 1
-
-# Outage count / downtime seconds over a day - robust even when an outage is
-# shorter than the scrape interval (counts confirmed transitions, not samples)
-increase(pingularity_outages_total[24h])
-increase(pingularity_outage_duration_seconds_total[24h])
-
-# The probe loop itself stopped (wedged/crashed prober, NOT a quiet link):
-# no completed rounds for 5m while probing should be running.
-rate(pingularity_probe_rounds_total[5m]) == 0 and pingularity_probing_active == 1
-
-# 30-day uptime under 99.9% - but only trust it where the window was actually
-# observed (coverage guards against a mostly-paused window reading falsely high)
-pingularity_uptime_ratio{window="30d"} < 0.999
-  and pingularity_uptime_coverage_ratio{window="30d"} > 0.95
-
-# p95 anchor latency over 5m (from the histogram)
-histogram_quantile(0.95, rate(pingularity_probe_latency_seconds_bucket[5m]))
-
-# A background worker died, or the scrape returned incomplete data (DB failing).
-# A worker that FINISHED its job (the one-shot settings-retry succeeding) removes
-# its series instead of reporting 0, so this matches only real deaths.
-pingularity_worker_up == 0
-pingularity_metrics_data_valid == 0
-
-# Speedtests have stopped landing (wedged scheduler, or every run failing). Not a
-# plain time() subtraction: the last-run series appears only once a run has
-# SUCCEEDED, so an install whose every speedtest fails has no series to go stale -
-# and a bare subtraction keeps firing once scheduled tests are deliberately turned
-# off. Gating on next_run (present only while the schedule is on) and treating an
-# absent last run as a stale one covers both. Raise 7200 (2x the default 1h
-# interval) above the longest gap a Speedtest schedule window leaves - a nightly
-# window means ~22h of honestly stale last_run - and expect this to be true on a
-# new install until the first run lands.
-pingularity_speed_next_run_timestamp_seconds
-  unless on(instance, job) (pingularity_speed_last_run_timestamp_seconds > time() - 7200)
-
-# How overdue the next scheduled speedtest is (present only while scheduled tests
-# are on). Read this one, don't alert on it: a next_run in the past is normal while
-# a closed window or a busy link is holding the run back, because that deferral
-# deliberately leaves the schedule anchor where it is. Nothing on /metrics tells a
-# deferral apart from a wedge, so alert with the query above and use this one to
-# answer "why hasn't it run" (the log says "speedtest deferred" too).
-time() - pingularity_speed_next_run_timestamp_seconds
-
-# Download below 100 Mbit/s on the last speedtest
-pingularity_speed_download_mbps < 100
-
-# DNS resolution failing while the link itself is up (name resolution broke)
-pingularity_dns_up == 0 and pingularity_up == 1
-
-# Last speedtest failed its configured thresholds, or a long current outage
-pingularity_speed_healthy == 0
-pingularity_current_outage_seconds > 300
-
-# Speedtests failing by stage, per hour (server_fetch / ping / download / …).
-# sum by (stage), not a bare sum: this is a labelled family with one series per
-# stage, and summing without the label collapses all nine into a single number that
-# answers the opposite of the question.
-sum by (stage) (rate(pingularity_speed_failures_total[1h])) * 3600
-
-# Webhook deliveries failing or SSRF-blocked - series exist at 0 from startup,
-# so the first event is a visible 0->1 step for rate()/increase()
-rate(pingularity_notification_failures_total[15m]) > 0
-rate(pingularity_notification_blocked_total[15m]) > 0
-
-# Average speedtest duration over 6h (the _sum/_n summary pair)
-rate(pingularity_stat_total{stat="speed.duration_s_sum"}[6h])
-  / rate(pingularity_stat_total{stat="speed.duration_n"}[6h])
-```
+**→ [docs/metrics.md](docs/metrics.md)** - every metric and its labels, the
+health endpoints, how to scrape it, worked alert rules with the reasoning behind
+each query, and the importable Grafana dashboard.
 
 ## HTTP API
 
-Responses are gzip-encoded when the client sends `Accept-Encoding: gzip` and the
-body is at least 1 KiB (smaller ones are sent as-is - gzip's framing can make a
-short body bigger, and it already fits in one packet). Every such response
-carries `Vary: Accept-Encoding`. The two streaming downloads, `/api/export` and
-`/api/speed/runs.csv`, are always sent uncompressed so they keep streaming at
-constant memory.
+Everything the dashboard does, it does over this API, so anything the UI can do
+is scriptable. Reads return JSON and are gzip-encoded when worth it; writes are
+POSTs guarded by the same access rules as the dashboard. Two streaming
+downloads - a full database export and the speedtest run history as CSV - are
+always sent uncompressed so they keep streaming.
 
-Every `POST` must carry `Content-Type: application/json`, **including the ones
-with no body at all** (`/api/speedtest`, `/api/speedtest/abort`, `/api/netinfo`,
-`/api/iperf/check`, `/api/speedtest/servers`, `/api/speedtest/candidates`,
-`/api/auth/logout`), which answer `415` without it. It is a CSRF guard: a cross-site form cannot set that content
-type without a preflight this daemon never grants. So
-`curl -X POST -H 'Content-Type: application/json' http://127.0.0.1:9000/api/speedtest`,
-and `-d '{…}'` where a body is listed below.
-
-- `GET /api/status` - current status, uptime, per-family state, targets, latest
-  speed, and live speedtest progress. Every uptime figure ships with its
-  observation coverage (`uptime_coverage` per window, `uptime_custom_coverage`
-  for `?upMins=`); a coverage of `0` means the window observed nothing and has no
-  uptime to report, exactly as `pingularity_uptime_ratio` is then absent. A
-  running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
-  (`0` when idle) - that id is what `/api/speedtest/abort` takes, so a stop can
-  name the run it was decided against. A fresh install awaiting first-run consent
-  reports `quick_setup_pending`, and `access_local_only` mirrors the loopback-only
-  access filter (so a client can default the Quick Setup access choice to how the
-  install booted); `bridged_container` is present only in a bridged container,
-  where measurements describe the container network rather than the host's
-- `GET /api/series?mins=…[&exclude=…]` - latency / online time series (server-side
-  bucketed); `exclude` drops targets from the lowest-latency line. Also takes an
-  absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`; omit `to`
-  for an open end), which wins over `mins`. Either form reaches at most 366 days
-  back: a `from` older than that is silently raised to the floor, and a `mins`
-  beyond it is ignored in favour of the endpoint's default window - so a window
-  lying entirely further back than a year returns nothing even where retention
-  kept the rows. The bucket width follows the part of
-  the window that can hold data - `[from, min(to, now))` - so an omitted or
-  future `to` buckets as if the window ended now rather than coarsening the lot
-- `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log.
-  `limit` defaults to 10 (50 on `/api/speed/runs`) and is silently capped at 1000,
-  the same ceiling `/api/logs` uses - page with `offset` and trust the `total` in
-  the body rather than the length of the array you got back
-- `POST /api/outages/delete` - `{ts}` delete one resolved outage (`ts` = the unix
-  seconds of its closing up event); removes it from the log, heatmap, and
-  uptime stats. Idempotent
-- `GET /api/speed?mins=…` - speedtest history for the chart, capped at about 1500
-  points. A window holding fewer runs than that is returned in full; a larger one
-  is thinned by taking an even stride through the runs *by position* (not by
-  time), always keeping the newest. Every point is a real recorded row, never a
-  derived value - unlike `/api/series`, which buckets by time and reduces each
-  bucket to one number (the lowest latency measured in it, and the mean DNS time). The stride is positional, so widening a window past 1500 runs re-picks
-  from scratch: the newest run is always kept, but the other points are generally
-  *different* runs rather than a superset of the narrower window's. The body stays
-  a bare array; the disclosure is
-  in the headers - `X-Total-Count` (runs in the window), `X-Returned-Count` and
-  `X-Sampled` (`true` when thinned), so a client can tell a thinned answer from a
-  complete one. For every run, use `/api/speed/runs` (paginated) or
-  `/api/speed/runs.csv` - both cover the whole history rather than a window, so a
-  caller that wants one window filters on `ts` itself. Also
-  takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
-  omit `to` for an open end), which wins over `mins` when present - with the same
-  366-day reach as `/api/series`, so a window entirely older than that comes back
-  empty however long retention keeps the runs
-- `GET /api/speed/runs?limit=&offset=` - paginated run history (full detail).
-  With **Discard losers** off, a Best-of round's other measurements are rows
-  of their own here and on `/api/speed` (the chart plots them like any other
-  run), each carrying `round_ts` - the winner row's `ts`; the latest-run
-  endpoints and the digest never list them.
-  Runs that recorded them carry `ip_family` (`4`/`6`/`mixed`, the family the
-  transfer actually used) and `udp_direction` (`down`/`up`, which way the
-  loss/jitter probe sampled); on runs that didn't establish one - and rows
-  predating the fields - the keys are omitted rather than sent empty
-- `GET /api/speed/runs.csv` - all runs as CSV. Everything added since the
-  original column set is appended at the END, so consumers indexing existing
-  columns by position keep working. In order, the tail is `ip_family` and
-  `udp_direction` (blank = unrecorded); `round_of`, which on a row measured in
-  a Best-of round that another server won (**Discard losers** off) carries the
-  winner's timestamp and is blank on a test's own result; and then the same
-  five the runs table's **Centre** column is built from - `win_reason`,
-  `race_outcome`, `race_winner_label`, `race_winner_ms`, `race_racers`
-- `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
-- `GET /api/speed/runs/servers?ts=` - the server-selection report for one
-  Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge
-  run, and pinned run writes one, not only Best-of rounds: every candidate that
-  was ranked, raced, measured, or failed - each with its own numbers, the
-  capacity the round believed, any direction it refused to believe, and the
-  rule that made the winner win (`win_reason` on the winner row:
-  `fastest_ranked`, `fallback`, `incumbent`, `on_net`, `challenger`, `challenger_won`,
-  `challenger_failed`, `pinned`, and for Best-of rounds `score`, `favourite`
-  (a starred server scored highest), `ping_bootstrap`, `pinned_bestof`,
-  `pinned_companion` - the same value the runs table shows as the muted tag). `404` only when no such run exists; a run
-  with no report (an iperf3 run, history from before the report existed, an
-  old backup) answers `200` with an empty `servers` array
-- `GET /api/speed/usage` - cumulative data used per window
-- `POST /api/speedtest/candidates` - the field an automatic Ookla run would race
-  right now: every origin's pool (exit router, ISP city, starred servers' cities,
-  the last race's winning city, Ookla's placement), deduplicated and pinged, fastest first, plus the rest of
-  the winning city's field pinged the same way (a Best of above 1 ranks the
-  whole union instead, its pools widened to the count, so every row is then
-  in the field and nothing more is pinged); `in_field` marks the rows a run
-  would actually choose from, and `distance_km` is re-measured from the winning
-  city for every row that has a coordinate; when Ookla's own placement wins
-  (it has no coordinate to measure from) each row keeps the distance from the
-  origin that listed it, so distances are then not comparable across origins;
-  `409` while a speedtest is running
-- `POST /api/speedtest/ping` - `{ids:[...]}` measure the ping to up to twelve
-  Ookla servers by ID, the way the race pings (no transfer), probing each
-  one's upload endpoint on the way - the picker's saved-pane refresh; answers
-  `{pings:{id: ms|null}, health:{id: bool}}` (`health` only where the probe
-  could tell, so a starred server outside every listing can earn its
-  Unsupported mark); `409` while a speedtest is running
-- `GET /api/speed/server-pings?ids=` - the median of each server's recent
-  ranking pings from this daemon's own runs (no network); a server never
-  ranked is absent
-- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; `?id=<ookla
-  id>` resolves one server by its Ookla ID instead - identity plus `fallback_ok`
-  when its upload endpoint could be probed, no coordinate, and a `distance_km`
-  of `0` that means *unknown*, because that endpoint reports the *caller's*
-  position as the server's: `404` when Ookla answers and knows no such server, `502`/`504` when
-  Ookla could not be asked; by default the list is centred where auto last
-  tested, else near you)
-- `POST /api/iperf/check?addr=` - check that an iperf3 server is reachable
-- `GET /api/heatmap?days=365[&tz=Europe/Berlin]` - daily downtime, plus
-  `window_s`/`observed_s` on every day it returns (how much of it was in range
-  and how much was actually monitored). The response is **sparse**: a day earns a
-  row only if it had an outage or was not watched end to end, so a year of clean
-  monitoring comes back as a handful of rows rather than 366. An absent date
-  therefore means "nothing on record", not "watched all day and clean" - history
-  you deleted, or that retention pruned, is missing in exactly the same way, so a
-  client must not read observation coverage out of a gap. `days` defaults to 365
-  and is capped at 366; `tz` takes an IANA zone name and decides where each day
-  starts (default: the server's own zone), so a client in another zone gets its
-  own calendar days rather than the server's
-- `GET /api/netinfo` - connection info (IP/ISP/DNS); `POST` forces a full refresh
-- `GET|POST /api/settings` - read / update live settings. POST is a **partial**
-  update: fields you omit keep their current value, and only the settings form is
-  reachable here - monitoring (`/api/monitoring`), access/auth (`/api/access`), the
-  update check (`/api/update`) and logging (`/api/logs`) have no field in it
-- `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
-- `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The
-  session cookie lasts **30 days**, and a logout revokes **every** signed-in
-  browser rather than just the one that asked (the revocation is persisted, so it
-  survives a restart) - which is also how you evict a lost laptop
-- `POST /api/speedtest` - run a speedtest now
-- `POST /api/speedtest/abort[?run=…]` - stop a speedtest in flight. A bare POST
-  stops whatever is running when it arrives; `run=` (the `speedtest_run_id` from
-  `/api/status`) stops only that run, and is **recommended for any client that
-  might be delayed** - a stop decided seconds ago would otherwise kill a run that
-  started in between. `204` = stopped, `409` = nothing matching to stop (idle, or
-  that run already ended), `400` = `run` was not a run id. A best-of-N run that
-  has already measured a server keeps that result; an abort before the first
-  result stores nothing. `204` means the run was released, not that the traffic
-  stopped: the Ookla engine's transfer does not observe cancellation, so it keeps
-  moving bytes until its own 15-second capture window closes. Those bytes are still
-  counted against your data usage, and a fresh run started immediately afterwards
-  waits (up to ~20s) for the abandoned one to go quiet rather than measuring
-  through it
-- `GET|POST /api/monitoring` - read / set `{enabled}` master start/stop (the power toggle)
-- `POST /api/quick-setup` - apply the first-run **Quick Setup** answer in ONE
-  transaction (speedtest cadence, network access, update check, and an optional
-  login) and mark it answered so the dialog never returns; `{dismiss:true}` marks
-  it answered without changing anything else (once a login is active, dismissing
-  requires that login too). `auth_enabled` must agree with
-  whether a `password` is sent. Two things refuse a full answer with `403`: a
-  login already being configured (change access under Settings then), and the
-  first-run window having closed - the offer lasts 48h from first launch, and
-  once it lapses this endpoint stops accepting full answers just as `/api/status`
-  stops advertising it. `{dismiss:true}` keeps working past that point, because
-  all it writes is the answered marker a lapsed window already implies, and a
-  dialog left open on a stale tab should always be able to close itself. Fresh
-  installs only; the offer is `quick_setup_pending` in `/api/status`
-- `GET|POST /api/update` - update-check status / toggle the daily release poll
-- `GET|POST /api/logs` - the About-tab log viewer: read recent lines (or
-  `?download=1` for a text file, still the complete buffer - add `&masked=1` for
-  the PII-masked form, which is the one to attach to a bug report; the raw form is
-  the default here, since the redaction setting is a display choice) / set log
-  level, PII redaction, or clear the buffer. A bare read returns the newest 500 lines;
-  `?limit=` asks for a different window (capped at 1000, `?limit=0` for the whole
-  buffer). Responses carry `limit` (the cap applied) and `buffered` (lines held),
-  so a short answer can be told from a complete one, plus `epoch`, `first_seq`,
-  `next_seq` and `dropped`, so a
-  poller can pass `?since=<next_seq>&epoch=<epoch>` and be sent only what has
-  arrived since - `since` is ignored unless `epoch` matches, because a restart
-  reseeds the buffer and re-uses the same sequence numbers for different lines
-- `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
-- `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
-  export / import config + history. Pick at least one of those four categories (any
-  non-empty value selects one); with none at all the export is a `400`.
-  (JSON; export streams a single consistent snapshot with a small manifest; import
-  streams in bounded batches and is **not atomic** - a mid-file error leaves earlier
-  categories applied and returns `{partial:true, committed:{…}}`. Import puts no
-  cap on the total request (a default install's own export outgrows any fixed one)
-  and bounds the pieces instead: 8 MiB per record, 256 MiB per JSON element
-  (413), 8 MiB per batch held in memory. In a file from Pingularity's own
-  exporter, config is applied last, so a data failure can't half-change your
-  settings; a hand-built or third-party file is applied in *its* key order, so put
-  `config` last yourself)
-- `POST /api/notify/test` - `{url}` send a test alert to a webhook
-- `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
-
-> All endpoints are **unauthenticated** by default; what protects a fresh
-> install - native or container - is the **Network access** filter starting
-> off (localhost only). Once you open network access for other devices or Prometheus, every
-> device on the LAN can use every endpoint - the **Access** tab's **login**
-> (cookie for browsers, HTTP Basic for API/Prometheus) is the fix if that LAN
-> isn't fully trusted. Either way, the dashboard speaks plain HTTP: for
-> exposure over untrusted networks, still front it with a TLS reverse proxy.
-> The webhook test posts to a URL you supply, so treat access to the dashboard
-> as access to that capability.
->
-> **DNS-rebinding protection** is always on: requests whose `Host` header is a
-> public domain are refused (403), which stops malicious web pages from using
-> a local browser as a proxy into the API. IP addresses, `localhost`, dotless
-> LAN names (`plex:9000`), and `.local`/`.lan`/`.home`/`.internal`/`.home.arpa`
-> all work without configuration. Serving the dashboard behind a reverse proxy
-> on a real domain? Set `-allow-host=ping.example.com` (comma-separate several)
-> and have the proxy **preserve** the `Host` header - it must reach Pingularity
-> as the public domain so the rebinding guard can vet it and the session cookie
-> is marked `Secure`. Add `-trusted-proxy` with the proxy's address so the login
-> rate limiter keys on the real client instead of the proxy.
->
-> **Secrets at rest:** the database stores the login password hash and
-> webhook/heartbeat URLs - so Pingularity creates its data directory `0700`
-> and the database file `0600` (owner-only).
-> Keep it that way if you relocate the DB with `-db`.
->
-> **Legacy Docker volumes:** the database file is always owner-only, but a named
-> volume created by an *older* image may have a group/world-readable directory
-> root (Docker's volume copy-up loosens it). A volume first created by a current
-> image is recognized as the daemon's own - its path, its owner, and a marker
-> file the image plants - and re-tightened to `0700` at boot automatically. One
-> created by an older image carries no marker, and Pingularity won't silently
-> re-lock a directory it can't prove is its own - so it logs a one-line notice
-> on start instead. The data is already private; to clear the notice, tighten
-> the directory once from any container that can reach the volume (the default
-> image has no shell to `docker exec` into):
-> `docker run --rm -v pingularity-data:/data debian:13-slim chmod 700 /data`.
->
-> The full picture - what the trust boundary is, what privilege each install
-> channel runs with, what the defaults protect and how to deploy it safely - is in
-> [docs/security-model.md](https://github.com/pingular/pingularity/blob/main/docs/security-model.md). To report a vulnerability,
-> see [SECURITY.md](SECURITY.md).
+**→ [docs/api.md](docs/api.md)** - every endpoint, its shape, and the rules
+they share.
 
 ## How it works
 
@@ -2176,11 +1547,13 @@ targets, and overall is up when *either* family is. A confirmed flip needs
 ```mermaid
 stateDiagram-v2
   [*] --> Online: starts optimistic
-  Online --> Online: round ok, or < down-after failures
   Online --> Offline: down-after consecutive failed rounds<br/>→ write 'down' event + alert
-  Offline --> Offline: round bad, or < up-after successes
   Offline --> Online: up-after consecutive ok rounds<br/>→ write 'up' (with duration) + speedtest + alert
 ```
+
+Any round that does not meet the threshold leaves the state where it is: a single
+bad round while Online, or a run of successes shorter than `-up-after` while
+Offline, changes nothing and writes nothing.
 
 **Each round fans out into the raw series and the derived records.** Outage
 *events* - not per-probe success - drive uptime and the heatmap, so those views
@@ -2201,60 +1574,16 @@ flowchart LR
 **The store is seven independent time-series tables** (plus a key/value settings
 table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
 
-```mermaid
-erDiagram
-  samples {
-    int  ts
-    text target
-    real latency_ms
-    int  success
-    text family
-  }
-  dns {
-    int  ts
-    real latency_ms "NULL when the lookup failed"
-    int  success
-  }
-  events {
-    int  ts
-    text type "up | down"
-    int  duration_s
-  }
-  pauses {
-    int  ts
-    int  duration_s "unobserved span: paused, scheduled-off, or process-down"
-  }
-  pauses_quarantine {
-    int  ts "pause rows held aside by clock repair, returned if the clock corrects"
-    int  duration_s
-  }
-  speed {
-    int  ts
-    real down_mbps
-    real up_mbps
-    real ping_ms
-    real jitter_ms
-    real packet_loss
-    int  healthy
-    text server
-    text race_outcome "how the centre was chosen: decided | silent | unanchored | failed | skipped | bypassed_pin"
-    text race_origins "every city that raced, with its fastest answer"
-    text race_winner_label
-    real race_winner_ms
-  }
-  speed_servers {
-    int  run_ts "joins speed.ts: each run's server-selection report"
-    text server_id
-    real rank_ping_ms
-    real score
-    int  winner
-    text win_reason
-  }
-  settings {
-    text key
-    text value
-  }
-```
+| table | columns |
+| --- | --- |
+| `samples` | `ts` int · `target` text · `latency_ms` real · `success` int · `family` text |
+| `dns` | `ts` int · `latency_ms` real (NULL when the lookup failed) · `success` int |
+| `events` | `ts` int · `type` text (`up` \| `down`) · `duration_s` int |
+| `pauses` | `ts` int · `duration_s` int - an unobserved span: paused, scheduled-off, or process-down |
+| `pauses_quarantine` | `ts` int · `duration_s` int - pause rows held aside by clock repair, returned if the clock corrects |
+| `speed` | `ts` int · `down_mbps` `up_mbps` `ping_ms` `jitter_ms` `packet_loss` real · `healthy` int · `server` text · `race_outcome` text (how the centre was chosen: `decided` \| `silent` \| `unanchored` \| `failed` \| `skipped` \| `bypassed_pin`) · `race_origins` text (every city that raced, with its fastest answer) · `race_winner_label` text · `race_winner_ms` real |
+| `speed_servers` | `run_ts` int - joins `speed.ts`, one row per candidate in that run's server-selection report · `server_id` text · `rank_ping_ms` real · `score` real · `winner` int · `win_reason` text |
+| `settings` | `key` text · `value` text - the key/value table, not a time series |
 
 **Exit-node discovery** traces toward `1.1.1.1`, attributes each hop to an ASN,
 and finds the ISP boundary - then geolocates the two boundary hops. The trace is
@@ -2277,7 +1606,7 @@ flowchart TB
 ```
 
 **Every request passes the access guard** before any handler runs, with two
-deliberate exceptions: the [`/healthz` and `/readyz` probes](#health-endpoints)
+deliberate exceptions: the [`/healthz` and `/readyz` probes](docs/metrics.md#health-endpoints)
 are answered ahead of it, so a load balancer hitting a bare IP with no
 credentials still gets its verdict (they carry no data to protect). Everything
 else meets the DNS-rebinding `Host` check first, then the loopback filter

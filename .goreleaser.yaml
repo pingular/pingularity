@@ -27,6 +27,10 @@ archives:
       - LICENSE*
       - README*
       - THIRD-PARTY-NOTICES.md
+      # The reference the README links to rather than inlines (metrics, HTTP API,
+      # flags, security model). Without this an archive carries a README whose
+      # "see docs/..." links point at nothing that shipped with it.
+      - docs/*.md
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     format_overrides:
