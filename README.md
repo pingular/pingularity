@@ -10,9 +10,10 @@ by majority vote (a *quorum* across multiple *anchors*), with anti-flapping
 latency, uptime, and speed to SQLite and shows it all in a live UI - no runtime
 to install.
 
-This is the [live demo](https://demo.pingularity.dev) - same dashboard, synthetic data:
+This is the dashboard on a real install. The [live demo](https://demo.pingularity.dev)
+is the same thing on synthetic data, with a badge to say so:
 
-![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), a speedtest with bufferbloat, the latency-over-time chart, and a year-long downtime heatmap](https://raw.githubusercontent.com/pingular/pingularity/main/docs/dashboard.png)
+![The Pingularity dashboard: top-bar status bubbles, the Connection panel (IP / ISP / DNS / internet exit), the Speed panel - seven stat tiles over three stacked charts - the "Lowest round-trip across anchors" latency chart with its DNS line and clickable anchor pills, and a year-long downtime heatmap](https://raw.githubusercontent.com/pingular/pingularity/main/docs/dashboard.png)
 
 ## Quick start
 
@@ -454,7 +455,11 @@ published.
 > are down: any run carrying the new columns stamps the export for the release
 > that introduced them - 0.70 for the failed-run marker, higher again for the
 > city-race verdict every Ookla run has recorded since - and an older build
-> refuses a newer stamp outright rather than restoring half of it.
+> refuses a newer stamp outright rather than restoring half of it. One rung is
+> yours to trigger: with **Discard losers** off a round's other servers are kept
+> as rows of their own, which stamps the export a rung higher again, so take the
+> backup before you turn it off (or turn it back on first) if the file has to
+> restore onto an older release.
 
 ## Run in the background (systemd / launchd / Windows service)
 
@@ -670,13 +675,13 @@ transfer, reported as their **median** (if none of them land, iperf3's own
 `min_rtt`, and failing that the idle baseline). There is no separate fastest
 figure on those runs, so that median is both what is shown and what decides.
 
-![The Speed panel: a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, and a save-as-image button](https://raw.githubusercontent.com/pingular/pingularity/main/docs/speed-panel.png)
+![The Speed panel: a header row with the RUN button, the server this test used and when the next one is due, and a window picker; below it a row of stat tiles (download, upload, ping, jitter, packet loss, and bufferbloat both directions) above three stacked time charts for speed, ping and bufferbloat, with window averages for download, upload and ping below them, per-chart show/hide toggles, a Show all runs button, and a save-as-image button](https://raw.githubusercontent.com/pingular/pingularity/main/docs/speed-panel.png)
 
 **Bufferbloat** is the extra lag that appears only while the line is busy - the
 reason a video call breaks up the moment a big download starts. Pingularity
 measures it by pinging before the test (idle) and during it (loaded) - both
-against a fixed target of its own rather than the speedtest server, so only the
-gap between them is meaningful, and the idle figure will not match the **ping**
+against a fixed target of its own (`one.one.one.one`, Cloudflare) rather than
+the speedtest server, so only the gap between them is meaningful, and the idle figure will not match the **ping**
 recorded above:
 
 ```mermaid
@@ -942,7 +947,7 @@ rather than by jitter: a run **keeps the server the last automatic run
 measured** while it is still among the servers this run pings (the winning
 city's list, seeded as above) and still pings within max(2 ms, 15 %) of the
 fastest (win reason `incumbent` when that kept it ahead of a faster server;
-plain `fastest` when it was the fastest anyway), and failing that prefers your
+plain `fastest_ranked` when it was the fastest anyway), and failing that prefers your
 ISP's own server inside the same band (`on_net`) - so the history compares
 like with like instead of flipping between equivalent servers, while a server
 that has gone bad loses its seat the run it goes bad, because the seat is
@@ -1154,6 +1159,7 @@ Below that:
 > | **RIPE IPmap** | the two boundary router IPs the traceroute settles on, and your resolver's egress address, for geolocation | connection refresh + exit discovery |
 > | **ipwho.is**, then **geojs.io** | your public IP, for the ISP/geo line | connection refresh |
 > | **Cloudflare** (`/cdn-cgi/trace`) | a plain fetch, to learn the serving PoP | connection refresh |
+> | **one.one.one.one:443** (Cloudflare) | bare TCP handshakes, no payload - the fixed target the bufferbloat idle and loaded samples are measured against. Resolved through your own resolver, so it reaches whichever of `1.1.1.1`/`1.0.0.1` (or their v6 pair) that answer names | every speedtest that samples bufferbloat |
 > | reverse DNS | router/host IPs, for names | connection refresh |
 > | **Ookla** servers | the speedtest traffic itself, plus a server-list lookup and a small probe of each listed server's upload endpoint (remembered, so a repeat does not send it again); opening the Ookla tab can also cost one by-ID lookup and one name search first, to centre the list on the server your last automatic run used; for the picker's Auto button, the same selection a run performs - one list fetch per candidate city, a round of pings at every racer, then a round at the rest of the winning city's field (up to twelve), no transfer; for a server ID typed in Find, and for a saved pin the drawer has not yet checked this page load (at most twice per server), one by-ID lookup plus one small POST at that server's upload endpoint to learn whether it can still run a test, no transfer; and for the saved list's refresh button, one by-ID lookup, one endpoint probe and a round of pings at each kept server (up to twelve), no transfer | when a speedtest runs, when the Ookla settings tab is opened or a city is searched, when a server ID is typed in Find or a saved pin is first shown, on every Auto click, and on every refresh click in the saved list |
 > | your own **iperf3 server** (opt-in) | the test traffic itself - the TCP transfers, plus a short UDP pass for loss and jitter; or, for the status light in the settings drawer, one bare TCP handshake and nothing else | when an iperf3 speedtest runs, and when the drawer checks a saved server's status light - once per address while the drawer is open with iperf3 selected, plus whenever you click a server's light or change its address |
@@ -1219,9 +1225,11 @@ Below that:
 > run unvetted. Full reasoning in
 > [docs/security-model.md](https://github.com/pingular/pingularity/blob/main/docs/security-model.md).
 
-The **logo** (top-right) opens a tabbed settings drawer; a **power** toggle in
-the tab row starts/stops all monitoring. Changes apply **live** (no restart)
-and persist across restarts:
+The **logo** (top-right) opens a tabbed settings drawer; the **power** toggle
+beside it, in the top bar, starts/stops all monitoring. Changes apply **live** (no restart)
+and persist across restarts.
+
+![The settings drawer, open on its Ookla tab: a row of tabs (Speedtest, Ookla, iperf3, Latency, Schedule, Data, Alerts, Access, Appearance, About) above the per-test knobs - Best of, Discard losers, Retries, Packet-loss probe, Direction and Parallel connections, each with a hover-help dot; below them the Saved pane with Auto selected, a Find box that takes a place or an Ookla server ID, and the server list with ID, ping and distance columns and a star on each row; Save and Discard sit at the bottom left, Reset to defaults and Reset tiles at the bottom right](https://raw.githubusercontent.com/pingular/pingularity/main/docs/settings-ookla.png)
 
 - **Latency** → latency probing on/off, latency interval, probe timeout, and
   sensitivity (failures→down / successes→up, IPv6 mode auto/on/off), plus the
@@ -1420,7 +1428,7 @@ and persist across restarts:
 **Nine built-in themes**, every one fully recolourable (backgrounds, panels,
 status colours, chart series - each picker previews live and resets to the theme):
 
-![Six of Pingularity's built-in themes side by side: Retro, Dark, Light, Cyber, Solarized, and Amoled](https://raw.githubusercontent.com/pingular/pingularity/main/docs/themes.png)
+![All nine of Pingularity's built-in themes in a three-by-three grid: Retro, Dark, Amoled across the top; Cyber, Slate, Light in the middle; Parchment, Solarized, Ember along the bottom](https://raw.githubusercontent.com/pingular/pingularity/main/docs/themes.png)
 
 > **Notifications** post to one webhook URL, shaped per host so the common
 > targets just work - JSON everywhere except ntfy. Discord → `{content}`,
@@ -1925,8 +1933,8 @@ constant memory.
 
 Every `POST` must carry `Content-Type: application/json`, **including the ones
 with no body at all** (`/api/speedtest`, `/api/speedtest/abort`, `/api/netinfo`,
-`/api/iperf/check`, `/api/speedtest/servers`, `/api/auth/logout`), which answer
-`415` without it. It is a CSRF guard: a cross-site form cannot set that content
+`/api/iperf/check`, `/api/speedtest/servers`, `/api/speedtest/candidates`,
+`/api/auth/logout`), which answer `415` without it. It is a CSRF guard: a cross-site form cannot set that content
 type without a preflight this daemon never grants. So
 `curl -X POST -H 'Content-Type: application/json' http://127.0.0.1:9000/api/speedtest`,
 and `-d '{…}'` where a body is listed below.
@@ -1987,12 +1995,14 @@ and `-d '{…}'` where a body is listed below.
   transfer actually used) and `udp_direction` (`down`/`up`, which way the
   loss/jitter probe sampled); on runs that didn't establish one - and rows
   predating the fields - the keys are omitted rather than sent empty
-- `GET /api/speed/runs.csv` - all runs as CSV. The same two fields are the
-  final columns, `ip_family` and `udp_direction`, appended at the end so
-  consumers indexing existing columns by position keep working; blank =
-  unrecorded. After them, `round_of`: on a row measured in a Best-of round
-  that another server won (**Discard losers** off), the winner's timestamp;
-  blank on a test's own result
+- `GET /api/speed/runs.csv` - all runs as CSV. Everything added since the
+  original column set is appended at the END, so consumers indexing existing
+  columns by position keep working. In order, the tail is `ip_family` and
+  `udp_direction` (blank = unrecorded); `round_of`, which on a row measured in
+  a Best-of round that another server won (**Discard losers** off) carries the
+  winner's timestamp and is blank on a test's own result; and then the same
+  five the runs table's **Centre** column is built from - `win_reason`,
+  `race_outcome`, `race_winner_label`, `race_winner_ms`, `race_racers`
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
   Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge
