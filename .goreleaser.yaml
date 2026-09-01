@@ -89,6 +89,12 @@ dockers_v2:
     ids:
       - pingularity
     dockerfile: Dockerfile
+    # Named so the docker build context carries them; both Dockerfiles COPY them
+    # to /usr/share/doc/pingularity so an image carries the same notices the
+    # archives and the deb/rpm do.
+    extra_files:
+      - LICENSE
+      - THIRD-PARTY-NOTICES.md
     images:
       - ghcr.io/pingular/pingularity
     # buildx builds every platform in one pass and assembles a multi-arch manifest
@@ -127,6 +133,12 @@ dockers_v2:
     ids:
       - pingularity
     dockerfile: Dockerfile.iperf
+    # Named so the docker build context carries them; both Dockerfiles COPY them
+    # to /usr/share/doc/pingularity so an image carries the same notices the
+    # archives and the deb/rpm do.
+    extra_files:
+      - LICENSE
+      - THIRD-PARTY-NOTICES.md
     images:
       - ghcr.io/pingular/pingularity
     platforms:

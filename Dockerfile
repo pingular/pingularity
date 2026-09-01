@@ -53,6 +53,16 @@ LABEL org.opencontainers.image.title="pingularity" \
       org.opencontainers.image.source="https://github.com/pingular/pingularity" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=setcap /pingularity /pingularity
+# The licences the binary is distributed under. Every other channel carries these
+# - the archives ship them beside the binary (.goreleaser.yaml archives.files) and
+# the deb/rpm install them under /usr/share/doc/pingularity - but an image is a
+# binary distribution too, and the statically-linked binary carries BSD-3 code
+# (golang.org/x, speedtest-go, the modernc/musl-derived libc) plus an embedded
+# OFL font, all of which ask for their notice to travel with it. goreleaser stages
+# only the built binaries into the docker context, so both files are named in that
+# builder's extra_files; without them this COPY fails the build rather than
+# silently shipping an image with no notices.
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/pingularity/
 # The data dir must exist owned by nonroot (65532) so a freshly created named
 # volume inherits that ownership and the unprivileged process can write to it.
 # It is copied as an entry INSIDE /seed rather than being the destination itself:
