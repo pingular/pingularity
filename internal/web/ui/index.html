@@ -19,6 +19,12 @@
     /* How wide the page may grow. html.wide (the Full-width toggle) lifts the cap so the
        bar, the content, and the settings drawer all fill the window. */
     --page-w:1100px;
+    /* Hover-bubble width. 250px gave about 39 characters a line, under the 45-75
+       that reads comfortably, so the longer tips (87 of them, half carrying
+       bullet lists) came out as tall narrow columns: 9.5 lines on average,
+       26 at worst. At 380px that is 6.8 and 18. Read by placeTip() too, so the
+       flip below is decided against the same number the box is drawn at. */
+    --tip-w:380px;
     /* The wordmark's two halves - "Ping" and "ularity". Themes redefine them below; the
        Appearance pickers override them per-user (see PAL_VARS logoPing/logoUl). */
     --logo-ping:#8B5CF6; --logo-ul:#6B8EF5;
@@ -129,11 +135,11 @@
   :is(html[data-theme="slate"],html[data-theme="light"]) body{background:var(--bg);}
   :is(html[data-theme="slate"],html[data-theme="light"]) header,
   :is(html[data-theme="slate"],html[data-theme="light"]) .coach,
-  :is(html[data-theme="slate"],html[data-theme="light"]) .info::after,
+  :is(html[data-theme="slate"],html[data-theme="light"]) .info>.tip,
   :is(html[data-theme="slate"],html[data-theme="light"]) .hm-tip,
   :is(html[data-theme="slate"],html[data-theme="light"]) #blackout{backdrop-filter:none;-webkit-backdrop-filter:none;}
   :is(html[data-theme="slate"],html[data-theme="light"]) .coach{background:var(--panel);}
-  :is(html[data-theme="slate"],html[data-theme="light"]) .info::after,
+  :is(html[data-theme="slate"],html[data-theme="light"]) .info>.tip,
   :is(html[data-theme="slate"],html[data-theme="light"]) .hm-tip{background:var(--panel2);}
   *{box-sizing:border-box}
   /* Keyboard focus ring for controls that don't paint their own focus style
@@ -800,11 +806,16 @@
   /* Help bubbles: frosted glass - the panel colour at ~80% over a backdrop blur,
      a neutral hairline ring, a soft layered shadow with a faint lit top edge,
      and a slight rise as it opens. */
-  .info::after{content:attr(data-tip);position:absolute;top:165%;left:-2px;
-    width:250px;max-width:80vw;white-space:pre-line;color:var(--fg);padding:11px 14px;border-radius:12px;
-    /* text-wrap:pretty stops a wrapped sentence stranding one or two words alone on its last
-       line - the thing that makes these bubbles look broken. Costs nothing where unsupported. */
-    text-wrap:pretty;
+  .info>.tip{position:absolute;top:165%;left:-2px;translate:var(--tip-dx,0px) 0;
+    /* Hug the text rather than always drawing the full --tip-w: balance evens a
+       point's lines out, which on a short tip leaves a fixed-width box with an
+       empty gutter down its right. --tip-w is the ceiling now, not the width. */
+    /* Declared, not inherited: .lbl sets white-space:nowrap in the latency pane,
+       the notify rows and the iperf grid, and a child element inherits it - which
+       rendered those tips as one unwrapped line straight out of the bubble. The
+       old ::after set pre-line here for the same reason. */
+    white-space:normal;
+    width:max-content;max-width:min(var(--tip-w),80vw);color:var(--fg);padding:11px 14px;border-radius:12px;
     background:color-mix(in srgb,var(--panel2) 80%,transparent);
     -webkit-backdrop-filter:blur(14px) saturate(1.15);backdrop-filter:blur(14px) saturate(1.15);
     border:1px solid color-mix(in srgb,var(--fg) 14%,transparent);
@@ -817,26 +828,56 @@
        the fade-out. Engines without those show/hide instantly - fine. */
     display:none;opacity:0;transform:translateY(5px);pointer-events:none;
     transition:opacity .16s ease,transform .16s ease,display .16s allow-discrete;z-index:70;}
-  .info:hover::after{display:block;opacity:1;transform:none;}
+  /* Plain wrapping. Neither balance nor pretty is right here: both buy their
+     tidy last line by pushing words down, which leaves every line short of the
+     box's edge and the bubble looking under-filled. fitTip() sizes the BOX
+     instead, so the lines run full and no point ends on a stub. */
+  /* Pinned to the window by placeTip when the bubble would be cut off below -
+     the only way out of a scrolling ancestor, since an absolutely positioned
+     box is clipped by it. left/top come from the script, in viewport space. */
+  .info>.tip.pinned{position:fixed;translate:none;
+    /* A bubble taller than the window has to scroll: pinning it can only choose
+       WHERE it starts, and the tallest run to 450px against a 520px window. */
+    max-height:calc(100vh - 16px);overflow-y:auto;overscroll-behavior:contain;pointer-events:auto;}
+  .info>.tip>span{display:block;}
+  /* A point's wrapped lines hang under its text, not under its bullet - as a
+     two-column row rather than a negative indent, because the indent has to
+     equal the bullet's width exactly and that is a guess: 1.05em against a
+     9.4px bullet left every wrapped line 3.8px right of the first one. */
+  .info>.tip>.tb{display:flex;gap:.42em;}
+  .info>.tip>.tb>.mk{flex:none;}
+  .info>.tip>.tb>.tx{flex:1;min-width:0;}
+  .info>.tip>.tp+.tp,.info>.tip>.tp+.tb,.info>.tip>.tb+.tb,.info>.tip>.tb+.tp{margin-top:.55em;}
+  .info:hover>.tip{display:block;opacity:1;transform:none;}
   .info:focus{outline:none;border-color:var(--accent);color:var(--accent);}
-  .info:focus::after{display:block;opacity:1;transform:none;}
+  .info:focus>.tip{display:block;opacity:1;transform:none;}
   @starting-style{
-    .info:hover::after,.info:focus::after{opacity:0;transform:translateY(5px);}
+    .info:hover>.tip,.info:focus>.tip{opacity:0;transform:translateY(5px);}
   }
   /* The alerts row's rightmost group sits on the pane's right edge; its bubble
      opens leftward so a SHOWN bubble can't jut past the viewport either. */
-  .notif-inline .srow:last-child .info::after{left:auto;right:-2px;}
+  /* --tip-dx: how far placeTip() has to slide a bubble to keep it on screen. It
+     rides on `translate` rather than `left` so it works for the right-anchored
+     variants too (.info.chart-tip), and leaves the fade-in's `transform` alone.
+     A slide, not a left/right flip: on a phone the bubble is nearly as wide as
+     the screen, so anchoring it to the glyph's other edge just pushes it off
+     the far side - measured at 390px, flipping put 80 of them off the left. */
   /* Light grounds want much softer shadows and a brighter glass edge. */
-  html[data-theme="light"] .info::after{
+  html[data-theme="light"] .info>.tip{
     box-shadow:0 2px 6px rgba(15,23,42,.08),0 18px 44px rgba(15,23,42,.16),inset 0 1px 0 rgba(255,255,255,.65);}
-  @media (prefers-reduced-motion:reduce){.info::after{transition:opacity .16s;transform:none;}
+  @media (prefers-reduced-motion:reduce){.info>.tip{transition:opacity .16s;transform:none;}
     .drawer,.drawer.open,.drawer.open.scroll{transition:none;}}
   /* Chart help bubbles sit at a panel's top-right, so their tooltip opens leftward
      (right-aligned) and a bit wider to fit the multi-value descriptions. */
   /* The chart legends are one line per metric; at 330px every one of them wrapped onto a
      second row. 460px is what the longest of them needs to sit on a single line (measured).
      Right-aligned, so it opens leftward from an icon that sits at the panel's right edge. */
-  .info.chart-tip::after{left:auto;right:0;width:min(460px,88vw);}
+  /* Wider viewport allowance than the rest (these sit in a panel header with
+     room to spare), but the WIDTH is the fit's to choose: declaring --tip-w on
+     the bubble itself beat the fitted value inherited from the glyph, pinning
+     these two at 460px - where "better)." and "off." each broke onto a line of
+     their own, and no widening could reach them. */
+  .info.chart-tip>.tip{left:auto;right:0;max-width:min(var(--tip-w),88vw);}
   /* Connection-info-off marker: a corner state indicator, not a help (i). It sits
      one slot left of the refresh button (24px box + a 6px gap, the same spacing
      .chart-save keeps from the drag handle) and matches that button's box exactly
@@ -850,7 +891,7 @@
     font:600 13px/1 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;cursor:help;}
   .info.conn-off:hover,.info.conn-off:focus-visible{border-color:var(--accent);
     background:color-mix(in srgb,var(--accent) 22%,transparent);}
-  .info.conn-off::after{left:auto;right:0;width:min(330px,84vw);}
+  .info.conn-off>.tip{left:auto;right:0;--tip-w:min(330px,84vw);}
   /* .info sets display:inline-flex, which outranks the UA [hidden] rule. */
   .info.conn-off[hidden]{display:none;}
   /* On the light themes the --line2 ring all but vanishes; give the icon the
@@ -858,7 +899,7 @@
      out-specifies .info:hover/:focus, so re-assert the accent ring for those. */
   html[data-theme="light"] .info{border-color:var(--muted);background:color-mix(in srgb,var(--muted) 12%,transparent);}
   html[data-theme="light"] .info:hover, html[data-theme="light"] .info:focus{border-color:var(--accent);}
-  @media (max-width:600px){ .info::after{width:min(250px,86vw);left:auto;right:0;} .lbl .info::after,.ie-lbl .info::after,.netinfo .info:not(.conn-off)::after{position:fixed;left:8px !important;right:auto !important;top:auto;bottom:12px;width:min(250px,86vw);} }
+  @media (max-width:600px){ .info>.tip{width:min(250px,86vw);left:auto;right:0;} .lbl .info>.tip,.ie-lbl .info>.tip,.netinfo .info:not(.conn-off)>.tip{position:fixed;left:8px !important;right:auto !important;top:auto;bottom:12px;width:min(250px,86vw);} }
 
   /* ---- Ookla server picker: the saved pane above, the search results below ---- */
   .fp-cols{display:flex;flex-direction:column;gap:16px;}
@@ -1503,7 +1544,7 @@
      right edge - open the bubble leftward (anchored to the icon's right) so it
      can't clip off-screen, and give it a little breathing room from the data. */
   .netinfo .info{margin-left:7px;vertical-align:middle;}
-  .netinfo .info::after{left:auto;right:0;}
+  .netinfo .info>.tip{left:auto;right:0;}
   /* Banner shown when the status poll keeps failing - for a connectivity
      monitor, silently-frozen data is indistinguishable from "all good". */
   .stale-bar{position:fixed;left:0;right:0;bottom:0;z-index:95;text-align:center;padding:8px 14px;
@@ -1732,7 +1773,7 @@
   html:not(.round) .sdot,
   html:not(.round) .heatmap .cell,
   html:not(.round) .cov-track,
-  html:not(.round) .info::after,
+  html:not(.round) .info>.tip,
   html:not(.round) .hm-tip{border-radius:var(--r-flat);}
   html:not(.round) .viz-c input[type=color]::-webkit-color-swatch{border-radius:var(--r-flat);}
   html:not(.round) .viz-c input[type=color]::-moz-color-swatch{border-radius:var(--r-flat);}
@@ -2121,7 +2162,8 @@
           <div class="dtable-head"><span>Dataset</span><span>Keep for</span><span></span></div>
           <div class="drow">
             <span class="dname" id="dnameLatency">Latency
-              <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest. Delete now clears all three.">i</span></span>
+              <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest.
+Delete now clears all three.">i</span></span>
             <span class="ctl"><input type="number" id="setRetention" step="1" min="0" aria-labelledby="dnameLatency"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delLatency" type="button">Delete now</button>
           </div>
@@ -3786,6 +3828,163 @@ function repositionCoach(){ const c=$('coachmark'); if(!c) return;
   // height changes when the toolbar wraps on narrow/mobile viewports).
   const hdr=document.querySelector('header');
   c.style.top=((hdr?hdr.getBoundingClientRect().bottom:52)+8)+'px'; }
+// A hover bubble is anchored under its (i) and drawn --tip-w wide, so one near
+// the right edge hangs off the page - and the bubble hides nothing, it simply
+// sits half outside the window. Measured across every tab: ten did that at the
+// old 250px, forty-three would at 380px. Decided as the bubble is about to
+// show, because which glyphs sit near an edge depends on the width the drawer
+// is at right now, not on anything knowable in the stylesheet.
+// The bubble is built from data-tip the first time it is needed, one element
+// per point. As a single run of text (which is what content:attr() gives you) a
+// bubble cannot space its points apart, cannot indent a wrapped point under its
+// own text, and cannot keep an interior point from stranding two words on a
+// line - text-wrap:pretty only ever guards the last line of a whole block.
+// Rebuilt when the text changes: some tips are rewritten at runtime.
+function buildTip(el){
+  const src = el.getAttribute('data-tip') || '';
+  let box = el.querySelector(':scope > .tip');
+  if(box && box.dataset.src === src) return box;
+  delete el.dataset.tipW;                 // new text, so the fitted width is stale
+  el.style.removeProperty('--tip-w');
+  if(!box){ box = document.createElement('span'); box.className = 'tip'; el.appendChild(box); }
+  box.textContent = '';
+  box.dataset.src = src;
+  for(const raw of src.split('\n')){
+    const line = raw.trim();
+    if(!line) continue;                     // blank lines did the spacing before; the CSS does it now
+    const p = document.createElement('span');
+    const bullet = line.startsWith('\u2022');
+    p.className = bullet ? 'tb' : 'tp';
+    if(bullet){
+      const mk = document.createElement('span'); mk.className = 'mk'; mk.textContent = '\u2022';
+      const tx = document.createElement('span'); tx.className = 'tx';
+      tx.textContent = line.slice(1).trim();
+      p.appendChild(mk); p.appendChild(tx);
+    } else {
+      p.textContent = line;
+    }
+    box.appendChild(p);
+  }
+  return box;
+}
+// The widest box, within reason, at which no point ends on a stub line.
+// Sizing the box is the alternative to sizing the TEXT: text-wrap balance and
+// pretty both avoid a stub by moving words down, which leaves the lines short
+// of the edge. Measured once per tip on an off-screen copy, then remembered.
+// The ceiling is what the fit is allowed to widen a bubble to. 460 was too low:
+// the reconnect tip's opening line needs ~500px to stay whole, so below that it
+// broke and left "is on." trailing on a line of its own, and the widest
+// stub-free width the fit could reach was 368 - narrower AND taller.
+const TIP_MIN = 260, TIP_MAX = 560, TIP_STEP = 12;
+// How many words end up alone on a point's last line. Counted, not guessed from
+// the line's width: "one or two words on their own" is the thing worth
+// avoiding, and a last line that is merely short is not the same fault.
+function lastLineWords(node){
+  const t = node.firstChild;
+  if(!t || t.nodeType !== 3) return 99;
+  const str = t.textContent;
+  const all = document.createRange();
+  all.setStart(t, 0); all.setEnd(t, str.length);
+  const rects = [...all.getClientRects()];
+  if(rects.length < 2) return 99;                       // one line strands nothing
+  const lastTop = rects[rects.length - 1].top;
+  let lo = 0, hi = str.length - 1, start = str.length - 1;
+  while(lo <= hi){                                      // first character on the last line
+    const mid = (lo + hi) >> 1, r = document.createRange();
+    r.setStart(t, mid); r.setEnd(t, mid + 1);
+    if(r.getBoundingClientRect().top >= lastTop - 1){ start = mid; hi = mid - 1; }
+    else lo = mid + 1;
+  }
+  return str.slice(start).trim().split(/\s+/).filter(Boolean).length;
+}
+// The widest box, within reason, at which no point ends on one or two words.
+// Sizing the box is the alternative to sizing the TEXT: text-wrap balance and
+// pretty both avoid a stub by moving words down, which leaves the lines short
+// of the edge.
+//
+// Measured on the REAL bubble rather than an off-screen copy. A copy has to be
+// parented somewhere, and every rule that styles a bubble is `.info>.tip`, so a
+// clone parented anywhere else is unstyled - and one parented into a stand-in
+// glyph is still statically positioned where the real box is absolute, which
+// resolves max-content against a different containing block. Both measure a
+// bubble that does not exist. The loop below forces a few synchronous layouts
+// inside one frame, before paint, so nothing flickers; the answer is cached.
+function fitTip(el, box){
+  if(el.dataset.tipW) return +el.dataset.tipW;
+  const lh = parseFloat(getComputedStyle(box).lineHeight) || 19;
+  const prev = box.style.maxWidth;
+  let chosen = TIP_MAX, bestStubs = Infinity, bestLines = Infinity;
+  for(let w = TIP_MAX; w >= TIP_MIN; w -= TIP_STEP){
+    box.style.maxWidth = w + 'px';
+    let stubs = 0, lines = 0;
+    for(const p of box.children){
+      const tx = p.classList.contains('tb') ? p.querySelector('.tx') : p;
+      if(!tx) continue;
+      lines += Math.round(tx.getBoundingClientRect().height / lh);
+      if(lastLineWords(tx) <= 2) stubs++;
+    }
+    if(stubs < bestStubs || (stubs === bestStubs && lines < bestLines)){
+      chosen = w; bestStubs = stubs; bestLines = lines;
+    }
+    if(stubs === 0) break;
+  }
+  box.style.maxWidth = prev;
+  el.dataset.tipW = chosen;
+  return chosen;
+}
+function placeTip(el){
+  if(!el || !el.hasAttribute('data-tip')) return;
+  const box = buildTip(el);
+  el.style.removeProperty('--tip-dx');
+  // Measured, not predicted: the bubbles are not all one width (.chart-tip is
+  // min(460px,88vw)), and a predicted width under-corrects the wider ones. One
+  // frame later, so the :hover style that reveals the bubble has been applied
+  // and the box has a size to read.
+  requestAnimationFrame(() => {
+    if(!box.getBoundingClientRect().width) return;  // never shown; nothing to place
+    el.style.setProperty('--tip-w', fitTip(el, box) + 'px');
+    const r = box.getBoundingClientRect();
+    const W = document.documentElement.clientWidth;
+    let dx = 0;
+    if(r.right > W - 8) dx = (W - 8) - r.right;     // back off the right edge
+    if(r.left + dx < 8) dx = 8 - r.left;            // but never past the left
+    if(dx) el.style.setProperty('--tip-dx', dx.toFixed(1) + 'px');
+
+    // Vertical. A bubble opens below its glyph and can be 450px tall, so one
+    // low in the window - or in the drawer once the drawer is scrolling its own
+    // pane - is cut off with no way to read the rest. Anchored to the glyph it
+    // cannot escape a scrolling ancestor at all, so it is pinned to the window
+    // instead and placed in viewport coordinates: above the glyph when the room
+    // is there, otherwise wherever it fits.
+    const gr = el.getBoundingClientRect();
+    const H = document.documentElement.clientHeight;
+    const clip = (() => {                       // nearest ancestor that would cut it
+      for(let n = el.parentElement; n && n !== document.body; n = n.parentElement){
+        const cs = getComputedStyle(n);
+        if(cs.overflowY !== 'visible' && cs.overflowY !== 'clip') return n.getBoundingClientRect();
+      }
+      return null;
+    })();
+    const box2 = box.getBoundingClientRect();
+    const cutBelow = box2.bottom > H - 8 || (clip && box2.bottom > clip.bottom - 2);
+    if(!cutBelow){ box.classList.remove('pinned'); box.style.left = box.style.top = ''; return; }
+    box.classList.add('pinned');                // position:fixed, out of the clip
+    requestAnimationFrame(() => {               // measure it where it now lives
+      const b = box.getBoundingClientRect(), W2 = document.documentElement.clientWidth;
+      const above = gr.top - 8 - b.height;      // room above the glyph?
+      const top = above >= 8 ? above : Math.max(8, Math.min(gr.bottom + 8, H - 8 - b.height));
+      box.style.top = top.toFixed(1) + 'px';
+      box.style.left = Math.max(8, Math.min(gr.left - 2, W2 - 8 - b.width)).toFixed(1) + 'px';
+    });
+  });
+}
+// Delegated, and on the events that PRECEDE the bubble appearing: these glyphs
+// are created and destroyed all over the app (rendered rows, the picker, the
+// iperf3 list), so binding per element would miss every one built later.
+const tipTarget = e => e.target && e.target.closest ? e.target.closest('.info[data-tip]') : null;
+document.addEventListener('mouseover', e => { const t = tipTarget(e); if(t) placeTip(t); });
+document.addEventListener('focusin', e => { const t = tipTarget(e); if(t) placeTip(t); });
+
 function dismissCoach(){ const c=$('coachmark'); if(c) c.remove();
   window.removeEventListener('resize', repositionCoach);
   if(coachRO){ coachRO.disconnect(); coachRO=null; }
