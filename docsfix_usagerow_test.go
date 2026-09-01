@@ -1,7 +1,8 @@
 package main
 
-// Regression tests for the README's data-usage claim about the row a FAILED run
-// leaves behind (README.md, the pingularity_speed_data_used_bytes bullet).
+// Regression tests for the documented data-usage claim about the row a FAILED
+// run leaves behind (docs/metrics.md, the pingularity_speed_data_used_bytes
+// bullet - it lived in README.md until the metrics inventory was split out).
 //
 // History, because it is the point: recordFailedUsage used to write an UNMARKED
 // row - byte counts set, every measurement left at its zero value. Since
@@ -28,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -194,29 +196,31 @@ func TestFailedUsageRowIsFilteredOutOfTheAPIButStillCounted(t *testing.T) {
 }
 
 func TestREADMEUsageBulletMatchesTheRowTheCodeServes(t *testing.T) {
-	readme, err := os.ReadFile("README.md")
+	// The data-usage bullet moved to docs/metrics.md when the metrics inventory
+	// was split out of the README; the claim it makes is unchanged.
+	doc, err := os.ReadFile(filepath.Join("docs", "metrics.md"))
 	if err != nil {
-		t.Fatalf("read README.md: %v", err)
+		t.Fatalf("read docs/metrics.md: %v", err)
 	}
-	bullet := bulletContaining(t, string(readme), usageBulletMarker)
+	bullet := bulletContaining(t, string(doc), usageBulletMarker)
 
 	if usageRowIsInvisibleToMeasurements(t, speedAPI(t)) {
 		// The row exists for accounting and is filtered out of everything that
 		// reads as a measurement. The bullet must not describe the old wart.
 		for _, forbidden := range []string{"0.0", "pulls the speed chart", "wart"} {
 			if strings.Contains(bullet, forbidden) {
-				t.Errorf("README data-usage bullet still describes the pre-repair wart (%q), but the accounting row no longer reaches /api/speed/runs", forbidden)
+				t.Errorf("docs/metrics.md data-usage bullet still describes the pre-repair wart (%q), but the accounting row no longer reaches /api/speed/runs", forbidden)
 			}
 		}
 		if !strings.Contains(bullet, "flagged") {
-			t.Error("README data-usage bullet does not say the accounting row is flagged (and so kept out of the measurement views)")
+			t.Error("docs/metrics.md data-usage bullet does not say the accounting row is flagged (and so kept out of the measurement views)")
 		}
 		return
 	}
 	// The other branch: the row is reaching measurement surfaces again. Then
 	// the reader has to be warned, in the words the wart earned.
 	if !strings.Contains(bullet, "0.0") {
-		t.Error("the accounting row is reaching /api/speed/runs (or its bytes stopped counting) - the README must warn that its zeros read as a 0.0 measurement")
+		t.Error("the accounting row is reaching /api/speed/runs (or its bytes stopped counting) - docs/metrics.md must warn that its zeros read as a 0.0 measurement")
 	}
 }
 
@@ -227,7 +231,7 @@ func bulletContaining(t *testing.T, doc, marker string) string {
 	t.Helper()
 	at := strings.Index(doc, marker)
 	if at < 0 {
-		t.Fatalf("README no longer contains %q - the data-usage bullet was reworded; recheck this test's claim", marker)
+		t.Fatalf("docs/metrics.md no longer contains %q - the data-usage bullet was reworded; recheck this test's claim", marker)
 	}
 	start := strings.LastIndex(doc[:at], "\n- ")
 	if start < 0 {

@@ -15,8 +15,10 @@ import (
 // never match.
 var promMetricName = regexp.MustCompile(`pingularity_[a-z0-9_]+`)
 
-// TestREADMEMetricsInventoryMatchesTheExposition holds the README's metrics
-// inventory to the families /metrics actually exports.
+// TestREADMEMetricsInventoryMatchesTheExposition holds the metrics inventory in
+// docs/metrics.md to the families /metrics actually exports. The inventory lived
+// in README.md until it was split out; the README now carries only a summary and
+// a link, so this test follows the prose rather than the filename.
 //
 // That inventory is maintained BY HAND - one bullet per family, carrying the
 // prose that says when a series goes absent and what its labels mean - and
@@ -41,6 +43,9 @@ var promMetricName = regexp.MustCompile(`pingularity_[a-z0-9_]+`)
 // direction. And nothing here checks the PROSE - whether a bullet still
 // describes when its series is absent needs a human to read it. This only makes
 // a NAME impossible to leave behind.
+//
+// The README is deliberately NOT read here. Its summary names no metric, so
+// checking it either way round would fail on every family or pass on anything.
 func TestREADMEMetricsInventoryMatchesTheExposition(t *testing.T) {
 	_, thisFile, ok := callerFile()
 	if !ok {
@@ -56,7 +61,7 @@ func TestREADMEMetricsInventoryMatchesTheExposition(t *testing.T) {
 		return string(b)
 	}
 
-	readme := read("README.md")
+	inventory := read(filepath.Join("docs", "metrics.md"))
 	webSrc := read(filepath.Join("internal", "web", "web.go"))
 
 	exported := exportedMetricNames(t, webSrc)
@@ -64,14 +69,14 @@ func TestREADMEMetricsInventoryMatchesTheExposition(t *testing.T) {
 		t.Fatalf("found only %d metric names in the exposition tables - the slice has lost its shape, and this test would pass on anything", len(exported))
 	}
 	for _, name := range exported {
-		if !strings.Contains(readme, name) {
-			t.Errorf("/metrics exports %s but README.md never names it - add it to the metrics inventory, beside the family it belongs with", name)
+		if !strings.Contains(inventory, name) {
+			t.Errorf("/metrics exports %s but docs/metrics.md never names it - add it to the metrics inventory, beside the family it belongs with", name)
 		}
 	}
 
-	for _, name := range uniqueSorted(promMetricName.FindAllString(readme, -1)) {
+	for _, name := range uniqueSorted(promMetricName.FindAllString(inventory, -1)) {
 		if !strings.Contains(webSrc, trimSampleSuffix(name)) {
-			t.Errorf("README.md documents %s, which internal/web/web.go no longer exports - drop the entry, or restore the metric", name)
+			t.Errorf("docs/metrics.md documents %s, which internal/web/web.go no longer exports - drop the entry, or restore the metric", name)
 		}
 	}
 }
