@@ -1115,6 +1115,66 @@ test('dataBarValue: window lookup, flat fallback, custom carries the last readin
   assert.equal(WV.dataBarValue({}), 512);                           // poll without it keeps the cache
 });
 
+// --- uptime popover: the keyboard selects the row, not the pill ---
+// Enter or Space on a focused window row is the keyboard's click. The handler
+// handed focus back to the pill first and only THEN asked document.activeElement
+// which row had been chosen - by which point the active element was the pill,
+// which carries no data-win. So chooseUptime(undefined) ran: the window became
+// undefined, localStorage kept the literal string "undefined", and the next
+// status poll painted the no-value pill - a bare "-" with no role and no
+// tabindex - which a keyboard user cannot reach again until a reload puts the
+// window back to 7d. The data popover reads the row before it moves focus; this
+// holds the uptime one to the same order, with Space beside Enter since both
+// go through the one branch. The handler is wired with a fake pill and rows
+// whose focus() moves activeElement the way a browser's would.
+test('uptime popover: Enter and Space choose the focused row, then hand focus to the pill', () => {
+  const src = extract("$('uptimePop').addEventListener('keydown'");
+  const doc = { activeElement: null };
+  const pill = { dataset: {}, matches: () => false, focus() { doc.activeElement = pill; } };
+  const row = w => ({ dataset: { win: w }, matches: s => s === '.row[data-win]', focus() { doc.activeElement = this; } });
+  const rows = [row('24h'), row('7d'), row('all')];
+  const input = { dataset: {}, matches: () => false, focus() { doc.activeElement = input; } };
+  const els = {
+    families: { querySelector: s => (s === '.stat-up' ? pill : null) },
+    uptimePop: { addEventListener(_t, fn) { this.fn = fn; }, querySelectorAll: () => [...rows, input] },
+  };
+  const chosen = [];
+  let hidden = 0;
+  new Function('document', '$', 'chooseUptime', 'hideUptimePop', src + ');')(
+    doc, id => els[id], w => chosen.push(w), () => { hidden++; });
+  const key = k => els.uptimePop.fn({ key: k, preventDefault() {}, stopPropagation() {} });
+
+  doc.activeElement = rows[0];
+  key('Enter');
+  assert.deepEqual(chosen, ['24h'], 'Enter chose something other than the focused row');
+  assert.equal(doc.activeElement, pill, 'focus did not go back to the pill after Enter');
+
+  doc.activeElement = rows[2];
+  key(' ');
+  assert.deepEqual(chosen, ['24h', 'all'], 'Space chose something other than the focused row');
+  assert.equal(doc.activeElement, pill, 'focus did not go back to the pill after Space');
+
+  // Enter on the custom input is that input's own affair (it parses the typed
+  // window itself), never a row selection.
+  doc.activeElement = input;
+  key('Enter');
+  assert.deepEqual(chosen, ['24h', 'all'], 'Enter on the custom input was taken as a row selection');
+
+  // The arrows rove the rows and the custom input as one ring, entered from
+  // the pill at either end; Escape closes and hands focus back to the pill.
+  doc.activeElement = pill;
+  key('ArrowDown'); assert.equal(doc.activeElement, rows[0], 'ArrowDown from outside the ring should land on the first row');
+  key('ArrowUp');   assert.equal(doc.activeElement, input, 'ArrowUp from the first row should wrap to the custom input');
+  key('ArrowDown'); assert.equal(doc.activeElement, rows[0], 'ArrowDown from the custom input should wrap to the first row');
+  doc.activeElement = pill;
+  key('ArrowUp');   assert.equal(doc.activeElement, input, 'ArrowUp from outside the ring should land on the custom input');
+  doc.activeElement = rows[1];
+  key('Escape');
+  assert.equal(hidden, 1, 'Escape did not close the popover');
+  assert.equal(doc.activeElement, pill, 'Escape did not hand focus back to the pill');
+  assert.deepEqual(chosen, ['24h', 'all'], 'moving around the popover chose a window');
+});
+
 // lossStr/msStr are brace-less one-line arrows - regex-grab them like engOf.
 const fmtFactory = new Function(
   script.match(/const lossStr = [^;]*;/)[0] + '\n' + script.match(/const msStr = [^;]*;/)[0] + '\nreturn { lossStr, msStr };');
