@@ -6920,3 +6920,128 @@ test('every settings control carries a name a screen reader can announce', () =>
   }
   assert.deepEqual(unnamed, [], `controls with no accessible name: ${unnamed.join(', ')}`);
 });
+
+// --- the 3s status timer stands down while a poll is in the air -------------
+//
+// The timer used to start a status poll whether or not the previous one had
+// come back, and the sequence guard in refreshStatus then threw every poll
+// slower than 3s away as superseded - the timed-out ones included. A hung link
+// (the very case fget's deadline exists for) therefore never counted a single
+// failure and the stale bar never showed, and a server answering in 4s had
+// every answer discarded while the header sat frozen, reading as live. Only the
+// timer waits: a direct call - the power button after its POST, a window
+// picker - still goes out at once and supersedes the poll in the air, whose
+// answer predates the action and must not paint over it.
+//
+// The driver runs the real refreshStatus and the real timer callback, both cut
+// from the source. Only the fetch and the bookkeeping it lands in are driven:
+// the parsed status refuses to be read, so an answer that is applied stops the
+// poll - with STOP - at the first field the header paints from. That leans on
+// the ORDER of the source after the fetch: the stale-recovery burst and
+// `staleFails=0; lastStatusAt=Date.now(); setStale(false);` must come before
+// the first read of `s.`, which the driver checks so a reorder fails in words
+// rather than as an answer that looks discarded.
+const STOP = new Error('the header is not built here');
+const STATUS_TIMER = /^setInterval\(vis\(([\s\S]*?)\), 3000\);$/m;
+function statusDriver() {
+  const state = { fetches: 0, urls: [], pending: [], stale: [], burst: 0, painted: [] };
+  const src = extract('async function refreshStatus');
+  const tail = src.slice(src.indexOf('catch(e)'));
+  const burstAt = tail.indexOf('if(staleFails>=2)'), bookAt = tail.indexOf('staleFails=0; lastStatusAt=Date.now(); setStale(false);'), readAt = tail.search(/\bs\.\w/);
+  assert.ok(burstAt >= 0 && burstAt < bookAt && bookAt < readAt,
+    'this driver stops an applied poll at its first read of the parsed status, which has to come after the stale-recovery burst and the bookkeeping');
+  const timer = script.match(STATUS_TIMER);
+  assert.ok(timer, 'the status timer is no longer a `setInterval(vis(...), 3000)` at column 0');
+  // `then` has to read as absent, or awaiting the body would trip the trap
+  // inside the poll's own try and count as a failed fetch. The tag is the
+  // fetch's ordinal, so `painted` says which answer reached the header.
+  const body = tag => new Proxy({}, { get: (_, k) => { if (k === 'then') return undefined; state.painted.push(tag); throw STOP; } });
+  const api = new Function('fget', '$', 'setStale', 'refreshChart', 'refreshSpeedChart', 'refreshHeatmap',
+    'refreshNetinfo', 'loadOutages', 'loadRuns', 'state',
+    // The poller's own state, from the source, so a counter declared beside
+    // statusSeq is declared here too.
+    script.match(/^let staleFails=[^\n]*;/m)[0]
+    + '\nlet speedSeq = 0, dataWindow = "", dataCustomMins = 0, uptimeCustomMins = 0;\n'
+    + src
+    // The timer's callback names refreshStatus, so the binding is wrapped to
+    // keep the promise of every poll started; tick() then hands back the poll
+    // its firing started, or undefined when the timer stood down.
+    + '\nconst polls = []; const real = refreshStatus;'
+    + '\nrefreshStatus = () => { const p = real(); polls.push(p); return p; };'
+    + '\nconst fire = ' + timer[1] + ';'
+    + '\nconst tick = () => { const n = polls.length; fire(); return polls[n]; };'
+    + '\nreturn { refreshStatus, tick, fails: () => staleFails, at: () => lastStatusAt, upMins: m => { uptimeCustomMins = m; } };')(
+    // Every fetch waits to be told how it ended: 'ok' answers with the tagged
+    // body, 'fail' is fget's deadline. The test settles them in the order the
+    // scenario calls for.
+    async url => {
+      const tag = ++state.fetches; state.urls.push(url);
+      const d = deferred(); state.pending.push(d);
+      if (await d.p === 'fail') throw new Error('timed out');
+      return { json: async () => body(tag) };
+    },
+    () => ({ style: { display: 'none' } }),
+    on => { state.stale.push(on); },
+    () => {}, () => {}, () => { state.burst++; }, () => {}, () => {}, () => {}, state);
+  return Object.assign(api, { state });
+}
+// A poll whose answer is applied runs into STOP; one that is superseded or
+// fails returns quietly. Either way the promise settles.
+const settle = p => p.then(() => 'done', e => { if (e !== STOP) throw e; return 'applied'; });
+
+test('a status poll that outlives the timer is neither doubled up nor thrown away', async () => {
+  const c = statusDriver();
+  const slow = c.tick();                                   // the timer's poll, and it will take longer than 3s
+  const later = [c.tick(), c.tick()];                      // 3s and 6s in, the timer fires again
+  assert.equal(c.state.fetches, 1,
+    'the timer started another status request behind one still in the air - and the sequence ' +
+    'guard then throws the earlier one away, so a server that answers in 4s never gets a word in');
+  assert.deepEqual(later, [undefined, undefined], 'a tick under a poll in the air starts nothing');
+  c.state.pending.shift().go('ok');
+  assert.equal(await settle(slow), 'applied', 'the slow answer must land: it is the newest there is');
+  assert.ok(c.at() > 0, 'lastStatusAt was never written, so the slow answer was discarded');
+  // Not a latch: the tick after the answer lands polls again.
+  const next = c.tick();
+  assert.equal(c.state.fetches, 2, 'the timer must poll again once the answer is back');
+  c.state.pending.shift().go('ok'); await settle(next);
+});
+
+test('timed-out status polls count toward the stale bar, whatever the timer did meanwhile', async () => {
+  const c = statusDriver();
+  for (let i = 1; i <= 2; i++) {
+    const hung = c.tick();
+    c.tick(); c.tick();                                    // 3s and 6s in, the timer fires again
+    c.state.pending.shift().go('fail');                    // 8s in, fget's deadline aborts the poll
+    await settle(hung);
+    assert.equal(c.fails(), i, 'a timed-out poll was not counted: with two newer polls already ' +
+      'started, every deadline abort read as superseded, so a hung link never showed the stale bar');
+  }
+  assert.deepEqual(c.state.stale, [true], 'the bar shows on the second consecutive failure');
+  // The link returns: the next answer clears the bar and catches every panel up.
+  const back = c.tick();
+  c.state.pending.shift().go('ok'); await settle(back);
+  assert.deepEqual([c.fails(), c.state.stale.at(-1), c.state.burst], [0, false, 1],
+    'recovery must clear the count, hide the bar and fire the catch-up burst');
+});
+
+test('a direct refresh goes out under the timer\'s poll, and its answer is the one painted', async () => {
+  const c = statusDriver();
+  c.upMins(90);  const poll = c.tick();                    // the timer's poll leaves for the 90 min window
+  c.upMins(120); const pick = c.refreshStatus();           // 300ms in, the user picks 2h: the picker's own refresh
+  assert.deepEqual(c.state.urls, ['api/status?upMins=90', 'api/status?upMins=120'],
+    'the pick\'s refresh must go out at once, under the poll in the air: a gate on the function ' +
+    'itself swallows it, and the older poll - which left before the user acted - then paints ' +
+    'the 90 min figure under the 2h label until the next tick');
+  assert.equal(c.tick(), undefined, 'the timer stands down while the two are in the air');
+  // The older poll lands first, as it left first.
+  c.state.pending.shift().go('ok');
+  assert.equal(await settle(poll), 'done', 'a poll that left before the pick must not paint over it');
+  assert.equal(c.tick(), undefined, 'and still while the pick\'s own poll is in the air: a flag the first ' +
+    'to land cleared would let the timer start a third poll behind it');
+  c.state.pending.shift().go('ok');
+  assert.equal(await settle(pick), 'applied', 'the pick\'s own answer is the one painted');
+  assert.deepEqual(c.state.painted, [2], 'only the second answer (upMins=120) reached the header');
+  const next = c.tick();
+  assert.equal(c.state.fetches, 3, 'the timer polls again once both are back');
+  c.state.pending.shift().go('ok'); await settle(next);
+});
