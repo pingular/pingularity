@@ -4610,7 +4610,14 @@ $('uptimePop').addEventListener('keydown', e=>{
     const n=i<0?f[e.key==='ArrowDown'?0:f.length-1]:f[(i+(e.key==='ArrowDown'?1:-1)+f.length)%f.length];
     if(n) n.focus(); return; }
   if((e.key==='Enter'||e.key===' ') && document.activeElement && document.activeElement.matches('.row[data-win]')){
-    e.preventDefault(); if(pill) pill.focus(); chooseUptime(document.activeElement.dataset.win); }
+    e.preventDefault();
+    // Read the row before focus moves. Once the pill has focus it IS the active
+    // element, and it carries no data-win, so choosing after the focus() call
+    // selected undefined: the pill then rendered as a bare "-" with no role or
+    // tabindex, and the keyboard had no way back into the popover until a
+    // reload. Same order as the data popover above.
+    const win=document.activeElement.dataset.win;
+    if(pill) pill.focus(); chooseUptime(win); }
 });
 document.addEventListener('click', e=>{
   if(!e.target.closest('#uptimePop') && !e.target.closest('.stat-up')) hideUptimePop();
