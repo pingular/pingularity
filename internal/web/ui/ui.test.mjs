@@ -4469,12 +4469,83 @@ test('the runs table and the quality chart gate ping on the same predicate', () 
   assert.match(runs, /pingMeasured\(r\)\?num1\(r\.ping_ms\):'-'/,
     'the runs table prints num1(0) = "0.0" for a run that never probed');
   const q = extract('function drawQualityChart');
-  assert.match(q, /pingMeasured\(p\)\?p\.ping_ms/, 'the jitter envelope still anchors on a 0 ms ping');
+  assert.match(q, /const pp=points\.filter\(pingMeasured\);\n\s*const env=pp\.map\(p=>p\.ping_ms/,
+    'the jitter envelope must be built from the gated rows, so a 0 ms ping can neither anchor it nor leak in as a placeholder');
   assert.match(q, /points\.filter\(pingMeasured\)/, 'the plotted set still includes the sentinel');
   assert.match(q, /spdLine\(x,pp,X,Y,'ping_ms'/,
     "spdLine's own filter is isNum, which keeps 0 - it must be handed the gated set");
   assert.match(q, /if\(pingMeasured\(p\)\) chartDot/, 'a single 0 ms run still draws a dot at the floor');
   assert.ok(!/isNum\(p\.ping_ms\)/.test(q), 'a bare isNum ping gate is left in the chart');
+});
+
+// --- one unprobed run must not take the whole quality chart down with it ------
+// The envelope that sets the ping axis used to map every unprobed row to a NaN
+// placeholder and then filter with isNum - a typeof check, for which NaN IS a
+// number. The placeholder reached Math.max, the ceiling became NaN, every Y
+// became NaN, and canvas silently drops NaN coordinates: one iperf3 run with the
+// latency probe off blanked the strip for the entire window and printed "NaN" as
+// its only axis label, while the Ping tile an inch above read a real number. The
+// source-shape test above could not see it, because it never ran the axis math.
+// So this drives the REAL drawQualityChart against a context that records every
+// label and every path coordinate, the way drawHeatmap and drawXAxis are driven.
+function driveQuality(rows, tc = {}) {
+  const calls = [];
+  const rec = m => (...a) => { calls.push([m, ...a]); };
+  const x = { font: '', fillStyle: '', strokeStyle: '', textAlign: 'left', textBaseline: '', lineWidth: 1,
+    lineJoin: '', lineCap: '', globalAlpha: 1, lineDashOffset: 0,
+    save() {}, restore() {}, setLineDash() {}, translate() {}, rotate() {}, scale() {}, clearRect() {},
+    beginPath: rec('beginPath'), closePath: rec('closePath'), moveTo: rec('moveTo'), lineTo: rec('lineTo'),
+    arc: rec('arc'), stroke: rec('stroke'), fill: rec('fill'), fillText: rec('fillText') };
+  const canvas = { classList: { contains: () => false }, clientWidth: 900, clientHeight: 80, offsetTop: 0 };
+  const TC = { xLab: true, yLab: true, yTitle: false, gridOn: true, axis: '#888', grid: '#333',
+    jit: '#0f0', ping: '#f00', lw: 1.5, thrPing: false, ...tc };
+  const defs = script.match(/const isNum = [^;]*;/)[0] + '\n'
+    + extract('function pingMeasured') + '\n' + extract('function spanOne') + '\n' + extract('function xMap') + '\n'
+    + extract('function padL') + '\n' + extract('function padR') + '\n' + extract('function spdLine') + '\n'
+    + extract('function chartDot') + '\n' + extract('function threshLine') + '\n'
+    + script.match(/const axisWorthDrawing = [^;]*;/)[0] + '\n' + extract('const cursorSpan') + '\n'
+    + extract('function drawQualityChart');
+  // The time axis, the sideways title and the selection cursor are covered
+  // elsewhere; the axis owner is pointed at the speed chart so none of them draw
+  // here and every recorded coordinate belongs to the ping data.
+  new Function('$', 'setupCanvas', 'TC', 'AX_PAD', 'chartThresh', 'drawYTitle', 'spdAxisOwner', 'drawXAxis',
+    'cursorX', 'drawCursor', 'emptyHint', 'speedEmptyMsg', 'ROWS',
+    'let qPlot = null, qHover = -1;\n' + defs + '\ndrawQualityChart(ROWS);')(
+    () => canvas, () => ({ x, w: 900, h: 80 }), TC, 26, { ping: tc.thr || 0 },
+    () => {}, () => 'speedChart', () => {}, () => null, () => {}, () => {}, () => '', rows);
+  const coords = calls.filter(c => c[0] === 'moveTo' || c[0] === 'lineTo' || c[0] === 'arc');
+  return { calls, coords, labels: calls.filter(c => c[0] === 'fillText').map(c => c[1]),
+    nan: coords.filter(c => c.slice(1).some(v => Number.isNaN(v))) };
+}
+
+test('one run with no ping probe cannot blank the quality chart or print a NaN axis', () => {
+  const probed = [{ ts: 1770000000, ping_ms: 20, jitter_ms: 2 }, { ts: 1770007200, ping_ms: 25, jitter_ms: 3 }];
+  const withGap = [probed[0], { ...iperfNoPing, ts: 1770003600 }, probed[1]];
+  const r = driveQuality(withGap);
+  assert.deepEqual(r.nan, [], 'NaN coordinates reached the canvas, which drops them without a word');
+  // The ceiling is the largest ping+jitter (28) with 20% headroom, labelled at half height.
+  assert.deepEqual(r.labels, ['17'], 'the one axis label must scale to the PROBED pings');
+  // Three evenly spread runs sit at x=40, 465 and 890; the unprobed middle one may
+  // leave nothing on the chart.
+  assert.ok(!r.coords.some(c => Math.round(c[1]) === 465),
+    'the unprobed run put a point on the chart: ' + JSON.stringify(r.coords));
+  // And the two probed runs land on the same two x positions with or without it,
+  // so the drawing must be identical: an unprobed run contributes nothing at all.
+  assert.deepEqual(r.calls, driveQuality(probed).calls, 'an unprobed run changed what was drawn for the probed ones');
+  // Without jitter the envelope is the bare ping: 25 * 1.2 / 2.
+  assert.deepEqual(driveQuality([{ ts: 1, ping_ms: 20 }, { ts: 2, ping_ms: 0 }, { ts: 3, ping_ms: 25 }]).labels, ['15']);
+  // The max-ping threshold rides the same axis, so it can only draw once the axis is finite.
+  const t = driveQuality(withGap, { thrPing: true, thr: 25 });
+  assert.deepEqual(t.nan, []);
+  assert.equal(t.coords.length, r.coords.length + 2, 'the ping threshold line did not draw');
+});
+
+test('a window where nothing probed ping draws an empty strip on the floor axis, not NaN', () => {
+  const r = driveQuality([{ ...iperfNoPing, ts: 1770000000 }, { ...iperfNoPing, ts: 1770003600 }]);
+  assert.deepEqual(r.nan, []);
+  assert.deepEqual(r.labels, ['6'], 'the 10 ms floor with headroom, halved - there is nothing else to scale to');
+  // Only the mid gridline: no band, no line, no dot for runs that never probed.
+  assert.equal(r.coords.length, 2, 'something was plotted for runs that never probed: ' + JSON.stringify(r.coords));
 });
 
 // The helpers must actually be consumed where runs are detailed, or the labels

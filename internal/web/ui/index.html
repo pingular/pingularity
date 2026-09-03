@@ -5866,14 +5866,20 @@ function drawQualityChart(points){
   drawYTitle(x,"PING (ms)",w,pad,H);
   // pingMeasured, not isNum: a ping_ms of 0 is "not probed", and drawing it would
   // put a perfect zero-latency point (and a 0-anchored jitter band) on the chart.
-  const env=points.map(p=>pingMeasured(p)?p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0):NaN).filter(isNum);
+  // The gate runs once, up front, and the envelope is built from the rows that
+  // pass it - NOT by mapping the unprobed rows to a NaN placeholder and filtering
+  // that back out afterwards. isNum is a typeof check, and typeof NaN is "number",
+  // so the placeholders sailed through it into Math.max: the ceiling came out NaN,
+  // every Y came out NaN, and one unprobed run anywhere in the window emptied the
+  // whole strip while its only axis label printed the word "NaN".
+  const pp=points.filter(pingMeasured);
+  const env=pp.map(p=>p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0));
   const maxV=Math.max(10, ...(env.length?env:[10]))*1.2, Y=v=>pad.t+(1-v/maxV)*H;
   x.font='11px ui-monospace,monospace';
   // Only the middle reference line - the top/bottom edge gridlines read as a divider
   // rule above the chart, so they are dropped.
   { const yy=pad.t+H/2; if(TC.gridOn){ x.strokeStyle=TC.grid; x.beginPath(); x.moveTo(pad.l,yy); x.lineTo(w-pad.r,yy); x.stroke(); }
     if(TC.yLab){ x.fillStyle=TC.axis; x.textAlign='left'; x.fillText((maxV/2).toFixed(0),6,yy+3); } }
-  const pp=points.filter(pingMeasured);
   if(pp.length){
     x.beginPath();
     pp.forEach((p,i)=>{ const yu=Y(p.ping_ms+(isNum(p.jitter_ms)?p.jitter_ms:0)); i?x.lineTo(X(p.ts),yu):x.moveTo(X(p.ts),yu); });
