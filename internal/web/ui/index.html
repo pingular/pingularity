@@ -4433,10 +4433,17 @@ async function showDataPop(anchor){
   // popover down before the request meant a slow answer left NEITHER on screen -
   // measured at 2.8 seconds - and a failed one left the reader with nothing at
   // all, having closed what they were reading.
+  // The pill we were handed may no longer be on the page: a status poll landing
+  // during the round trip rebuilds the whole pill row (refreshStatus), and a
+  // node that has left the document measures as a rectangle of zeros. Anchored
+  // to that, the popover went to top 6px with its right edge at x=0 - fully
+  // off-screen while flagged open, so the next press closed what nobody could
+  // see. Anchor to whichever pill is live now, as hideDataPop already does.
+  const pill=$('families').querySelector('.stat-data')||anchor;
   hideUptimePop(); // only one stats popover open at a time
   pop.hidden=false;
-  anchor.setAttribute('aria-expanded','true'); // only after the popover actually shows (fetch above can return early)
-  const r=anchor.getBoundingClientRect();
+  pill.setAttribute('aria-expanded','true'); // only after the popover actually shows (fetch above can return early)
+  const r=pill.getBoundingClientRect();
   pop.style.top=(r.bottom+6)+'px';
   pop.style.left='auto';
   pop.style.right=Math.max(8, window.innerWidth-r.right)+'px';

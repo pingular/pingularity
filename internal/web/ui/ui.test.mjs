@@ -6614,6 +6614,52 @@ test('the data pill names the window its number is for', () => {
   assert.equal(f('custom', 720, m => m + 'm')(), '720m');
 });
 
+// Opening the data popover takes a round trip, and the status poll rebuilds the
+// pill row through innerHTML every few seconds. When a poll lands during that
+// round trip the pill the reader pressed is no longer in the document, and a
+// detached node measures as a rectangle of zeros: anchored to it, the popover
+// opened at top 6px with its right edge at x=0 - entirely off-screen, yet
+// flagged open, so the next press closed what nobody could see and a third was
+// needed. Once the answer lands it has to anchor to whichever pill is live.
+test('data popover: anchors to the live pill when a poll rebuilt the row mid-fetch', async () => {
+  const pillAt = (left, right, bottom) => ({ attrs: {}, setAttribute(k, v) { this.attrs[k] = v; },
+    getBoundingClientRect: () => ({ left, right, top: bottom - 28, bottom, width: right - left, height: 28 }) });
+  const input = { value: '', addEventListener() {}, select() {} };
+  const pop = { hidden: true, innerHTML: '', style: {}, querySelector: () => input, insertAdjacentHTML() {} };
+  let live = pillAt(942, 1134, 34);
+  const els = { dataPop: pop, families: { querySelector: s => (s === '.stat-data' ? live : null) } };
+  let answer;
+  const SD = new Function('$', 'fetch', 'window', 'fmtWin', 'bytesStr', 'parseDur', 'chooseDataCustom', 'hideUptimePop',
+    'let dataPopOpening=false, dataCustomMins=0, dataCustomBytes=0, lastDataUsage=null, dataWindow="all";\n'
+    + extract('async function showDataPop') + '\nreturn { showDataPop };')(
+    id => els[id], () => new Promise(r => { answer = r; }), { innerWidth: 1400 }, m => m + 'm', String, () => 0, () => {}, () => {});
+  const usage = { json: async () => ({ '24h': 1, '7d': 2, all: 3 }) };
+
+  const pressed = live;
+  const opening = SD.showDataPop(pressed);
+  // The poll lands while the answer is out: the row is rebuilt, the pressed node
+  // leaves the document and measures as zeros, a fresh pill stands in its place.
+  pressed.getBoundingClientRect = () => ({ left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 });
+  live = pillAt(942, 1134, 34);
+  answer(usage);
+  await opening;
+  assert.equal(pop.hidden, false, 'the popover never opened');
+  assert.equal(pop.style.right, '266px', 'anchored to the detached pill: right edge at the viewport width, off-screen');
+  assert.equal(pop.style.top, '40px', 'anchored to the detached pill: top 6px instead of under the pill');
+  assert.equal(live.attrs['aria-expanded'], 'true', 'the pill on screen never said it was expanded');
+
+  // No poll in the window: the pressed pill is still the live one, and the
+  // popover sits under wherever it is - here a pill that wrapped onto a second row.
+  pop.hidden = true;
+  live = pillAt(200, 380, 60);
+  const quiet = SD.showDataPop(live);
+  answer(usage);
+  await quiet;
+  assert.equal(pop.style.right, '1020px');
+  assert.equal(pop.style.top, '66px');
+  assert.equal(live.attrs['aria-expanded'], 'true');
+});
+
 test('number inputs never declare a step coarser than the daemon accepts', () => {
   // The daemon stores these as plain integers (settings atoi + clamp), so any
   // integer in range is a legal STORED value - including one saved by an old
