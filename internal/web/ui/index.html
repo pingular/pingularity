@@ -4741,7 +4741,7 @@ let latBackoffMs=0, speedBackoffMs=0;
 // Stale-data banner: a connectivity dashboard silently frozen on old data is
 // indistinguishable from "all good", so surface consecutive status-poll
 // failures (2+, to ride out a one-off hiccup or restart).
-let staleFails=0, lastStatusAt=0, statusSeq=0;
+let staleFails=0, lastStatusAt=0, statusSeq=0, statusInFlight=0;
 function setStale(on){
   if(on) $('staleSince').textContent = lastStatusAt ? new Date(lastStatusAt).toLocaleTimeString() : 'before startup';
   $('staleBar').hidden=!on;
@@ -4769,8 +4769,13 @@ async function refreshStatus() {
   const _q=[];
   if(dataWindow==='custom'&&dataCustomMins>0) _q.push('dataMins='+dataCustomMins);
   if(uptimeCustomMins>0) _q.push('upMins='+uptimeCustomMins);
+  // Counted, not flagged: a direct call (the power button, a window picker) can
+  // overlap the 3s timer's poll, and the timer stands down until every one of
+  // them is back - see the timer for why it waits at all.
+  statusInFlight++;
   let s; try { s = await (await fget('api/status'+(_q.length?'?'+_q.join('&'):''), 8000)).json(); }
   catch(e) { if(my!==statusSeq) return; if(++staleFails>=2) setStale(true); return; }
+  finally { statusInFlight--; }
   if(my!==statusSeq) return;
   // Server just became reachable again after going stale - catch every panel
   // up now rather than letting them wait out their own polling cycles (the
@@ -10130,7 +10135,19 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) tick();
 // instead of waiting out the polling cycles. (Server-side outages don't fire
 // this; those are caught by the stale-recovery hook in refreshStatus.)
 window.addEventListener('online', ()=>tick());
-setInterval(vis(refreshStatus), 3000);
+// The status poll is given 8s to answer (fget's deadline, for a link that has
+// gone dead rather than refused) but this timer fires every 3s, and it used to
+// start the next poll regardless. The sequence guard in refreshStatus then took
+// every poll slower than 3s for superseded and dropped it - the timed-out ones
+// included - so a hung link never counted a single failure and the stale bar
+// never showed, and a daemon answering in 4s had every answer thrown away while
+// the header froze, reading as live. So the timer stands down while a poll is
+// in the air: whatever comes back is then the newest there is, and is applied
+// or counted. Only the timer waits. A direct refreshStatus() - the power button
+// after its POST, a window picker, tick() when the tab comes back - still goes
+// out at once and supersedes the poll in flight, because that poll left before
+// the user acted and its answer would paint the state from before.
+setInterval(vis(()=>{ if(!statusInFlight) refreshStatus(); }), 3000);
 // Chart refresh cadence scales with the window being drawn - wide ranges barely
 // change second-to-second and re-aggregating them is expensive server-side.
 // Cadence prices the span the server will actually SCAN. For an absolute range
