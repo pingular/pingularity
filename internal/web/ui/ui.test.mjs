@@ -2863,6 +2863,28 @@ test('the orphaned-password warning survives Done and blocks Save', () => {
     'save must refuse an orphaning payload before it is built');
 });
 
+// The no-server gate exists because iperf3 with nothing to dial fails every
+// run, so it has to be judged on the engine that will RUN. The body's
+// speed_engine is the saved preference, kept as iperf3 while the binary is
+// missing so it survives a temporarily-absent iperf3 - and while it is missing
+// the daemon runs Ookla, the pill is forced to Ookla, and no control clears the
+// preference. Judged on the preference alone the gate refused every Save (theme,
+// alerts, retention - anything) once the server list was empty, over an engine
+// the drawer showed as not selected. The condition is lifted out of the save
+// handler and driven directly, so a rewrite that drops the availability check
+// fails here rather than in a drawer nobody can save.
+test('the no-server gate is judged on the engine that will run, not the hidden iperf3 preference', () => {
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  const m = save.match(/if\((body\.speed_engine==='iperf3'[^\n]*?!body\.iperf_server)\)\{/);
+  assert.ok(m, 'the no-server gate is present in the save handler');
+  const refuses = new Function('body', 'iperfAvailable', 'return !!(' + m[1] + ');');
+  const noServer = { speed_engine: 'iperf3', iperf_server: '' };
+  assert.equal(refuses(noServer, true), true, 'iperf3 selected, binary present, no server: still refused');
+  assert.equal(refuses(noServer, false), false, 'binary missing: Ookla is what runs, so there is nothing to refuse');
+  assert.equal(refuses({ speed_engine: 'iperf3', iperf_server: 'nas.local:5201' }, true), false, 'a picked server clears the gate');
+  assert.equal(refuses({ speed_engine: 'ookla', iperf_server: '' }, false), false, 'Ookla never needs an iperf3 server');
+});
+
 // Quick Setup's cost line is arithmetic shown to a stranger deciding whether to
 // consent to data spend - the numbers are pinned, not trusted, and pinned as a
 // CEILING. A speedtest-go transfer runs a fixed 15s per direction (the library's

@@ -9349,7 +9349,14 @@ function saveFailed(text){
   const body = settingsBody();   // captures the open iperf3 editor (incl. a just-typed address) too
   // iperf3 with no valid server set would fail every run ("no iperf3 server set") - block
   // the save and point the user at the fix rather than persist a broken engine.
-  if(body.speed_engine==='iperf3' && !body.iperf_server){
+  // Judged on the engine that will RUN, not on the preference alone. With the
+  // binary missing the daemon runs Ookla whatever speed_engine says, the pill is
+  // forced to Ookla (so the list hint, keyed on the pill, is silent), and the
+  // preference is kept in the body on purpose so it survives a temporarily-absent
+  // iperf3 - which leaves no control that could clear it. Gating on the
+  // preference refused every Save, for any setting, over an engine the drawer
+  // showed as not selected, and Reset to defaults was the only way out.
+  if(body.speed_engine==='iperf3' && iperfAvailable && !body.iperf_server){
     activateTab('iperf'); // where the message is asking them to do something, as its two neighbours do
     saveFailed('The iperf3 engine needs a server - add one with a host:port and pick it as the test target before saving.');
     return;
