@@ -715,6 +715,7 @@
     .ipl .ipl-auth,.ipl .fp-hdr>span:nth-child(4){display:none;}
   }
   .iperf-dot{flex:none;width:9px;height:9px;border-radius:50%;border:none;padding:0;cursor:pointer;background:var(--muted);opacity:.5;}
+  .iperf-dot:disabled{cursor:default;} /* a light with no address to dial is not a button, and must not offer itself as one */
   .iperf-dot.on{background:var(--up);opacity:1;box-shadow:0 0 5px var(--up);}
   .iperf-dot.off{background:var(--down);opacity:1;}
   .iperf-dot.loading{background:var(--warn);opacity:1;animation:iperfpulse 1s ease-in-out infinite;}
@@ -922,6 +923,16 @@
   .fp-rows::-webkit-scrollbar-track{background:transparent;}
   .fp-rows::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px;}
   .fp-rows::-webkit-scrollbar-thumb:hover{background:var(--muted);}
+  /* The list fetch reaches Ookla and can take seconds. The select's own spinner
+     lives inside a wrapper the picker keeps display:none, so the results pane is
+     the only place that can say a fetch is under way - and an empty pane
+     otherwise reads as "no servers near here", or as a fetch that failed.
+     Above the rows rather than instead of them: keyed on an empty pane, the
+     line never appeared for anyone whose chosen server the browse list does not
+     carry, because that server is drawn as a row in this very pane (fpPanes
+     holds it there), and their whole round trip to Ookla said nothing at all. */
+  .fp-list.loading .fp-rows::before{content:"Loading…";display:block;
+    padding:11px 12px;color:var(--muted);font-size:12px;}
   .fp-list{position:relative;}
   /* Enough to read as "more below" without dimming the row underneath: it stops
      partway to the page ground rather than reaching it. */
@@ -3882,7 +3893,8 @@ function openDrawer(){
     // unsaved edits, so the refetch can't wipe them.
     const formClean = (savedBody==='' || formSnapshot()===savedBody);
     savedBody = formSnapshot();   // provisional baseline for the unsaved-changes check
-    if(formClean) (async()=>{ drawerReopening=true; try{ await loadSettings(); } finally{ drawerReopening=false; } await loadAccess(); savedBody=formSnapshot(); })();
+    if(formClean) (async()=>{ drawerReopening=true; reopenHadList=serversLoaded;   // taken before activateTab below starts the tab's own fetch
+      try{ await loadSettings(); } finally{ drawerReopening=false; } await loadAccess(); savedBody=formSnapshot(); })();
     // Reopen where you left off - the tab, and the expanded Appearance section
     // with it, so a round trip back to (say) Chart customization is one click.
     activateTab(restoreDrawerPlace());
@@ -4827,7 +4839,7 @@ function focusMark(){
 // call before this line is reached would be a ReferenceError that kills the
 // whole script rather than a stale mark.
 var focusPending=null;
-function refocus(sel){
+function refocus(sel, fallback){
   // Only if the rebuild actually took focus. Several of these restore across an
   // async reload, and in that gap the reader may have moved on themselves -
   // pulling them back would be the same rudeness in the other direction.
@@ -4835,7 +4847,11 @@ function refocus(sel){
   if(at && at!==document.body){ focusPending=null; return; }
   const want=sel||focusPending; focusPending=null;
   if(!want) return;
-  const el=document.querySelector(want);
+  let el=document.querySelector(want);
+  // The control can be GONE rather than redrawn - the picker's stars remove
+  // their own row - so a caller that knows a sensible neighbour names one
+  // instead of letting focus fall to <body>.
+  if(!el && fallback) el=document.querySelector(fallback);
   if(!el || !el.focus) return;
   // A control redrawn mid-action comes back DISABLED - the picker's ping
   // refresh does exactly that while it measures - and focusing a disabled
@@ -4990,7 +5006,9 @@ async function refreshStatus() {
   const dnsDot = ms => hdot(dnsPct(ms), '--dot-dns');
   // Pill latency text: 1 decimal under 100 ms, whole ms at 100+ - keeps precision
   // where it's useful without widening the value slot on high/spiky readings.
-  const fmtMs = ms => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)) + ' ms';
+  // Rounded before the precision is chosen, for the reason fpPingText gives:
+  // 99.97 printed "100.0 ms" beside a 100.2 printing "100 ms".
+  const fmtMs = ms => { const v = Math.round(ms * 10) / 10; return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ms'; };
   // A DNS readout pill for the chart's DNS line trails the target toggles (omitted
   // until DNS has a sample). Its dot is the DNS line's colour (TC.dns) so the pill
   // legends that line, dimmed by intensity on the same threshold as the top-bar DNS
@@ -7552,7 +7570,7 @@ function fpShowAutoCache(){
   fpAutoCities=fpAutoCitiesOf(c.winner, c.origins);
   autoDefaultLoc=shortPlace(c.winner&&c.winner.label||''); autoCentreLastRun=false;
   const w=c.winner||{}; fpCentre=(typeof w.lat==='number' && typeof w.lon==='number' && (w.lat||w.lon)) ? {lat:w.lat, lon:w.lon} : null;
-  serversLoaded=true; serversScope='';
+  serversLoaded=true; serversScope=''; serversLatchGen=0;   // remembered, not fetched: no request owns this one
   populateServers(c.servers);
   return true;
 }
@@ -7569,9 +7587,19 @@ function fpAutoCitiesOf(winner, origins){
   return cities.length ? cities : (win ? [win] : []);
 }
 let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
+// Which request the reuse latch above is standing on (0 = none: a list shown
+// from memory, which no answer still in flight may take back down). A request
+// that was superseded may only un-latch what it latched itself: the scope
+// cannot tell it apart, because Auto's list and the default list are both
+// centred nowhere and so carry the same empty scope.
+let serversLatchGen=0;
 // drawerReopening: the settings refetch under way is a drawer REOPEN, so the
 // list you were looking at is fetched again rather than kept or replaced.
-let drawerReopening=false;
+// reopenHadList: whether there WAS such a list when this open began. On the
+// first open of a page load there is not one - the Ookla tab's own deferred
+// fetch is starting it - and refetching on top of that sent the same request
+// twice, milliseconds apart, and threw one answer away.
+let drawerReopening=false, reopenHadList=false;
 // shortPlace is the city alone: the geocoder answers with a whole address
 // ("Toronto, Golden Horseshoe, Ontario, Canada"), and the second part is
 // whatever regional label it felt like adding.
@@ -7705,6 +7733,11 @@ function setServerLoading(on){
   const w=$('serverSelectWrap'); if(!w) return;
   w.classList.toggle('loading', on);
   $('setServer').disabled=on;
+  // And the results pane, which is the only one of the two anybody can see: the
+  // wrapper above carries 'hidden' in the markup, so its dimming and its spinner
+  // paint nothing at all and the deferred first fetch read as an empty list for
+  // the whole round trip. The pane says so itself while it has no rows.
+  const a=$('fpAll'); if(a) a.classList.toggle('loading', on);
 }
 // Every list request takes the next generation and only the NEWEST one may write
 // the page's scope/list state - the same rule runsSeq/outagesSeq/heatmapSeq apply
@@ -7735,7 +7768,23 @@ async function fetchServers(opts){
     // would throw anyway, but a thrown parse says nothing about WHY - and for an
     // ID that difference is "no such server" versus "Ookla could not be asked"
     // (see searchServers).
-    if(!r.ok){ const e=new Error('servers '+r.status); e.status=r.status; throw e; }
+    if(!r.ok){ const e=new Error('servers '+r.status); e.status=r.status;
+      // The text as well as the status: a 503 raised because a backup is being
+      // restored and this handler's own 503 are the same number and mean
+      // opposite things to the reader - "wait two seconds" against "this cannot
+      // work here" (see fpAutoList).
+      // Two seconds of it, and no more: the status is the news, the body is
+      // only a nicety. Headers can arrive and the body never end - a proxy that
+      // emits 502 and then stalls, an upstream killed between the two, a link
+      // dropped mid-response - and every recovery below is downstream of this
+      // await: the failure message, un-latching serversLoaded so that coming
+      // back to the tab asks again, and the finally that gives Find and Auto
+      // their buttons back. Waiting for the whole body meant one stalled
+      // response wedged the entire picker until a page reload. Whichever
+      // arrives first wins; a body that misses the boat costs only its sentence.
+      e.body=await Promise.race([r.text().catch(()=>''),
+        new Promise(res=>setTimeout(()=>res(''), 2000))]);
+      throw e; }
     const d=await r.json();
     if(my!==serversGen) return;   // superseded while in flight: this answer is no longer the page's truth
     fpListLabel = opts.candidates ? 'Candidates' : 'Server';
@@ -7757,12 +7806,18 @@ async function fetchServers(opts){
       if(s && s.fallback_ok===false) fpRefusedID=String(opts.id);
       else pendingServer=String(opts.id); // pin a specific server
     }
-    else if(opts.city){ browseLoc=`${d.lat},${d.lon}`; browseLabel=shortPlace(d.location); rememberFind(); } // a search moves the browse list; it commits nothing - but it is remembered across a reload
+    else if(opts.city){ browseLoc=`${d.lat},${d.lon}`; browseLabel=shortPlace(d.location); rememberFind(); // a search moves the browse list; it commits nothing - but it is remembered across a reload
+      // This IS the list for the centre now in effect, as in the candidates
+      // branch below. Without saying so, the next load - a click on the tab that
+      // is already active, or the settings reload a Save triggers - fetched the
+      // same place again, spending an Ookla list lookup and a ping at every
+      // listed server on a list already on screen.
+      serversLoaded=true; serversScope=browseLoc; serversLatchGen=my; }
     else if(opts.candidates){
       browseLoc=''; browseLabel=''; autoDefaultLoc=shortPlace(d.winner&&d.winner.label||''); autoCentreLastRun=false; // the race's own field: the winner's city is where a run now would centre
       // This IS the list for the centre now in effect, so a tab revisit or a
       // settings reload reuses it rather than refetching a browse list over it.
-      serversLoaded=true; serversScope=browseLoc;
+      serversLoaded=true; serversScope=browseLoc; serversLatchGen=my;
       // Distances are the daemon's, measured from the winning city for every
       // row (see RaceListing), so the column means one thing down the list.
     }
@@ -7780,6 +7835,18 @@ async function fetchServers(opts){
 }
 const serverTabActive = () => { const at=document.querySelector('.tab.active');
   return _drawer.classList.contains('open') && at && at.dataset.tab==='ookla'; };
+// Counts the writes to #settingsMsg that race a list load - today just the one,
+// Reset to defaults, which is the only button that starts a load and then writes
+// into the footer behind it. loadServers has to know whether anybody has spoken
+// since it began, and the WORDS cannot answer that: the reset writes a constant,
+// so pressing it twice in a row put up a line identical to the one already
+// there, "unchanged" looked true, and the list failure talked over the
+// confirmation exactly as it had before. The writer bumps, the racer compares -
+// the same shape as statusSeq and chartSeq.
+let settingsMsgSeq=0;
+// Named once because loadServers both puts it up and takes it down again, and
+// the two have to be talking about the same sentence.
+const SERVER_LIST_ERR='Could not load the server list - Find a place or press Auto to try again.';
 async function loadServers(){
   // The Ookla server-list fetch is an external call and most page loads never
   // open the Ookla tab - defer it until that tab is first shown. The select
@@ -7790,7 +7857,7 @@ async function loadServers(){
   fpRefreshPingsIfStale({quiet:true});   // ... and their live pings, measured again when stale (see fpPingedAt)
   // A remembered or reopened Auto: shown again from its result while that is
   // fresh, raced again once it is stale - never a plain list fetch.
-  if(startOnAuto){ startOnAuto=false; if(fpAutoFresh() && fpShowAutoCache()) return; serversLoaded=true; serversScope=browseLoc; fpAutoList({fallback:true}); return; }
+  if(startOnAuto){ startOnAuto=false; if(fpAutoFresh() && fpShowAutoCache()) return; serversLoaded=true; serversScope=browseLoc; serversLatchGen=0; fpAutoList({fallback:true}); return; }
   // Keyed on the scope, not a bare flag: the list is only reusable if it was
   // fetched for the location currently in effect. Reopening the drawer restores
   // straight onto this tab while the settings refetch is still in flight, and an
@@ -7798,10 +7865,57 @@ async function loadServers(){
   const centre=browseLoc;
   if(serversLoaded && serversScope===centre){ applyPendingServer(); updateScopeNote(); return; }
   serversLoaded=true; serversScope=centre;
-  try{
-    if(centre){ const p=centre.split(','); await fetchServers({lat:p[0],lon:p[1]}); }
-    else await fetchServers({});
-  }catch(e){ serversLoaded=false; }
+  const pt=centre?centre.split(','):null;
+  const req = pt ? fetchServers({lat:pt[0],lon:pt[1]}) : fetchServers({});
+  const myGen=serversGen;   // fetchServers takes its generation synchronously, so this names THIS request
+  serversLatchGen=myGen;    // ... and the latch just taken out is this request's, until a newer answer takes it
+  // What the footer said when this load began, AND which write said it, so a
+  // failure only speaks into a footer nobody has spoken into since (the same
+  // "clear only what this click wrote" rule the webhook test button follows).
+  // Reset to defaults starts this load and THEN writes "Defaults loaded - click
+  // Save to apply."; the failure landing a moment later replaced it, and the
+  // reset had happened, still needed a Save, and no longer said so. The text on
+  // its own could not tell a second reset from no reset at all - it writes the
+  // same sentence every time - so the sequence number is what identifies the
+  // write, and the text still catches every other writer, all of which change
+  // the words.
+  const footerAtStart=$('settingsMsg').textContent, footerSeqAtStart=settingsMsgSeq;
+  try{ await req;
+    // Owning the message below cuts both ways. The retry it names first is
+    // coming back to this tab, and that is a plain reload with no success arm,
+    // so the sentence outlived every failure it described and sat under a fully
+    // populated list saying the list could not be fetched. Only this load's own
+    // message, and only from the newest request: an older answer landing late
+    // has already been thrown away and must not un-say a failure that stands.
+    if(myGen===serversGen && serverErrShown===SERVER_LIST_ERR){
+      if($('settingsMsg').textContent===serverErrShown) $('settingsMsg').textContent='';
+      serverErrShown=''; }
+  }
+  catch(e){
+    if(myGen!==serversGen){
+      // Superseded while it was in flight - a Find, an Auto or a reload - so this
+      // failure is not the page's news, the same rule searchServers and fpAutoList
+      // follow. Speaking here would blame the list on screen for a request it
+      // replaced, and un-latching would cost that list a refetch of the very
+      // place it is already showing.
+      //
+      // Unless the request that replaced this one failed too. Then there is no
+      // list to protect: the latch is still this request's, over a pane nothing
+      // ever filled, and leaving it on meant the cheapest retry there is -
+      // leaving the tab and coming back - stopped asking for anything at all.
+      if(serversLatchGen===myGen) serversLoaded=false;
+      return;
+    }
+    serversLoaded=false;
+    // Find and Auto each report their failures; this one said nothing, so a
+    // daemon that could not reach Ookla left a pane identical to "no servers
+    // near here" with no hint that it could be asked again. Owned like a search
+    // error (serverErrShown) so typing, the next Find, a row click or closing
+    // the drawer retire it - and only while the tab is actually showing, since a
+    // settings reload can call this with the drawer closed over the footer.
+    if(serverTabActive() && settingsMsgSeq===footerSeqAtStart && $('settingsMsg').textContent===footerAtStart){ serverErrShown=SERVER_LIST_ERR;
+      $('settingsMsg').textContent=serverErrShown; }
+  }
 }
 // Track the in-flight city search so a quick Save waits for it: searchServers is
 // async and only repopulates the dropdown after the
@@ -7860,7 +7974,19 @@ async function searchServers(){
       $('settingsMsg').textContent=serverErrShown;
       return;
     }
-    serverFieldError(opts.id ? (e.status===404 ? 'server '+q+' not found' : 'could not check server '+q) : 'city not found'); serverSearchFailed=true; }
+    if(opts.id){ serverFieldError(e.status===404 ? 'server '+q+' not found' : 'could not check server '+q); serverSearchFailed=true; return; }
+    // A place the geocoder does not know is the user's to fix, and only a 404
+    // says that: the daemon answers 502 when it could not ask at all, 503 while
+    // it is restoring a backup, and there is no status at all when the page
+    // could not reach the daemon. Blaming the typed city for any of those told
+    // the reader to correct a place name that was never wrong - and, because it
+    // also blocked Save, threw away every other edit in the drawer with it. A
+    // city search moves the browse list and commits nothing to settings, so a
+    // failure to run one is worth saying and nothing more. This is the split the
+    // ID branch above already makes, for the same reason.
+    if(e.status===404){ serverFieldError('city not found'); serverSearchFailed=true; return; }
+    serverErrShown='Could not look up '+q+' - the server list could not be fetched. Try again.';
+    $('settingsMsg').textContent=serverErrShown; }
   finally{ if(serverSearchInFlight===p) serverSearchInFlight=null;
     btnBusy(b, false); }   // in the finally so an abandoned search still releases the button
 }
@@ -8021,9 +8147,14 @@ function fpHeldServer(){
 let fpPinging=false;
 function fpHeader(saved){
   const h=document.createElement('div'); h.className='fp-hdr';
+  // Nothing kept, nothing to measure: fpRefreshPings returns at once on an empty
+  // list, so a live-looking button here was a click that did nothing whatever -
+  // no request, no spinner, no word about why. Disabled, and the title says what
+  // would make it work.
+  const none=!speedServers.length;
   h.innerHTML='<span></span><span>'+(saved?'Saved':fpListLabel)+'</span><span>ID</span>'+
     '<span class="fp-hdr-ping"><span>Ping</span>'+(saved?'<button class="fp-refresh'+(fpPinging?' spin':'')+'" id="fpRefreshPings" type="button"'+
-      (fpPinging?' disabled':'')+' title="Measure the ping to each of your servers now" aria-label="Refresh pings for your servers"><svg width="13" height="13" viewBox="0 0 24 24"'+
+      (fpPinging||none?' disabled':'')+' title="'+(none?'Star a server to measure its ping':'Measure the ping to each of your servers now')+'" aria-label="Refresh pings for your servers"><svg width="13" height="13" viewBox="0 0 24 24"'+
       ' fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"'+
       ' stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/>'+
       '<polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64'+
@@ -8035,7 +8166,10 @@ function fpHeader(saved){
 // the decimal is the difference, whole milliseconds above. Deliberately coarser
 // than the connection panel's fmtMs (a decimal to 100 ms): a column of
 // 27.7 / 28.1 / 28.4 reads worse than 28 / 28 / 28 and says no more.
-function fpPingText(ms){ return ms<10 ? (Math.round(ms*10)/10).toFixed(1) : String(Math.round(ms)); }
+// Rounded BEFORE the precision is chosen: branching on the raw value printed
+// 9.96 as "10.0" directly above a 10.2 printing "10", which reads as two
+// different numbers for pings a tenth of a millisecond apart.
+function fpPingText(ms){ const v=Math.round(ms*10)/10; return v<10 ? v.toFixed(1) : String(Math.round(v)); }
 // fpKmText prints a distance for innerHTML: whole kilometres, and "<1 km"
 // under one - a server at the city's own point is near, not unknown. Blank
 // when there is no figure (a by-ID row carries none worth showing).
@@ -8050,9 +8184,23 @@ function fpRow(s){
   const w=document.createElement('div'); w.className='fp-row'; w.dataset.pick=s.id;
   const b=document.createElement('button'); b.type='button';
   const hist=s.pingSrc==='history';
+  // A server can arrive with only half a name: a pin the browse list does not
+  // carry has no city (fpHeldServer synthesizes "Server <id>" and nothing else),
+  // and a catalogue row can come through with no sponsor. Joining the halves
+  // whatever they held printed the separator with nothing after it - "Server
+  // 424242 ·" - and named the star "Keep " with no subject, so both now take
+  // whichever half exists.
+  const label=s.sponsor||s.name||('Server '+s.id);
+  const sub=(s.sponsor&&s.name) ? '<span class="fp-sub"> · '+esc(s.name)+'</span>' : '';
   b.className='fp-btn'+(chosen?' on':'')+(bad?' bad':'');
+  // Which row is chosen was carried by that class and a decorative dot alone,
+  // and the two places that hold the choice as text - the select underneath and
+  // the caption above it - are both display:none, so nothing told a screen
+  // reader which server the next run uses. aria-pressed, as the iperf3 picker's
+  // identical row already sets on its own pick button.
+  b.setAttribute('aria-pressed', String(chosen));
   b.innerHTML='<span class="fp-radio'+(bad&&!chosen?' off':'')+'"></span>'+
-    '<span class="fp-name"><span class="fp-txt">'+esc(s.sponsor)+'<span class="fp-sub"> · '+esc(s.name)+'</span></span>'+
+    '<span class="fp-name"><span class="fp-txt">'+esc(label)+sub+'</span>'+
     (bad?'<span class="fp-badge bad" title="'+FP_UNSUPPORTED_TIP+'">Unsupported</span>':'')+'</span>'+
     '<span class="fp-id">#'+esc(s.id)+'</span>'+
     (s.ping>0?'<span class="fp-ping'+(hist?' hist':'')+'"'+(hist?' title="Median of the ranking pings recent tests measured to it"':'')+'>'+fpPingText(s.ping)+' ms</span>':'<span class="fp-ping none">—</span>')+
@@ -8068,8 +8216,8 @@ function fpRow(s){
   // this button does something it will not do - and pressing it did nothing at
   // all, with the reason visible only as a mouse tooltip. Name the reason, and
   // say the control is unavailable.
-  h.setAttribute('aria-label', capped ? ('Keep '+s.sponsor+' - keeping '+FP_MAX+' servers already')
-                                      : (kept?'Remove ':'Keep ')+s.sponsor);
+  h.setAttribute('aria-label', capped ? ('Keep '+label+' - keeping '+FP_MAX+' servers already')
+                                      : (kept?'Remove ':'Keep ')+label);
   if(capped) h.setAttribute('aria-disabled','true');
   h.innerHTML=kept?STAR_ON:STAR_OFF;
   w.appendChild(h);
@@ -8080,7 +8228,9 @@ function fpRow(s){
 function fpAutoRow(){
   const w=document.createElement('div'); w.className='fp-row'; w.dataset.pick='';
   const b=document.createElement('button'); b.type='button';
-  b.className='fp-btn'+($('setServer').value===''?' on':'');
+  const chosen=$('setServer').value==='';
+  b.className='fp-btn'+(chosen?' on':'');
+  b.setAttribute('aria-pressed', String(chosen));   // the same state the server rows report
   b.innerHTML='<span class="fp-radio"></span>'+
     '<span class="fp-name"><span class="fp-txt">Auto<span class="fp-sub"> · fastest near you, measured each run</span></span></span>'+
     '<span></span><span class="fp-ping"></span><span class="fp-km"></span>';
@@ -8118,10 +8268,18 @@ function fpDraw(){
   // meant the restore ran while the other pane still held its previous render,
   // so the selector found nothing and un-starring dropped the keyboard - the
   // "cannot be pressed twice" failure, in the one control that changes panes.
-  const mark=(f.contains(document.activeElement) || a.contains(document.activeElement)) ? focusMark() : null;
+  const inFav=f.contains(document.activeElement), inAll=a.contains(document.activeElement);
+  const mark=(inFav||inAll) ? focusMark() : null;
   fpFill(f, fpHeader(true), [fpAutoRow()].concat(p.kept.map(fpRow)));
   fpFill(a, fpHeader(false), p.rest.map(fpRow));
-  refocus(mark);
+  // The row the mark names can be GONE rather than redrawn: un-starring a kept
+  // server this list does not carry removes its only row, and with nothing to
+  // find the keyboard was dropped on <body>, several stops back inside the
+  // drawer. Name the pane it was in, so focus lands beside where it was - and
+  // name a star, not any button: the saved pane opens with the Auto row, whose
+  // button is what chooses the server every test runs against, so "the first
+  // button in the pane" handed the keyboard a settings change one Space away.
+  refocus(mark, mark ? (inFav ? '#fpFav .fp-rows .fp-star' : '#fpAll .fp-rows .fp-star') : '');
 }
 // fpAdopt takes the browse page. populateServers is the one place a fetched list
 // arrives, whatever asked for it, so the first load, Find and Auto all land here.
@@ -8136,8 +8294,23 @@ function fpAdopt(list){
 // the daemon's own runs measured to them are fetched afterwards: no network,
 // and a kept server is usually outside whatever list the pane below holds.
 function fpAdoptSaved(list){
+  // What the pane already had for these servers, by id: the settings payload
+  // carries no pings, so rebuilding straight from it threw away whatever had
+  // just been measured - and every Save, drawer reopen and Discard rebuilds,
+  // while the ten-minute freshness rule below then refused to measure them
+  // again. A kept server outside the browse list and without run history read
+  // "—" seconds after the refresh had answered for it. Same id, same ping; a
+  // reset or an import bringing different servers carries nothing over.
+  const had=new Map(speedServers.map(s=>[s.id,s]));
   speedServers=(Array.isArray(list)?list:[])
-    .map(s=>({id:String(s.id==null?'':s.id), sponsor:s.sponsor||'', name:s.name||'', country:s.country||'', lat:s.lat||0, lon:s.lon||0}))
+    .map(s=>{ const id=String(s.id==null?'':s.id), was=had.get(id);
+      const row={id:id, sponsor:s.sponsor||'', name:s.name||'', country:s.country||'', lat:s.lat||0, lon:s.lon||0};
+      // The number decides, not the label: a ping the star copied off the browse
+      // listing (fpToggleStar) records no source at all, so keying on the source
+      // dropped exactly the ping the pane had just shown for a freshly starred
+      // server, which is the case this carrying exists for.
+      if(was && (was.pingSrc || was.ping>0)){ row.ping=was.ping; row.pingSrc=was.pingSrc; }
+      return row; })
     .filter(s=>s.id).slice(0, FP_MAX);
   // These rows carry no pings - the settings payload has none - so the stored
   // pings have to be fetched again even when the ID list is unchanged. Without
@@ -8226,7 +8399,13 @@ function fpToggleStar(id){
   // endpoint reports OUR position for a server on our own ISP and sends no
   // coordinate here at all, so a by-ID row is kept without one - the 0,0 the
   // settings layer reads as unknown.
-  speedServers.push({id:id, sponsor:b.sponsor||'', name:b.name||'', country:b.country||'', lat:b.lat||0, lon:b.lon||0});
+  const row={id:id, sponsor:b.sponsor||'', name:b.name||'', country:b.country||'', lat:b.lat||0, lon:b.lon||0};
+  // The ping rides along when there is one: fpPanes borrows one from the browse
+  // listing only while that listing carries the server, so a server starred off
+  // one list showed "—" the moment a Find moved the list - for a number the pane
+  // had shown a second earlier.
+  if(b.ping>0) row.ping=b.ping;
+  speedServers.push(row);
   fpDraw();
 }
 // A server that fails every transfer cannot be chosen. One that is ALREADY chosen
@@ -8276,8 +8455,16 @@ function fpAutoList(opts){
     // Owned like a search error (serverErrShown), so typing, the next Find, a
     // row click or closing the drawer retire it - but no red outline: the box
     // is empty and there is nothing to fix.
+    // Every route answers 503 while a backup is being restored, and that means
+    // "wait a couple of seconds", not "this host cannot do Auto" - which is what
+    // the reader was told, and the difference between waiting and giving up.
+    // Read from the daemon's own words: the Retry-After header isReconcile503
+    // prefers is not carried out of fetchServers, and that helper's rule about
+    // POSTs is about pollers deciding to back off, which this is not - only the
+    // sentence changes here.
     serverErrShown = e&&e.status===409 ? 'A speedtest is running - try Auto again when it finishes.'
-      : e&&e.status===503 ? 'Auto selection is not available.'
+      : e&&e.status===503 ? (/restoring a backup/i.test(e.body||'') ? 'Restoring a backup - try Auto again shortly.'
+                                                                   : 'Auto selection is not available.')
       : 'Could not race the candidate cities.';
     $('settingsMsg').textContent=serverErrShown;
   }).finally(()=>btnBusy(b, false));
@@ -8525,7 +8712,7 @@ function applySettings(s){
   // again (when the Ookla tab is the one reopening; otherwise the default list
   // on the next visit). A first load starts on the default list. Reset to
   // defaults is the one act that puts the default list back on purpose.
-  if(drawerReopening && !$('serverAuto').disabled){   // a race already in flight for this list is the refresh; a fetch now would supersede it
+  if(drawerReopening && reopenHadList && !$('serverAuto').disabled){   // a race already in flight for this list is the refresh; a fetch now would supersede it
     serversLoaded=false;
     if(fpListLabel==='Candidates') startOnAuto=true;   // loadServers shows or races instead of fetching, once the tab shows
   }
@@ -8705,6 +8892,21 @@ let iperfBridged=false;              // is the container's network namespace ISO
 let iperfWanted=false;               // did the user choose iperf3 as the engine (even if it's unavailable and forced to Ookla)?
 let busyDeferSupported=true;         // can the daemon's host read interface counters for skip-when-busy? (from GET settings)
 function iperfDotTitle(st){ return st==='on'?'Reachable - click to recheck' : st==='off'?'Unreachable - click to retry' : st==='loading'?'Checking…' : 'Status unknown - click to check'; }
+// The same state as a word, for the light's accessible NAME. That name was the
+// constant "Server status" on every row, so a reader that announces the name
+// (and not the title) heard the same thing for a server that answered, one that
+// refused and one nobody had checked - the state lived only in the colour.
+function iperfDotWord(st){ return st==='on'?'reachable' : st==='off'?'unreachable' : st==='loading'?'checking' : 'not checked yet'; }
+// Everything the light shows for one server. A row with no usable address has
+// nothing to dial - probeIperf returns immediately on one - so its light is
+// disabled rather than a click that quietly does nothing.
+function iperfDotState(s){
+  const dead=!iperfAddrValid(s.addr), st=dead?'unknown':(iperfHealth[s.addr]||'unknown');
+  const who=s.label||s.addr||'new server';
+  return { st, dead,
+    title: dead ? (s.addr ? 'Fix this address before checking' : 'Add an address to check this server') : iperfDotTitle(st),
+    label: who+' status: '+(dead ? (s.addr ? 'address not usable' : 'no address yet') : iperfDotWord(st)) };
+}
 // Probe one server's reachability (a TCP dial via the backend), updating its dot.
 async function probeIperf(addr){
   if(!iperfAddrValid(addr)) return;
@@ -8718,8 +8920,9 @@ function refreshIperfDots(){
   list.querySelectorAll('.ipl-row').forEach(card=>{
     const s=iperfServers.find(x=>x._id===+card.dataset.id), dot=card.querySelector('.iperf-dot');
     if(!s||!dot) return;
-    const st=iperfHealth[s.addr]||'unknown';
-    dot.className='iperf-dot '+st; dot.title=iperfDotTitle(st);
+    const d=iperfDotState(s);
+    dot.className='iperf-dot '+d.st; dot.title=d.title;
+    dot.disabled=d.dead; dot.setAttribute('aria-label', d.label);
   });
 }
 // A fresh saved server: path defaults to the OS route + auto IP family, auth off.
@@ -8761,9 +8964,93 @@ function updateIperfLoopbackWarn(){
   w.classList.toggle('show', !!trap);
 }
 function editingIperfServer(){ return iperfServers.find(s=>s._id===iperfEditingId)||null; }
-// Lenient client check (the backend + tester validate strictly): non-empty, not
-// flag-shaped, no embedded whitespace. Good enough for instant feedback.
-function iperfAddrValid(a){ a=(a||'').trim(); return !!a && a[0]!=='-' && !/\s/.test(a); }
+// The client check has to be the tester's check, because nothing between them
+// says no: the settings store deliberately leaves the address alone ("the
+// tester's parseIperfServer does that at run time"), so an address only this
+// page could have refused - a port of 99999, a stray second colon, a bracket
+// that never closes - saved without a murmur and then failed every run with
+// "invalid iperf3 server". The status light cannot rescue that either: the
+// check endpoint answers the same {reachable:false} for a typo as for a server
+// that is simply down. So these are parseIperfServer's own rules: non-empty;
+// host and port not flag-shaped; no whitespace or leftover bracket in the host;
+// a colon in the host only when it really is an IP literal; and a numeric port
+// inside 1-65535.
+function iperfAddrValid(a){
+  // [\s\u0085] rather than \s, and the same set is trimmed off the ends. The two
+  // sides were reading different tables: Go's unicode.IsSpace counts U+0085
+  // (NEL) and JavaScript's \s does not, so an address carrying one was saved
+  // from here without a murmur and then failed every run with "invalid iperf3
+  // server" - the one outcome this check exists to prevent. The other direction
+  // (U+FEFF, a byte-order mark, which JavaScript counts and Go did not) is
+  // closed in parseIperfServer, so the two now answer alike for every address.
+  const s=String(a==null?'':a).replace(/^[\s\u0085]+|[\s\u0085]+$/g,'');
+  if(!s) return false;
+  let host=s, port='';
+  const hp=hostPortSplit(s);
+  if(hp){ host=hp.host; port=hp.port; }
+  // A bracketed IPv6 literal with no port ("[2001:db8::1]") never splits, so
+  // unwrap it here - otherwise its own brackets would condemn it below.
+  else if(s[0]==='[' && s[s.length-1]===']' && ipLiteral(s.slice(1,-1))) host=s.slice(1,-1);
+  if(!host || host[0]==='-' || port[0]==='-') return false;
+  if(/[\[\]\s\u0085]/.test(host)) return false;
+  if(host.indexOf(':')>=0 && !ipLiteral(host)) return false;
+  return !port || (/^\+?\d+$/.test(port) && +port>=1 && +port<=65535);
+}
+// net.SplitHostPort's rules, which is where the tester's host and port come
+// from: the port is what follows the LAST colon, a bracketed host has to close
+// its bracket immediately before that colon, and an unbracketed host may not
+// carry a colon of its own. null where Go would return an error - the caller
+// then reads the whole string as a host, exactly as parseIperfServer does.
+function hostPortSplit(s){
+  const i=s.lastIndexOf(':');
+  if(i<0) return null;
+  let host, j=0, k=0;
+  if(s[0]==='['){
+    const end=s.indexOf(']');
+    if(end<0 || end+1===s.length || end+1!==i) return null;
+    host=s.slice(1,end); j=1; k=end+1;
+  } else {
+    host=s.slice(0,i);
+    if(host.indexOf(':')>=0) return null;
+  }
+  if(s.indexOf('[',j)>=0 || s.indexOf(']',k)>=0) return null;
+  return { host, port:s.slice(i+1) };
+}
+// Is this a bare IP address the way netip.ParseAddr reads one (what the tester
+// asks)? A dotted quad with no leading zeros, or IPv6 in any compressed form -
+// zone included ("fe80::1%eth0": a LAN iperf3 box on a link-local address is a
+// real setup), and with an embedded IPv4 tail, which fills the last two groups.
+function ipLiteral(s){
+  s=String(s==null?'':s);
+  const z=s.indexOf('%');
+  // The colon has to be in the ADDRESS, not anywhere in the string: asking the
+  // whole string let a colon inside the zone stand in for one, so '1.2.3.4%eth0:5201:9'
+  // had its zone chopped off unexamined and passed as the quad in front of it,
+  // while netip.ParseAddr - which allows a zone only on IPv6 - refuses it and
+  // every run against it failed with "invalid iperf3 server".
+  if(z>=0){ if(z===s.length-1 || s.slice(0,z).indexOf(':')<0) return false; s=s.slice(0,z); } // a zone belongs to IPv6 and must name something
+  if(s.indexOf(':')<0) return ip4Literal(s);
+  const halves=s.split('::');
+  if(halves.length>2) return false;   // only one run of zeros may be compressed
+  let n=0;
+  for(let i=0;i<halves.length;i++){
+    if(halves[i]==='') continue;
+    const g=halves[i].split(':');
+    for(let j=0;j<g.length;j++){
+      if(j===g.length-1 && i===halves.length-1 && g[j].indexOf('.')>=0){
+        if(!ip4Literal(g[j])) return false;
+        n+=2; continue;
+      }
+      if(!/^[0-9a-fA-F]{1,4}$/.test(g[j])) return false;
+      n++;
+    }
+  }
+  return halves.length===2 ? n<=7 : n===8;   // '::' has to stand for at least one group
+}
+function ip4Literal(s){
+  const p=s.split('.');
+  return p.length===4 && p.every(o=>/^(0|[1-9]\d{0,2})$/.test(o) && +o<=255);
+}
 // The row's name: the label with the address muted after it (the Ookla rows'
 // sponsor · name shape), the bare address, or a placeholder for a new server;
 // plus the bind source when one is set, since it changes what the test measures.
@@ -8780,7 +9067,7 @@ const IPL_PENCIL='<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" str
 // details below the list. A server marked for removal keeps its row, struck
 // through, with Undo where the pencil was - the removal happens on Save.
 function iperfRowHTML(s){
-  const on=s._id===iperfActiveId, st=iperfHealth[s.addr]||'unknown', editing=s._id===iperfEditingId;
+  const on=s._id===iperfActiveId, d=iperfDotState(s), editing=s._id===iperfEditingId;
   const who=esc(s.label||s.addr||'new server');
   const ip=s.ipver==='4'?'v4':s.ipver==='6'?'v6':'auto';
   return `<div class="fp-row ipl-row${s._del?' pending-del':''}" data-id="${s._id}">`
@@ -8789,7 +9076,7 @@ function iperfRowHTML(s){
     +`<span class="ipl-ip" title="${ip==='auto'?'IP version: whichever iperf3 picks':'IPv'+ip.slice(1)+' only'}">${ip}</span>`
     +`<span class="ipl-auth">${s.auth?'<span class="fp-badge ok" title="RSA authentication">RSA</span>':'<span class="fp-badge bad" title="No authentication">open</span>'}</span>`
     +`</button>`
-    +`<button class="iperf-dot ${st}" type="button" data-act="check" data-id="${s._id}" title="${iperfDotTitle(st)}" aria-label="Server status"></button>`
+    +`<button class="iperf-dot ${d.st}" type="button" data-act="check" data-id="${s._id}"${d.dead?' disabled':''} title="${d.title}" aria-label="${esc(d.label)}"></button>`
     +(s._del
       ? `<button class="btn sm ipl-undo" type="button" data-act="undo" data-id="${s._id}" title="Keep this server">Undo</button>`
       : `<button class="fp-star ipl-edit" type="button" data-act="edit" data-id="${s._id}" aria-pressed="${editing}" title="${editing?'Close the details':'Edit this server'}" aria-label="${editing?'Close':'Edit'} ${who}">${IPL_PENCIL}</button>`)
@@ -8803,12 +9090,23 @@ function renderIperfServers(){
     const live=iperfServers.filter(s=>!s._del);
     iperfActiveId = live.length?live[0]._id:null;
   }
-  const full=iperfServers.length>=IPERF_MAX;
+  // Live rows only, which is what the daemon caps: a row marked for removal is
+  // not one of the twelve that will be kept (settingsBody drops it before
+  // posting), so counting it left "Add a server" greyed out at the cap - and
+  // the retire-and-replace edit the address check below goes out of its way to
+  // allow was blocked until an intermediate Save.
+  const full=iperfServers.filter(s=>!s._del).length>=IPERF_MAX;
   list.innerHTML = '<div class="fp-hdr"><span></span><span>Server</span><span>IP</span><span>Auth</span><span>Status</span><span></span></div>'
     +'<div class="fp-rows">'+iperfServers.map(iperfRowHTML).join('')
     +'<button class="ipl-add" type="button" data-act="add"'+(full?' disabled title="Keeping '+IPERF_MAX+' servers already"':'')
       +'><span class="ipl-plus" aria-hidden="true">'+IPL_PLUS+'</span><span>Add a server</span></button>'
     +'</div>';
+  // Load the editor BEFORE the message below is decided. loadIperfEditor blanks
+  // #iperfMsg (the address warning belongs to the edit that raised it), so with
+  // the editor loaded last, opening another server's details - or adding one -
+  // wiped the orphaned-password warning while the orphan was still there, and
+  // the only thing left saying so was the Save that refused.
+  renderIperfEditor();
   // The message under the list dies when its REASON dies, not when the editor
   // closes. Closing the editor over a renamed server does not un-orphan its
   // stored password: the rename is applied live, Done captures it, and the next
@@ -8831,7 +9129,6 @@ function renderIperfServers(){
   if($('setSpeedEngine').checked && _drawer.classList.contains('open'))
     iperfServers.forEach(s=>{ if(iperfAddrValid(s.addr) && iperfHealth[s.addr]===undefined) probeIperfSoon(s.addr); });
   updateIperfLoopbackWarn(); // any list change can create or clear the loopback-in-container trap
-  renderIperfEditor();
 }
 // Show the editor only while a server is being edited (and iperf3 is the engine). Reload
 // the inputs ONLY when the edited server changes, so a re-render mid-edit doesn't wipe
@@ -8841,10 +9138,11 @@ function renderIperfEditor(){
   const show=!!s;   // the iperf3 tab is always on the bar, so editing works whichever engine runs
   $('iperfEditor').classList.toggle('hidden', !show);
   if(show){ if(iperfLoadedId!==s._id){ loadIperfEditor(s); iperfLoadedId=s._id; } }
-  else iperfLoadedId=null;
+  else { iperfLoadedId=null; iperfAddrOK(); } // nothing loaded, so nothing for a refusal to be about: Reset and Discard left the box outlined red
 }
 function loadIperfEditor(s){
   $('iperfMsg').textContent='';   // the address warning belongs to the edit that raised it
+  iperfAddrOK();                  // and so does the red outline: this is a different server's address
   $('setIperfLabel').value=s.label||''; $('setIperfAddr').value=s.addr||'';
   $('setIperfIPVer').value=s.ipver||'auto'; $('setIperfBind').value=s.bind||'';
   $('setIperfAuth').checked=!!s.auth; $('setIperfUsername').value=s.username||'';
@@ -8862,8 +9160,23 @@ function captureIperfEditor(){
   s.rsa_key=$('setIperfRSAKey').value; s.password=$('setIperfPassword').value; // pending pw ('' = keep)
   s.pkcs1=$('setIperfPKCS1').checked;
 }
+// The address is committed on change, and a refused one is deliberately left in
+// the box to be fixed - so closing the editor over it would drop what was typed
+// and leave the model on its old address, with the next Save reporting success
+// on an edit that never happened (iperfAddrError goes quiet the moment the
+// editor closes). Keep the details open and say why instead; Remove is still
+// there for a server that was meant to go.
+function iperfEditorBlocked(){
+  const err=iperfAddrError(); if(!err) return false;
+  iperfAddrBad(err); $('setIperfAddr').focus();
+  return true;
+}
 function openIperfEditor(id){
-  if(iperfEditingId===id){ captureIperfEditor(); iperfEditingId=null; renderIperfServers(); return; } // toggle closed
+  if(iperfEditorBlocked()) return;
+  if(iperfEditingId===id){ captureIperfEditor(); iperfEditingId=null; renderIperfServers();
+    // The rebuild replaced the pencil that was just pressed; keep the keyboard on it.
+    $('iperfServerList').querySelector('.ipl-edit[data-id="'+id+'"]')?.focus({preventScroll:true});
+    return; } // toggle closed
   captureIperfEditor();            // stash edits to the previously-open server first
   iperfEditingId=id; renderIperfServers();
   $('iperfEditor').scrollIntoView({block:'nearest'}); $('setIperfAddr').focus({preventScroll:true});
@@ -8885,13 +9198,37 @@ $('iperfServerList').addEventListener('click', e=>{
     if(nr) nr.focus({preventScroll:true});
   }
   else if(btn.dataset.act==='undo'){
+    const s=iperfServers[idx];
+    // The address may have been handed on while this row sat struck through:
+    // the duplicate check ignores rows marked for removal on purpose, which is
+    // what makes "retire this box, add its replacement at the same address"
+    // work. Bringing the old row back on top of that address leaves two live
+    // servers on one address, and the store keeps only the first - so the
+    // replacement, its label and its credentials disappeared on Save with
+    // nothing said. Refuse, and name the row that has the address now. A draft
+    // with no address yet is not holding one: two of those matched each other's
+    // '' and Undo refused with a sentence full of blanks, over rows settingsBody
+    // drops before it posts anything.
+    const clash=s.addr ? iperfServers.find(o=>o!==s && !o._del && o.addr===s.addr) : null;
+    if(clash){ $('iperfMsg').textContent='Can’t keep '+(s.label||s.addr)+' - '+(clash.label||clash.addr)+' now uses '+s.addr+'. Change or remove that one first.'; return; }
+    // Undo is the other door into a thirteenth server. The cap counts the rows
+    // that will be kept, so at twelve a removal frees the slot a replacement
+    // then takes - and un-deleting afterwards asks the store to keep one more
+    // than it will. It keeps the first twelve and drops the rest in silence,
+    // and the row at the end is the replacement just typed, with its label and
+    // its credentials. So this door needs the belt the Add row has.
+    if(iperfServers.filter(o=>!o._del).length>=IPERF_MAX){
+      $('iperfMsg').textContent='Can’t keep '+(s.label||s.addr)+' - '+IPERF_MAX+' servers are already being kept. Remove another one first.'; return; }
     // Undo means undo. Removing the row that was the test target moved the
     // target to whatever was left (the live-target guard in
     // renderIperfServers), and clearing _del alone left it there - so the
     // server came back but the tests were still pointed somewhere else.
-    const s=iperfServers[idx]; delete s._del;
+    delete s._del;
     if(s._delWasTarget){ iperfActiveId=s._id; delete s._delWasTarget; }
     renderIperfServers();
+    // Undo's own button is gone with the strike-through; focus the pencil that
+    // replaced it, as the pick branch above does.
+    $('iperfServerList').querySelector('.ipl-edit[data-id="'+id+'"]')?.focus({preventScroll:true});
   }
 });
 // Removal lives in the details, beside Done: marked for deletion on Save (the row
@@ -8900,6 +9237,9 @@ $('iperfEditRemove').addEventListener('click', ()=>{
   const s=editingIperfServer(); if(!s) return;
   s._delWasTarget = (iperfActiveId===s._id); // so Undo can put the target back
   s._del=true; iperfEditingId=null; renderIperfServers();
+  // The editor holding this button closed and the list was rebuilt, so hand the
+  // keyboard to what took its place on the row: the Undo that puts it back.
+  $('iperfServerList').querySelector('.ipl-undo[data-id="'+s._id+'"]')?.focus({preventScroll:true});
 });
 // The address box: Add saves a server at the typed address (or an empty one to
 // fill in below) and opens its details; Check tries one handshake and says what
@@ -8909,7 +9249,8 @@ $('iperfEditRemove').addEventListener('click', ()=>{
 // are where every other field is typed, and the row's own status light is what
 // says whether the address answers.
 function iperfAddServer(){
-  if(iperfServers.length>=IPERF_MAX) return; // the row is disabled at the cap; this is the belt
+  if(iperfEditorBlocked()) return;            // don't switch the editor away from an address it refused
+  if(iperfServers.filter(s=>!s._del).length>=IPERF_MAX) return; // the row is disabled at the cap; this is the belt (live rows, as there)
   captureIperfEditor();
   const sv=newIperfServer('',''); sv._id=nextIperfId(); iperfServers.push(sv);
   if(iperfActiveId==null) iperfActiveId=sv._id; // first server becomes the default target
@@ -8918,7 +9259,15 @@ function iperfAddServer(){
   $('iperfEditor').scrollIntoView({block:'nearest'});
   $('setIperfAddr').focus({preventScroll:true});
 }
-$('iperfEditDone').addEventListener('click', ()=>{ captureIperfEditor(); iperfEditingId=null; renderIperfServers(); });
+$('iperfEditDone').addEventListener('click', ()=>{
+  if(iperfEditorBlocked()) return;
+  const s=editingIperfServer();
+  captureIperfEditor(); iperfEditingId=null; renderIperfServers();
+  // Done rebuilt the list under the button that was pressed. Focus the row's
+  // pencil - the control that reopens what was just closed - rather than
+  // dropping the keyboard on <body>.
+  if(s) $('iperfServerList').querySelector('.ipl-edit[data-id="'+s._id+'"]')?.focus({preventScroll:true});
+});
 // The row follows the details while they are open: every cell the details can
 // change (auth badge, IP version, the bind suffix in the name) is repainted
 // here, so the list never shows a server as it was a moment ago.
@@ -8976,6 +9325,16 @@ function iperfAddrOK(){
 function iperfAddrError(){
   const s=editingIperfServer(); if(!s) return '';           // editor closed -> nothing to validate
   const v=$('setIperfAddr').value.trim();
+  // The box still holding the address this server already has is not an edit.
+  // Nothing was typed, closing the details drops nothing, and a save posts what
+  // the store already holds - so there is nothing here to refuse. Judging it
+  // anyway trapped exactly the lists the stricter address check was written
+  // for: one old entry the tester cannot parse (saved before this page checked
+  // addresses, or restored from a backup) made Done, the other pencils and
+  // every Save refuse over a row nobody had touched, whichever engine was
+  // going to run. That entry is still named, once, by the save gate that knows
+  // which engine that is.
+  if(v===s.addr) return '';
   if(!v) return s.orig_addr ? 'Enter an address, or use Remove to delete this server.' : '';
   if(!iperfAddrValid(v)) return 'Enter a valid host or host:port.';
   // Not a row already marked for removal: settingsBody drops those before it
@@ -9070,7 +9429,15 @@ Object.entries(SCHED_FEATS).forEach(([feat,f])=>{
   $(f.cont).addEventListener('click', e=>{
     const day=e.target.closest('.day'); if(day){ toggleBtn(day); updateConflictWarnings(); return; }
     const chip=e.target.closest('.chip[data-preset]'); if(chip){ applyPreset(chip); updateConflictWarnings(); return; }
-    const rm=e.target.closest('.win-rm'); if(rm && $(f.cont).querySelectorAll('.sched-win').length>1){ rm.closest('.sched-win').remove(); syncWinRm(feat); updateConflictWarnings(); } });
+    const rm=e.target.closest('.win-rm'); if(rm && $(f.cont).querySelectorAll('.sched-win').length>1){
+      const row=rm.closest('.sched-win'), nb=row.nextElementSibling||row.previousElementSibling;
+      row.remove(); syncWinRm(feat); updateConflictWarnings();
+      // The removed row took the focused button with it. Hand the keyboard to
+      // the neighbouring row's own Remove - or, when one row is left and its
+      // Remove is hidden, to the button that adds another.
+      const nx=nb&&nb.querySelector('.win-rm');
+      (nx && !nx.classList.contains('hidden') ? nx : document.querySelector('.add-win[data-feat="'+feat+'"]'))?.focus({preventScroll:true});
+    } });
   $(f.cont).addEventListener('input', e=>{ if(e.target.matches('.win-from,.win-to')) updateConflictWarnings(); });
 });
 document.querySelectorAll('.add-win[data-feat]').forEach(btn=> btn.addEventListener('click', ()=>{
@@ -9365,7 +9732,11 @@ function settingsBody(){
   captureIperfEditor();
   // The server list rides outside FIELDS: it is a list, not a single input. Each
   // server carries its own path + creds; the password is write-only (blank = keep stored).
-  // Drop blank-address drafts (an Add that was never filled in) so they don't persist.
+  // Drop blank-address drafts (an Add that was never filled in) so they don't
+  // persist. Only those: a server the store already holds at an address this
+  // page would now refuse (saved before the address was checked, or restored
+  // from a backup) must not be quietly deleted by a save of something else -
+  // the gate below names it instead, and only when iperf3 is what runs.
   const iperfActiveSrv = activeIperfServer();
   // The kept Ookla list rides outside FIELDS too: it is a list, not an input, and
   // starring is an edit like any other - being here is what puts it in
@@ -9375,7 +9746,7 @@ function settingsBody(){
             speed_engine: iperfWanted?'iperf3':'ookla', // the committed choice, not the pill (which is forced to Ookla when iperf3 is missing), so a saved iperf3 preference survives a temporarily-absent binary
 
             iperf_server: iperfActiveSrv ? iperfActiveSrv.addr : '',
-            iperf_servers: iperfServers.filter(s=>!s._del && iperfAddrValid(s.addr)).map(s=>({label:s.label, addr:s.addr, bind:s.bind||'', ipver:s.ipver||'auto',
+            iperf_servers: iperfServers.filter(s=>!s._del && s.addr).map(s=>({label:s.label, addr:s.addr, bind:s.bind||'', ipver:s.ipver||'auto',
               auth:!!s.auth, username:s.username||'', rsa_key:s.rsa_key||'', pkcs1:!!s.pkcs1, password:s.password||''})) };
   FIELDS.forEach(([id,key,kind,fb])=> b[key]=getField(id,kind,fb));
   b.sched_lat_enabled=$('setSchedLatEnabled').checked; b.sched_lat_windows=collectWindows('lat');
@@ -9489,6 +9860,18 @@ function saveFailed(text){
   if(body.speed_engine==='iperf3' && iperfAvailable && !body.iperf_server){
     activateTab('iperf'); // where the message is asking them to do something, as its two neighbours do
     saveFailed('The iperf3 engine needs a server - add one with a host:port and pick it as the test target before saving.');
+    return;
+  }
+  // And it may not point at an address iperf3 itself cannot parse. The store
+  // does not check addresses (the tester does, at run time), so an entry saved
+  // before this page checked them - or restored from a backup - can still be
+  // sitting in the list, and every run against it fails with "invalid iperf3
+  // server" while the light only ever says unreachable. Judged on the engine
+  // that will RUN, like the gate above, so an old unusable row can never block
+  // an Ookla save.
+  if(body.speed_engine==='iperf3' && iperfAvailable && !iperfAddrValid(body.iperf_server)){
+    activateTab('iperf');
+    saveFailed('iperf3 can’t use “'+body.iperf_server+'” as a server address - fix it (a host, or host:port) before saving.');
     return;
   }
   // A blank time is not midnight. timeToMin('') returns 0, so clearing the "to"
@@ -9605,8 +9988,12 @@ $('resetSettings').addEventListener('click', () => {
   // rather than in the list refetch below, so the reset does not depend on
   // Ookla answering.
   $('setServer').value='';
-  pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind(); serversLoaded=false; loadServers();   // back to the default list: a reset starts over
+  pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind();
   fpAdoptSaved(d.speed_servers);   // the kept list rides outside FIELDS, like the iperf3 one below
+  // The kept list goes first: loading the list re-measures whatever is kept when
+  // that measurement is stale, so reloading before this fired a round of live
+  // pings at Ookla for the very servers the same click was discarding.
+  serversLoaded=false; loadServers();   // back to the default list: a reset starts over
   $('serverCity').value=''; clearServerFieldError(); // else leftover text re-searches on Save and overrides the reset to Auto
   updateAutoLocUI();
   // Engine + iperf3 server list ride outside FIELDS, so reset them by hand (direction/retries
@@ -9625,7 +10012,9 @@ $('resetSettings').addEventListener('click', () => {
   $('setWide').checked=false; applyWide(false, true);
   applyCorners(false); // sets the checkbox itself
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable; updateEngineUI();
-  $('settingsMsg').textContent='Defaults loaded - click Save to apply.';
+  // Bump before the write, not after: the list load started above is already in
+  // flight and its failure compares this number the moment it lands.
+  settingsMsgSeq++; $('settingsMsg').textContent='Defaults loaded - click Save to apply.';
 });
 
 // Test webhook: POST the URL currently typed in the field and report the result.

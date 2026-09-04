@@ -2021,9 +2021,20 @@ func (s *Server) handleSpeedtestServers(w http.ResponseWriter, r *http.Request) 
 	var centreSrv *speedtest.ServerInfo // that server; guaranteed into the list below
 	if city := strings.TrimSpace(r.URL.Query().Get("city")); city != "" {
 		var err error
-		lat, lon, locName, err = geocode(ctx, city)
+		lat, lon, locName, err = geocodeFn(ctx, city)
 		if err != nil {
-			http.Error(w, "could not find that city", http.StatusBadGateway)
+			// Only "no such place" is the user's to fix, and this is the same
+			// split the by-ID branch above makes for the same reason: a
+			// geocoder that could not be reached, or a deadline of ours, says
+			// nothing about what was typed, and answering 502 for both left the
+			// page no way to tell them apart - so it painted "city not found"
+			// over real cities and refused to save the drawer until the box was
+			// cleared.
+			if errors.Is(err, errNoSuchCity) {
+				http.Error(w, "could not find that city", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "could not look up that city", http.StatusBadGateway)
 			return
 		}
 	} else {
@@ -2461,10 +2472,22 @@ var getOoklaServer = speedtest.GetOoklaServer
 // a seam for the same reason listOoklaServers is.
 var searchOoklaServers = speedtest.SearchOoklaServers
 
+// geocodeFn resolves the Find box's city; a seam for the same reason the three
+// above are - it is the only way a test can assert which STATUS a failed city
+// lookup answers with (a place the geocoder does not know against a geocoder it
+// could not reach) without opening a socket at Nominatim.
+var geocodeFn = geocode
+
 var geocodeClient = &http.Client{
 	Timeout:       10 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
+
+// errNoSuchCity: the geocoder answered, and knows no such place. Every other
+// failure here (unreachable, a bad reply, our own deadline) says nothing about
+// the query, and the caller reports the two differently - see
+// handleSpeedtestServers.
+var errNoSuchCity = errors.New("no such city")
 
 // geocode resolves a free-text place to a coordinate via OpenStreetMap Nominatim.
 func geocode(ctx context.Context, query string) (lat, lon float64, name string, err error) {
@@ -2490,7 +2513,7 @@ func geocode(ctx context.Context, query string) (lat, lon float64, name string, 
 		return 0, 0, "", err
 	}
 	if len(arr) == 0 {
-		return 0, 0, "", fmt.Errorf("no match for %q", query)
+		return 0, 0, "", fmt.Errorf("%w: no match for %q", errNoSuchCity, query)
 	}
 	lat, err = strconv.ParseFloat(arr[0].Lat, 64)
 	if err != nil {

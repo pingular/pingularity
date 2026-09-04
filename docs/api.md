@@ -116,7 +116,9 @@ and `-d '{…}'` where a body is listed below.
 - `GET /api/speed/server-pings?ids=` - the median of each server's recent
   ranking pings from this daemon's own runs (no network); a server never
   ranked is absent
-- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city; `?id=<ookla
+- `POST /api/speedtest/servers?city=` - list Ookla servers (near a city - `404`
+  when the geocoder knows no such place, `502` when it could not be asked at
+  all, a distinction the picker reports differently; `?id=<ookla
   id>` resolves one server by its Ookla ID instead - identity plus `fallback_ok`
   when its upload endpoint could be probed, no coordinate, and a `distance_km`
   of `0` that means *unknown*, because that endpoint reports the *caller's*

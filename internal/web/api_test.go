@@ -1331,3 +1331,94 @@ func TestNotifyTestHonorsFormat(t *testing.T) {
 		t.Fatalf("bogus format should fall back to detection (generic here): body=%q", got.body)
 	}
 }
+
+// A place the geocoder does not know is the user's to fix; a geocoder that
+// could not be reached, or this handler's own deadline, says nothing about what
+// was typed. Both used to answer 502, so the picker could only report one
+// thing - it painted "city not found" over real cities and refused to save the
+// whole drawer until the box was cleared. This is the same split the by-ID
+// branch has always made between "no such server" and "Ookla could not be
+// asked".
+func TestCityLookupSeparatesAnUnknownPlaceFromAFailedLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"no such place", fmt.Errorf("%w: no match for %q", errNoSuchCity, "Nowherecity"), http.StatusNotFound},
+		{"geocoder unreachable", errors.New("dial tcp: no such host"), http.StatusBadGateway},
+		{"our own deadline", context.DeadlineExceeded, http.StatusBadGateway},
+		{"a reply we could not read", errors.New("invalid character '<'"), http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := geocodeFn
+			geocodeFn = func(context.Context, string) (float64, float64, string, error) { return 0, 0, "", tc.err }
+			t.Cleanup(func() { geocodeFn = old })
+			s := &Server{netinfo: stubNetInfo{}}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers?city=Nowherecity", nil)
+			req.Header.Set("Content-Type", "application/json")
+			s.handleSpeedtestServers(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.want, strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+}
+
+// geocodeReply answers every request the geocoder makes with one canned body,
+// or with a transport failure when body is empty - the seam the real geocode
+// runs through, so a test can drive it without a network.
+type geocodeReply struct {
+	body string
+}
+
+func (g geocodeReply) RoundTrip(*http.Request) (*http.Response, error) {
+	if g.body == "" {
+		return nil, errors.New("dial tcp: no such host")
+	}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(g.body)), Header: make(http.Header)}, nil
+}
+
+// The split above is only reachable because geocode itself marks the one
+// failure that IS about what was typed: an answer with no match comes back
+// wrapped in errNoSuchCity, and nothing else does. The test above builds that
+// wrapped error by hand behind a stubbed geocodeFn, so it pins the handler and
+// not the producer - take the wrap off and every one of its subtests still
+// passes while real cities go back to being blamed for a geocoder that could
+// not be reached. This one runs the real geocode, and the real handler on top
+// of it.
+func TestAnEmptyGeocoderAnswerIsWhatMakesTheCitySplitReachable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"the geocoder knows no such place", "[]", http.StatusNotFound},
+		{"the geocoder could not be reached", "", http.StatusBadGateway},
+		{"an answer we could not read", "<html>not json</html>", http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := geocodeClient.Transport
+			geocodeClient.Transport = geocodeReply{body: tc.body}
+			t.Cleanup(func() { geocodeClient.Transport = old })
+			s := &Server{netinfo: stubNetInfo{}}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/speedtest/servers?city=Nowherecity", nil)
+			req.Header.Set("Content-Type", "application/json")
+			s.handleSpeedtestServers(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.want, strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+	// And the same producer on a place it does know: no error at all, so
+	// nothing here can be passing because everything looks like no-such-city.
+	old := geocodeClient.Transport
+	geocodeClient.Transport = geocodeReply{body: `[{"lat":"43.65","lon":"-79.38","display_name":"Toronto, ON, Canada"}]`}
+	t.Cleanup(func() { geocodeClient.Transport = old })
+	lat, lon, name, err := geocode(context.Background(), "Toronto")
+	if err != nil || lat != 43.65 || lon != -79.38 || name != "Toronto, ON, Canada" {
+		t.Fatalf("geocode(Toronto) = (%v,%v,%q,%v), want the coordinate it answered with and no error", lat, lon, name, err)
+	}
+}
