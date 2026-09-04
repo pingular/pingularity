@@ -200,6 +200,21 @@ test('parseDur: unit math + rejects garbage', () => {
   assert.equal(F.parseDur('5x'), 0); // unknown unit
 });
 
+test('fmtWin: names a window in words parseDur can read straight back', () => {
+  // The window label is not just prose: the data and uptime popovers prefill
+  // their custom box with it and re-read it on Enter, so a lossy label quietly
+  // moves the window. "1.0h" for 61 minutes did exactly that, and the 1y preset
+  // was described on its own hover text as "Last 365d".
+  const cases = [[45, '45m'], [60, '1h'], [61, '61m'], [62, '62m'], [90, '1.5h'],
+                 [120, '2h'], [1439, '1439m'], [1440, '1d'], [1441, '1441m'],
+                 [1500, '25h'], [10080, '7d'], [43200, '30d'],
+                 [525600, '1y'], [527040, '366d']];
+  for (const [m, want] of cases) {
+    assert.equal(F.fmtWin(m), want, String(m));
+    assert.equal(F.parseDur(want), m, 'round trip ' + want);
+  }
+});
+
 test('minToTime / timeToMin: round-trip + wrap', () => {
   assert.equal(F.minToTime(0), '00:00');
   assert.equal(F.minToTime(90), '01:30');
@@ -1259,6 +1274,17 @@ test('parseRange: open-ended forms leave the other bound at 0', () => {
   assert.deepEqual([b.from, b.to, b.openStart], [0, sec(2026, 6, 18), true]);
 });
 
+test('parseRange: up to is the same open-ended form as until', () => {
+  // The two-sided separator used to eat the " to " inside it, leaving "up" as a
+  // start date nothing can read, so the whole line came back as a rejection.
+  for (const s of ['up to jul 8', 'until jul 8', 'till jul 8', 'to jul 8']) {
+    assert.deepEqual(span(s), [0, sec(2026, 6, 9)], s);
+    assert.equal(PR(s).openStart, true, s);
+  }
+  assert.equal(F.fmtRangeEcho(PR('up to jul 8')), 'Up to 8 Jul 2026');
+  assert.deepEqual(span('up to yesterday'), [0, sec(2026, 6, 18)]);
+});
+
 test('parseRange: before and after exclude the day named, until and since include it', () => {
   assert.equal(PR('until jul 5').to, sec(2026, 6, 6));   // through the end of the 5th
   assert.equal(PR('before jul 5').to, sec(2026, 6, 5));  // stops where the 5th starts
@@ -1306,6 +1332,109 @@ test('parseRange: bare times mean today, rolling back a day if that is ahead of 
   assert.deepEqual(span('9am to 5pm'), [sec(2026, 6, 18, 9, 0), sec(2026, 6, 18, 17, 0)]);
   const early = new Date(2026, 6, 18, 8, 0).getTime();  // before 9am: must mean yesterday
   assert.deepEqual(span('9am to 5pm', early), [sec(2026, 6, 17, 9, 0), sec(2026, 6, 17, 17, 0)]);
+});
+
+test('parseRange: a bare time beside a dated one takes that date, not today', () => {
+  // Pinned to today, "yesterday 9am to 5pm" spanned thirty-two hours and
+  // "9am to 5pm yesterday" came back reversed and flagged as swapped dates.
+  const cases = [
+    ['jul 1 9am to 5pm',      sec(2026, 6, 1, 9, 0),  sec(2026, 6, 1, 17, 0)],
+    ['jul 1 9:00 to 18:30',   sec(2026, 6, 1, 9, 0),  sec(2026, 6, 1, 18, 30)],
+    ['yesterday 9am to 5pm',  sec(2026, 6, 17, 9, 0), sec(2026, 6, 17, 17, 0)],
+    ['9am to 5pm yesterday',  sec(2026, 6, 17, 9, 0), sec(2026, 6, 17, 17, 0)],
+    // a whole day on one side still starts (or ends) where that day does
+    ['jul 1 to 5pm',          sec(2026, 6, 1),        sec(2026, 6, 1, 17, 0)],
+    ['5pm to jul 2',          sec(2026, 6, 2, 17, 0), sec(2026, 6, 3)],
+    // the night rule applies here too, in both directions
+    ['jul 1 10pm to 2am',     sec(2026, 6, 1, 22, 0), sec(2026, 6, 2, 2, 0)],
+    ['10pm to jul 2 2am',     sec(2026, 6, 1, 22, 0), sec(2026, 6, 2, 2, 0)],
+    // now and N ago carry an instant and no calendar fields, so the day comes
+    // off the instant itself
+    ['now to 5pm',            sec(2026, 6, 18, 14, 30), sec(2026, 6, 18, 17, 0)],
+    ['3 days ago to 5pm',     sec(2026, 6, 15, 14, 30), sec(2026, 6, 15, 17, 0)],
+    ['5pm to now',            sec(2026, 6, 17, 17, 0),  sec(2026, 6, 18, 14, 30)],
+  ];
+  for (const [s, from, to] of cases) {
+    const r = PR(s);
+    assert.deepEqual([r.from, r.to, r.swapped], [from, to, false], s);
+  }
+  // a bare time with no date anywhere on the line still means today, and a lone
+  // one still rolls back a day when today at that time has not happened yet
+  assert.deepEqual(span('9am to 5pm'), [sec(2026, 6, 18, 9, 0), sec(2026, 6, 18, 17, 0)]);
+  assert.deepEqual(span('until 5pm'), [0, sec(2026, 6, 17, 17, 0)]);
+  // the dated side is still the most recent one it can be. A clock time says
+  // nothing about a year, so it cannot be the far end of a span running into the
+  // future - and read that way "dec 20 9am to 5pm" typed in January asked for
+  // eight hours NEXT December, where no sample can ever exist.
+  const jan = new Date(2027, 0, 10, 12, 0).getTime();
+  assert.deepEqual(span('dec 20 9am to 5pm', jan), [sec(2026, 11, 20, 9, 0), sec(2026, 11, 20, 17, 0)]);
+  assert.deepEqual(span('jul 1 9am to 5pm', jan), [sec(2026, 6, 1, 9, 0), sec(2026, 6, 1, 17, 0)]);
+  assert.deepEqual(span('5pm to jul 1', jan), [sec(2026, 6, 1, 17, 0), sec(2026, 6, 2)]);
+  assert.deepEqual(span('oct 1 to 5pm'), [sec(2025, 9, 1), sec(2025, 9, 1, 17, 0)]);
+});
+
+test('parseRange: the night rule stops at the night after today', () => {
+  // The night rule reads "10pm to 2am" as the night between them, but a start on
+  // TODAY makes that night end tomorrow, which nobody has lived through, and the
+  // chart had nothing to draw. Refused, the pair is simply out of order and
+  // reads as two ends typed the wrong way round - the same backward reading
+  // every other dateless bound here takes.
+  for (const [s, from, to] of [
+    ['now to 9am',         sec(2026, 6, 18, 9, 0), sec(2026, 6, 18, 14, 30)],
+    ['now to 2am',         sec(2026, 6, 18, 2, 0), sec(2026, 6, 18, 14, 30)],
+    ['2h ago to 9am',      sec(2026, 6, 18, 9, 0), sec(2026, 6, 18, 12, 30)],
+    ['today 13:00 to 9am', sec(2026, 6, 18, 9, 0), sec(2026, 6, 18, 13, 0)],
+  ]) {
+    const r = PR(s);
+    assert.deepEqual([r.from, r.to, r.swapped], [from, to, true], s);
+  }
+  // an evening window typed before the evening has happened is the same shape
+  const evening = new Date(2026, 6, 18, 19, 8).getTime();
+  assert.deepEqual(span('today 22:00 to 2am', evening),
+    [sec(2026, 6, 18, 2, 0), sec(2026, 6, 18, 22, 0)]);
+  // It is the start's DAY that decides, never how far past now the end lands. A
+  // night that began yesterday runs into today and holds real history, so it
+  // still rolls: asked at half past midnight what happened last night, judging
+  // the end instead answered with twenty hours of the previous afternoon, and
+  // "yesterday 22:00 to 22:00" was turned down altogether.
+  const small = new Date(2026, 6, 18, 0, 30).getTime();
+  assert.deepEqual(span('yesterday 10pm to 2am', small),
+    [sec(2026, 6, 17, 22, 0), sec(2026, 6, 18, 2, 0)]);
+  assert.deepEqual(span('yesterday 22:00 to 9am', small),
+    [sec(2026, 6, 17, 22, 0), sec(2026, 6, 18, 9, 0)]);
+  assert.deepEqual(span('yesterday 22:00 to 21:00'),
+    [sec(2026, 6, 17, 22, 0), sec(2026, 6, 18, 21, 0)]);
+  // the two ends naming the same clock time is the day between them, not a
+  // window collapsed onto one instant and rejected
+  assert.deepEqual(span('yesterday 22:00 to 22:00', small),
+    [sec(2026, 6, 17, 22, 0), sec(2026, 6, 18, 22, 0)]);
+  assert.deepEqual(span('jul 17 9am to 9am'), [sec(2026, 6, 17, 9, 0), sec(2026, 6, 18, 9, 0)]);
+  // a night someone dated into the future is still the night they typed: there
+  // is nothing to draw either way, and reading it backwards invented a
+  // twenty-hour daytime slice and called the dates swapped
+  assert.deepEqual(span('dec 20 2026 10pm to 2am'),
+    [sec(2026, 11, 20, 22, 0), sec(2026, 11, 21, 2, 0)]);
+  // where the calendar has already put the pair in the past, the night is still
+  // the night; and a pair with no date at all was already reading backwards -
+  // "10pm to 2am" at eight in the evening is last night, not tonight
+  assert.deepEqual(span('jul 1 10pm to 2am'), [sec(2026, 6, 1, 22, 0), sec(2026, 6, 2, 2, 0)]);
+  assert.deepEqual(span('10pm to 2am', evening), [sec(2026, 6, 17, 22, 0), sec(2026, 6, 18, 2, 0)]);
+});
+
+test('parseRange: the same clock time on both ends is the day between them', () => {
+  // With a day on one side only, refusing the night roll dropped the end back
+  // onto the start, the swap had nothing left to repair, and the line was turned
+  // down: the box fell back to its placeholder hint and Enter did nothing, for
+  // text that had always selected the obvious twenty-four hours.
+  const small = new Date(2026, 6, 18, 0, 30).getTime();   // before either clock
+  for (const [s, from, to] of [
+    ['yesterday 22:00 to 22:00', sec(2026, 6, 17, 22, 0),  sec(2026, 6, 18, 22, 0)],
+    ['yesterday 9am to 9am',     sec(2026, 6, 17, 9, 0),   sec(2026, 6, 18, 9, 0)],
+    ['jul 17 23:59 to 23:59',    sec(2026, 6, 17, 23, 59), sec(2026, 6, 18, 23, 59)],
+  ]) assert.deepEqual(span(s, small), [from, to], s);
+  // A start on today has no day to roll into, so those two ends really are one
+  // instant and reach the rejection every other empty span gets.
+  assert.equal(PR('today 9am to 9am'), null);
 });
 
 test('parseRange: a year-less date resolves to the most recent one', () => {
@@ -1364,6 +1493,76 @@ test('fmtRangeEcho: says how the text was read, with an inclusive end', () => {
   assert.equal(F.fmtRangeEcho(null), '');
 });
 
+test('fmtRangeEcho: each end is read back the way it was typed', () => {
+  // The inclusive end used to need BOTH ends on a day boundary, so a clock time
+  // on the start printed the end's half-open bound instead - "9 Jul 2026, 00:00"
+  // for a span the button beside it labelled "1 Jul - 8 Jul".
+  const cases = [
+    ['jul 1 9am to jul 8',      '1 Jul 2026, 09:00 to 8 Jul 2026'],
+    ['3 days ago to yesterday', '15 Jul 2026, 14:30 to 17 Jul 2026'],
+    ['jul 1 9am to aug',        '1 Jul 2026, 09:00 to 31 Aug 2026'],
+    ['jul 1 to jul 8 5pm',      '1 Jul 2026 to 8 Jul 2026, 17:00'],
+    ['jul 1 to jul 8',          '1 Jul 2026 to 8 Jul 2026'],
+    ['jul 1 09:00 to jul 1 18:30', '1 Jul 2026, 09:00 to 1 Jul 2026, 18:30'],
+    // and one day is named once, as the button label already does
+    ['yesterday',               '17 Jul 2026'],
+    ['jul 18',                  '18 Jul 2026'],
+    ['jul 1 to jul 1',          '1 Jul 2026'],
+    ['july',                    '1 Jul 2026 to 31 Jul 2026'],
+  ];
+  for (const [s, want] of cases) assert.equal(F.fmtRangeEcho(PR(s)), want, s);
+});
+
+test('fmtRangeEcho: a span that fits inside one day still reads forwards', () => {
+  // The end of such a span sits on the next day's boundary, so read on its own
+  // it prints as the last day inside the span - which is the START's day. With
+  // a clock time on the start and none on the end the line came out as
+  // "1 Jul 2026, 09:00 to 1 Jul 2026", an end apparently before its own start,
+  // and the collapse below could not catch it because the two ends were spelled
+  // differently. The button beside it says "1 Jul", and so does this.
+  const cases = [
+    ['jul 1 9am to jul 1', '1 Jul 2026, 09:00 to 1 Jul 2026, 23:59'],
+    ['5pm to jul 2',       '2 Jul 2026, 17:00 to 2 Jul 2026, 23:59'],
+    ['9am to jul 2',       '2 Jul 2026, 09:00 to 2 Jul 2026, 23:59'],
+    // a start ON the day boundary says nothing a date does not, so it stays bare
+    ['jul 1 to 5pm',       '1 Jul 2026 to 1 Jul 2026, 17:00'],
+    // and the moment the span reaches a second day, the end is a day again
+    ['jul 1 9am to jul 2', '1 Jul 2026, 09:00 to 2 Jul 2026'],
+    ['jul 1 to jul 1',     '1 Jul 2026'],
+    // Giving that end its clock back can land it in the start's own minute,
+    // where the span is a real sixty seconds and naming the stamp once would
+    // call it a moment. Only a whole day named twice collapses.
+    ['jul 1 23:58 to jul 1', '1 Jul 2026, 23:58 to 1 Jul 2026, 23:59'],
+    ['jul 1 23:59 to jul 1', '1 Jul 2026, 23:59 to 1 Jul 2026, 23:59'],
+    ['23:59 to jul 1',       '1 Jul 2026, 23:59 to 1 Jul 2026, 23:59'],
+  ];
+  for (const [s, want] of cases) assert.equal(F.fmtRangeEcho(PR(s)), want, s);
+  // and the span behind that echo really is a minute, not an instant
+  assert.deepEqual(span('jul 1 23:59 to jul 1'),
+    [sec(2026, 6, 1, 23, 59), sec(2026, 6, 2)]);
+});
+
+test('fmtRangeEcho: a whole day is still a whole day where midnight does not exist', () => {
+  // Santiago puts its clocks forward at local midnight every September, so the
+  // first instant of that day is 01:00. Deciding "whole day" by asking for hours
+  // 0 and minutes 0 called it a timed span and printed a bound nobody typed:
+  // "6 Sep 2025, 00:00 to 7 Sep 2025, 01:00".
+  const tz = process.env.TZ;
+  try {
+    process.env.TZ = 'America/Santiago';
+    assert.equal(new Date(2025, 8, 7, 0, 0).getHours(), 1,
+      'this zone no longer shifts at local midnight - pick one that does');
+    const sep = new Date(2025, 8, 20, 12, 0).getTime();
+    const e = s => F.fmtRangeEcho(F.parseRange(s, sep, false));
+    assert.equal(e('sep 6'), '6 Sep 2025');            // the day before the shift
+    assert.equal(e('sep 7'), '7 Sep 2025');            // the shifting day itself
+    assert.equal(e('sep 5 to sep 6'), '5 Sep 2025 to 6 Sep 2025');
+    assert.equal(e('apr 5'), '5 Apr 2025');            // an ordinary midnight
+  } finally {
+    if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+  }
+});
+
 test('rangeLoad: rolling stays a bare int, spans are JSON, junk resets', () => {
   const MAX = 366 * 24 * 60;
   // what the current build has always written
@@ -1413,6 +1612,35 @@ test('parseRange: a year given on one side applies to the other', () => {
   assert.deepEqual(span('1 jan 2025 to 31 dec 2025'), [sec(2025, 0, 1), sec(2026, 0, 1)]);
 });
 
+test('parseRange: a carried year does not turn a new-year span inside out', () => {
+  // Copying the stated year onto the other side put both ends in one year and
+  // inverted the pair, and the repair then answered "dec 20 2026 to jan 5" with
+  // the eleven months from 5 Jan back to 20 Dec, marked "dates swapped".
+  const cases = [
+    ['dec 20 2026 to jan 5',      sec(2026, 11, 20), sec(2027, 0, 6)],
+    ['dec 20 to jan 5 2027',      sec(2026, 11, 20), sec(2027, 0, 6)],
+    ['20 dec 2025 to 5 jan',      sec(2025, 11, 20), sec(2026, 0, 6)],
+    ['dec 20 2026 to jan 5 2027', sec(2026, 11, 20), sec(2027, 0, 6)],
+    // a year-less pair already crossed new year on its own, and still does
+    ['dec 20 to jan 5',           sec(2025, 11, 20), sec(2026, 0, 6)],
+  ];
+  for (const [s, from, to] of cases) {
+    const r = PR(s);
+    assert.deepEqual([r.from, r.to, r.swapped], [from, to, false], s);
+  }
+  // reversed inside one year is still a swap: that reading is the shorter one
+  const back = PR('dec 20 2026 to dec 5');
+  assert.deepEqual([back.from, back.to, back.swapped], [sec(2026, 11, 5), sec(2026, 11, 21), true]);
+  // nothing carries from today or yesterday, which wear this year because that
+  // is when they are rather than because the line says so: offered the year
+  // after on their word, "yesterday to jan 5" read as the six months AHEAD of
+  // now instead of the six behind
+  const fwd = PR('yesterday to jan 5');
+  assert.deepEqual([fwd.from, fwd.to, fwd.swapped], [sec(2026, 0, 5), sec(2026, 6, 18), true]);
+  // an ISO date does say its year, so that one still carries across new year
+  assert.deepEqual(span('2026-07-08 to jan 5'), [sec(2026, 6, 8), sec(2027, 0, 6)]);
+});
+
 test('parseRange: only whole month names count, never a three-letter prefix', () => {
   // junk read as June, octopus as October, decade as December
   for (const s of ['junk', 'octopus', 'decade', 'maybe', 'augment', 'marching', 'jul 1 to junk'])
@@ -1422,6 +1650,36 @@ test('parseRange: only whole month names count, never a three-letter prefix', ()
   assert.deepEqual(span('sept'), [sec(2025, 8, 1), sec(2025, 9, 1)]);
   assert.deepEqual(span('september'), [sec(2025, 8, 1), sec(2025, 9, 1)]);
   assert.deepEqual(span('mar'), [sec(2026, 2, 1), sec(2026, 3, 1)]);
+});
+
+test('parseRange: two identical instants are a rejection, not a year', () => {
+  // A zero-width pair reached the out-of-order repair, where rolling the start
+  // back a year was the only candidate that came out longer than nothing - so a
+  // mistyped moment committed, persisted and fetched the 365 days before it.
+  for (const s of ['jul 1 9am to jul 1 9am', 'jul 1 9:00 to jul 1 9:00',
+                   'jul 1 2026 9am to jul 1 2026 9am',
+                   '2026-07-01 09:00 to 2026-07-01 09:00', 'now to now'])
+    assert.equal(PR(s), null, s);
+  // a lone moment with no second side is the same shape and the same answer
+  assert.equal(PR('jul 1 9am'), null);
+  // spans that only look zero-width are unaffected: a day named twice is that
+  // whole day, and a bare time named twice is the night between the two
+  assert.deepEqual(span('jul 1 to jul 1'), [sec(2026, 6, 1), sec(2026, 6, 2)]);
+  assert.deepEqual(span('9am to 9am'), [sec(2026, 6, 18, 9, 0), sec(2026, 6, 19, 9, 0)]);
+  // two whole units running, typed the wrong way round, are still a swap: their
+  // bounds MEET rather than cross, because the end of the 1st is where the 2nd
+  // begins, and that is not the same as naming one moment twice
+  for (const [s, from, to] of [
+    ['jul 2 to jul 1',           sec(2026, 6, 1),  sec(2026, 6, 3)],
+    ['today to yesterday',       sec(2026, 6, 17), sec(2026, 6, 19)],
+    ['2026-07-02 to 2026-07-01', sec(2026, 6, 1),  sec(2026, 6, 3)],
+    ['jul 1 to jun 30',          sec(2026, 5, 30), sec(2026, 6, 2)],
+    ['aug to jul',               sec(2026, 6, 1),  sec(2026, 8, 1)],
+    ['2026 to 2025',             sec(2025, 0, 1),  sec(2027, 0, 1)],
+  ]) {
+    const r = PR(s);
+    assert.deepEqual([r.from, r.to, r.swapped], [from, to, true], s);
+  }
 });
 
 test('parseRange: an overnight span is the night, not the daytime complement', () => {
@@ -1445,6 +1703,28 @@ test('parseRange: from X to Y is a span, since X stays open-ended', () => {
 test('parseRange: nothing predates the epoch, since rangeLoad would drop it on reload', () => {
   for (const s of ['until 1920', 'before 1950-01-01', '1 jan 1900 to 1 jan 1901'])
     assert.equal(PR(s), null, s);
+});
+
+test('parseRange: one unambiguous slash date settles the order for the whole line', () => {
+  // Judged side by side, "7/1 to 7/15" came back with its two halves read in
+  // different orders - the 15 forces month-first on the end while the start fell
+  // back to a day-first locale, answering a two-week question with 7 Jan to 15 Jul.
+  const cases = [
+    // text,                 dayFirst, from,             to,                guessed
+    ['7/1 to 7/15',          true,     sec(2026, 6, 1),  sec(2026, 6, 16),  false],
+    ['7/1 to 13/1',          false,    sec(2026, 0, 7),  sec(2026, 0, 14),  false],
+    ['7/1/2026 to 15/7/2026', true,    sec(2026, 0, 7),  sec(2026, 6, 16),  false],
+    // nothing settles these, so the locale decides and the echo says it did
+    ['1/7 to 8/7',           true,     sec(2026, 6, 1),  sec(2026, 6, 9),   true],
+    ['1/7-8/7',              true,     sec(2026, 6, 1),  sec(2026, 6, 9),   true],
+    // one side says day-first and the other month-first: the line proves nothing,
+    // so each date keeps the order its own arithmetic gives it
+    ['13/1 to 7/15',         false,    sec(2026, 0, 13), sec(2026, 6, 16),  false],
+  ];
+  for (const [s, df, from, to, guessed] of cases) {
+    const r = PR(s, NOW, df);
+    assert.deepEqual([r.from, r.to, r.guessed], [from, to, guessed], s);
+  }
 });
 
 // ---------------------------------------------------------------------------
