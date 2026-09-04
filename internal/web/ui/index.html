@@ -2762,10 +2762,19 @@ function parseDur(s){
   return Math.round(parseFloat(m[1]) *
     {'':60, m:1, min:1, h:60, hr:60, d:1440, w:10080, mo:43200, y:525600}[(m[2]||'').toLowerCase()]);
 }
+// fmtWin names a rolling window in the vocabulary parseDur reads back, because
+// every label it makes can be typed at it again: the data and uptime popovers
+// prefill their custom box with one of these and re-read it on Enter. A year
+// comes first so the 1y preset is spoken of as 1y rather than as 365d on the
+// button's hover text and in the empty-chart hint. Tenths of an hour are used
+// only where they are exact - toFixed(1) on anything else called 61 minutes
+// "1.0h", losing the minute on screen and again on the way back in.
 function fmtWin(m){ if(m<60) return m+'m';
+  if(m%525600===0) return (m/525600)+'y';
   if(m%1440===0) return (m/1440)+'d';
   if(m%60===0) return (m/60)+'h';
-  return (m/60).toFixed(1)+'h'; }
+  if(m%6===0) return (m/60).toFixed(1)+'h';
+  return m+'m'; }
 // parseRange reads one line of window text as either a rolling window (kind
 // win, in minutes - exactly what parseDur has always meant, delegated to it so
 // the two grammars can never drift apart) or an absolute span (kind range, in
@@ -2804,6 +2813,17 @@ function parseRange(s, nowMs, dayFirst){
   if(al){ const t=al[1].trim(), n=parseDur(/\d/.test(t)?t:'1'+t); return n>0?{kind:'win', mins:n}:null; }
 
   let guessed=false;
+  // A field over 12 settles day/month order for the WHOLE line, not only for the
+  // date it stands in. Read on its own each half of "7/1 to 7/15" answers
+  // differently: the 15 proves the user writes month first, but the 7/1 falls
+  // back to the locale, and on a day-first browser that reads as 7 January - a
+  // two-week request answered with a six-month span, over a note saying only
+  // that the locale was consulted. Contradictory evidence (13/1 to 7/15) proves
+  // nothing about the line, so each side keeps its own arithmetic as before.
+  const orders=[...raw.matchAll(/(?:^|[^\d\/])(\d{1,2})\/(\d{1,2})(?:\/\d{2,4})?(?![\d\/])/g)]
+    .map(m=>+m[1]>12?true:(+m[2]>12?false:null)).filter(v=>v!==null);
+  const settled=orders.length>0 && orders.every(v=>v===orders[0]);
+  if(settled) dayFirst=orders[0];
   // A month token has to be the whole word: the three-letter abbreviation, or
   // the full name. Matching on the first three letters alone would read junk as
   // June, octopus as October and decade as December, which is worse than a
@@ -2833,26 +2853,28 @@ function parseRange(s, nowMs, dayFirst){
       return {y:p.getFullYear(), m:p.getMonth(), d:p.getDate(), gran:'day'}; }
     let m;
     if((m=/^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/.exec(t)))
-      return {y:+m[1], m:+m[2]-1, d:m[3]?+m[3]:1, gran:m[3]?'day':'month'};
+      return {y:+m[1], m:+m[2]-1, d:m[3]?+m[3]:1, gran:m[3]?'day':'month', hasYear:true};
     if((m=/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/.exec(t))){
       const a=+m[1], b=+m[2]; let df=dayFirst;
-      // A field over 12 settles the order arithmetically, whatever the locale.
-      if(a>12) df=true; else if(b>12) df=false; else guessed=true;
+      // A field over 12 settles the order arithmetically, whatever the locale;
+      // `settled` is that same verdict reached from the other side of a pair, so
+      // it is not a guess either and carries no note.
+      if(a>12) df=true; else if(b>12) df=false; else if(!settled) guessed=true;
       const dd=df?a:b, mm=df?b:a;
       if(mm<1||mm>12) return null;
       let y=m[3]?+m[3]:now.getFullYear();
       if(m[3]&&m[3].length===2) y+=y<70?2000:1900;
-      return {y, m:mm-1, d:dd, gran:'day', noYear:!m[3]};
+      return {y, m:mm-1, d:dd, gran:'day', noYear:!m[3], hasYear:!!m[3]};
     }
     if((m=/^([a-z]{3,9})\.?(?: (\d{1,2}))?(?:,? (\d{4}))?$/.exec(t))){
       const k=monIdx(m[1]);
-      if(k>=0) return {y:m[3]?+m[3]:now.getFullYear(), m:k, d:m[2]?+m[2]:1, gran:m[2]?'day':'month', noYear:!m[3]};
+      if(k>=0) return {y:m[3]?+m[3]:now.getFullYear(), m:k, d:m[2]?+m[2]:1, gran:m[2]?'day':'month', noYear:!m[3], hasYear:!!m[3]};
     }
     if((m=/^(\d{1,2}) ([a-z]{3,9})\.?(?:,? (\d{4}))?$/.exec(t))){
       const k=monIdx(m[2]);
-      if(k>=0) return {y:m[3]?+m[3]:now.getFullYear(), m:k, d:+m[1], gran:'day', noYear:!m[3]};
+      if(k>=0) return {y:m[3]?+m[3]:now.getFullYear(), m:k, d:+m[1], gran:'day', noYear:!m[3], hasYear:!!m[3]};
     }
-    if((m=/^(\d{4})$/.exec(t))) return {y:+m[1], m:0, d:1, gran:'year'};
+    if((m=/^(\d{4})$/.exec(t))) return {y:+m[1], m:0, d:1, gran:'year', hasYear:true};
     return null;
   };
   const side=(str)=>{
@@ -2870,7 +2892,7 @@ function parseRange(s, nowMs, dayFirst){
     if(!dt) return {bare:true, hh:tm.hh, mi:tm.mi, gran:'inst'};
     const at=mk(dt.y, dt.m, dt.d, tm?tm.hh:0, tm?tm.mi:0);
     if(!at) return null;
-    return {at, gran:tm?'inst':dt.gran, y:dt.y, m:dt.m, d:dt.d, hh:tm?tm.hh:0, mi:tm?tm.mi:0, noYear:dt.noYear};
+    return {at, gran:tm?'inst':dt.gran, y:dt.y, m:dt.m, d:dt.d, hh:tm?tm.hh:0, mi:tm?tm.mi:0, noYear:dt.noYear, hasYear:dt.hasYear};
   };
   // withYear rebuilds an endpoint in a different year, keeping its clock time.
   const withYear=(x,y)=>{ if(!x||!x.at||x.y==null) return x;
@@ -2887,6 +2909,12 @@ function parseRange(s, nowMs, dayFirst){
 
   let body=raw, L=null, R=null, m2, exFrom=false, exTo=false, single=false;
   const btw=/^between (.+)$/.exec(body); if(btw) body=btw[1].replace(/ and /,' to ');
+  // "up to jul 8" is one of the open-ended forms further down, but the two-sided
+  // split runs first and its separator has no idea what precedes it: it tore the
+  // line into "up" and "jul 8" and rejected a shape the grammar promises to
+  // read. Dropping the "up" leaves the "to" form, which the split already leaves
+  // alone because the separator has to have a space in front of it.
+  body=body.replace(/^up to /, 'to ');
   // A bare hyphen separator must be spaced, or 2026-07-01 would split into a
   // year and a month-day and quietly produce the wrong span. The single
   // unspaced form allowed is a pair of slash dates, which no ISO date resembles.
@@ -2907,10 +2935,18 @@ function parseRange(s, nowMs, dayFirst){
   let ls=L!=null?side(L):null, rs=R!=null?side(R):null;
   if((L!=null&&!ls)||(R!=null&&!rs)) return null;
   // A year stated on ONE side carries to the other: 1 jan to 31 dec 2025 means
-  // the whole of 2025, not two dates a year apart.
+  // the whole of 2025, not two dates a year apart. Which side took the year is
+  // remembered, because on a span that crosses new year (dec 20 2026 to jan 5)
+  // the year that carried is the wrong one and the repair below has to know
+  // there is a neighbouring year worth trying. Only a year the line SPELLS OUT
+  // counts as carried: today and yesterday wear this year because that is when
+  // they are, not because anyone said so, and offering the neighbouring year on
+  // their word read yesterday to jan 5 as the six months ahead of now rather
+  // than the six behind.
+  let carried=null;
   if(ls&&rs&&ls.y!=null&&rs.y!=null){
-    if(ls.noYear&&!rs.noYear) ls=withYear(ls, rs.y);
-    else if(rs.noYear&&!ls.noYear) rs=withYear(rs, ls.y);
+    if(ls.noYear&&!rs.noYear){ ls=withYear(ls, rs.y); if(rs.hasYear) carried='l'; }
+    else if(rs.noYear&&!ls.noYear){ rs=withYear(rs, ls.y); if(ls.hasYear) carried='r'; }
   }
   // A year-less date means the most recent one, but that has to be judged for
   // the PAIR. Rolling each side on its own turns jul 1 to aug 31, typed in July
@@ -2919,6 +2955,13 @@ function parseRange(s, nowMs, dayFirst){
   // typed in January); one end ahead is just a span running into the future.
   if(ls&&rs){
     if(future(ls)&&future(rs)){ ls=withYear(ls, ls.y-1); rs=withYear(rs, rs.y-1); }
+    // A clock time names no year, so it is no evidence of a span running into
+    // the future: it can only land on the day the dated side names, and that day
+    // is the most recent one. Judged as a pair and left where it was, dec 20 9am
+    // to 5pm typed in January asked for eight hours NEXT December, where no
+    // sample can ever exist.
+    else if(rs.bare&&future(ls)) ls=withYear(ls, ls.y-1);
+    else if(ls.bare&&future(rs)) rs=withYear(rs, rs.y-1);
   } else {
     if(future(ls)) ls=withYear(ls, ls.y-1);
     if(future(rs)) rs=withYear(rs, rs.y-1);
@@ -2942,6 +2985,42 @@ function parseRange(s, nowMs, dayFirst){
     // instead of the single night between them. The local-component constructor is
     // DST-safe.
     if(!single && rs.at.getTime()<=ls.at.getTime()){ rs={...rs, at:new Date(ls.at.getFullYear(), ls.at.getMonth(), ls.at.getDate()+1, rs.hh, rs.mi)}; overnight=true; }
+  } else if(ls&&rs&&(ls.bare||rs.bare)){
+    // Only ONE side of this pair carries a day - spelled out, or arrived at as
+    // an instant the way now and 3 days ago do - so the clock time on the other
+    // side belongs to that day. "Today" is the right answer only when nothing on
+    // the line says otherwise, and here something does: pinning the bare side to
+    // today made "yesterday 9am to 5pm" a thirty-two hour span ending this
+    // afternoon, and "9am to 5pm yesterday" came back reversed and labelled as
+    // swapped dates. The day is taken off the other endpoint's own instant
+    // rather than its calendar fields, which an instant has none of. The end
+    // still crosses into the next morning when it lands at or before the start,
+    // the same night rule the both-bare pair above applies - except where the
+    // start is on TODAY, because the night after today ends tomorrow and nobody
+    // has lived through it yet: "now to 9am" in the afternoon and "today 22:00
+    // to 2am" before ten at night both came back as tomorrow morning and drew an
+    // empty chart. It is the start's own day that decides this and nothing else.
+    // A night that began on an earlier day ends today at the latest and holds
+    // real history however far past now its end sits, which is the reading the
+    // both-bare pair above gives "10pm to 2am" at half past midnight; judged on
+    // the end instead, "yesterday 10pm to 2am" typed at that hour came back as
+    // twenty hours of the previous afternoon, and "yesterday 22:00 to 22:00" was
+    // refused outright. Where the roll IS refused the pair is simply out of
+    // order, and the repair below reads it as the two ends typed the wrong way
+    // round - the backward reading every other dateless bound here takes.
+    const onDay=(x,d,off)=>({...x, at:new Date(d.getFullYear(),d.getMonth(),d.getDate()+(off||0),x.hh,x.mi)});
+    const onToday=d=>d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth()&&d.getDate()===now.getDate();
+    if(rs.bare){
+      rs=onDay(rs, ls.at);
+      if(rs.at.getTime()<=ls.at.getTime() && !onToday(ls.at)){ rs=onDay(rs, ls.at, 1); overnight=true; }
+    } else {
+      // Measured against the END BOUND, not the end instant: with a whole day on
+      // the right, "5pm to jul 2" ends when the 2nd does, so its 5pm is on the
+      // 2nd and nothing needs moving.
+      const end=nextUnit(rs);
+      ls=onDay(ls, rs.at);
+      if(ls.at.getTime()>=end.getTime()){ ls=onDay(ls, end, -1); overnight=true; }
+    }
   } else {
     if(ls&&ls.bare) ls=atDay(0,ls);
     if(rs&&rs.bare) rs=atDay(0,rs);
@@ -2960,11 +3039,27 @@ function parseRange(s, nowMs, dayFirst){
   // typed the wrong way round. Take whichever gives the SHORTER span - that
   // picks the cross-new-year reading for dec 20 to jan 5, and the swap for
   // jul 8 to jul 1, where rolling would invent an eleven-month window.
+  // A pair whose two bounds merely MEET is out of order too, and the swap is
+  // the only reading that helps it: jul 2 to jul 1 names two days running, and
+  // the end of the 1st is where the 2nd begins. Rolling a year is offered only
+  // to a pair that is strictly out of order, because on a pair of that width it
+  // is the one candidate longer than nothing and wins by default - which is how
+  // jul 1 9am to jul 1 9am, a slip of the fingers, used to commit the whole year
+  // before it. Two identical instants have no swap to fall back on either, so
+  // they still reach the rejection every other empty span gets.
   if(from&&to&&to.getTime()<=from.getTime()&&ls&&rs&&!overnight){
-    const cands=[];
-    if(ls.noYear){
+    const cands=[], inverted=to.getTime()<from.getTime();
+    // The start belongs to the year before: either it was typed without one, or
+    // it took the end's year and that is what put the pair out of order.
+    if(inverted&&(ls.noYear||carried==='l')){
       const r=withYear(ls, ls.y-1), b=bounds(r, rs);
       if(b.from&&b.to&&b.to>b.from) cands.push({b, ls:r, rs, sw:false});
+    }
+    // The mirror image, and the only reading of dec 20 2026 to jan 5: an end
+    // that took the START's year and landed before it belongs to the next one.
+    if(inverted&&carried==='r'){
+      const r=withYear(rs, rs.y+1), b=bounds(ls, r);
+      if(b.from&&b.to&&b.to>b.from) cands.push({b, ls, rs:r, sw:false});
     }
     const bs=bounds(rs, ls);
     if(bs.from&&bs.to&&bs.to>bs.from) cands.push({b:bs, ls:rs, rs:ls, sw:true});
@@ -2982,10 +3077,11 @@ function parseRange(s, nowMs, dayFirst){
 // fmtRangeEcho is the line under the custom input: it states how the text was
 // read. No chart here draws a time axis, so this is also the only place the
 // plotted dates are written down.
-// A whole-day span is shown with an INCLUSIVE end (one second inside the
-// half-open bound), so 1 jul to 8 jul reads back as 8 Jul rather than 9 Jul. A
-// span with a clock time on it shows the bound as typed, which is already what
-// the user wrote.
+// A span is read back one END at a time. An end sitting on a day boundary named
+// a whole day, so it prints as the last day INSIDE the span - one second inside
+// the half-open bound - and 1 jul to 8 jul reads back as 8 Jul rather than
+// 9 Jul however the other end was typed. An end carrying a clock time prints
+// that time, which is already what the user wrote.
 function fmtRangeEcho(sel){
   if(!sel) return '';
   if(sel.kind==='win') return 'Last '+fmtWin(sel.mins);
@@ -2994,15 +3090,35 @@ function fmtRangeEcho(sel){
   const stamp=(ms,withTime)=>{ const d=new Date(ms);
     return d.getDate()+' '+MON[d.getMonth()]+' '+d.getFullYear()+(withTime?', '+p2(d.getHours())+':'+p2(d.getMinutes()):''); };
   const f=sel.from?sel.from*1000:0, t=sel.to?sel.to*1000:0;
-  const mid=ms=>{ const d=new Date(ms); return d.getHours()===0&&d.getMinutes()===0; };
-  // A span sitting on midnight boundaries named whole days, so print the days
-  // rather than a pair of 00:00 stamps.
-  const whole=(!f||mid(f))&&(!t||mid(t));
-  const lo=f?stamp(f,!whole):'', hi=t?stamp(whole?t-1000:t,!whole):'';
+  // The first instant of a local day, which is not always midnight: where the
+  // clocks go forward at 00:00 - Santiago every September, Havana every March -
+  // the day begins at 01:00, and asking for hours 0 and minutes 0 called such a
+  // day a timed span and printed the clock stamps to prove it.
+  const mid=ms=>{ const d=new Date(ms); return ms===new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime(); };
+  // Each end is judged on its own. An end sitting on a day boundary named a
+  // whole day, so it reads as the last day INSIDE the span rather than as the
+  // half-open bound: jul 1 9am to jul 8 used to echo "9 Jul 2026, 00:00", a date
+  // nobody typed, and disagreed with the button label beside it. A start on a
+  // day boundary is the beginning of that day, so its 00:00 says nothing either.
+  const lo=f?stamp(f,!mid(f)):'';
+  // The one time a day-boundary end still needs its clock is when the day it
+  // names is the start's own day: printed bare there it reads as an end BEFORE
+  // the start it is measured from - "1 Jul 2026, 09:00 to 1 Jul 2026" - and the
+  // collapse below cannot rescue it, because the start is carrying a time the
+  // end is not. The last minute inside the span says the same thing forwards
+  // and still names the single day the button beside it names.
+  const oneDay=!!f&&!!t&&!mid(f)&&stamp(f,false)===stamp(t-1000,false);
+  const hi=t?(mid(t)?stamp(t-1000,oneDay):stamp(t,true)):'';
   let out;
   if(!f) out='Up to '+hi;
   else if(!t) out='From '+lo+' onwards';
-  else out=lo+' to '+hi;
+  // One day named twice is one day, the same collapse the button label makes.
+  // A DAY, though, and nothing else: a span can be narrower than the minute it
+  // starts in, and there the last minute inside it is the start's own minute -
+  // "jul 1 23:59 to jul 1" is sixty seconds - so collapsing on the matching
+  // stamps would say a range is one instant. Printed as a span it reads exactly
+  // as "jul 1 23:58 to jul 1" does a minute earlier.
+  else out=(lo===hi&&mid(f)) ? lo : lo+' to '+hi;
   const notes=[];
   if(sel.swapped) notes.push('dates swapped');
   if(sel.guessed) notes.push('day/month order from your locale');
