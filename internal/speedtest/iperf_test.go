@@ -44,6 +44,11 @@ func TestParseIperfServer(t *testing.T) {
 		{"10.0.0.5:99999", "", "", true},                     // port out of range
 		{"host\nx", "", "", true},                            // newline in host
 		{"host\rx", "", "", true},                            // carriage return in host
+		{"host\u0085x", "", "", true},                        // U+0085 (NEL) is whitespace to Go, and now to the dashboard's check too
+		{"host\ufeffx", "", "", true},                        // a byte-order mark pasted into the middle of a host name
+		// ... and both are trimmed off the ends, like any other space.
+		{"\ufeffiperf.example.com", "iperf.example.com", "", false},
+		{"\u0085iperf.example.com:5201", "iperf.example.com", "5201", false},
 	}
 	for _, c := range cases {
 		host, port, err := parseIperfServer(c.in)

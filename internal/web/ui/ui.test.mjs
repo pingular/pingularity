@@ -347,7 +347,8 @@ test('engOf: legacy/empty engine reads as ookla', () => {
 });
 
 // --- iperf3 saved-server picker helpers ---
-const IP = new Function('esc', extract('function iperfAddrValid') + '\n' + extract('function iperfRowName') +
+const IP = new Function('esc', extract('function iperfAddrValid') + '\n' + extract('function hostPortSplit') + '\n'
+  + extract('function ipLiteral') + '\n' + extract('function ip4Literal') + '\n' + extract('function iperfRowName') +
   '\nreturn { iperfAddrValid, iperfRowName };')(s => String(s)); // esc stubbed to identity
 
 test('iperfAddrValid: accepts host[:port], rejects empty/flag/whitespace', () => {
@@ -359,6 +360,71 @@ test('iperfAddrValid: accepts host[:port], rejects empty/flag/whitespace', () =>
   assert.equal(IP.iperfAddrValid('-R'), false);                // flag-shaped
   assert.equal(IP.iperfAddrValid('host --logfile x'), false);  // whitespace
   assert.equal(IP.iperfAddrValid(null), false);
+});
+
+// Nothing between this page and the run refuses an address: the settings store
+// leaves it alone on purpose ("the tester's parseIperfServer does that at run
+// time"), and /api/iperf/check flattens a parse error and a refused connection
+// into the same {reachable:false}, so a typo showed up as a server that would
+// not answer while every test failed with "invalid iperf3 server". These are
+// parseIperfServer's own verdicts, taken from it directly.
+test('iperfAddrValid answers what the tester answers - ports, colons and brackets included', () => {
+  for (const a of ['127.0.0.1:5201', '127.0.0.1:65535', 'nas.local', 'host:', 'host:05201', '1.2.3.4.5',
+    '2001:db8::1', '[2001:db8::1]', '[2001:db8::1]:5201', 'fe80::1%eth0', '[fe80::1%eth0]:5201',
+    '::', '::1', '1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7::', '::ffff:1.2.3.4', '010.1.1.1',
+    // Brackets round a dotted quad: odd to type, but netip reads what is inside
+    // them and the tester unwraps it to 1.2.3.4, so refusing it here would lock a
+    // user out of an address that works. It is the one place a no-colon string
+    // reaches ipLiteral at all, and the only thing standing between it and the
+    // IPv6 walker - which would score it two groups and condemn it - is that
+    // walker's dotted-quad shortcut.
+    '[1.2.3.4]'])
+    assert.equal(IP.iperfAddrValid(a), true, a + ': the tester takes it, so the editor must');
+  for (const a of ['host:abc', '127.0.0.1:99999', '127.0.0.1:0', '127.0.0.1:65536', 'host:-1', 'host: 5201',
+    '1.2.3.4:5201:9', ':5201', '[2001:db8::1', '[2001:db8::1]x:5201', '[010.1.1.1]', 'a]b', 'a[b',
+    '1:2:3:4:5:6:7:8:9', '1:2:3:4:5:6:7:8::',
+    // A host with a colon in it is judged as an IP literal, so every rule that
+    // makes one a literal has to hold: a group is hex and at most four digits of
+    // it, and an embedded IPv4 tail is a real dotted quad. Drop either rule and
+    // the page starts saving addresses netip.ParseAddr refuses.
+    'gggg::1', '12345::1', '::1.2.3.999', '[::ffff:256.1.1.1]:5201',
+    // '::' may appear once. Twice, the eight groups still add up, so counting
+    // them is not enough on its own - netip.ParseAddr refuses a second '::'
+    // outright, and without the same refusal here these save from the editor
+    // without a murmur and then fail every run with "invalid iperf3 server".
+    '1:2:3:4::5:6::7:8', '[1:2:3:4::5:6::7:8]', '[1:2:3:4::5:6::7:8]:5201', '1:2:3:4::5:6::7:8%eth0'])
+    assert.equal(IP.iperfAddrValid(a), false, a + ': the tester refuses it, so saving it only buys a failed run');
+});
+
+// A zone belongs to IPv6 and to nothing else - netip.ParseAddr says so, and the
+// tester asks netip. The check looked for the colon that makes an address IPv6
+// anywhere in the WHOLE string, so a colon sitting inside the zone answered for
+// one: '1.2.3.4%eth0:5201:9' had its zone cut away unexamined and passed on the
+// quad in front of it, saved without a murmur and refused on every run after.
+test('iperfAddrValid puts a zone where the tester puts one, and nowhere else', () => {
+  for (const a of ['fe80::1%eth0', 'fe80::1%eth0:5201', '[fe80::1%eth0]:5201', 'fe80::1%25eth0'])
+    assert.equal(IP.iperfAddrValid(a), true, a + ': a LAN box on a link-local address is a real setup');
+  for (const a of ['1.2.3.4%eth0:5201:9', '192.168.1.5%en0:5201:5201', '[1.2.3.4%a:b]', '0.0.0.0%::'])
+    assert.equal(IP.iperfAddrValid(a), false, a + ': a zone on an IPv4 address is not an address netip will parse');
+  // With no colon left in the host the tester never asks netip at all - this is
+  // a host name, odd-looking but its own to resolve - so refusing it here would
+  // refuse something the daemon takes.
+  assert.equal(IP.iperfAddrValid('10.0.0.5%eth0:5201'), true);
+});
+
+// The two sides were drawing "whitespace" from different tables. Go's
+// unicode.IsSpace counts U+0085 (NEL) where JavaScript's \s does not, so an
+// address carrying one was saved without a murmur and then failed every run
+// with "invalid iperf3 server" - the one failure this check exists to prevent.
+// JavaScript's \s counts U+FEFF (a byte-order mark, which is what a line
+// pasted out of a file often begins with) where Go's did not. Both sides read
+// the same table now, and it is the wider of the two.
+test('iperfAddrValid counts the invisible characters the tester counts', () => {
+  assert.equal(IP.iperfAddrValid('a\u0085b:5201'), false, 'a NEL is whitespace to the tester, so the editor cannot save one');
+  assert.equal(IP.iperfAddrValid('a\ufeffb:5201'), false, 'and a byte-order mark is junk inside a host name on both sides');
+  assert.equal(IP.iperfAddrValid('nas.local:5201\u0085'), true, 'trailing, it is trimmed by the tester - refusing it would refuse a working address');
+  assert.equal(IP.iperfAddrValid('\u0085nas.local:5201'), true);
+  assert.equal(IP.iperfAddrValid('\ufeffnas.local:5201'), true);
 });
 
 test('iperfRowName: "label · addr", bare addr, or a new-server placeholder, plus the bind source when set', () => {
@@ -3499,6 +3565,402 @@ test('an edit-scoped iperf message cannot outlive its editor', () => {
     'the clear must come BEFORE the list status line, or it wipes it');
 });
 
+// A saved server can still carry an address the tester refuses - written before
+// the editor checked them, or restored from a backup. settingsBody used to drop
+// exactly those rows on the way out, so an unrelated Save deleted a server
+// nobody had touched; now the row rides along and the gate names it, judged on
+// the engine that will RUN so it can never block an Ookla save.
+test('an unusable saved address is refused by name, not dropped from the payload', () => {
+  const body = extract('function settingsBody');
+  assert.match(body, /iperfServers\.filter\(s=>!s\._del && s\.addr\)/, 'only address-less drafts are dropped');
+  assert.doesNotMatch(body, /filter\(s=>!s\._del && iperfAddrValid/, 'a save of something else must not delete a server it cannot parse');
+  const save = script.slice(script.indexOf("$('saveSettings').addEventListener"));
+  const m = save.match(/if\((body\.speed_engine==='iperf3'[^\n]*?!iperfAddrValid\(body\.iperf_server\))\)\{/);
+  assert.ok(m, 'the save handler checks the target address against the tester’s rules');
+  const refuses = new Function('body', 'iperfAvailable', 'iperfAddrValid', 'return !!(' + m[1] + ');');
+  const valid = a => a === 'nas.local:5201';
+  assert.equal(refuses({ speed_engine: 'iperf3', iperf_server: '127.0.0.1:99999' }, true, valid), true, 'iperf3 runs and cannot dial it: refuse');
+  assert.equal(refuses({ speed_engine: 'iperf3', iperf_server: '127.0.0.1:99999' }, false, valid), false, 'binary missing: Ookla runs, so it is not this save’s problem');
+  assert.equal(refuses({ speed_engine: 'ookla', iperf_server: '127.0.0.1:99999' }, true, valid), false, 'Ookla never dials it either');
+  assert.equal(refuses({ speed_engine: 'iperf3', iperf_server: 'nas.local:5201' }, true, valid), false, 'a usable address passes');
+
+  // And the refusal itself, run: the sentence and the `return` under it are each
+  // one line, and a gate that says its piece and then saves anyway is precisely
+  // the silent success this exists to stop.
+  const said = [];
+  const gate = new Function('body', 'iperfAvailable', 'iperfAddrValid', 'activateTab', 'saveFailed',
+    extract("if(body.speed_engine==='iperf3' && iperfAvailable && !iperfAddrValid(body.iperf_server))")
+    + '\nreturn "saved";');
+  const press = (b, avail) => { said.length = 0;
+    return gate(b, avail, valid, t => said.push(['tab', t]), m => said.push(['said', m])); };
+  assert.equal(press({ speed_engine: 'iperf3', iperf_server: '1.2.3.4:5201:9' }, true), undefined,
+    'a refused address stops the save here rather than falling through to it');
+  assert.deepEqual(said[0], ['tab', 'iperf'], 'on the tab where the fix is');
+  assert.match(said[1][1], /1\.2\.3\.4:5201:9/, 'and it names the address it cannot use');
+  assert.equal(press({ speed_engine: 'iperf3', iperf_server: 'nas.local:5201' }, true), 'saved',
+    'an address the tester takes is not stopped');
+  assert.equal(said.length, 0, 'and nothing is said about it');
+});
+
+// The address is committed on blur and a refused one is deliberately left in the
+// box to be fixed, with the model still on its last good value. Closing the
+// details over it therefore dropped the edit: iperfAddrError only speaks while
+// the editor is open, so Save then posted the OLD address and reported success -
+// the silent failure the address gate exists to prevent. Every way out of the
+// details has to go through the same guard.
+// The guard is run and Done is pressed, not read. `return true` is a line of its
+// own: without it the guard states the refusal and then answers "nothing wrong
+// here", and every source assertion about it stays true. The same goes for
+// Done's own two lines - and the slice a source assertion had to take to find
+// them ran to the end of the file, so an `iperfEditingId=null` seven hundred
+// lines further down satisfied it whether or not Done had one.
+function driveIperfBlocked(err) {
+  const said = [], field = { focused: 0, focus() { this.focused++; } };
+  const B = new Function('iperfAddrError', 'iperfAddrBad', '$',
+    extract('function iperfEditorBlocked') + '\nreturn iperfEditorBlocked;')(
+    () => err, m => said.push(m), () => field);
+  return { verdict: B(), said, focused: field.focused };
+}
+function driveIperfDone(opts) {
+  const out = { captured: 0, rendered: 0, focused: '' };
+  const listEl = { querySelector(sel) { return { focus() { out.focused = sel; } }; } };
+  const body = extract("$('iperfEditDone').addEventListener");
+  const press = new Function('$', 'iperfEditorBlocked', 'editingIperfServer', 'captureIperfEditor',
+    'renderIperfServers', 'out', 'startId',
+    'let iperfEditingId=startId;\n(() => ' + body.slice(body.indexOf('{')) + ')();\n'
+    + 'out.editingId=iperfEditingId; return out;');
+  return press(() => listEl, () => opts.blocked, () => opts.editing, () => { out.captured++; },
+    () => { out.rendered++; }, out, opts.editing ? opts.editing._id : null);
+}
+
+test('the details cannot be closed over an address that was refused', () => {
+  const refused = driveIperfBlocked('that is not a valid host');
+  assert.equal(refused.verdict, true, 'a refused address blocks every way out of the details');
+  assert.deepEqual(refused.said, ['that is not a valid host'], 'and the refusal is re-stated rather than closing quietly');
+  assert.equal(refused.focused, 1, 'with the keyboard put back in the box that has to be fixed');
+  const fine = driveIperfBlocked('');
+  assert.equal(fine.verdict, false, 'nothing wrong with it: the details close as usual');
+  assert.equal(fine.said.length, 0);
+  assert.equal(fine.focused, 0);
+
+  const open3 = { _id: 7, label: 'Home NAS', addr: 'nas.local:5201' };
+  const stopped = driveIperfDone({ blocked: true, editing: open3 });
+  assert.equal(stopped.editingId, 7, 'blocked, Done leaves the details open on the same server');
+  assert.equal(stopped.captured, 0, 'captures nothing');
+  assert.equal(stopped.rendered, 0, 'and rebuilds nothing');
+  const closed = driveIperfDone({ blocked: false, editing: open3 });
+  assert.equal(closed.captured, 1, 'allowed, Done folds the fields back onto the server it was editing');
+  assert.equal(closed.editingId, null, 'closes the details');
+  assert.equal(closed.rendered, 1, 'and rebuilds the list');
+  assert.equal(closed.focused, '.ipl-edit[data-id="7"]', 'handing the keyboard to the pencil that reopens them');
+
+  const open = extract('function openIperfEditor');
+  assert.ok(open.indexOf('iperfEditorBlocked()') >= 0 && open.indexOf('iperfEditorBlocked()') < open.indexOf('captureIperfEditor'),
+    'and so does the pencil, which closes one editor to open another');
+  assert.match(extract('function iperfAddServer'), /if\(iperfEditorBlocked\(\)\) return;/, 'and adding a server, which also moves the editor');
+});
+
+// That guard - and the save gate behind it - judge the field, so they must not
+// judge a field nobody typed in. A saved server can carry an address the tester
+// refuses (written before this page checked them, or restored from a backup);
+// merely opening its details put the editor in the refused state, and from there
+// Done, the other pencils and every Save refused, whichever engine was going to
+// run. Nothing is lost by letting that row be looked at and left alone: the save
+// gate that knows which engine will run still names it.
+test('an address the operator never typed is not an edit to refuse', () => {
+  const ERR = extract('function iperfAddrError') + '\n' + extract('function iperfAddrValid') + '\n'
+    + extract('function hostPortSplit') + '\n' + extract('function ipLiteral') + '\n' + extract('function ip4Literal')
+    + '\nreturn iperfAddrError;';
+  const err = (s, typed, list) => new Function('editingIperfServer', '$', 'iperfServers', ERR)(
+    () => s, () => ({ value: typed }), list || [s])();
+  const legacy = { label: 'Legacy', addr: '127.0.0.1:99999', orig_addr: '127.0.0.1:99999' };
+  assert.equal(err(legacy, '127.0.0.1:99999'), '', 'the stored address, untouched, is not this editor’s problem');
+  assert.match(err(legacy, '127.0.0.1:999999'), /valid host/, 'a value typed over it is judged as ever');
+  assert.match(err(legacy, ''), /use Remove/, 'and blanking a saved server still means Remove');
+  const good = { label: 'Good', addr: 'good.example:5201', orig_addr: 'good.example:5201' };
+  assert.match(err(good, 'nas.local:5201', [good, { addr: 'nas.local:5201' }]), /already used/, 'a typed duplicate still is one');
+  assert.equal(err({ addr: '' }, ''), '', 'a draft with nothing in it yet is dropped on save, not refused');
+  assert.equal(err(null, 'anything'), '', 'and a closed editor has nothing to validate');
+});
+
+// The red outline and aria-invalid belong to the value in the box. Only the
+// change handler and Add ever cleared them, so loading another server's (good)
+// address left it looking refused, and Reset/Discard left the outline on a box
+// with nothing in it.
+test('the address outline describes the address on screen', () => {
+  assert.match(extract('function loadIperfEditor'), /iperfAddrOK\(\);/, 'loading a server clears the previous one’s refusal');
+  assert.match(extract('function renderIperfEditor'), /iperfLoadedId=null; iperfAddrOK\(\);/, 'and so does closing the editor with nothing loaded');
+});
+
+// The cap is the daemon's, and the daemon counts what it keeps: settingsBody
+// drops rows marked for removal before posting. Counting them here left "Add a
+// server" inert at twelve with a tooltip claiming twelve were being kept, which
+// blocked the retire-and-replace edit the address check goes out of its way to
+// allow.
+test('the twelve-server cap counts the rows that will be kept', () => {
+  const m = extract('function renderIperfServers').match(/const full=([^;]+);/);
+  assert.ok(m, 'the add row is gated on a computed `full`');
+  const full = new Function('iperfServers', 'IPERF_MAX', 'return ' + m[1] + ';');
+  const list = Array.from({ length: 12 }, (_, i) => ({ addr: 's' + i + '.example:5201' }));
+  assert.equal(full(list, 12), true, 'twelve kept servers is the cap');
+  list[11]._del = true;
+  assert.equal(full(list, 12), false, 'one marked for removal leaves eleven kept, so a replacement fits');
+});
+
+// The iperf3 list, DRAWN rather than read. The tests around here used to ask what
+// renderIperfServers and iperfRowHTML say in the source, and a sentence about
+// where a line sits is still true when that line has been deleted - which matters
+// most where a single `const` declares the names the row template then goes on to
+// use, because dropping it is a ReferenceError on every draw. So the real
+// functions are lifted and run against a small stand-in for the list element.
+// renderIperfEditor is a stub that blanks #iperfMsg the way loadIperfEditor does,
+// since that is the whole reason the order of the two matters.
+function driveIperfList(opts) {
+  opts = opts || {};
+  const servers = opts.servers || [];
+  const log = { editor: 0, order: [], loopback: 0, probed: [] };
+  const msg = { textContent: opts.msg || '' };
+  // One card per server, the shape refreshIperfDots walks: the row carries the
+  // id it matches on and the light it repaints.
+  const cards = servers.map(s => ({
+    dataset: { id: String(s._id) },
+    dot: { className: '', title: '', disabled: false, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    querySelector(sel) { return sel === '.iperf-dot' ? this.dot : null; },
+  }));
+  const listEl = { innerHTML: '', querySelectorAll: () => cards, querySelector: () => null };
+  const els = { iperfServerList: listEl, iperfMsg: msg, setSpeedEngine: { checked: opts.engine !== false } };
+  const api = new Function('$', 'esc', 'IPERF_MAX', 'IPL_PLUS', 'IPL_PENCIL', '_drawer', 'iperfHealth',
+    'iperfPwOrphan', 'renderIperfEditor', 'updateIperfLoopbackWarn', 'probeIperfSoon', 'seed',
+    'let iperfServers=seed.servers, iperfActiveId=seed.activeId, iperfEditingId=seed.editingId;\n'
+    + ['function iperfDotTitle', 'function iperfDotWord', 'function iperfDotState',
+      'function iperfAddrValid', 'function hostPortSplit', 'function ipLiteral', 'function ip4Literal',
+      'function iperfRowName', 'function iperfRowHTML', 'function refreshIperfDots',
+      'function renderIperfServers'].map(extract).join('\n')
+    + '\nreturn { renderIperfServers, refreshIperfDots, iperfRowHTML,'
+    + ' state: () => ({ activeId: iperfActiveId, editingId: iperfEditingId }) };')(
+    id => els[id], esc, 12, '[+]', '[pencil]',
+    { classList: { contains: () => opts.drawerOpen !== false } }, opts.health || {},
+    () => { log.order.push('orphan'); return opts.orphan || null; },
+    () => { log.editor++; log.order.push('editor'); msg.textContent = ''; },
+    () => { log.loopback++; }, a => log.probed.push(a),
+    { servers, activeId: opts.activeId == null ? null : opts.activeId, editingId: opts.editingId == null ? null : opts.editingId });
+  return { api, log, msg, listEl, cards };
+}
+
+// The orphaned-password warning is written by renderIperfServers and promises to
+// stay while the orphan does, but loadIperfEditor blanks that same line - so with
+// the editor loaded last, opening another server's details (or adding one) wiped
+// the warning while the password was still one Save from being lost.
+test('the orphan warning is decided after the editor has loaded, not before', () => {
+  const orphan = { _id: 2, label: 'Home NAS', addr: 'new.example:5201', orig_addr: 'old.example:5201',
+    orig_has_password: true, password: '' };
+  const { api, log, msg } = driveIperfList({ servers: [{ _id: 1, label: 'A', addr: 'a.example:5201' }, orphan],
+    activeId: 1, editingId: 2, orphan });
+  api.renderIperfServers();
+  assert.equal(log.editor, 1, 'the render loads the editor - once: a second load blanks the message again');
+  assert.deepEqual(log.order, ['editor', 'orphan'], 'the editor first, then the message is decided');
+  assert.match(msg.textContent, /Home NAS/, 'so the warning is still standing when the draw is done');
+  assert.match(extract('function loadIperfEditor'), /\$\('iperfMsg'\)\.textContent='';/, 'which is what makes the order matter');
+});
+
+test('a server row is built, and says which server it is and what state it is in', () => {
+  const chosen = { _id: 1, label: 'Home NAS', addr: 'a.example:5201', auth: true, ipver: '6' };
+  const editing = { _id: 2, label: '', addr: 'b.example:5201' };
+  const going = { _id: 3, label: 'Retiring', addr: 'c.example:5201', _del: true };
+  const { api } = driveIperfList({ servers: [chosen, editing, going], activeId: 1, editingId: 2,
+    health: { 'a.example:5201': 'on', 'b.example:5201': 'off' } });
+  const rows = [chosen, editing, going].map(sv => api.iperfRowHTML(sv));
+  assert.match(rows[0], /class="fp-btn on"/, 'the test target draws as the one in force');
+  assert.match(rows[0], /aria-pressed="true"/, 'and reports it');
+  assert.match(rows[0], /class="iperf-dot on"/, 'its light shows the state iperfDotState worked out');
+  assert.match(rows[0], /aria-label="Home NAS status: reachable"/, 'named, rather than "Server status" on every row');
+  assert.match(rows[0], /<span class="ipl-ip" [^>]*>v6<\/span>/, 'the IP column says which family');
+  assert.match(rows[0], /RSA<\/span>/, 'and the auth column, which kind of login');
+  assert.match(rows[0], /title="Edit this server"/);
+  assert.match(rows[1], /class="fp-btn"/, 'a row that is not the target does not draw as one');
+  assert.match(rows[1], /class="iperf-dot off"/);
+  assert.match(rows[1], /aria-pressed="true" title="Close the details" aria-label="Close b\.example:5201"/,
+    'the pencil on the open row says it closes them');
+  assert.match(rows[2], /class="fp-row ipl-row pending-del"/, 'a server on its way out keeps its row, struck through');
+  assert.match(rows[2], /data-act="undo"/, 'with Undo where the pencil was');
+  assert.doesNotMatch(rows[2], /ipl-edit/);
+  const dead = api.iperfRowHTML({ _id: 4, label: 'Legacy', addr: '127.0.0.1:99999' });
+  assert.match(dead, /class="iperf-dot unknown"[^>]*disabled/, 'an address the tester refuses has nothing to dial');
+  assert.match(dead, /title="Fix this address before checking"/);
+});
+
+// The duplicate check ignores rows marked for removal on purpose, so a
+// replacement can be added at a retiring server's address. Undo then put the old
+// row back on top of it: two live rows, one address, and the store keeps the
+// first - so the replacement, its label and its credentials vanished on Save
+// with nothing said.
+// Undo is a branch of the delegated row-click handler, so these press the
+// button rather than reading the source: an assertion about where `if(clash)`
+// sits in the file is just as true when the whole `if` has been deleted, and
+// the guard's job is what it does to the list.
+function driveIperfUndo(list, idx, activeId) {
+  const msg = { textContent: '' };
+  const block = extract("btn.dataset.act==='undo'");
+  const press = new Function('$', 'iperfServers', 'idx', 'id', 'IPERF_MAX', 'renderIperfServers', 'out',
+    'let iperfActiveId=out.activeId;\ntry{' + block.slice(block.indexOf('{')) + '}finally{ out.activeId=iperfActiveId; }');
+  const out = { activeId };
+  press(id => (id === 'iperfMsg' ? msg : { querySelector: () => null }),
+    list, idx, list[idx]._id, 12, () => {}, out);
+  return { msg: msg.textContent, activeId: out.activeId };
+}
+
+test('Undo will not put a server back on an address another row now holds', () => {
+  const acts = script.slice(script.indexOf("btn.dataset.act==='undo'"), script.indexOf("$('iperfEditRemove')"));
+  const m = acts.match(/const clash=([^;]+);/);
+  assert.ok(m, 'Undo looks for a live row on the same address first');
+  const clash = new Function('iperfServers', 's', 'return ' + m[1] + ';');
+  const old = { label: 'Old box', addr: 'a.example:5201', _del: true };
+  const other = { label: 'Other', addr: 'b.example:5201' };
+  assert.equal(clash([old, other], old), undefined, 'nothing took the address: Undo goes ahead');
+  const repl = { label: 'New box', addr: 'a.example:5201' };
+  assert.equal(clash([old, other, repl], old), repl, 'the replacement holds it now, so Undo has to refuse');
+  repl._del = true;
+  assert.equal(clash([old, other, repl], old), undefined, 'a row on its way out is not holding anything');
+  const blank = { label: '', addr: '', _del: true }, blank2 = { label: '', addr: '' };
+  assert.ok(!clash([blank, blank2], blank), 'two drafts with no address yet are not fighting over one');
+
+  // And the press itself: refused, the row stays struck through and the target
+  // stays where the removal put it.
+  const gone = { _id: 1, label: 'Old box', addr: 'a.example:5201', _del: true, _delWasTarget: true };
+  const taken = { _id: 3, label: 'New box', addr: 'a.example:5201' };
+  const refused = driveIperfUndo([gone, { _id: 2, label: 'Other', addr: 'b.example:5201' }, taken], 0, 3);
+  assert.equal(gone._del, true, 'two live rows on one address: the store keeps the first and drops the replacement in silence');
+  assert.match(refused.msg, /New box/, 'and the refusal has to name the row holding the address now');
+  assert.equal(refused.activeId, 3, 'a refused Undo must not move the test target either');
+
+  const free = { _id: 1, label: 'Old box', addr: 'a.example:5201', _del: true, _delWasTarget: true };
+  const ok = driveIperfUndo([free, { _id: 2, label: 'Other', addr: 'b.example:5201' }], 0, 2);
+  assert.ok(!('_del' in free), 'with the address free, Undo is just an undo');
+  assert.equal(ok.msg, '');
+  assert.equal(ok.activeId, 1, 'and it takes the test target back with the row');
+});
+
+// The cap counts the rows that will be kept, so Undo is the other way past it:
+// at twelve, a removal frees the slot a replacement takes, and un-deleting
+// afterwards leaves thirteen. sanitizeIperfServers keeps the first twelve and
+// drops the rest in silence - and the row at the end is the replacement just
+// typed, with its label and its credentials.
+test('Undo will not put back a server the store would have to drop', () => {
+  const acts = script.slice(script.indexOf("btn.dataset.act==='undo'"), script.indexOf("$('iperfEditRemove')"));
+  const m = acts.match(/if\((iperfServers\.filter\(o=>!o\._del\)\.length>=IPERF_MAX)\)\{/);
+  assert.ok(m, 'Undo counts the kept rows, the same count the Add row is gated on');
+  const full = new Function('iperfServers', 'IPERF_MAX', 'return ' + m[1] + ';');
+  const list = Array.from({ length: 12 }, (_, i) => ({ addr: 's' + i + '.example:5201' }));
+  list[11]._del = true;
+  assert.equal(full(list, 12), false, 'the slot the removal freed is still free: Undo is just an undo');
+  list.push({ label: 'Replacement', addr: 'replacement.example:5201' });
+  assert.equal(full(list, 12), true, 'a replacement took it, so putting the old row back asks for thirteen');
+
+  // Pressed: eleven live rows and a struck-through twelfth put the twelfth back.
+  const rows = n => Array.from({ length: n }, (_, i) => ({ _id: i + 1, label: 'S' + i, addr: 's' + i + '.example:5201' }));
+  const room = rows(12); room[11]._del = true; room[11]._delWasTarget = true;
+  const undone = driveIperfUndo(room, 11, 1);
+  assert.ok(!('_del' in room[11]), 'eleven kept rows and a twelfth on its way out: there is room for it');
+  assert.equal(undone.msg, '');
+
+  // Twelve live rows and a struck-through thirteenth do not.
+  const atCap = rows(12); atCap[11]._del = true; atCap[11]._delWasTarget = true;
+  atCap.push({ _id: 13, label: 'Replacement', addr: 'replacement.example:5201' });
+  const refused = driveIperfUndo(atCap, 11, 1);
+  assert.equal(atCap[11]._del, true, 'thirteen live rows, and the store drops the last one - the replacement just typed');
+  assert.match(refused.msg, /12 servers are already being kept/, 'and it says which limit was reached');
+});
+
+// The schedule window Remove, pressed: the delegated branch lifted out of the
+// page and run against stand-in rows, so what is checked is where the keyboard
+// ends up rather than which selector appears in the source.
+function driveWinRemove(opts) {
+  const out = { removed: 0, synced: 0, warned: 0, focused: '' };
+  const focuser = name => ({ focus() { out.focused = name; },
+    classList: { contains: c => c === 'hidden' && !!opts.neighbourHidden } });
+  const neighbour = { querySelector: () => focuser('next .win-rm') };
+  const row = { nextElementSibling: opts.rows > opts.at + 1 ? neighbour : null,
+    previousElementSibling: opts.at > 0 ? neighbour : null,
+    remove() { out.removed++; } };
+  const cont = { querySelectorAll: () => new Array(opts.rows) };
+  const body = extract("const rm=e.target.closest('.win-rm')");
+  const press = new Function('e', '$', 'f', 'feat', 'syncWinRm', 'updateConflictWarnings', 'document', 'out',
+    body + '\nreturn out;');
+  return press({ target: { closest: sel => (sel === '.win-rm' ? { closest: () => row } : null) } },
+    () => cont, { cont: 'schedLatWins' }, 'lat',
+    () => { out.synced++; }, () => { out.warned++; },
+    { querySelector: () => focuser('add-win') }, out);
+}
+
+// Remove, Undo, Done and the pencil all rebuild the list with innerHTML, which
+// destroys the button that was just pressed - the keyboard landed on <body>
+// every time. The pick branch has always handed focus on; these follow it, and
+// so does removing a schedule window.
+test('the controls that rebuild a list hand the keyboard to what replaced them', () => {
+  const rm = script.slice(script.indexOf("$('iperfEditRemove').addEventListener"), script.indexOf('// The address box:'));
+  assert.match(rm, /\.ipl-undo\[data-id="'\+s\._id\+'"\]'\)\?\.focus/, 'Remove focuses the Undo that took its place');
+  const acts = script.slice(script.indexOf("btn.dataset.act==='undo'"), script.indexOf("$('iperfEditRemove')"));
+  assert.match(acts, /\.ipl-edit\[data-id="'\+id\+'"\]'\)\?\.focus/, 'Undo focuses the pencil that took its place');
+  const done = script.slice(script.indexOf("$('iperfEditDone').addEventListener"), script.indexOf('function repaintIperfRow'));
+  assert.match(done, /\.ipl-edit\[data-id="'\+s\._id\+'"\]'\)\?\.focus/, 'Done focuses the pencil that reopens what it closed');
+  assert.match(extract('function openIperfEditor'), /\.ipl-edit\[data-id="'\+id\+'"\]'\)\?\.focus/, 'and the pencil keeps itself when it toggles closed');
+  // The schedule's Remove is pressed rather than read: the fallback is the half a
+  // regex can see, and pinning only that let the primary path - hand the keyboard
+  // to the neighbouring row's own Remove - be deleted with the suite green.
+  const three = driveWinRemove({ rows: 3, at: 1 });
+  assert.equal(three.removed, 1, 'the row goes');
+  assert.equal(three.synced, 1, 'the Remove buttons are re-synced with what is left');
+  assert.equal(three.focused, 'next .win-rm', 'and the keyboard lands on the neighbouring row\u2019s own Remove');
+  const last = driveWinRemove({ rows: 2, at: 1, neighbourHidden: true });
+  assert.equal(last.focused, 'add-win', 'with one row left its Remove is hidden, so the add button takes the keyboard');
+  const only = driveWinRemove({ rows: 1, at: 0 });
+  assert.equal(only.removed, 0, 'and the last window is not removable at all: an enabled schedule always has a slot');
+});
+
+// The light's accessible name was the constant "Server status" on every row, so
+// the state lived only in the colour and the title; and a row with no usable
+// address answered a click with nothing at all, because probeIperf returns
+// immediately on one.
+test('the status light names its state, and says so instead of taking a dead click', () => {
+  const DOT = new Function('iperfHealth',
+    extract('function iperfDotTitle') + '\n' + extract('function iperfDotWord') + '\n' + extract('function iperfDotState') + '\n'
+    + extract('function iperfAddrValid') + '\n' + extract('function hostPortSplit') + '\n' + extract('function ipLiteral') + '\n'
+    + extract('function ip4Literal') + '\nreturn iperfDotState;')({ 'a.example:5201': 'on', 'b.example:5201': 'off' });
+  const on = DOT({ label: 'Home NAS', addr: 'a.example:5201' });
+  const off = DOT({ label: '', addr: 'b.example:5201' });
+  const unknown = DOT({ label: 'Fresh', addr: 'c.example:5201' });
+  assert.match(on.label, /reachable/); assert.equal(on.dead, false);
+  assert.match(off.label, /unreachable/);
+  assert.match(unknown.label, /not checked yet/);
+  assert.notEqual(on.label, off.label, 'two lights in different states cannot announce the same thing');
+  const draft = DOT({ label: '', addr: '' });
+  assert.equal(draft.dead, true, 'a draft with no address has nothing to dial');
+  assert.match(draft.title, /Add an address/);
+  const broken = DOT({ label: 'Legacy', addr: '127.0.0.1:99999' });
+  assert.equal(broken.dead, true, 'nor has an address the tester would refuse');
+  assert.match(broken.title, /Fix this address/);
+  const row = extract('function iperfRowHTML');
+  assert.match(row, /\$\{d\.dead\?' disabled':''\}/, 'and the light is disabled rather than clickable-but-silent');
+  assert.match(row, /aria-label="\$\{esc\(d\.label\)\}"/, 'the name is escaped: it carries the operator’s own label');
+  assert.match(html, /\.iperf-dot:disabled\{cursor:default;\}/, 'and it stops pointing at itself, like every other disabled control here');
+
+  // The in-place repaint, run rather than read. It reads one iperfDotState and
+  // then writes the class, the title, the disabled state and the name from it -
+  // four things off one line, and a source assertion about any of them survives
+  // the deletion of that line.
+  const live = { _id: 1, label: 'Home NAS', addr: 'a.example:5201' };
+  const blank = { _id: 2, label: '', addr: '' };
+  const { api, cards } = driveIperfList({ servers: [live, blank], health: { 'a.example:5201': 'on' } });
+  api.refreshIperfDots();
+  assert.equal(cards[0].dot.className, 'iperf-dot on', 'the light takes the state it was given');
+  assert.equal(cards[0].dot.title, 'Reachable - click to recheck', 'and the tooltip that goes with it');
+  assert.equal(cards[0].dot.attrs['aria-label'], 'Home NAS status: reachable', 'the repaint keeps the name in step');
+  assert.equal(cards[0].dot.disabled, false);
+  assert.equal(cards[1].dot.className, 'iperf-dot unknown');
+  assert.equal(cards[1].dot.disabled, true, 'a row with no address still cannot be checked after a repaint');
+  assert.equal(cards[1].dot.attrs['aria-label'], 'new server status: no address yet');
+});
+
 // opacity on a label multiplies into everything inside it, including the help
 // tooltip - which is body-size text that then fails contrast. .srow.dep-off has
 // carried an escape for this all along; the server editor's own field layout
@@ -3986,6 +4448,131 @@ test('a refresh result is shown even when the listing also carries the server', 
   assert.match(src, /const b=fpBrowse\.find/, 'so the refresh updates the browse copy too');
 });
 
+// The only loading affordance the list fetch had toggled a class on
+// #serverSelectWrap, which the picker keeps display:none - so the whole
+// round-trip to Ookla looked exactly like an empty list.
+test('a list fetch in flight says so where the list is', () => {
+  const src = extract('function setServerLoading');
+  assert.match(src, /\$\('fpAll'\)/, 'the results pane is the only part of this the user can see');
+  assert.match(html, /\.fp-list\.loading \.fp-rows::before\{content:"Loading/,
+    'an empty pane has to say it is still loading rather than that there is nothing here');
+  // Gated on :empty it said nothing whenever the pane held anything at all -
+  // and the chosen server the browse list does not carry is drawn as a row in
+  // exactly that pane, so a pinned server made the whole round trip silent.
+  assert.doesNotMatch(html, /:empty::after\{content:"Loading/,
+    'a pane holding the pinned row it could not list is not empty, and said nothing for the whole fetch');
+});
+
+// The settings payload carries no pings, so rebuilding the kept rows from it -
+// which every Save, drawer reopen and Discard does - threw away whatever the
+// pane had just measured, while the ten-minute freshness rule refused to
+// measure it again.
+test('a kept server keeps its ping across a Save', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  const kept = p.saved()[0]; kept.ping = 13.2; kept.pingSrc = 'live';   // what fpRefreshPings writes
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);  // the settings reload a Save triggers
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML, /class="fp-ping">13 ms/,
+    'the measurement was seconds old and the pane blanked it');
+  assert.equal(p.saved()[0].pingSrc, 'live', 'and it is still a live measurement, not a history median');
+  p.fpAdoptSaved([{ id: '7', sponsor: 'Other', name: 'Elsewhere' }]);
+  assert.equal(p.saved()[0].ping, undefined, 'a different server carries nothing over');
+});
+
+// Starring a listed server and then searching elsewhere left the kept row with
+// no ping at all: the star saved the row without the one the listing showed.
+test('starring a listed server keeps the ping it was listed with', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1001', { ping_ms: 17.2 })]);
+  p.fpToggleStar('1001');
+  p.fpAdopt([SRV('3001')]);   // a Find in another city: the listing no longer carries it
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1001')).innerHTML, /class="fp-ping">17 ms/,
+    'the pane knew this server’s ping a moment ago');
+  // And through the rebuild a Save, a reopen or a Discard does. The star copies
+  // the number the listing showed and records nothing about where it came from,
+  // so a carry-over that asks for a source drops precisely this ping.
+  p.fpAdoptSaved([{ id: '1001', sponsor: 'Sponsor 1001', name: 'City' }]);
+  assert.match(fpBtn(fpRowOf(p.els.fpFav, '1001')).innerHTML, /class="fp-ping">17 ms/,
+    'and a Save is not what blanks it, with ten minutes to go before anything measures it again');
+});
+
+// A row can arrive with only half a name: a pin the browse list does not carry
+// has no city, and a catalogue row can come through with no sponsor at all.
+// Joining the halves unconditionally printed a separator with nothing after it
+// and named the star after a sponsor that was not there.
+test('a row with only half a name prints the half it has', () => {
+  const p = drivePicker();
+  p.fpAdopt([{ id: '424242', sponsor: 'Server 424242', name: '' },
+    { id: '747', sponsor: '', name: 'NoSponsor City' },
+    { id: '9', sponsor: 'Both', name: 'City' }]);
+  const txt = id => fpBtn(fpRowOf(p.els.fpAll, id)).innerHTML;
+  assert.match(txt('9'), /Both<span class="fp-sub"> · City<\/span>/, 'both halves still read as one name');
+  assert.doesNotMatch(txt('424242'), /fp-sub/, 'a pin Ookla could not resolve has no city to put after the separator');
+  assert.match(txt('424242'), /<span class="fp-txt">Server 424242<\/span>/);
+  assert.doesNotMatch(txt('747'), /fp-sub/, 'and a sponsorless row must not lead with a separator');
+  assert.match(txt('747'), /<span class="fp-txt">NoSponsor City<\/span>/, 'the city is the name it has');
+  assert.equal(fpStar(fpRowOf(p.els.fpAll, '747')).getAttribute('aria-label'), 'Keep NoSponsor City',
+    'the star has to name what it keeps; "Keep " with nothing after it names nothing');
+  assert.equal(fpStar(fpRowOf(p.els.fpAll, '424242')).getAttribute('aria-label'), 'Keep Server 424242');
+});
+
+// The pick control is a plain button whose choice was carried only by a CSS
+// class and a decorative dot, and both text fallbacks (the hidden select, the
+// hidden caption) are display:none - so nothing said which server a run uses.
+test('the chosen row reports itself as chosen', () => {
+  const p = drivePicker();
+  p.fpAdopt([SRV('1'), SRV('2')]);
+  assert.equal(fpBtn(fpRowOf(p.els.fpFav, '')).getAttribute('aria-pressed'), 'true',
+    'with nothing pinned the Auto row is the choice in force');
+  // The two halves are separate lines and the eye reads the class, so pin both:
+  // without the class Auto reports itself as chosen while looking like every
+  // other row.
+  assert.equal(fpBtn(fpRowOf(p.els.fpFav, '')).className, 'fp-btn on', 'and it looks it');
+  assert.equal(fpBtn(fpRowOf(p.els.fpAll, '1')).getAttribute('aria-pressed'), 'false');
+  p.fpChoose('1');
+  assert.equal(fpBtn(fpRowOf(p.els.fpAll, '1')).getAttribute('aria-pressed'), 'true', 'the picked row');
+  assert.equal(fpBtn(fpRowOf(p.els.fpFav, '')).getAttribute('aria-pressed'), 'false', 'and Auto gives the state up');
+  assert.equal(fpBtn(fpRowOf(p.els.fpFav, '')).className, 'fp-btn', 'in both channels');
+  assert.equal(fpBtn(fpRowOf(p.els.fpAll, '2')).getAttribute('aria-pressed'), 'false');
+});
+
+// The refresh measures speedServers; with none there is nothing to measure and
+// the click did nothing at all - no request, no message, no busy state.
+test('the saved pane refresh is inert when nothing is kept', () => {
+  const p = drivePicker();
+  p.fpAdoptSaved([]);
+  const hdr = p.fpHeader(true).innerHTML;
+  assert.match(hdr, /class="fp-refresh" id="fpRefreshPings" type="button" disabled/,
+    'a button that cannot do anything must not look like one that can');
+  assert.match(hdr, /title="Star a server[^"]*"/, 'and it says what would make it work');
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  assert.doesNotMatch(p.fpHeader(true).innerHTML, /disabled/, 'with something kept it is live again');
+});
+
+// fpPingText chooses its precision from the raw value but rounds inside the
+// branch, so 9.96 printed "10.0" directly above a 10.2 printing "10".
+test('fpPingText rounds before it picks a precision', () => {
+  const fpPingText = new Function(extract('function fpPingText') + '\nreturn fpPingText;')();
+  assert.equal(fpPingText(9.94), '9.9', 'under ten keeps the decimal that is the difference');
+  assert.equal(fpPingText(3.26), '3.3');
+  assert.equal(fpPingText(9.96), '10', 'rounding to ten IS ten - "10.0" beside "10" reads as two different numbers');
+  assert.equal(fpPingText(9.99), '10');
+  assert.equal(fpPingText(10), '10');
+  assert.equal(fpPingText(10.4), '10');
+  assert.equal(fpPingText(27.7), '28');
+});
+
+// The header's latency pills choose their precision at the same seam, one
+// decimal place higher: a 99.97 rounded to 100 while it was still being read as
+// under 100 printed "100.0 ms" in a slot beside a 100.2 printing "100 ms".
+test('the header latency pills round before they pick a precision', () => {
+  const fmtMs = new Function(script.match(/const fmtMs = [^\n]*/)[0] + '\nreturn fmtMs;')();
+  assert.equal(fmtMs(99.9), '99.9 ms', 'under a hundred keeps the decimal that is the difference');
+  assert.equal(fmtMs(99.97), '100 ms', 'rounding to a hundred IS a hundred - "100.0 ms" beside "100 ms" reads as two different numbers');
+  assert.equal(fmtMs(100.2), '100 ms');
+  assert.equal(fmtMs(8.42), '8.4 ms');
+});
+
 test('the runs table says how each run chose its centre', () => {
   const raceCell = new Function('esc', 'num1', extract('function raceCell') + '\nreturn raceCell;')(esc, v => (typeof v === 'number' ? v : 0).toFixed(1));
   assert.equal(raceCell({}), '<span class="muted">-</span>', 'a row from before the verdict existed says nothing');
@@ -4108,11 +4695,11 @@ test('server list: a reopen re-runs the last Find on the same place', async () =
   assert.equal(st.browseLabel, 'Toronto', 'the place name survives a coordinate refetch (the daemon names none for one)');
   assert.equal(st.browseLoc, '43.7,-79.4');
   const apply = extract('function applySettings');
-  assert.match(apply, /if\(drawerReopening && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/,
+  assert.match(apply, /if\(drawerReopening && reopenHadList && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/,
     'a reopen refetches the list showing - the same place, or the same race - unless a race is already in flight for it (a fetch then would supersede the race and show the default list); any other settings load keeps it');
   assert.doesNotMatch(apply, /browseLoc='';/, 'a settings load must not throw the search away');
-  assert.match(script, /drawerReopening=true; try\{ await loadSettings\(\); \} finally\{ drawerReopening=false; \}/, 'only the drawer\u2019s own reopen refetch counts as a reopen');
-  assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\); serversLoaded=false; loadServers\(\);\s*\/\/ back to the default list/, 'Reset to defaults is the act that starts over');
+  assert.match(script, /drawerReopening=true; reopenHadList=serversLoaded;[\s\S]*?try\{ await loadSettings\(\); \} finally\{ drawerReopening=false; \}/, 'only the drawer\u2019s own reopen refetch counts as a reopen, and only when it had a list to fetch again');
+  assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\);[\s\S]*?serversLoaded=false; loadServers\(\);\s*\/\/ back to the default list/, 'Reset to defaults is the act that starts over');
 });
 
 // The last Find outlives a reload: the browser remembers the place (never the
@@ -4159,7 +4746,7 @@ test('server list: the last listing is remembered - a Find by its place, an Auto
   assert.equal(JSON.parse(api.state().remembered[api.state().remembered.length - 1]).at, 0, 'and says so in the browser\u2019s memory');
   assert.match(script, /if \(hadRun\)\{ autoCentreLastRun=false; serversLoaded=false; fpAutoStale\(\); \}/, 'wired to the status poll\u2019s new-run detection');
   assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\);/, 'Reset to defaults forgets both');
-  assert.match(script, /if\(drawerReopening && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/, 'a reopen shows or re-races an Auto the same way');
+  assert.match(script, /if\(drawerReopening && reopenHadList && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/, 'a reopen shows or re-races an Auto the same way');
   assert.doesNotMatch(extract('function fpShowAutoCache'), /as of|ago/i, 'no "as of" note: the list is either fresh enough to stand or raced again');
 });
 
@@ -4352,7 +4939,7 @@ test('the iperf3 tab is laid out like the Ookla tab: the knobs on top, the serve
   assert.doesNotMatch(html, /iperf-card|iperfPick|iperfCardHTML|\+ Add server/, 'the cards and their radios are gone');
   const row = extract('function iperfRowHTML');
   assert.match(row, /class="fp-btn\$\{on\?' on':''\}" type="button" data-act="pick"/, 'the row itself is the pick, like an Ookla row');
-  assert.match(row, /class="iperf-dot \$\{st\}" type="button" data-act="check"/, 'the status light still re-checks on click');
+  assert.match(row, /class="iperf-dot \$\{d\.st\}" type="button" data-act="check"/, 'the status light still re-checks on click');
   assert.match(row, /class="fp-star ipl-edit" type="button" data-act="edit"/, 'the pencil sits where the star does');
   assert.match(row, /data-act="undo"/, 'a server marked for removal keeps its row with Undo');
   const render = extract('function renderIperfServers');
@@ -4402,7 +4989,7 @@ test('adding is the list\u2019s last row, and the row follows its details', () =
   assert.match(add, /newIperfServer\('',''\)/, 'the new server starts empty - the address is typed in the details');
   assert.match(add, /iperfEditingId=sv\._id/, 'which open straight away');
   assert.match(add, /\$\('setIperfAddr'\)\.focus/, 'with the address field focused');
-  assert.match(add, /if\(iperfServers\.length>=IPERF_MAX\) return;/, 'and a belt behind the disabled row');
+  assert.match(add, /if\(iperfServers\.filter\(s=>!s\._del\)\.length>=IPERF_MAX\) return;/, 'and a belt behind the disabled row, counting the same rows it does');
   const acts = script.slice(script.indexOf("$('iperfServerList').addEventListener('click'"), script.indexOf("$('iperfEditRemove')"));
   assert.match(acts, /act==='add'\)\{ iperfAddServer\(\); return; \}/, 'the add row is handled before the code that expects a server id');
   assert.doesNotMatch(html, /\.ipl-add\{[^}]*dashed/, 'it separates with the list\u2019s own hairline, not a dashed rule of its own');
@@ -4468,9 +5055,9 @@ test('the code that named the Server tab follows it to the Ookla and iperf3 tabs
   assert.doesNotMatch(script, /activateTab\('server'\)|dataset\.tab==='server'|name==='server'/, 'nothing still names the removed tab');
   const start = script.indexOf("$('saveSettings').addEventListener");
   const save = script.slice(start, script.indexOf("$('discardSettings')", start));
-  assert.equal((save.match(/activateTab\('iperf'\)/g) || []).length, 3,
-    'a bad iperf3 address, an orphaned password AND "the engine needs a server" all send the user to the iperf3 tab - ' +
-    'a refusal that names a tab has to open it, or the reader is told to fix something they cannot see');
+  assert.equal((save.match(/activateTab\('iperf'\)/g) || []).length, 4,
+    'a bad iperf3 address, an orphaned password, "the engine needs a server" AND an address iperf3 cannot parse all send ' +
+    'the user to the iperf3 tab - a refusal that names a tab has to open it, or the reader is told to fix something they cannot see');
   const restore = extract('function restoreDrawerPlace');
   assert.match(restore, /if\(want==='server'\) want='ookla'/, 'a drawer place saved before the split reopens on the Ookla half');
 });
@@ -4516,8 +5103,16 @@ function driveServers() {
   const fetches = [];
   const fetchStub = url => new Promise((resolve, reject) => {
     fetches.push({ url, ok: body => resolve({ ok: true, json: async () => body }), fail: () => reject(new Error('offline')),
-      // A daemon error: text/plain, so the body is not JSON either way.
-      status: code => resolve({ ok: false, status: code, json: async () => { throw new Error('not json'); } }) });
+      // A daemon error: text/plain, so the body is not JSON either way - but the
+      // text itself distinguishes a restore's 503 from the handler's own.
+      status: (code, body = '') => resolve({ ok: false, status: code, text: async () => body,
+        json: async () => { throw new Error('not json'); } }),
+      // Headers in, body never finishing - a proxy that emits 502 and then
+      // stalls, or an upstream killed between the two. This is a real response,
+      // not a rejection: nothing here ever throws, so every recovery downstream
+      // of reading the body simply never happens.
+      stall: (code) => resolve({ ok: false, status: code, text: () => new Promise(() => {}),
+        json: () => new Promise(() => {}) }) });
   });
   const els = {
     serverCity: { value: '' },
@@ -4531,9 +5126,14 @@ function driveServers() {
       setAttribute() {}, removeAttribute() {} },
   };
   const log = { loading: [], populated: [], errs: [], drew: 0 };
+  // The wait fetchServers puts on an error body is real wall clock in the page;
+  // here it fires at once and records what it was asked for, so a test can see
+  // that the read is bounded without spending the bound.
+  const timers = [];
   const api = new Function('$', 'fetch', 'setServerLoading', 'populateServers',
     'applyPendingServer', 'updateScopeNote', 'clearServerFieldError', 'serverFieldError', 'serverTabActive', 'btnBusy', 'fpDraw',
-    'let serversLoaded=false, serversScope="", serverTabSeen=true, pendingServer="", '
+    'setTimeout',
+    'let serversLoaded=false, serversScope="", serversLatchGen=0, serverTabSeen=true, pendingServer="", '
     + 'autoDefaultLoc="", autoCentreLastRun=false, serverSearchInFlight=null, serverSearchFailed=false, '
     // Every page-level name the lifted functions write, or a sloppy-mode
     // assignment creates a global that leaks between drives and a test passes
@@ -4550,21 +5150,211 @@ function driveServers() {
     // The generation counter itself is lifted from the page, so deleting it there
     // fails this drive rather than letting the test supply its own.
     + script.match(/let serversGen\s*=\s*0;/)[0] + '\n'
+    // ... and so is the footer's write counter, for the same reason.
+    + script.match(/let settingsMsgSeq=0;/)[0] + '\n'
     + script.match(/const shortPlace = [^;]*;/)[0] + '\n'
+    // The failure line itself, lifted rather than retyped: the assertions below
+    // are about a message loadServers both writes and retires, and a copy here
+    // would let the two drift apart without a test noticing.
+    + script.match(/const SERVER_LIST_ERR=[^\n]*/)[0] + '\n'
     + extract('async function fetchServers') + '\n'
     + extract('async function loadServers') + '\n'
     + extract('async function searchServers') + '\n'
     + extract('function fpAutoList') + '\n'
-    + 'return { fetchServers, searchServers, fpAutoList, loadServers, '
+    // The two statements Reset to defaults ends with, in its order: count the
+    // write, then make it. A test that only assigned els.settingsMsg.textContent
+    // would be a writer the page does not have.
+    + 'function writeFooter(t){ settingsMsgSeq++; $(\'settingsMsg\').textContent=t; }\n'
+    + 'return { fetchServers, searchServers, fpAutoList, loadServers, writeFooter, '
     + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, autoCentreLastRun, pinRefused: serverPinRefused, autoCities: fpAutoCities, remembered, startOnAuto, setStartOnAuto: v => { startOnAuto = v; }, autoCache: fpAutoCache, ageAuto: ms => { fpAutoCache.at = Date.now() - ms; }, stale: fpAutoStale,'
-    + ' searchFailed: serverSearchFailed, pinUnverified: serverPinUnverified, errShown: serverErrShown, listLabel: fpListLabel }) };')(
+    + ' searchFailed: serverSearchFailed, pinUnverified: serverPinUnverified, errShown: serverErrShown, listLabel: fpListLabel,'
+    + ' setAutoCache: c => { fpAutoCache = c; }, loaded: serversLoaded, scope: serversScope, latch: serversLatchGen, gen: serversGen }) };')(
     id => els[id], fetchStub, on => log.loading.push(on), s => log.populated.push(s),
     () => {}, () => {}, () => {}, m => log.errs.push(m), () => true,
     // The real btnBusy, lifted from the page: the button-release assertions below
     // are about what it does, so a hand-written stand-in would prove nothing.
-    new Function(extract('function btnBusy') + '\nreturn btnBusy;')(), () => { log.drew++; });
-  return { api, els, fetches, log };
+    new Function(extract('function btnBusy') + '\nreturn btnBusy;')(), () => { log.drew++; },
+    (fn, ms) => { timers.push(ms); return setTimeout(fn, 0); });
+  return { api, els, fetches, log, timers };
 }
+// The sentence loadServers puts up and takes down again, lifted rather than
+// retyped so the two cannot drift apart without a test noticing.
+const SERVER_LIST_ERR = script.match(/const SERVER_LIST_ERR='([^']*)'/)[1];
+
+// A failing list request tells the reader what went wrong, and the daemon's own
+// text is part of that - but the STATUS is the news and the body is only a
+// nicety. A response can have its headers and never finish its body: a proxy
+// that emits 502 and then stalls, an upstream killed between the two, a link
+// dropped mid-response. Waiting for the whole body put every recovery behind it
+// - the failure line, letting the reuse latch go so coming back to the tab asks
+// again, and the finally that gives Find and Auto their buttons back - so one
+// stalled response left the picker inert until the page was reloaded.
+test('an error body that never finishes cannot wedge the picker', async () => {
+  const { api, els, fetches, log, timers } = driveServers();
+  let settled = false;
+  api.loadServers().then(() => { settled = true; });
+  await tick();
+  fetches[0].stall(502);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(settled, true, 'the load finishes on the status alone');
+  // The number, not merely that a number was passed: `some(ms => ms > 0)` was
+  // true of 2 s and of an hour alike, and an hour is the very wedge this test
+  // exists to prevent - the picker inert behind a stalled body until a reload.
+  // The stub fires every timer at once and records what it was ASKED for, so the
+  // bound can be read here without spending it.
+  const bodyWait = timers.find(ms => ms > 0);
+  assert.notEqual(bodyWait, undefined, 'because the wait on the body is bounded');
+  assert.ok(bodyWait <= 5000, `and bounded in seconds - a stall behind ${bodyWait}ms is the wedge itself`);
+  assert.ok(bodyWait >= 500, `while still leaving the daemon's own text time to arrive - ${bodyWait}ms would drop it every time`);
+  assert.equal(els.settingsMsg.textContent, SERVER_LIST_ERR, 'and the reader is told the list could not be fetched');
+  assert.equal(api.state().loaded, false, 'the reuse latch is let go');
+  assert.equal(log.loading[log.loading.length - 1], false, 'and the spinner comes down');
+  api.loadServers();
+  await tick();
+  assert.equal(fetches.length, 2, 'so the retry the message names - leaving the tab and coming back - asks again');
+
+  // Find and Auto release their buttons in a finally, which is downstream of the
+  // same await: stuck there, both stayed disabled through a drawer close and
+  // reopen, and only a reload got them back.
+  const f = driveServers();
+  f.els.serverCity.value = 'Toronto';
+  let findDone = false;
+  f.api.searchServers().then(() => { findDone = true; });
+  await tick();
+  f.fetches[0].stall(504);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(findDone, true, 'the search finishes');
+  assert.equal(f.els.serverSearchBtn.disabled, false, 'and Find is pressable again');
+  assert.match(f.els.settingsMsg.textContent, /Could not look up Toronto/, 'having said what happened');
+
+  const a = driveServers();
+  let autoDone = false;
+  a.api.fpAutoList().then(() => { autoDone = true; });
+  await tick();
+  a.fetches[0].stall(502);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(autoDone, true);
+  assert.equal(a.els.serverAuto.disabled, false, 'and so is Auto');
+});
+
+const RESET_LINE = 'Defaults loaded - click Save to apply.';
+// Reset to defaults starts the list load and THEN writes its own line, so a
+// failure landing a moment later replaced it - and the reset had happened, still
+// needed a Save, and no longer said so. The failure only speaks into a footer
+// nobody has spoken into since the load began, which is the rule the webhook test
+// button already follows. "Nobody has spoken" is a count of writes and not a
+// comparison of words, because the reset writes the same sentence every time:
+// pressing it twice in a row left the second press's confirmation looking exactly
+// like a footer nobody had touched, and the failure went back to talking over it.
+test('a list failure does not speak over a line put up after it started', async () => {
+  const { api, els, fetches } = driveServers();
+  const load = api.loadServers();
+  await tick();
+  api.writeFooter(RESET_LINE);   // what the reset writes
+  fetches[0].status(502, 'no route to host');
+  await load;
+  assert.equal(els.settingsMsg.textContent, RESET_LINE,
+    'the reset happened and still needs a Save, so its own line is the one that stands');
+  assert.equal(api.state().loaded, false, 'the list is un-latched all the same, so the tab can ask again');
+  assert.match(script.slice(script.indexOf("$('resetSettings').addEventListener")),
+    /serversLoaded=false; loadServers\(\);[\s\S]*?settingsMsgSeq\+\+; \$\('settingsMsg'\)\.textContent='Defaults loaded - click Save to apply\.';/,
+    'which is the order the reset does the three things in: start the load, count the write, write');
+
+  // The same press again, with the first press's line still on screen. The words
+  // are identical, so only the count can tell that somebody just spoke.
+  const twice = driveServers();
+  twice.api.writeFooter(RESET_LINE);          // reset #1, its line still up
+  const load2 = twice.api.loadServers();      // reset #2 starts a fresh load
+  await tick();
+  twice.api.writeFooter(RESET_LINE);          // ... and writes the same sentence again
+  twice.fetches[0].status(502, 'no route to host');
+  await load2;
+  assert.equal(twice.els.settingsMsg.textContent, RESET_LINE,
+    'the second reset needs a Save just as much as the first, so its line stands too');
+
+  // Every other writer of this footer - Save, the webhook test, an import - knows
+  // nothing about a list load and counts nothing. They are covered by the words,
+  // which they always change; both halves of the guard have work to do.
+  const saving = driveServers();
+  const load3 = saving.api.loadServers();
+  await tick();
+  saving.els.settingsMsg.textContent = 'Saving…';   // a writer that does not count itself
+  saving.fetches[0].status(502, 'no route to host');
+  await load3;
+  assert.equal(saving.els.settingsMsg.textContent, 'Saving…',
+    'a save in progress is the newer news, and the list failure must not bury it');
+
+  // With nobody else speaking, the failure still says its piece.
+  const quiet = driveServers();
+  const load4 = quiet.api.loadServers();
+  await tick();
+  quiet.fetches[0].status(502, 'no route to host');
+  await load4;
+  assert.equal(quiet.els.settingsMsg.textContent, SERVER_LIST_ERR);
+});
+
+// The other half of that rule, and the deliberate half: a line that was ALREADY
+// on the footer when the load began is stale by the time the load fails, and the
+// reader still has to be told the list could not be fetched. Only a write made
+// after the load started earns the footer - "the footer is not empty" was never
+// the test, or a Save's confirmation from a minute ago would silence every list
+// failure that followed it.
+test('a list failure still speaks into a footer that was already stale when it started', async () => {
+  const { api, els, fetches } = driveServers();
+  api.writeFooter('Settings saved.');   // said before this load began, and nobody speaks again
+  const load = api.loadServers();
+  await tick();
+  fetches[0].status(502, 'no route to host');
+  await load;
+  assert.equal(els.settingsMsg.textContent, SERVER_LIST_ERR,
+    'nobody has spoken since the load began, so the failure is the news');
+});
+
+// The latch may only be taken down by the request that took it out. A list put
+// back from memory was fetched by nobody, so it records no owner at all - without
+// that, an older request failing after the fact un-latched a list it never
+// fetched, and the next visit to the tab paid for a refetch of what was already
+// on screen.
+test('a list put back from memory is not un-latched by a request already superseded', async () => {
+  const { api, fetches, log } = driveServers();
+  api.loadServers();                       // request A opens the tab
+  await tick();
+  assert.equal(api.state().latch, api.state().gen, 'the load that is running owns the latch');
+  api.fetchServers({ city: 'Toronto' });   // ... and a newer request supersedes A
+  await tick();
+  const race = { winner: { kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 }, origins: [],
+    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
+  api.state().setAutoCache({ at: Date.now(), servers: race.servers, winner: race.winner, origins: [] });
+  api.state().setStartOnAuto(true);
+  const before = fetches.length, shown = log.populated.length;
+  api.loadServers();                       // the reopen shows the remembered Auto
+  await tick();
+  assert.equal(fetches.length, before, 'shown from memory, so nothing is fetched');
+  assert.deepEqual(log.populated[shown], race.servers);
+  assert.equal(api.state().latch, 0, 'and no request owns what is on screen');
+  fetches[0].status(502, 'x');             // A, long superseded, finally fails
+  await tick(); await tick();
+  assert.equal(api.state().loaded, true, 'which cannot take down a list it never fetched');
+  api.loadServers();
+  await tick();
+  assert.equal(fetches.length, before, 'so the next visit to the tab reuses it instead of asking again');
+});
+
+test('a race started for a reopen does not carry the latch of the load it replaced', async () => {
+  const { api, fetches } = driveServers();
+  api.loadServers();                       // request A
+  await tick();
+  api.fetchServers({ city: 'Toronto' });   // supersedes it
+  await tick();
+  api.state().setStartOnAuto(true);        // reopened on Auto with nothing remembered
+  api.loadServers();
+  await tick();
+  assert.equal(fetches[fetches.length - 1].url, 'api/speedtest/candidates', 'so it races');
+  assert.equal(api.state().latch, 0, 'and the latch it takes out is nobody\u2019s until the race lands');
+  fetches[0].status(502, 'x');             // A finally fails
+  await tick(); await tick();
+  assert.equal(api.state().loaded, true, 'so the pane the race is filling is not un-latched under it');
+});
 
 test('server list: of two overlapping searches the newest wins, whichever answers first', async () => {
   const { api, fetches, log } = driveServers();
@@ -4711,16 +5501,241 @@ test('server list: an Auto that could not race says why', async () => {
   assert.equal(els.settingsMsg.textContent, '', 'an abandoned Auto must not paint its failure over the Find that replaced it');
 });
 
-test('server list: a city that cannot be found is "not found" whatever the status', async () => {
+test('server list: a city the geocoder does not know is "not found"', async () => {
   const { api, els, fetches, log } = driveServers();
   els.serverCity.value = 'Nowherecity';
   const search = api.searchServers();
   await tick();
-  fetches[0].status(502);   // the geocoder's answer for an unknown city
+  fetches[0].status(404);   // the daemon's answer when the geocoder knows no such place
   await search; await tick();
   assert.deepEqual(log.errs, ['city not found']);
   assert.equal(api.state().searchFailed, true);
   assert.equal(api.state().pendingServer, '', 'a city search never pins anything');
+});
+
+// Find and Auto both report their failures. The list load did not, so a daemon
+// that could not reach Ookla left a pane indistinguishable from "no servers
+// near here", with nothing to say it could be asked again.
+test('server list: a browse list that could not be fetched says so', async () => {
+  const { api, els, fetches } = driveServers();
+  const first = api.loadServers();
+  await tick();
+  fetches[0].status(502, 'could not reach the server catalogue');
+  await first; await tick();
+  assert.match(els.settingsMsg.textContent, /Could not load the server list/);
+  assert.equal(api.state().errShown, els.settingsMsg.textContent,
+    'owned like a search error, so typing, the next Find or closing the drawer retire it');
+  api.loadServers(); await tick();
+  assert.equal(fetches.length, 2, 'and a failed fetch must not latch the list as loaded');
+
+  // ... unless the page has moved past it. A Find that landed first is the list
+  // on screen: blaming it for a request it replaced is a message about nothing,
+  // and forgetting that it was fetched for the centre now in effect costs a
+  // refetch of the place the user is already looking at.
+  const { api: late, els: lateEls, fetches: lateFetches } = driveServers();
+  const abandoned = late.loadServers();
+  await tick();
+  lateEls.serverCity.value = 'Toronto';
+  const find = late.searchServers();
+  await tick();
+  lateFetches[1].ok({ lat: 43.65, lon: -79.38, location: 'Toronto, ON, Canada', servers: [{ id: 't' }] });
+  await find; await tick();
+  lateFetches[0].status(502, 'could not reach the server catalogue');
+  await abandoned; await tick();
+  assert.equal(lateEls.settingsMsg.textContent, '',
+    'an abandoned load must not paint its failure over the Find that replaced it');
+  late.loadServers(); await tick();
+  assert.equal(lateFetches.length, 2, 'nor drop the scope that Find left reusable');
+});
+
+// The generation guard above is there to protect the list that REPLACED this
+// one. When the request that replaced it failed too there is no such list: the
+// pane is empty, and the latch still says a list has been loaded for this
+// centre - so coming back to the tab, which is the cheapest retry there is,
+// asks for nothing at all.
+test('server list: two failures in a row still leave the list loadable', async () => {
+  for (const [what, supersede] of [
+    ['a Find', d => { d.els.serverCity.value = 'Toronto'; return d.api.searchServers(); }],
+    ['an Auto', d => d.api.fpAutoList()],
+  ]) {
+    const d = driveServers();
+    const load = d.api.loadServers();                                   // the tab's own list
+    await tick();
+    const next = supersede(d);                                          // ... replaced before it answers
+    await tick();
+    d.fetches[1].status(502, 'could not reach the server catalogue');   // and the replacement fails
+    await next; await tick();
+    d.fetches[0].status(502, 'could not reach the server catalogue');   // as does the one it replaced
+    await load; await tick();
+    d.api.loadServers(); await tick();
+    assert.equal(d.fetches.length, 3, `${what}: nothing was ever loaded, and the next visit asks for nothing`);
+  }
+});
+
+// The other half of that rule, and the reason the scope alone cannot decide it:
+// Auto's list is centred nowhere, exactly like the default list this load asked
+// for, so the two scopes are the same string and only the generation tells the
+// abandoned request from the answer that replaced it.
+test('server list: an abandoned load leaves the Auto that replaced it alone', async () => {
+  const { api, fetches } = driveServers();
+  const load = api.loadServers();
+  await tick();
+  const auto = api.fpAutoList();
+  await tick();
+  fetches[1].ok({ servers: [{ id: 'c1' }], winner: { label: 'Toronto, ON, Canada', lat: 43.65, lon: -79.38 }, origins: [] });
+  await auto; await tick();
+  fetches[0].status(502, 'could not reach the server catalogue');
+  await load; await tick();
+  api.loadServers(); await tick();
+  assert.equal(fetches.length, 2, 'the candidates on screen were thrown away and refetched as a browse list');
+});
+
+// The failure line is owned like a search error, and owning it cuts both ways:
+// a Find, an Auto or a row click retire it, but the retry it actually
+// advertises - come back to the tab - did not, so the sentence sat under a full
+// list of servers saying the list could not be fetched.
+test('server list: a load that succeeds takes its own failure line back down', async () => {
+  const { api, els, fetches } = driveServers();
+  const failed = api.loadServers();
+  await tick();
+  fetches[0].status(502, 'could not reach the server catalogue');
+  await failed; await tick();
+  assert.match(els.settingsMsg.textContent, /Could not load the server list/);
+  const again = api.loadServers();                 // the retry the message asks for
+  await tick();
+  fetches[1].ok({ location: 'Toronto, ON, Canada', servers: [{ id: 't1' }, { id: 't2' }] });
+  await again; await tick();
+  assert.equal(els.settingsMsg.textContent, '', 'the servers are on screen under a line saying they could not be fetched');
+  assert.equal(api.state().errShown, '', 'and the message is still owned, so the next thing to speak is not fighting it');
+});
+
+// Taking it down is the newest request's business too. An older load landing
+// late has already had its answer dropped, so letting it clear the footer would
+// un-say a failure the page is still standing on.
+test('server list: an abandoned load does not un-say a failure that still stands', async () => {
+  const { api, els, fetches } = driveServers();
+  const failed = api.loadServers();
+  await tick();
+  fetches[0].status(502, 'could not reach the server catalogue');
+  await failed; await tick();
+  assert.match(els.settingsMsg.textContent, /Could not load the server list/);
+  const late = api.loadServers();                  // the retry ...
+  await tick();
+  api.fetchServers({});                            // ... superseded before it answers, and still in flight
+  await tick();
+  fetches[1].ok({ location: 'Toronto, ON, Canada', servers: [{ id: 't1' }] });
+  await late; await tick();
+  assert.match(els.settingsMsg.textContent, /Could not load the server list/,
+    'a request whose answer was thrown away still cleared the footer');
+});
+
+// The daemon answers 404 only when the geocoder knows no such place; every
+// other status means the lookup could not be made, which says nothing about
+// what was typed. A city search commits nothing to settings, so a failure of
+// one must not refuse to save the rest of the drawer either.
+test('server list: a city lookup that could not run does not blame the typed city', async () => {
+  for (const [name, land] of [['502', f => f.status(502)], ['503', f => f.status(503)], ['offline', f => f.fail()]]) {
+    const { api, els, fetches, log } = driveServers();
+    els.serverCity.value = 'Toronto';
+    const search = api.searchServers();
+    await tick();
+    land(fetches[0]);
+    await search; await tick();
+    assert.deepEqual(log.errs, [], `${name}: a real city painted as a typo`);
+    assert.equal(api.state().searchFailed, false, `${name}: and the whole Save refused with it`);
+    assert.match(els.settingsMsg.textContent, /Could not look up Toronto/, `${name}: the failure is still reported`);
+    assert.equal(api.state().errShown, els.settingsMsg.textContent, `${name}: owned like a search error`);
+  }
+});
+
+// The split above is a contract with three parties: the daemon draws the line
+// (its handler is tested on its own side), the page reports the two sides
+// differently, and docs/api.md tells anyone writing against the API which is
+// which. The reference was the only one of the three nothing checked, so a
+// rewrite of that entry could quietly drop the distinction while both
+// implementations kept it.
+test('the API reference states the city-lookup split the page and the daemon keep', () => {
+  const doc = readSource(here, '..', '..', '..', 'docs', 'api.md').replace(/\s+/g, ' ');
+  const i = doc.indexOf('`POST /api/speedtest/servers?city=`');
+  assert.ok(i >= 0, 'the servers endpoint is documented');
+  const entry = doc.slice(i, doc.indexOf('- `POST /api/iperf/check', i));
+  assert.match(entry, /`404`[^;]{0,80}geocoder knows no such place/,
+    '404 is the geocoder knowing no such place - the one failure that IS about what was typed');
+  assert.match(entry, /`502`[^;]{0,80}could not be asked/,
+    'and 502 is not having been able to ask, which says nothing about the query');
+});
+
+// Every route answers 503 during a restore's reconcile window, and the picker
+// read all of them as "this feature is not available".
+test('server list: an Auto refused by a restore says to come back', async () => {
+  const { api, els, fetches } = driveServers();
+  const p = api.fpAutoList();
+  await tick();
+  fetches[0].status(503, 'restoring a backup; try again shortly');
+  await p; await tick();
+  assert.match(els.settingsMsg.textContent, /restoring a backup/i,
+    'the daemon said something more specific than "not available", and it is the difference between waiting and giving up');
+  assert.match(els.settingsMsg.textContent, /shortly|again/, 'and it says the wait is short');
+});
+
+// A search moves the browse list and commits nothing, so the list it fetched is
+// the list for the centre now in effect. Leaving the scope unchanged made the
+// very next load - a click on the already-active tab, or the settings reload a
+// Save triggers - fetch the same place all over again.
+test('server list: a Find leaves the list it fetched reusable', async () => {
+  const { api, els, fetches } = driveServers();
+  els.serverCity.value = 'Toronto';
+  const search = api.searchServers();
+  await tick();
+  fetches[0].ok({ lat: 43.65, lon: -79.38, location: 'Toronto, ON, Canada', servers: [{ id: 't' }] });
+  await search; await tick();
+  assert.equal(fetches.length, 1);
+  api.loadServers();
+  await tick();
+  assert.equal(fetches.length, 1, 'the list on screen was fetched for exactly this centre; refetching it costs a round of pings at every listed server');
+});
+
+// openDrawer starts the Ookla tab's deferred fetch itself; the settings reload
+// that follows it then started a second identical one and threw one answer away.
+test('server list: the first drawer open fetches the list once', () => {
+  assert.match(extract('function applySettings'), /if\(drawerReopening && reopenHadList &&/,
+    'a reopen refetches "the list you were looking at" - on a page load’s first open there is not one yet');
+  assert.match(script, /reopenHadList=serversLoaded/,
+    'and what decides that is whether a list had been loaded when the drawer opened');
+});
+
+// Reset loaded the default list before it emptied the kept one, so the load's
+// staleness check fired a live ping round at servers the same click discarded.
+test('server list: Reset clears the kept servers before it reloads the list', () => {
+  const src = script.slice(script.indexOf("$('resetSettings').addEventListener"));
+  const adopt = src.indexOf('fpAdoptSaved(d.speed_servers)'), load = src.indexOf('loadServers();');
+  assert.ok(adopt > 0 && load > 0);
+  assert.ok(adopt < load, 'a reset that reloads first pings the servers it is about to throw away');
+});
+
+// Every list, grid and pane here is redrawn wholesale and refocus puts the
+// keyboard back - but the control it was on can be GONE rather than redrawn:
+// un-starring a kept server the current list does not carry removes its only
+// row. With nothing to find, focus stayed on <body>.
+function driveRefocus(found) {
+  const body = { tag: 'body' };
+  const doc = { body, activeElement: body, querySelector: s => found[s] || null };
+  return new Function('document', 'var focusPending=null;\n' + extract('function refocus') + '\nreturn refocus;')(doc);
+}
+test('the keyboard goes to a neighbour when the control it was on is gone', () => {
+  let landed = '';
+  const star = { focus() { landed = 'star'; } }, neighbour = { focus() { landed = 'neighbour'; } };
+  const mark = '[data-pick="9001"] .fp-star', fallback = '#fpFav .fp-rows .fp-star';
+  driveRefocus({ [mark]: star, [fallback]: neighbour })(mark, fallback);
+  assert.equal(landed, 'star', 'a control that survived the redraw is still where the keyboard belongs');
+  landed = '';
+  driveRefocus({ [fallback]: neighbour })(mark, fallback);
+  assert.equal(landed, 'neighbour', 'and one that did not hands it to the pane it was in, not to <body>');
+  // The neighbour has to be another star. The saved pane's first button is the
+  // Auto row's, and Space on that changes which server every test runs against -
+  // so falling back to "any button in the pane" put the keyboard on a setting.
+  assert.match(extract('function fpDraw'), /refocus\(mark, mark \? \(inFav \? '#fpFav \.fp-rows \.fp-star' : '#fpAll \.fp-rows \.fp-star'\)/,
+    'the picker is where rows vanish under the keyboard, so it is what names the neighbour - and it names a star');
 });
 
 // --- container-awareness surfaces (I1/I5/I8/I9) ------------------------------
@@ -6886,7 +7901,7 @@ test('every redraw and every self-disabling control hands the keyboard back', ()
   // and was not: starring a server MOVES its row between the two panes, the
   // pane losing the row is filled first, and its restore then ran while the
   // other pane still held its previous render - so the selector found nothing.
-  assert.match(extract('function fpDraw'), /const mark=\(f\.contains\(document\.activeElement\) \|\| a\.contains\(document\.activeElement\)\)[\s\S]*fpFill\(f[\s\S]*fpFill\(a[\s\S]*refocus\(mark\)/,
+  assert.match(extract('function fpDraw'), /const mark=\(inFav\|\|inAll\) \? focusMark\(\) : null;[\s\S]*fpFill\(f[\s\S]*fpFill\(a[\s\S]*refocus\(mark, /,
     'the picker marks once, fills both panes, then restores - a star crosses panes');
   assert.doesNotMatch(extract('function fpFill'), /focusMark\(\)|refocus\(/,
     'and the per-pane fill must not do it again, or the first pane restores against the second pane\u2019s stale rows');
@@ -7062,7 +8077,7 @@ test('controls that cannot act say so instead of doing nothing', () => {
     'Discard losers stayed live at Best of 1, where its own tooltip says it does nothing');
   assert.match(html, /\.chart-save\[hidden\]\{display:none;\}/,
     'display:inline-flex outranks the UA [hidden] rule, so the hidden save-image button stayed clickable');
-  assert.match(script, /capped \? \('Keep '\+s\.sponsor\+' - keeping '\+FP_MAX\+' servers already'\)/,
+  assert.match(script, /capped \? \('Keep '\+label\+' - keeping '\+FP_MAX\+' servers already'\)/,
     'aria-label outranks title, so at the cap the star told assistive tech it does something it will not do');
 });
 

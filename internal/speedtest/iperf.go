@@ -476,6 +476,16 @@ func iperfOmit(fn func() int) int {
 	return o
 }
 
+// iperfAddrSpace is what counts as whitespace inside an address, and it is one
+// character wider than Go's own idea of it: unicode.IsSpace does not count
+// U+FEFF, the byte-order mark a line pasted out of a file often starts with.
+// It is invisible, it makes a host nothing can resolve, and the dashboard's
+// address check already refused it - so the two sides disagreed about the same
+// string, which is exactly the disagreement that check exists to end. The
+// reverse case, U+0085, Go has always counted and the page has not; the page
+// counts it now.
+func iperfAddrSpace(r rune) bool { return unicode.IsSpace(r) || r == '\uFEFF' }
+
 // parseIperfServer splits and validates a user-supplied "host" or "host:port", so a
 // typo or pasted command tail fails here with a clear message instead of as a cryptic
 // failed transfer. It rejects:
@@ -486,7 +496,7 @@ func iperfOmit(fn func() int) int {
 //
 // A bare host or bare IPv6 with no port is allowed (iperf3 defaults to 5201).
 func parseIperfServer(s string) (host, port string, err error) {
-	s = strings.TrimSpace(s)
+	s = strings.TrimFunc(s, iperfAddrSpace)
 	if s == "" {
 		return "", "", errors.New("no iperf3 server set")
 	}
@@ -501,7 +511,7 @@ func parseIperfServer(s string) (host, port string, err error) {
 	}
 	bad := host == "" || strings.HasPrefix(host, "-") || strings.HasPrefix(port, "-") ||
 		strings.ContainsAny(host, "[]") || // a surviving bracket is a malformed literal
-		strings.IndexFunc(host, unicode.IsSpace) >= 0 || // any whitespace (incl. newline/CR) is malformed
+		strings.IndexFunc(host, iperfAddrSpace) >= 0 || // any whitespace (incl. newline/CR, and a byte-order mark) is malformed
 		// A colon can only survive into host as a bare IPv6 literal (SplitHostPort
 		// failed). Anything colon-y that isn't a real IP ("1.2.3.4:5201:9") must
 		// fail HERE with a clear message, not as a cryptic dial error retried as
