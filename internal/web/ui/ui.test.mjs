@@ -258,6 +258,68 @@ test('fmtDur: two largest units, cascading up to years', () => {
   assert.equal(F.fmtDur(31536000 + 3 * 2592000), '1y 3mo'); // years are ~365d
 });
 
+// The month/year boundary, where twelve 30-day months fit inside a 365-day year
+// with five days to spare: the runtime pill printed "1y 12mo" for the five days
+// before every second birthday, and "12mo 4d" for the five days before the first
+// one. Those days hold at eleven months rather than claiming the year early.
+test('fmtDur: a twelfth month holds at eleven instead of claiming the year', () => {
+  const D = 86400;
+  const cases = [
+    [359 * D, '11mo 29d'],
+    [360 * D - 1, '11mo 29d'],
+    [360 * D, '11mo 29d'],  // a twelfth whole month, held below the year
+    [364 * D, '11mo 29d'],
+    [31535999, '11mo 29d'], // one second under 365d - used to be "12mo 4d"
+    [365 * D, '1y 0mo'],
+    [366 * D, '1y 0mo'],
+    [390 * D, '1y 0mo'],    // a year and 25 days: not a whole month more yet
+    [396 * D, '1y 1mo'],
+    [719 * D, '1y 11mo'],
+    [720 * D, '1y 11mo'],
+    [725 * D, '1y 11mo'],   // used to be "1y 12mo"
+    [729 * D, '1y 11mo'],
+    [730 * D, '2y 0mo'],
+    [1090 * D, '2y 11mo'],  // used to be "2y 12mo"
+    [1095 * D, '3y 0mo'],
+  ];
+  for (const [s, want] of cases) assert.equal(F.fmtDur(s), want, `fmtDur(${s})`);
+  // The general rule the constants have to keep: the smaller of the two units
+  // may never have reached the one above it - no 12mo, no 30d, no 24h, no 60m.
+  const carry = { mo: 12, d: 30, h: 24, m: 60, s: 60 };
+  const lastUnit = s => {
+    const parts = [...F.fmtDur(s).matchAll(/(\d+)\s*(mo|[dhms])/g)];
+    return parts[parts.length - 1];
+  };
+  for (let day = 0; day <= 4000; day++) {
+    const [, n, u] = lastUnit(day * D);
+    assert.ok(+n < carry[u], `fmtDur(${day}d) = ${F.fmtDur(day * D)}`);
+  }
+  for (let s = 0; s <= 3 * D; s += 997) {
+    const [, n, u] = lastUnit(s);
+    assert.ok(+n < carry[u], `fmtDur(${s}) = ${F.fmtDur(s)}`);
+  }
+});
+
+// Shortening the year to twelve 30-day months also removes "1y 12mo", but it
+// hands out anniversaries five days early and the error compounds: 720 days
+// would read "2y 0mo" ten days before the second year is up, and 1440 days
+// "4y 0mo" twenty days before the fourth. Every number this function prints is
+// a floor, so the safe direction is behind the calendar, never ahead of it.
+test('fmtDur: a duration never reads as further along than it is', () => {
+  const D = 86400, UNIT = { y: 365 * D, mo: 30 * D, d: D, h: 3600, m: 60, s: 1 };
+  const asSeconds = str => [...str.matchAll(/(\d+)\s*(y|mo|[dhms])/g)]
+    .reduce((n, [, v, u]) => n + +v * UNIT[u], 0);
+  for (let day = 0; day <= 4000; day++) {
+    const s = day * D, out = F.fmtDur(s);
+    assert.ok(asSeconds(out) <= s, `fmtDur(${day}d) = "${out}", longer than the duration itself`);
+  }
+  // the mid-year bands a shorter year would have moved, none of which were ever
+  // the "12mo" defect
+  assert.equal(F.fmtDur(390 * D), '1y 0mo');    // a year and 25 days
+  assert.equal(F.fmtDur(720 * D), '1y 11mo');   // ten days short of two years
+  assert.equal(F.fmtDur(1440 * D), '3y 11mo');  // twenty days short of four
+});
+
 test('bytesStr: SI units, rounds B/KB, 1dp from MB, rejects non-finite', () => {
   assert.equal(F.bytesStr(0), '0 B');
   assert.equal(F.bytesStr(500), '500 B');

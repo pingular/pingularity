@@ -3742,11 +3742,20 @@ function refreshSection(id){
 })();
 
 // Duration as the two largest meaningful units, cascading up through minutes,
-// hours, days, months (~30d), years (~365d): 144600s -> "1d 16h", not "40h 10m".
+// hours, days, months (~30d), years (365d): 144600s -> "1d 16h", not "40h 10m".
+// Thirty-day months do not quite fill a 365-day year: five days are left over,
+// and that is enough for the remainder after the years to hold a twelfth whole
+// month. Counted plainly it printed "1y 12mo" for the five days before a second
+// birthday, and "12mo 4d" for the five before the first - a month count no year
+// had claimed. Those five days hold at eleven months instead of borrowing the
+// year early, because a duration here is floored at every other tier too and it
+// is better for the pill to be a few days behind the calendar than ahead of it:
+// a machine up for 725 days reads "1y 11mo", not the "2y 0mo" a shorter year
+// would award it ten days in advance.
 const fmtDur = s => { s=Math.max(0,Math.floor(s));
-  const m=60,h=3600,d=86400,mo=2592000,y=31536000;
-  if(s>=y)  return `${Math.floor(s/y)}y ${Math.floor(s%y/mo)}mo`;
-  if(s>=mo) return `${Math.floor(s/mo)}mo ${Math.floor(s%mo/d)}d`;
+  const m=60,h=3600,d=86400,mo=2592000,y=365*d;
+  if(s>=y)  return `${Math.floor(s/y)}y ${Math.min(11,Math.floor(s%y/mo))}mo`;
+  if(s>=mo) return Math.floor(s/mo)>11 ? '11mo 29d' : `${Math.floor(s/mo)}mo ${Math.floor(s%mo/d)}d`;
   if(s>=d)  return `${Math.floor(s/d)}d ${Math.floor(s%d/h)}h`;
   if(s>=h)  return `${Math.floor(s/h)}h ${Math.floor(s%h/m)}m`;
   if(s>=m)  return `${Math.floor(s/m)}m ${s%m}s`;
