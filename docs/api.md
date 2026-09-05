@@ -22,8 +22,13 @@ and `-d '{…}'` where a body is listed below.
   speed, and live speedtest progress. Every uptime figure ships with its
   observation coverage (`uptime_coverage` per window, `uptime_custom_coverage`
   for `?upMins=`); a coverage of `0` means the window observed nothing and has no
-  uptime to report, exactly as `pingularity_uptime_ratio` is then absent. A
-  running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
+  uptime to report, exactly as `pingularity_uptime_ratio` is then absent. The
+  latest run rides along as `speed` (`null` until the first test completes), and
+  `speed_known` says whether that `null` is a fact: a poll whose store read failed
+  still answers `200` with a `null` speed, and reports `speed_known: false` so a
+  client can tell "no run yet" from "could not look" rather than acting on the
+  `null` - the dashboard empties its speed panel on the first and leaves it alone
+  on the second. A running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
   (`0` when idle) - that id is what `/api/speedtest/abort` takes, so a stop can
   name the run it was decided against. A fresh install awaiting first-run consent
   reports `quick_setup_pending`, and `access_local_only` mirrors the loopback-only
@@ -141,7 +146,11 @@ and `-d '{…}'` where a body is listed below.
 - `GET|POST /api/settings` - read / update live settings. POST is a **partial**
   update: fields you omit keep their current value, and only the settings form is
   reachable here - monitoring (`/api/monitoring`), access/auth (`/api/access`), the
-  update check (`/api/update`) and logging (`/api/logs`) have no field in it
+  update check (`/api/update`) and logging (`/api/logs`) have no field in it. A
+  value the daemon refuses outright - today, an iperf3 password beginning with the
+  reserved `enc:v1:` seal prefix - comes back as `400` with the reason as the body,
+  so it can be shown to whoever typed it; a `500` here really is a daemon-side
+  failure
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The
   session cookie lasts **30 days**, and a logout revokes **every** signed-in

@@ -68,6 +68,7 @@ const DEFS = {
   serverOptionText: 'const serverOptionText',
   spdExportAvgSegments: 'function spdExportAvgSegments',
   bloatBins: 'function bloatBins', bloatCeiling: 'function bloatCeiling',
+  threshLine: 'function threshLine',
   bloatDataMax: 'function bloatDataMax', cursorSpan: 'const cursorSpan',
   drawCursor: 'function drawCursor',
   logPostAction: 'function logPostAction', spdAvgNote: 'function spdAvgNote',
@@ -457,9 +458,10 @@ test('seriesGapSec: 3x the median point spacing; Infinity when unknowable', () =
 // --- settings form field mapping ---
 // Stub $ with a per-id object store so set/getField run without a DOM.
 const els = {};
-const SF = new Function('$', extract('const secOrig') + '\n' + extract('function setField') + '\n' +
+const SF = new Function('$', extract('const secOrig') + '\n' + extract('const fieldOrig') + '\n' +
+  extract('function setField') + '\n' +
   extract('function intOf') + '\n' + extract('function getField') +
-  '\nreturn { setField, getField };')(id => els[id] || (els[id] = {}));
+  '\nreturn { setField, getField, fieldOrig };')(id => els[id] || (els[id] = {}));
 
 test('set/getField: an unedited min/day field round-trips its exact seconds', () => {
   SF.setField('ret', 'day', 21600);               // CLI-set 6h renders as 0 days
@@ -1139,7 +1141,38 @@ test('speedTileMbps: "-" when the direction was not measured, else rounded Mbps'
   assert.equal(F.speedTileMbps(123.6, 5000), '124 Mbps'); // measured: bytes present, rounds
   assert.equal(F.speedTileMbps(0, 0), '0 Mbps');          // 0 bytes is still a measurement of a very slow run
   assert.equal(F.speedTileMbps(0, null), '-');            // no upload phase ran -> absent, not "0 Mbps"
-  assert.equal(F.speedTileMbps(500, undefined), '-');     // omitempty drops the field entirely
+  assert.equal(F.speedTileMbps(0, undefined), '-');       // omitempty drops the field entirely
+});
+
+// --- a real throughput with no byte count is still a measurement --------------
+// Byte presence is the right signal for the case it was written for: a partial or
+// direction-only run leaves the untested direction's bytes absent AND its figure at
+// exactly 0. It is the wrong signal on its own, because the byte columns are also
+// missing from rows that measured perfectly well - a database carried over from
+// before those columns existed, a restored backup whose speed rows had none, and
+// rows the at-rest integer repair strips when it cannot read one. Those runs were
+// blanked in the cards, the table and the range average, and left out of the line -
+// while the chart's ceiling went on scaling to the value it was hiding.
+test('a run with a real speed and no byte counts is drawn, not erased', () => {
+  const legacy = { down_mbps: 322.62, up_mbps: 25.04 }; // omitempty dropped both byte fields
+  assert.equal(F.spMeasured(legacy, 'down_mbps'), true);
+  assert.equal(F.spMeasured(legacy, 'up_mbps'), true);
+  assert.equal(F.speedTileMbps(legacy.down_mbps, legacy.download_bytes), '323 Mbps');
+  assert.equal(F.speedTileMbps(legacy.up_mbps, legacy.upload_bytes), '25 Mbps');
+
+  // The direction-only run the rule exists for is untouched: its untested side
+  // reports 0, which is not evidence of anything and must still read as "-".
+  const partial = { down_mbps: 940.2, download_bytes: 5.9e8, up_mbps: 0 };
+  assert.equal(F.spMeasured(partial, 'down_mbps'), true);
+  assert.equal(F.spMeasured(partial, 'up_mbps'), false, 'a 0 with no bytes is "not tested", not "0 Mbps"');
+  assert.equal(F.speedTileMbps(partial.up_mbps, partial.upload_bytes), '-');
+  // And an absent figure is still absent, whatever the bytes say.
+  assert.equal(F.spMeasured({ download_bytes: 1 }, 'down_mbps'), false);
+
+  // The pill labelled "average download across the range" has to cover the range.
+  const rows = [legacy, { down_mbps: 300, up_mbps: 25, download_bytes: 1, upload_bytes: 1 }];
+  assert.equal(F.spdAverages(rows).down.toFixed(2), '311.31',
+    'a run the chart draws must be in the average the chart is labelled with');
 });
 
 // --- Range averages: the three readout pills on the speed panel's runs bar ------
@@ -2134,6 +2167,67 @@ test('the RUN button does not offer to stop a run whose id it does not know', ()
   assert.match(btn.title, /Run a speedtest now/);
 });
 
+// --- and the caption when there is no run to describe at all -----------------
+// setSpeedtestRunning writes "Running speedtest on ..." and only the status poll
+// takes it down again - but the poll repainted the caption only when the daemon
+// HAD a completed run, and painted the cards only then too. So with no run on
+// record the panel got stuck: on a fresh install a first run aborted before it
+// stored anything left "Running speedtest on ..." over an idle RUN button until a
+// reload, and deleting the speed history left the seven cards and the "<server> -
+// last <time>" line describing a run that no longer existed, beside a chart that
+// had already repainted to "No speedtests in the last 1d".
+test('a panel with no run left to describe blanks its cards and its caption', () => {
+  const cards = ['dl', 'ul', 'sp_ping', 'sp_jitter', 'sp_loss', 'sp_bloat_dn', 'sp_bloat_up'];
+  const els = {};
+  for (const id of cards) els[id] = { textContent: '293 Mbps', title: 'Probed on the download path' };
+  els.speedWhen = { textContent: 'Running speedtest on Mock Server, Nowhere…',
+    classList: { removed: [], remove(c) { this.removed.push(c); } } };
+  const clear = new Function('$', extract('function clearSpeedPanel') + '\nreturn clearSpeedPanel;')(id => els[id]);
+  clear();
+  for (const id of cards) assert.equal(els[id].textContent, '-', `${id} kept a deleted run's number`);
+  assert.equal(els.sp_jitter.title, '', 'a tooltip describing how a vanished run was measured');
+  assert.equal(els.sp_loss.title, '');
+  assert.equal(els.speedWhen.textContent, '', 'the caption still claimed a run');
+  assert.ok(els.speedWhen.classList.removed.includes('run-err'),
+    'an error caption must not leave the empty state painted red');
+
+  // And the status poll reaches it. This is the arm the caption branch never had:
+  // "the daemon reports no completed run", which is what both a fresh install and
+  // a just-deleted history look like.
+  assert.ok(script.includes('} else if (s.speed_known && !s.speed && !speedFrozen()) {'),
+    'refreshStatus no longer blanks the panel when the daemon reports no run');
+  // The pinned-span path blanks the same seven cards for a range holding no runs,
+  // and writes its own caption straight after - one list of card ids, not two.
+  assert.ok(script.includes('if(last) setSpeedTiles(last);\n    else clearSpeedPanel();'),
+    'an empty pinned span no longer blanks the cards, so it shows the last window\'s numbers');
+});
+
+// --- but only when the daemon really looked ----------------------------------
+// The daemon sends `speed: null` for two different reasons: no test has ever
+// finished, and this poll could not read the store - handleStatus logs that at
+// debug level and answers 200 with the same null anyway, which is why it sends
+// speed_known beside it. Only the first is "there is no run to describe".
+// Blanking on the second empties the seven cards and the caption over a history
+// that is all still there, and nothing else on the page contradicts it: the
+// request succeeded, so the stale bar stays down, and the numbers reappear on
+// the next good poll as if the panel had blinked for no reason.
+test('the panel is blanked only by a poll that actually read the speed history', () => {
+  const arm = script.match(/\} else if \(([^\n]*?)\) \{\n(?:\s*\/\/[^\n]*\n)+\s*clearSpeedPanel\(\);/);
+  assert.ok(arm, 'the empty-panel arm in refreshStatus has moved - find it and re-pin this test');
+  const blanks = new Function('s', 'speedFrozen', `return !!(${arm[1]});`);
+  const live = () => false, pinned = () => true;
+  assert.equal(blanks({ speed: null, speed_known: true }, live), true,
+    'a poll that read the history and found no run must blank the panel');
+  assert.equal(blanks({ speed: null, speed_known: false }, live), false,
+    'a poll whose store read failed sends the same null - it is no evidence the runs are gone');
+  assert.equal(blanks({}, live), false,
+    'a payload that never mentioned the speed history says nothing about it either way');
+  assert.equal(blanks({ speed: { ts: 1 }, speed_known: true }, live), false,
+    'a poll carrying a run must not blank the panel that just described it');
+  assert.equal(blanks({ speed: null, speed_known: true }, pinned), false,
+    'a pinned span owns these cards - syncSpeedPanel blanks them there, not the status poll');
+});
+
 // The affordance and the action must be driven by the same state, not by two
 // variables that happen to agree today.
 test('the RUN click handler consults speedtestAbortable, not the local flag alone', () => {
@@ -2470,7 +2564,7 @@ test('log truncation note: a complete pane stays unbannered across idle polls', 
 test('the log poll is not gated on the logging switch', () => {
   assert.equal(/setInterval\(\(\)=>\{ if\(!document\.hidden && \$\('setLogOn'\) && \$\('setLogOn'\)\.checked/.test(script), false,
     'the poll still requires logging to be on, so a tab with it off never sees a clear');
-  assert.ok(/setInterval\(\(\)=>\{ if\(!document\.hidden\s*\n\s*&& \$\('drawer'\)\.classList\.contains\('open'\)/.test(script),
+  assert.ok(/setInterval\(\(\)=>\{ if\(!document\.hidden[^\n]*\n\s*&& \$\('drawer'\)\.classList\.contains\('open'\)/.test(script),
     'the poll should run whenever the About tab is open and visible');
 });
 
@@ -2492,7 +2586,7 @@ const gateDoc = (section, hidden) => ({
   querySelector: sel => sel === '.panel[data-section="' + section + '"]'
     ? { classList: { contains: c => c === 'section-hidden' && hidden } } : null,
 });
-function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {}, hidden = false, force = false } = {}) {
+function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {}, hidden = false, force = false, bridgedContainer = false } = {}) {
   const body = extract('async function refreshNetinfo');
   const panel = { innerHTML: '' };
   const warn = { innerHTML: '', classList: { add() {}, remove() {} } };
@@ -2504,10 +2598,13 @@ function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {}, hi
   // netinfoIdleReason is pulled from the same source, not restated here: the
   // whole point of the fix is that one answer drives both call sites.
   const idle = script.includes('function netinfoIdleReason') ? extract('function netinfoIdleReason') : '';
+  // netinfoEmpty comes out of the page for the same reason: whether a snapshot is
+  // worth drawing is the thing under test, so a stub here would test nothing.
+  const empty = script.includes('function netinfoEmpty') ? extract('function netinfoEmpty') : '';
   const make = new Function(
     '$', 'fget', 'syncNetinfoOffMark', 'netinfoOff', 'monitoring', 'setTimeout', 'clearTimeout',
-    'labelInfoBubbles', 'esc', 'document',
-    TILE_GATE + '\n' + idle + '\nlet netinfoSeq = 0, netinfoRetry = null;\n' + body
+    'labelInfoBubbles', 'esc', 'document', 'bridgedContainer',
+    TILE_GATE + '\n' + idle + '\n' + empty + '\nlet netinfoSeq = 0, netinfoRetry = null;\n' + body
     + '\nreturn Object.assign(refreshNetinfo, { seq: () => netinfoSeq });');
   const fn = make(
     $,
@@ -2519,6 +2616,7 @@ function driveNetinfo({ netinfoOff = false, monitoring = true, snapshot = {}, hi
     () => {},
     s => String(s),
     gateDoc('connection', hidden),
+    bridgedContainer,
   );
   return fn(force).then(() => ({ html: panel.innerHTML, polls: scheduled.length, fetched, seq: fn.seq() }));
 }
@@ -2562,6 +2660,58 @@ function drivePower(sequence) {
   for (const on of sequence) api.setPowerUI(on);
   return calls.length;
 }
+
+// An IPv6-only host is a complete answer, not a missing one: the daemon leaves the
+// v4 address blank on purpose there and fills in the v6 address, ISP, city and PoP,
+// and its DNS egress row only appears once the resolver echo has answered. The
+// panel's empty test asked for a v4 address, an error or that DNS egress, so the
+// whole snapshot went unrendered behind "gathering..." while the 3s catch-up poll
+// re-asked for it forever.
+test('connection panel: an IPv6-only snapshot is drawn, not mistaken for nothing', async () => {
+  const v6only = {
+    public_ip: '', public_ipv6: '2001:db8:0:1::10', hostname: 'host6.example.net',
+    isp: 'AS64500 Example Fibre', city: 'Toronto', country: 'CA', cf_colo: 'YYZ',
+    exit_unavailable: 'needs IPv4 (this host is IPv6-only)', updated_at: 1788290000,
+  };
+  const { html, polls } = await driveNetinfo({ snapshot: v6only });
+  assert.doesNotMatch(html, /gathering/,
+    'a snapshot carrying an address, an ISP, a city and a PoP is not "nothing yet". Got: ' + html);
+  assert.match(html, /2001:db8:0:1::10/, 'the IPv6 address is what this host has');
+  assert.match(html, /AS64500 Example Fibre/);
+  assert.match(html, /Toronto, CA/);
+  assert.match(html, /YYZ/, 'and the Cloudflare PoP it reaches');
+  assert.equal(polls, 0,
+    'and nothing is being waited for, so the 3s catch-up poll must not be armed - it fired ' +
+    'about 1200 times an hour for as long as the host stayed IPv6-only');
+
+  // The catch-up poll still has to exist for the state it was written for.
+  const first = await driveNetinfo({ snapshot: {} });
+  assert.match(first.html, /gathering/, 'a genuinely empty snapshot still says so');
+  assert.equal(first.polls, 1, 'and still polls fast until the first one lands');
+
+  // The predicate is the union of what the rows are built from; any one of these
+  // alone is something to show, and a snapshot with none of them is not.
+  const isEmpty = new Function(extract('function netinfoEmpty') + '\nreturn netinfoEmpty;')();
+  assert.equal(isEmpty(null), true);
+  assert.equal(isEmpty({}), true);
+  assert.equal(isEmpty({ updated_at: 1788290000, exit_unavailable: 'needs IPv4' }), true,
+    'a stamp and a reason the Exit row is hidden draw no rows between them');
+  for (const [what, n] of [
+    ['public_ip', { public_ip: '203.0.113.9' }],
+    ['public_ipv6', { public_ipv6: '2001:db8::1' }],
+    ['error', { error: 'ip lookup failed' }],
+    ['dns_upstream', { dns_upstream: { ip: '1.1.1.1', provider: 'Cloudflare' } }],
+    ['dns_configured', { dns_configured: ['192.168.1.1'] }],
+    ['isp', { isp: 'AS64500 Example Fibre' }],
+    ['city', { city: 'Toronto' }],
+    ['country', { country: 'CA' }],
+    ['cf_colo', { cf_colo: 'YYZ' }],
+    ['exit router', { exit: { ip: '198.51.100.1' } }],
+    ['exit city', { exit: { loc: 'Ottawa' } }],
+    ['handoff', { exit: { next_name: 'ix1' } }],
+  ]) assert.equal(isEmpty(n), false, what + ' alone draws a row, so the panel is not empty');
+  assert.equal(isEmpty({ dns_configured: [] }), true, 'an empty list is not a configured resolver');
+});
 
 test('turning monitoring back on releases the connection panel, once', () => {
   assert.equal(drivePower([false, true]), 1,
@@ -2847,6 +2997,41 @@ test('bloatCeiling ignores a threshold that is nowhere near the data', () => {
   // A limit close to the data still belongs in scale - that is what makes it
   // useful to see.
   assert.ok(F.bloatCeiling(100, 150) >= 150, 'a nearby limit must stay visible');
+});
+
+// ...and having refused the axis to it, the strip still has to SHOW it. Dropping
+// the line as well left a bufferbloat limit above the data with nothing on screen
+// at all, and the two Appearance switches for it doing visibly nothing.
+test('a bufferbloat limit above the whole chart is drawn along the edge', () => {
+  // The bloat strip's own axis maths: a diverging scale whose Y clamps at maxV,
+  // which is what makes an out-of-range line drawable in the first place.
+  const maxV = F.bloatCeiling(20, 200), cen = 84, half = 35;
+  const Ydn = v => cen + Math.min(v, maxV) / maxV * half;
+  const rec = () => ({ ys: [], dash: null, save() {}, restore() {}, beginPath() {},
+    setLineDash(d) { this.dash = d; }, moveTo(x, y) { this._y = y; }, lineTo() {},
+    stroke() { this.ys.push(this._y); } });
+
+  let x = rec();
+  F.threshLine(x, 0, 100, Ydn, 200, maxV, '#fff', true);
+  assert.deepEqual(x.ys, [Ydn(maxV)], `a 200ms limit over a ${maxV}ms axis drew nothing`);
+  assert.deepEqual(x.dash, [5, 4], 'and it has to read as a threshold, not as a data line');
+
+  // A limit inside the axis is unaffected, and 0 still means "no threshold".
+  x = rec(); F.threshLine(x, 0, 100, Ydn, 30, maxV, '#fff', true);
+  assert.deepEqual(x.ys, [Ydn(30)]);
+  x = rec(); F.threshLine(x, 0, 100, Ydn, 0, maxV, '#fff', true);
+  assert.deepEqual(x.ys, []);
+
+  // Without the flag an out-of-range line is still dropped: the quality chart
+  // does not fold its ping limit into the axis and wants it to appear only as
+  // ping climbs toward it, so its Y does not clamp and the line has nowhere to go.
+  x = rec(); F.threshLine(x, 0, 100, v => v, 200, maxV, '#fff');
+  assert.deepEqual(x.ys, [], 'a chart that does not clamp must not draw off-canvas');
+
+  // Both bufferbloat directions ask for the clipping; nothing else does.
+  for (const call of ['threshLine(x,pad.l,w-pad.r,Yup,chartThresh.bloatUp,maxV,TC.bup,true)',
+                      'threshLine(x,pad.l,w-pad.r,Ydn,chartThresh.bloatDown,maxV,TC.bdown,true)'])
+    assert.ok(script.includes(call), `the bufferbloat chart no longer asks to clip: ${call}`);
 });
 
 // Rounded to a stable step, so the axis number stops drifting between refreshes
@@ -6142,7 +6327,10 @@ function driveDownloads({ status = 200 } = {}) {
   const anchors = [];
   const doc = {
     body: { appendChild() {} },
-    createElement: () => { const a = { clicked: false, click() { this.clicked = true; }, remove() {} }; anchors.push(a); return a; },
+    // listeners: downloadVia muzzles the anchor's own click so the handoff does not
+    // read as the reader clicking on the page (see the download-trigger test).
+    createElement: () => { const a = { clicked: false, listeners: [], click() { this.clicked = true; }, remove() {},
+      addEventListener(ev) { this.listeners.push(ev); } }; anchors.push(a); return a; },
   };
   const els = {}, handlers = {};
   const out = { busyOnWire: null };
@@ -7643,7 +7831,10 @@ test('the range averages describe runs, not the servers a round rejected', () =>
 // a whole round's bytes at whatever count those rounds measured, so the count
 // the history was measured under is the divisor - and settings cannot supply
 // it, because saving a new count changes settings and not the history.
-function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins = '60' } = {}) {
+// `windows` (a list of {days,start,end}) turns the speedtest schedule ON and
+// hands schedRunsPerDay the rows collectWindows would have read off the DOM;
+// covGrid and schedRunsPerDay themselves are the page's own.
+function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins = '60', windows = null } = {}) {
   const wi = { textContent: '' };
   const el = { classList: { add() {}, remove() {}, toggle() {} }, style: {}, querySelector: () => wi };
   const text = { innerHTML: '' };
@@ -7651,10 +7842,14 @@ function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins
     speedDataEst: el, speedDataEstText: text,
     setSpeedEngine: { checked: false }, setStEnabled: { checked: true },
     setSpeed: { value: mins }, setSpeedBestOf: { value: box },
+    setSchedSpeedEnabled: { checked: !!windows },
   };
   const src = `let speedAvgDown=${avgDown}, speedAvgUp=${avgUp}, speedAvgServers=${avgServers};\n`
     + script.match(/const EST_RUN_DOWN=[^;]*;/)[0] + '\n'
     + script.match(/const bytesStr = b => \{[\s\S]*?\n\};/)[0] + '\n'
+    + `function collectWindows(){ return ${JSON.stringify(windows || [])}; }\n`
+    + extract('function covGrid') + '\n'
+    + extract('function schedRunsPerDay') + '\n'
     + extract('function intOf') + '\n'
     + extract('function updateSpeedEstimate') + '\n'
     + 'return updateSpeedEstimate;';
@@ -7681,6 +7876,38 @@ test('the data estimate scales by the count the history was measured under, not 
   assert.match(driveEstimate({ box: '4' }), /19\.2 GB down/, 'no history: four times the single-server estimate');
   assert.doesNotMatch(script, /savedBestOfN/, 'the settings-derived divisor is gone: it became the new count the moment it was saved');
   assert.match(script, /speedAvgServers = Math\.max\(1, s\.speed_avg_servers\|\|1\)/, 'the divisor comes from the daemon, which counts what the runs measured');
+});
+
+// The scheduler is gated on the speedtest windows (Controller.SpeedAllowed), so
+// an hourly test confined to office hours does not run 24 times a day - but the
+// estimate read the interval alone, and went on claiming 24 tests and a full
+// month of bytes. On a metered link that is roughly a four-fold over-statement,
+// in the one figure the README calls a measured lower bound. A slot that comes
+// due outside a window is DEFERRED rather than dropped (the scheduler re-checks
+// and fires as the window opens, without moving its anchor), so each window
+// opening pays for one catch-up run on top of those the window has room for.
+test('the data estimate counts the speedtest schedule, not just the interval', () => {
+  const plain = driveEstimate({ mins: '60' });
+  assert.match(plain, /24 tests\/day/);
+  assert.match(plain, /4\.8 GB down/);
+  // 09:00-17:00 on weekdays: eight runs on each of five days, not 24 every day.
+  const office = driveEstimate({ mins: '60', windows: [{ days: '0111110', start: 540, end: 1020 }] });
+  assert.match(office, /6 tests\/day/, '40 runs a week is under six a day');
+  assert.doesNotMatch(office, /24 tests\/day/);
+  assert.match(office, /1\.1 GB down/, 'and the bytes move with the count, not just the caption');
+  // A window that covers everything costs exactly what no schedule costs.
+  assert.equal(driveEstimate({ mins: '60', windows: [{ days: '1111111', start: 0, end: 0 }] }), plain);
+  // A window narrower than the interval still runs once when it opens, so the
+  // figure is under one a day rather than zero - and "0 tests/day" beside a real
+  // pile of bytes is a contradiction.
+  const thin = driveEstimate({ mins: '60', windows: [{ days: '0000010', start: 540, end: 570 }] });
+  assert.match(thin, /<1 test\/day/);
+  assert.doesNotMatch(thin, /0 tests\/day/);
+  // The schedule changes it, so every path that edits a window has to redraw it.
+  assert.match(extract('function updateConflictWarnings'), /updateSpeedEstimate\(\)/,
+    'window edits all land in updateConflictWarnings');
+  assert.match(script, /\$\('setSchedSpeedEnabled'\)\.addEventListener\('change', \(\)=>\{ updateSchedDisabled\(\); updateSpeedEstimate\(\);/,
+    'and turning the schedule itself on or off redraws it too');
 });
 
 // The runs table used to refresh only when opened, after a delete, or after a
@@ -7742,6 +7969,139 @@ test('Save refuses a number the browser already knows is out of range', () => {
   assert.match(save, /saveFailed\(/, 'and refuses with a message, the way its six other gates do');
 });
 
+// A retention box the user emptied saved as 0, and 0 means KEEP FOREVER - the
+// Data card says so in bold. getField's 'day' kind has no shipping-default
+// fallback the way 'int' and 'min' do (intOf('') is NaN, and (NaN||0)*86400 is
+// 0), so clearing "365" turned a year into forever with the drawer closing on
+// success and nothing said. The same silence the negative case was closed for.
+// The three boxes are `required` now, which is what makes the browser call an
+// empty one invalid so the gate above can stop on it.
+test('an emptied retention box is refused rather than saved as keep-forever', () => {
+  SF.setField('setSpeedRet', 'day', 365 * 86400);
+  assert.equal(els.setSpeedRet.value, 365);
+  els.setSpeedRet.value = '';
+  assert.equal(SF.getField('setSpeedRet', 'day'), 0,
+    'the reader still turns a blank box into 0 = keep forever, which is exactly why a blank box must not reach it');
+  for (const id of ['setRetention', 'setSpeedRet', 'setDowntime'])
+    assert.match(html, new RegExp('<input type="number" id="' + id + '"[^>]*\\srequired[\\s>]'),
+      id + ' has to be required, or an empty box sails past the gate and saves as forever');
+  // And the card says so before the Save does. `required` turns clearing a box into
+  // a refusal, and "0 = keep forever" on its own does not tell anyone that clearing
+  // the box is not the same thing - so without this line the only way to learn it
+  // is to be refused.
+  assert.ok(html.includes('Each box needs a number - to keep everything, type 0 rather than clearing it.'),
+    'the Data card no longer says how to keep a dataset forever, leaving a refused Save to teach it');
+
+  // And the gate pressed, not read: an empty box and an out-of-range one are
+  // different mistakes, and "outside the range it allows" in front of a box
+  // holding nothing at all explains nothing.
+  const said = [];
+  const gate = new Function('_drawer', 'activateTab', 'saveFailed', 'fieldName',
+    extract('function invalidNumberField') + '\n'
+    + extract('{ const bad=invalidNumberField(') + '\nreturn "saved";');
+  const field = (validity, ok) => ({ id: 'setSpeedRet', min: '0', max: '', validity,
+    checkValidity: () => ok, closest: () => ({ dataset: { tab: 'retention' } }), focus() {} });
+  const press = f => { said.length = 0;
+    return gate({ querySelectorAll: () => [f] }, t => said.push(['tab', t]),
+      m => said.push(['said', m]), () => 'Speed'); };
+
+  assert.equal(press(field({ valueMissing: true }, false)), undefined, 'an empty box stops the save here');
+  assert.deepEqual(said[0], ['tab', 'retention'], 'on the tab holding it');
+  assert.match(said[1][1], /Speed is empty - type a number/, 'and it says the box is empty, not out of range');
+  assert.equal(press(field({ valueMissing: false, rangeUnderflow: true }, false)), undefined);
+  assert.match(said[1][1], /outside the range it allows \(lowest 0\)/, 'a real range failure still reads as one');
+  assert.equal(press(field({ valueMissing: false }, true)), 'saved', 'a box the browser accepts stops nothing');
+  assert.equal(said.length, 0);
+});
+
+// setDep only GREYS a control whose parent toggle is off - its own comment says
+// the value is preserved - but settingsBody read every box regardless, and the
+// range gate could not see the greyed ones: the browser bars a disabled input
+// from constraint validation, so checkValidity answers true however bad the box
+// is. 0 was posted as the probe interval and 99999 as the speedtest one, the
+// daemon clamped them to 1s and 24h, and the drawer closed reporting success.
+// What validity says is a different question from what checkValidity() answers,
+// which is the distinction the fix turns on: the stub inputs below model that
+// the way the browser does - min/max still judge a disabled box.
+function driveDeps() {
+  const nodes = {};
+  const $ = id => nodes[id] || (nodes[id] = { value: '', checked: false, disabled: false, tagName: 'INPUT',
+    min: '', max: '',
+    get validity() { const n = Number(this.value);
+      return { valid: !(this.value !== '' && Number.isFinite(n)
+        && ((this.min !== '' && n < Number(this.min)) || (this.max !== '' && n > Number(this.max)))) }; },
+    // And the asymmetry the fix turns on: a disabled input is not a candidate
+    // for constraint validation, so checkValidity() answers true however bad
+    // the box is, while validity goes on judging it.
+    checkValidity() { return this.disabled || this.validity.valid; } });
+  const src = 'let schedServerSkewMs=null;\n'
+    + script.match(/const FIELDS=\[[\s\S]*?\n\];/)[0] + '\n'
+    + extract('const secOrig') + '\n' + extract('const fieldOrig') + '\n'
+    + extract('function setField') + '\n' + extract('function intOf') + '\n'
+    + extract('function getField') + '\n' + extract('function setFields') + '\n'
+    + extract('function settingsBody') + '\n'
+    + 'return { setFields, settingsBody };';
+  const api = new Function('$', 'renderWindows', 'updateSchedDisabled', 'updateConflictWarnings',
+    'updateSpeedEstimate', 'syncDiscardLosersDep', 'captureIperfEditor', 'activeIperfServer',
+    'iperfServers', 'iperfWanted', 'speedServers', 'collectWindows', src)(
+    $, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => null, [], false, [], () => []);
+  return { ...api, $ };
+}
+
+test('a greyed field posts a number nobody typed as the value it was loaded with', () => {
+  const D = driveDeps();
+  const bounds = (id, min, max) => { D.$(id).min = min; D.$(id).max = max; };
+  // The daemon reports its own clamp limits and applySettings copies them into
+  // these two boxes, so min/max here IS the range the daemon would clamp to.
+  bounds('setLatency', '1', '3600'); bounds('setSpeed', '1', '1440');
+  D.setFields({ latency_enabled: true, latency_seconds: 5, speedtest_enabled: true, speed_seconds: 3600 });
+  // Typed while live, then the parent toggle goes off.
+  D.$('setLatency').value = '0'; D.$('setLatency').disabled = true;
+  D.$('setSpeed').value = '99999'; D.$('setSpeed').disabled = true;
+  const b = D.settingsBody();
+  assert.equal(b.latency_seconds, 5, '5s stays 5s - it went out as 0 and came back clamped to 1');
+  assert.equal(b.speed_seconds, 3600, 'and an hour stays an hour, not 99999 minutes clamped to 24h');
+  assert.ok('latency_seconds' in b && 'speed_seconds' in b,
+    'the keys still travel: this is a PATCH, and an omitted key keeps the STORED value, which would undo Reset to defaults for everything the defaults themselves grey out');
+  // A number the field ACCEPTS is an edit like any other, greyed or not: the
+  // operator turned Automatic on, typed 30, thought better of the toggle and
+  // left it off. Substituting here would have thrown that 30 away - and hidden
+  // it from the unsaved-changes guard too, since formSnapshot is this body, so
+  // the drawer would close without asking.
+  D.$('setSpeed').value = '30';
+  assert.equal(D.settingsBody().speed_seconds, 1800, 'an in-range edit still saves after its parent greys it');
+  assert.match(extract('function formSnapshot'), /settingsBody\(\)/,
+    'which is the same body the dirty check reads, so the edit is something to be asked about');
+  // Live again, and even a refused number goes out - the range gate is what
+  // stops that one, and it can only see a field the browser will judge.
+  D.$('setLatency').disabled = false;
+  assert.equal(D.settingsBody().latency_seconds, 0);
+  // Reset to defaults loads the defaults through the same door, so that is what
+  // a greyed box posts afterwards (Automatic ships off, greying its whole group).
+  D.setFields({ latency_enabled: false, latency_seconds: 5, speedtest_enabled: false, speed_seconds: 5400 });
+  D.$('setSpeed').disabled = true; D.$('setSpeed').value = '99999';
+  assert.equal(D.settingsBody().speed_seconds, 5400, 'a reset re-baselines what a greyed box will post');
+  // Controls with no range to breach - a select, a checkbox, a text box - are
+  // never substituted: they cannot hold a value the daemon would clamp, so an
+  // edit made just before the greying is all there is to save.
+  D.setFields({ latency_enabled: true, dns_probe_enabled: true, ipv6_mode: 'auto', netinfo_enabled: true, exit_target: '1.1.1.1' });
+  D.$('setDNSProbe').checked = false; D.$('setIPv6').value = 'off'; D.$('setExitTarget').value = '9.9.9.9';
+  ['setDNSProbe', 'setIPv6', 'setExitTarget'].forEach(id => { D.$(id).disabled = true; });
+  const nb = D.settingsBody();
+  assert.equal(nb.dns_probe_enabled, false, 'an unticked box stays unticked once latency probing goes off');
+  assert.equal(nb.ipv6_mode, 'off');
+  assert.equal(nb.exit_target, '9.9.9.9');
+  // A key the payload does not carry falls back to the box's own shipping
+  // default, the same one Save would have used - not to zero, which for a probe
+  // interval is not a value at all. That holds for both readings: the box's own,
+  // and the loaded value that replaces a refused box.
+  D.setFields({ latency_enabled: false });
+  D.$('setLatency').disabled = true;
+  assert.equal(D.settingsBody().latency_seconds, 5, 'the FIELDS fallback travels with the field');
+  D.$('setLatency').value = '0';
+  assert.equal(D.settingsBody().latency_seconds, 5, 'and with what a refused box is replaced by');
+});
+
 test('Reset to defaults really unpins the server', () => {
   const at = script.indexOf("$('resetSettings').addEventListener");
   const reset = script.slice(at, at + 2500);
@@ -7752,6 +8112,53 @@ test('Reset to defaults really unpins the server', () => {
     'the control Save actually reads has to go back to Auto, not just the pending-pin variable');
   assert.ok(reset.indexOf("$('setServer').value=''") < reset.indexOf('loadServers()'),
     'and before the async list refetch, so the reset does not depend on Ookla being reachable');
+});
+
+// Reset to defaults resets the theme, brightness, fade, width and corners, but
+// left every colour OVERRIDE standing: the page kept its custom background,
+// top-bar dots and red Download line through a click that announced "Defaults
+// loaded", and Save wrote them all back. The button's own tooltip says it puts
+// every setting back to how it shipped, access and security aside.
+function driveReset() {
+  const calls = [];
+  const nodes = {};
+  const $ = id => nodes[id] || (nodes[id] = { value: '', checked: false, textContent: '' });
+  const whole = extract("$('resetSettings').addEventListener('click', () => {");
+  const body = whole.slice(whole.indexOf('=> {') + 4, whole.lastIndexOf('}'));
+  const src = "let defaultSettings={speed_servers:[],iperf_servers:[],speed_engine:'ookla'};\n"
+    + "let pendingServer='55', browseLoc='x', browseLabel='x', fpListLabel='Candidates', startOnAuto=true, fpAutoCache={};\n"
+    + "let serversLoaded=true, iperfServers=[], iperfActiveId=1, iperfEditingId=1, iperfLoadedId=1, iperfWanted=true;\n"
+    + "let settingsMsgSeq=0, iperfAvailable=false;\n"
+    + "let palettePrefs={bg:'#123456',dotLat:'#00ff00'}, vizPrefs={dl:'#ff0000',lw:4};\n"
+    + extract('const PAL_VARS') + '\n'
+    + extract('function defaultPalette') + '\n' + extract('function defaultViz') + '\n'
+    + body + '\nreturn { palettePrefs, vizPrefs, defaults: { pal: defaultPalette(), viz: defaultViz() } };';
+  const note = n => () => calls.push(n);
+  const api = new Function('$', 'calls', 'setFields', 'syncLatencyDeps', 'syncSpeedDeps', 'rememberFind',
+    'fpAdoptSaved', 'loadServers', 'clearServerFieldError', 'updateAutoLocUI', 'mapIperfServer',
+    'nextIperfId', 'applyTheme', 'applyBrightness', 'applyFade', 'applyWide', 'applyCorners',
+    'applyPalette', 'syncPaletteControls', 'applyViz', 'syncVizControls', 'updateEngineUI', src)(
+    $, calls, note('setFields'), note('syncLatencyDeps'), note('syncSpeedDeps'), note('rememberFind'),
+    note('fpAdoptSaved'), note('loadServers'), note('clearServerFieldError'), note('updateAutoLocUI'),
+    v => v, () => 1, note('applyTheme'), note('applyBrightness'), note('applyFade'), note('applyWide'),
+    note('applyCorners'), note('applyPalette'), note('syncPaletteControls'), note('applyViz'),
+    note('syncVizControls'), note('updateEngineUI'));
+  return { ...api, calls };
+}
+
+test('Reset to defaults clears the colour overrides as well as the theme', () => {
+  const r = driveReset();
+  assert.equal(r.palettePrefs.bg, '', 'the UI-colour override goes');
+  assert.equal(r.palettePrefs.dotLat, '', 'and the Top-bar one, which has its own section and its own reset button');
+  assert.equal(r.vizPrefs.dl, '', 'and the Chart customization colour');
+  assert.equal(r.vizPrefs.lw, 2, 'right down to the line width, which is a number rather than a colour');
+  assert.deepEqual(r.palettePrefs, r.defaults.pal, 'every palette key, not a hand-listed few');
+  assert.deepEqual(r.vizPrefs, r.defaults.viz);
+  // Clearing the objects is only half of it: the page has to repaint and the
+  // pickers have to follow, or the swatches keep showing colours nothing uses.
+  for (const fn of ['applyPalette', 'syncPaletteControls', 'applyViz', 'syncVizControls'])
+    assert.ok(r.calls.includes(fn), fn + ' has to run, or the reset is invisible until a reload');
+  assert.ok(r.calls.includes('applyTheme'), 'and the theme reset it already did still happens');
 });
 
 test('a save that fails always says so, even when the caller has nothing to add', () => {
@@ -7783,7 +8190,7 @@ test('a page that fails to load leaves the pager where it was, and says so', asy
   const build = (ok) => {
     const said = [];
     const api = new Function('loadRuns', 'chartLoadFailed',
-      'let runsPage=1;\n' + extract('async function runsGoTo') +
+      'let runsPage=1, runsLoadedPage=1;\n' + extract('async function runsGoTo') +
       '\nreturn { runsGoTo, page: () => runsPage, set: p => { runsPage = p; } };')(
       async () => ok, w => said.push(w));
     return { ...api, said };
@@ -7807,6 +8214,302 @@ test('a page that fails to load leaves the pager where it was, and says so', asy
   assert.match(handlers, /runsGoTo/, 'the runs pager goes through it');
   const oh = script.slice(script.indexOf("$('outagesPrev').addEventListener"), script.indexOf("$('outagesPerPage').addEventListener"));
   assert.match(oh, /outagesGoTo/, 'and so does the outages pager');
+});
+
+// --- two page loads in the air at once ---------------------------------------
+//
+// Nothing disables Prev/Next while a page is being fetched, so two quick clicks
+// leave two loads racing. Only the newer one paints (runsSeq/outagesSeq), but the
+// older one used to come back from the loader looking exactly like a load that
+// FAILED - and the revert above then dragged the counter back to where the older
+// click had started, underneath the newer click's rows.
+//
+// This drives the REAL loader, pager caption and goTo out of index.html, with the
+// two responses held open so the overlap can be arranged either way round.
+function drivePagerRace(which, rowsFor) {
+  const isRuns = which === 'runs';
+  const els = {};
+  const $ = id => (els[id] = els[id] || {
+    innerHTML: '', textContent: '', disabled: false,
+    contains: () => false, querySelectorAll: () => [], querySelector: () => null,
+  });
+  const gates = [], offsets = [], said = [], blanked = [];
+  const respond = async (url) => {
+    const off = +(/offset=(\d+)/.exec(url) || [0, 0])[1];
+    offsets.push(off);
+    if (await new Promise(r => gates.push(r))) return { ok: false, json: async () => ({}) };
+    let rows = [];
+    for (let k = 0; k < 10; k++) rows.push({ ts: 1000 + off + k, type: 'up', has_duration: true, duration_s: 60 });
+    if (rowsFor) rows = rowsFor(off);
+    return { ok: true, json: async () => (isRuns ? { runs: rows, total: 160 } : { events: rows, total: 160 }) };
+  };
+  const str = () => '';
+  const api = isRuns
+    ? new Function('$', 'fetch', 'document', 'chartLoadFailed', 'listLoadFailed',
+      'fmtTime', 'spMeasured', 'pingMeasured', 'udpDirTitle', 'msStr', 'lossStr', 'bloatCell',
+      'bytesStr', 'showEngine', 'engOf', 'esc', 'winTag', 'famLabel', 'famTitle', 'raceCell',
+      'healthBadge', 'TRASH_SVG', 'num1', 'applyRunHighlight',
+      TILE_GATE + '\nlet runsPage = 1, runsPerPage = 10, runsTotal = 0, runsSeq = 0, runsLoadedPage = 1, pinnedRunTs = null;\n'
+      + extract('async function loadRuns') + '\n' + extract('function updateRunsPager') + '\n'
+      + extract('async function runsGoTo')
+      + '\nreturn { goTo: runsGoTo, page: () => runsPage };')(
+      $, respond, gateDoc('speed', false), w => said.push(w), b => blanked.push(b),
+      str, () => false, () => false, str, str, str, str,
+      str, () => false, str, s => String(s == null ? '' : s), str, str, str, str,
+      str, '', str, () => {})
+    : new Function('$', 'fget', 'document', 'chartLoadFailed', 'listLoadFailed',
+      'fmtTime', 'fmtDur', 'evHighlighted', 'outageDeletable', 'focusMark', 'refocus', 'TRASH_SVG',
+      TILE_GATE + '\nlet outagesPage = 1, outagesPerPage = 10, outagesTotal = 0, outagesSeq = 0, outagesLoadedPage = 1;\n'
+      + extract('async function loadOutages') + '\n' + extract('function updateOutagesPager') + '\n'
+      + extract('async function outagesGoTo')
+      + '\nreturn { goTo: outagesGoTo, page: () => outagesPage };')(
+      $, respond, gateDoc('downtime', false), w => said.push(w), b => blanked.push(b),
+      str, str, () => false, F.outageDeletable, () => null, () => {}, '');
+  const bodyId = isRuns ? 'runsBody' : 'events';
+  const infoId = isRuns ? 'runsPageInfo' : 'outagesPageInfo';
+  const prevId = isRuns ? 'runsPrev' : 'outagesPrev';
+  return {
+    ...api, offsets, said, blanked,
+    release: (i, fail) => gates[i](!!fail),
+    info: () => $(infoId).textContent,
+    prevDisabled: () => $(prevId).disabled,
+    firstRow: () => { const m = /data-ts="(\d+)"/.exec($(bodyId).innerHTML); return m ? +m[1] : null; },
+    body: () => $(bodyId).innerHTML,
+  };
+}
+
+// The runs table's own row markup, rendered by the shipped loadRuns.
+async function renderRuns(runs) {
+  const p = drivePagerRace('runs', () => runs);
+  const done = p.goTo(1);
+  await tick();
+  p.release(0);
+  await done;
+  return p.body();
+}
+
+test('two page clicks in the air at once: counter, caption and rows all land on the newer page', async () => {
+  for (const which of ['runs', 'outages']) {
+    // Both landing orders: the newer answer can arrive first (a slow first page)
+    // or second (the ordinary case), and the counter used to be lost either way -
+    // once to a "Page 1" caption over page-3 rows with Prev hard-disabled, once to
+    // a "Page 3" caption whose Prev was drawn enabled and did nothing.
+    for (const newerFirst of [true, false]) {
+      const p = drivePagerRace(which);
+      const a = p.goTo(2), b = p.goTo(3);
+      await tick();
+      assert.deepEqual(p.offsets, [10, 20], `${which}: each click asked for its own page`);
+      if (newerFirst) { p.release(1); await tick(); p.release(0); }
+      else { p.release(0); await tick(); p.release(1); }
+      await Promise.all([a, b]);
+      await tick();
+      const when = `${which}, newer answer ${newerFirst ? 'first' : 'second'}`;
+      assert.equal(p.firstRow(), 1020, `${when}: page 3's rows are the ones on screen`);
+      assert.equal(p.page(), 3,
+        `${when}: the superseded load reverted the counter to the page the FIRST click left, ` +
+        'so Prev/Next then moved relative to a page nobody is looking at');
+      assert.match(p.info(), /Page 3 \/ 16/, `${when}: and the caption has to name that same page`);
+      assert.equal(p.prevDisabled(), false, `${when}: Prev goes back from page 3`);
+    }
+  }
+});
+
+test('a page that fails still puts the pager back, and a stale answer still does not', async () => {
+  // The revert exists for a reason and has to survive the fix above, so both
+  // halves are checked against the shipped loader rather than a stand-in for it.
+  let p = drivePagerRace('runs');
+  const a = p.goTo(2);
+  await tick();
+  p.release(0, true);      // the daemon refuses page 2
+  await a;
+  await tick();
+  assert.equal(p.page(), 1, 'a page that does not load leaves you where you were');
+  assert.equal(p.firstRow(), null, 'and nothing was painted for it');
+
+  p = drivePagerRace('runs');
+  const b = p.goTo(2);
+  await tick();
+  p.release(0);
+  await b;
+  assert.equal(p.page(), 2, 'a page that loads is a page you are on');
+  const c = p.goTo(3), d = p.goTo(4);
+  await tick();
+  p.release(2);            // page 4 answers and paints
+  await tick();
+  p.release(1);            // the superseded page-3 load turns up afterwards
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.page(), 4, 'the stale page-3 answer must not drag the reader off page 4');
+  assert.equal(p.firstRow(), 1030, 'whose rows are the ones on screen');
+});
+
+test('a page that fails puts the pager back on the rows that are showing, not on a page nobody saw', async () => {
+  // Two loads in the air and one of them fails. Wherever the counter ends up, it
+  // has to name the page whose rows are on screen: the page a click STARTED from
+  // can be one that was asked for and never painted, and a counter parked there
+  // sits under a "Not loaded" caption with Prev and Next both disabled on a page
+  // the 60s live refresh will not touch - it only ever repaints page 1 - so
+  // nothing on the page puts the pager back. A load that has already been
+  // superseded owns none of this: it must move no counter and blank no pager.
+
+  // The newer click fails; the older one turns up afterwards, superseded.
+  let p = drivePagerRace('runs');
+  let a = p.goTo(2);
+  await tick();
+  p.release(0);            // page 2 paints
+  await a;
+  await tick();
+  assert.equal(p.page(), 2, 'page 2 is the one showing');
+  let c = p.goTo(3), d = p.goTo(4);
+  await tick();
+  p.release(2, true);      // the page-4 request is refused
+  await tick();
+  p.release(1);            // the page-3 answer lands afterwards and is superseded
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.firstRow(), 1010, 'page 2\u2019s rows are still the ones on screen');
+  assert.equal(p.page(), 2, 'and the counter names them - page 3 was asked for and never painted');
+
+  // The older click fails while the newer one is still coming. The stale failure
+  // must not drag the counter back, and must not blank a pager it no longer owns.
+  p = drivePagerRace('runs');
+  a = p.goTo(2);
+  await tick();
+  p.release(0);
+  await a;
+  await tick();
+  c = p.goTo(3); d = p.goTo(4);
+  await tick();
+  p.release(1, true);      // the page-3 request is refused, already superseded
+  await tick();
+  p.release(2);            // page 4 answers and paints
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.firstRow(), 1030, 'page 4\u2019s rows are the ones on screen');
+  assert.equal(p.page(), 4, 'and the counter followed them');
+  assert.match(p.info(), /Page 4 \/ 16/, 'as did the caption');
+  assert.deepEqual(p.blanked, [], 'a superseded failure reports no table it is no longer loading');
+
+  // Same again with the stale failure arriving after the newer page has painted.
+  p = drivePagerRace('runs');
+  c = p.goTo(2); d = p.goTo(3);
+  await tick();
+  p.release(1);            // page 3 paints
+  await tick();
+  p.release(0, true);      // the page-2 request fails long afterwards
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.page(), 3, 'the reader is still on page 3');
+  assert.match(p.info(), /Page 3 \/ 16/, 'under its own caption');
+  assert.deepEqual(p.blanked, [], 'and its pager was not disabled on behalf of a page nobody is on');
+  assert.deepEqual(p.said, [], 'nor was a failure announced for it');
+
+  // The outages table is the same code and gets the same guarantee.
+  p = drivePagerRace('outages');
+  a = p.goTo(2);
+  await tick();
+  p.release(0);
+  await a;
+  await tick();
+  c = p.goTo(3); d = p.goTo(4);
+  await tick();
+  p.release(2, true);
+  await tick();
+  p.release(1);
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.page(), 2, 'outages: the counter names the page on screen');
+  assert.equal(p.firstRow(), 1010, 'outages: whose rows are still there');
+
+  // ... including when it is the superseded load that fails.
+  p = drivePagerRace('outages');
+  c = p.goTo(2); d = p.goTo(3);
+  await tick();
+  p.release(1);            // page 3 paints
+  await tick();
+  p.release(0, true);      // the page-2 request fails afterwards
+  await Promise.all([c, d]);
+  await tick();
+  assert.equal(p.page(), 3, 'outages: a superseded failure moves no counter');
+  assert.deepEqual(p.blanked, [], 'outages: and disables no pager');
+});
+
+// --- what the delete confirms promise ----------------------------------------
+//
+// Run one of the page's own delegated click handlers over a fake row. The confirm
+// text and the toast are what the reader is told, and both used to say the same
+// thing whatever the daemon had actually done.
+function driveDelete(which, { round = '', dur = '', deleted = 1, ok = true } = {}) {
+  const src = extract(`$('${which}').addEventListener('click'`);
+  const arrow = src.slice(src.indexOf('async e=>'));
+  const toast = { textContent: '', hidden: true };
+  const btn = { dataset: { ts: '1788279605' }, disabled: false, focus() {}, closest: sel => sel === '.run-del' ? btn : null };
+  if (round) btn.dataset.round = round;
+  if (dur) btn.dataset.dur = dur;
+  const els = { [which]: { querySelectorAll: () => [btn] }, undoToast: toast };
+  const $ = id => els[id] || { querySelectorAll: () => [], focus() {} };
+  const asked = [];
+  let msg = null;
+  const stub = () => {};
+  const aStub = async () => {};
+  const fetch = async (url, opt) => {
+    asked.push(JSON.parse(opt.body));
+    return { ok, text: async () => 'server said no', json: async () => ({ deleted }) };
+  };
+  const fn = which === 'runsBody'
+    ? new Function('confirm', '$', 'fetch', 'loadRuns', 'refreshSpeedChart', 'refreshStatus', 'alert',
+      'setTimeout', 'clearTimeout', 'pinPlotted', 'dropGhostPin', 'focusRunOnChart', 'window',
+      'pinnedRunTs', 'runsBusy', 'return (' + arrow + ');')(
+      m => { msg = m; return true; }, $, fetch, aStub, aStub, stub, stub,
+      () => 1, stub, () => false, stub, stub, { getSelection: () => null }, null, false)
+    : new Function('confirm', '$', 'fetch', 'fmtDur', 'loadOutages', 'refreshHeatmap', 'refreshStatus',
+      'alert', 'setTimeout', 'clearTimeout', 'return (' + arrow + ');')(
+      m => { msg = m; return true; }, $, fetch, s => s + 's', aStub, stub, stub,
+      stub, () => 1, stub);
+  return fn({ target: btn }).then(() => ({ msg, toast: toast.textContent, asked }));
+}
+
+test('deleting a Best-of round member does not promise the round will go with it', async () => {
+  // The daemon cascades on the DELETED run's own timestamp, so a test's result
+  // takes the other servers of its round with it - and one of those other servers
+  // takes only itself, because its round_ts names the winner rather than itself
+  // (store.DeleteSpeed; the round row answers deleted:2, a member row deleted:1).
+  // One sentence for every row therefore made a false promise about a destructive
+  // action on exactly the rows tagged "· round".
+  const member = await driveDelete('runsBody', { round: '1788279607', deleted: 1 });
+  assert.doesNotMatch(member.msg, /go with it/,
+    'a member row is the one case where the round does NOT go. Got: ' + member.msg);
+  assert.match(member.msg, /rest of that round stays/, 'and it should say what does happen');
+  assert.match(member.msg, /cannot be undone/, 'without dropping the warning that matters');
+
+  const own = await driveDelete('runsBody', { deleted: 2 });
+  assert.match(own.msg, /same round go with it/,
+    'a run that IS a round’s result still warns that the round goes');
+  assert.equal(own.toast, 'Round deleted - 2 runs', 'and the toast still reports what went');
+
+  // The handler can only tell the two apart if the row carries it, and only the
+  // rows that have a round do.
+  const rows = await renderRuns([{ ts: 7, round_ts: 6 }, { ts: 6 }]);
+  assert.match(rows, /data-ts="7" data-round="6"/, 'a member row carries the round it belongs to');
+  assert.doesNotMatch(rows, /data-ts="6" data-round=/, 'a run with no round carries nothing');
+});
+
+test('deleting an outage that was already gone does not report a deletion', async () => {
+  // /api/outages/delete is idempotent and answers {"deleted": n}: n is 0 when
+  // nothing matched - the outage went in another tab, or retention swept it, in
+  // the minute between this table's refresh and the click. The handler never read
+  // the body, so it congratulated the reader on work the daemon had not done.
+  const gone = await driveDelete('events', { dur: '600', deleted: 0 });
+  assert.deepEqual(gone.asked, [{ ts: 1788279605 }], 'the row’s closing "up" event is what identifies it');
+  assert.equal(gone.toast, 'That outage was already gone',
+    'deleted:0 means nothing was deleted, and the toast has to say so');
+
+  // One outage is up + its "Link down" markers, so any count above zero is that
+  // one outage - never "2 outages".
+  const real = await driveDelete('events', { dur: '600', deleted: 2 });
+  assert.equal(real.toast, 'Outage deleted');
+  const one = await driveDelete('events', { dur: '600', deleted: 1 });
+  assert.equal(one.toast, 'Outage deleted');
 });
 
 test('iperf3 reachability probes are queued, and a settings load does not throw away what it knows', async () => {
@@ -8048,10 +8751,95 @@ test('a pin is dropped only when the run it names has actually gone', () => {
   assert.equal(m.calls.length, 0, 'a window change must not throw away a still-valid pin');
 });
 
+// --- what counts as clicking AWAY from a pinned run --------------------------
+// The document handler drops the pin for any click outside the charts and the runs
+// section. The panel's own chrome is outside both: the runs bar holds the Show/Hide
+// runs button, the average pills, the chart toggles and the save button, and the
+// window picker and its Live button live up in the heading. So opening the table,
+// hiding a chart or changing the window used to clear the highlight on the way past -
+// and on touch, where a tap pins the point and "Show all runs" is the follow-on
+// action the chart-click comment names, that button opened the table on nothing.
+test('the speed panel\'s own controls are not "clicking away" from a pinned run', () => {
+  // The real handler, driven over a synthetic ancestor chain: each entry lists the
+  // selectors that element carries in index.html, innermost first.
+  const line = script.match(/document\.addEventListener\('click', e=>\{ if\(pinnedRunTs==null\)[^\n]*\n/);
+  assert.ok(line, 'the click-away handler moved; this test no longer guards anything');
+  const sel = line[0].match(/closest\('([^']*)'\)/);
+  assert.ok(sel, 'the handler no longer exempts anything by selector');
+  // Every exemption has to be readable off the clicked element ALONE. The Live
+  // button's own handler goes back to the rolling window, and syncSpeedPanel then
+  // removes a button that no longer applies - so by the time this listener runs the
+  // target is already off the page, with no ancestors left to match against.
+  // "The Live button inside the speed panel" is a true description of that button
+  // and still matches nothing, which is why the exemption names an id instead.
+  for (const part of sel[1].split(','))
+    assert.ok(!/[\s>~+]/.test(part.trim()),
+      'this exemption names an ancestor (' + part.trim() + '), and the element it has to match has ' +
+      'already taken itself off the page by then, so it matches nothing');
+  let handler = null, cleared = 0;
+  new Function('document', 'pinnedRunTs', 'clearSelection', line[0])(
+    { addEventListener: (t, f) => { if (t === 'click') handler = f; } },
+    1788006365, () => cleared++);
+  assert.ok(handler, 'no click listener was registered');
+  const click = (...chain) => {
+    cleared = 0;
+    handler({ target: { closest: s => {
+      const want = s.split(',');
+      return chain.some(node => node.some(t => want.includes(t))) ? {} : null;
+    } } });
+    return cleared;
+  };
+  const panel = ['.panel'], bar = ['.runs-bar'], h2 = ['h2'];
+  assert.equal(click(['#runsToggle', '.btn', '.ghost'], bar, panel), 0, '"Show all runs"');
+  assert.equal(click(['.chart-toggle'], ['.chart-toggles'], bar, panel), 0, 'a chart show/hide toggle');
+  assert.equal(click(['.chart-save'], bar, panel), 0, 'the save-as-image button');
+  assert.equal(click(['.stat-val'], ['.chart-stat'], ['.chart-stats'], bar, panel), 0, 'an average pill');
+  assert.equal(click(['.chart-win'], ['#speedWindow', '.win-dd'], h2, panel), 0, 'the window picker');
+  assert.equal(click(['#speedLive', '.live-btn', '.btn', '.ghost'], h2, panel), 0, 'the Live button');
+  // The charts and the table keep managing the selection themselves...
+  assert.equal(click(['#speedChart']), 0);
+  assert.equal(click(['tr'], ['#runsBody'], ['#runsSection'], panel), 0);
+  // ...and a click genuinely elsewhere still clears it.
+  assert.equal(click(['#heatmap'], ['.panel']), 1, 'another panel must still count as away');
+  assert.equal(click(['#runSpeed', '.btn'], h2, panel), 1, 'starting a run is not reading one');
+  // The latency panel builds a Live button of its own, class for class the same
+  // one. It is a control in ANOTHER panel - away by any reading - and clicking it
+  // has always dropped the speed panel's pin. An exemption written as a bare
+  // .live-btn matches it too, and the highlighted row and the dotted cursor then
+  // survive a click nowhere near them.
+  assert.equal(click(['.live-btn', '.btn', '.ghost'], h2, panel), 1,
+    'the latency panel\'s Live button stopped counting as away');
+  assert.equal((script.match(/live\.className='btn ghost live-btn';/g) || []).length, 2,
+    'the two panels no longer build the same Live button, so this test is comparing nothing');
+  assert.equal((script.match(/live\.id='speedLive';/g) || []).length, 1,
+    'exactly one of them may carry the id the exemption names');
+
+  // The structural half: those controls really do sit outside #runsSection, which
+  // is the whole reason the four original selectors did not reach them.
+  const barAt = html.indexOf('<div class="runs-bar">'), secAt = html.indexOf('<div id="runsSection"');
+  assert.ok(barAt > 0 && secAt > barAt, 'the runs bar no longer precedes the runs section');
+  const markup = html.slice(barAt, secAt);
+  for (const needle of ['id="runsToggle"', 'class="chart-stats"', 'class="chart-toggles"', 'class="chart-save"'])
+    assert.ok(markup.includes(needle), `${needle} left the runs bar; the click-away exemption must follow it`);
+});
+
+// Saving the chart and exporting the CSV each build a throwaway <a download>, put
+// it on the body and click it. That is a real click event on document.body, so it
+// reached every click-away listener on the page: the pin the reader had set
+// vanished a moment after the file was written, from a click nobody made. The
+// button itself is exempt (above), which is exactly why this one was invisible.
+test('a download trigger does not read as a click on the page', () => {
+  const anchors = [...script.matchAll(/a\.href=u; a\.download=name;([\s\S]*?)document\.body\.appendChild\(a\); a\.click\(\);/g)];
+  assert.equal(anchors.length, 2, 'the two download anchors (chart image, CSV/backup) moved or multiplied');
+  for (const [, between] of anchors)
+    assert.match(between, /a\.addEventListener\('click', ev=>ev\.stopPropagation\(\)\);/,
+      'a download anchor whose click bubbles will close popovers and drop the pinned run');
+});
+
 test('the runs table behaves like its sibling: gated when hidden, polled while shown', () => {
   assert.match(extract('async function loadRuns'), /if\(tileIdle\('speed', force\)\) return false;/,
     'it rebuilt itself behind a hidden tile, which the outages table has always refused to do');
-  assert.match(script, /setInterval\(\(\)=>\{ if\(!document\.hidden\) runsFollowLive\(\); \}, 60000\);/,
+  assert.match(script, /setInterval\(\(\)=>\{ if\(!document\.hidden[^)]*\) runsFollowLive\(\); \}, 60000\);/,
     'following the newest run catches every insert and no delete - a run removed elsewhere sat there as a ghost');
   const del = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
   assert.match(del, /sel && !sel\.isCollapsed/,
@@ -8301,7 +9089,7 @@ test('every settings control carries a name a screen reader can announce', () =>
 const STOP = new Error('the header is not built here');
 const STATUS_TIMER = /^setInterval\(vis\(([\s\S]*?)\), 3000\);$/m;
 function statusDriver() {
-  const state = { fetches: 0, urls: [], pending: [], stale: [], burst: 0, painted: [] };
+  const state = { fetches: 0, urls: [], pending: [], stale: [], burst: 0, painted: [], drained: 0 };
   const src = extract('async function refreshStatus');
   const tail = src.slice(src.indexOf('catch(e)'));
   const burstAt = tail.indexOf('if(staleFails>=2)'), bookAt = tail.indexOf('staleFails=0; lastStatusAt=Date.now(); setStale(false);'), readAt = tail.search(/\bs\.\w/);
@@ -8319,6 +9107,7 @@ function statusDriver() {
     // statusSeq is declared here too.
     script.match(/^let staleFails=[^\n]*;/m)[0]
     + '\nlet speedSeq = 0, dataWindow = "", dataCustomMins = 0, uptimeCustomMins = 0;\n'
+    + extract('function isAuthRequired') + '\n'
     + src
     // The timer's callback names refreshStatus, so the binding is wrapped to
     // keep the promise of every poll started; tick() then hands back the poll
@@ -8334,7 +9123,14 @@ function statusDriver() {
     async url => {
       const tag = ++state.fetches; state.urls.push(url);
       const d = deferred(); state.pending.push(d);
-      if (await d.p === 'fail') throw new Error('timed out');
+      const how = await d.p;
+      if (how === 'fail') throw new Error('timed out');
+      // '401' is the daemon answering that it wants a session: a text/plain body,
+      // so reading it as JSON throws - which is the only way a 401 ever reached
+      // the failure counter. text() counts, because somebody has to read this body.
+      if (how === '401') return { status: 401,
+        json: async () => { throw new SyntaxError('Unexpected token a in JSON at position 0'); },
+        text: async () => { state.drained++; return 'authentication required'; } };
       return { json: async () => body(tag) };
     },
     () => ({ style: { display: 'none' } }),
@@ -8401,4 +9197,332 @@ test('a direct refresh goes out under the timer\'s poll, and its answer is the o
   const next = c.tick();
   assert.equal(c.state.fetches, 3, 'the timer polls again once both are back');
   c.state.pending.shift().go('ok'); await settle(next);
+});
+
+// --- signing in, session expiry, and getting back in ------------------------
+//
+// A 401 means the daemon answered and wants a session; the fetch wrapper raises
+// the sign-in overlay over the whole page. Everything below is about the page
+// not making that mean something else: the daemon is not unreachable, the charts
+// did not fail to load, the drawer's unsaved edits are not stale, and a login
+// the daemon has since been told to forget must not leave the page asking for it
+// forever.
+
+// The one string a Save refused by an expired session leaves behind, taken from
+// the page so the two halves - who writes it, who clears it - cannot drift.
+const AUTH_EXPIRED_MSG = (script.match(/const AUTH_EXPIRED_MSG='([^']*)'/) || [])[1];
+
+test('a Save the session outlived says the session expired, not "authentication required"', async () => {
+  assert.ok(AUTH_EXPIRED_MSG, 'the page no longer has a single expired-session message to clear');
+  const post = (status, text) => {
+    const els = { settingsMsg: { textContent: '' } };
+    const fn = new Function('$', 'fetch', 'flashStatus', 'AUTH_EXPIRED_MSG',
+      extract('async function postAccess') + '\nreturn postAccess;')(
+      id => els[id], async () => ({ ok: status === 200, status, text: async () => text, json: async () => ({}) }),
+      () => {}, AUTH_EXPIRED_MSG);
+    return fn({}).then(ok => ({ ok, msg: els.settingsMsg.textContent }));
+  };
+  assert.deepEqual(await post(401, 'authentication required'), { ok: false, msg: AUTH_EXPIRED_MSG },
+    'the daemon’s "authentication required" reads as a refusal of the settings, not of the session, ' +
+    'and nothing could then tell that message apart from a real one to clear it after the sign-in');
+  assert.deepEqual(await post(400, 'password too short'), { ok: false, msg: 'password too short' },
+    'a real refusal must still be quoted as the daemon put it');
+});
+
+// resumeAfterAuth is what the page does the moment the daemon will take it again.
+function driveResume({ dirty, msg }) {
+  const calls = [];
+  const classes = new Set(['err']);
+  const els = { settingsMsg: { textContent: msg },
+    saveSettings: { classList: { add: c => classes.add(c), remove: c => classes.delete(c) } } };
+  new Function('$', 'AUTH_EXPIRED_MSG', 'savedBody', 'formSnapshot', 'loadAccess', 'loadSettings', 'tick',
+    extract('function resumeAfterAuth') + '\nreturn resumeAfterAuth;')(
+    id => els[id], AUTH_EXPIRED_MSG, 'BASELINE', () => (dirty ? 'EDITED' : 'BASELINE'),
+    () => calls.push('loadAccess'), () => calls.push('loadSettings'), () => calls.push('tick'))();
+  return { calls, msg: els.settingsMsg.textContent, err: classes.has('err') };
+}
+
+test('signing back in does not throw away what was typed while the session lapsed', () => {
+  const dirty = driveResume({ dirty: true, msg: '' });
+  assert.deepEqual(dirty.calls, ['tick'],
+    'the re-login refetched the settings over an open drawer with unsaved edits - the session can ' +
+    'expire mid-edit, and openDrawer refuses this exact wipe while requestCloseDrawer asks first');
+  const clean = driveResume({ dirty: false, msg: '' });
+  assert.deepEqual(clean.calls, ['loadAccess', 'loadSettings', 'tick'],
+    'with nothing typed the page must still pull server truth - it may have been signed out for hours');
+});
+
+test('the Save an expired session refused can be clicked again as typed', () => {
+  const after = driveResume({ dirty: true, msg: AUTH_EXPIRED_MSG });
+  assert.equal(after.msg, '',
+    'a signed-in page went on showing the expired-session error over a Save that would now work');
+  assert.equal(after.err, false, 'and the Save button stayed red under it');
+  const other = driveResume({ dirty: true, msg: 'Probe timeout is outside the range it allows' });
+  assert.equal(other.msg, 'Probe timeout is outside the range it allows',
+    'only the expired-session message is the sign-in’s to clear');
+  assert.equal(other.err, true, 'and the button it reddened stays red');
+});
+
+test('a successful sign-in resumes through resumeAfterAuth, and a refused one says why', async () => {
+  const drive = status => {
+    let handler = null, calls = [];
+    const els = { loginForm: { addEventListener: (_e, fn) => { handler = fn; } },
+      loginErr: { textContent: '' }, loginUser: { value: ' bob ' }, loginPass: { value: 'pw' } };
+    new Function('$', '_fetch', 'hideLogin', 'resumeAfterAuth', 'loadAccess', 'loadSettings', 'tick',
+      extract("$('loginForm').addEventListener('submit'") + ');')(
+      id => els[id], async () => ({ ok: status === 200, status }),
+      () => calls.push('hideLogin'), () => calls.push('resumeAfterAuth'),
+      () => calls.push('loadAccess'), () => calls.push('loadSettings'), () => calls.push('tick'));
+    return handler({ preventDefault() {} }).then(() => ({ calls, err: els.loginErr.textContent, pass: els.loginPass.value }));
+  };
+  const ok = await drive(200);
+  assert.deepEqual(ok.calls, ['hideLogin', 'resumeAfterAuth'],
+    'the sign-in reloaded the settings form itself, which is the path that discarded unsaved edits');
+  assert.equal(ok.pass, '', 'the typed password must not stay in the box');
+  assert.equal((await drive(401)).err, 'Invalid username or password');
+  assert.equal((await drive(429)).err, 'Too many attempts - wait a moment and try again',
+    'the rate limiter refuses the RIGHT password too, so it must not be called invalid');
+});
+
+test('isAuthRequired: a 401 and nothing else', () => {
+  // Compiled here rather than through DEFS so its absence fails this test alone
+  // instead of taking the whole file down with it.
+  const isAuthRequired = new Function(extract('function isAuthRequired') + '\nreturn isAuthRequired;')();
+  assert.equal(isAuthRequired({ status: 401 }), true);
+  assert.equal(isAuthRequired({ status: 403 }), false); // local-only refusing the peer is not a login
+  assert.equal(isAuthRequired({ status: 503 }), false); // the reconcile pause has its own reader
+  assert.equal(isAuthRequired({ status: 200 }), false);
+  assert.equal(isAuthRequired(null), false);
+  assert.equal(isAuthRequired(undefined), false);
+});
+
+test('a 401 status poll is not a daemon that cannot be reached', async () => {
+  const c = statusDriver();
+  for (let i = 0; i < 4; i++) {
+    const p = c.tick();
+    c.state.pending.shift().go('401');
+    await settle(p);
+  }
+  assert.equal(c.fails(), 0,
+    'a 401 was counted as a failed poll: two of them put "Pingularity isn’t answering" up ' +
+    'behind the sign-in overlay, about a daemon that had just answered');
+  assert.deepEqual(c.state.stale, [], 'the stale bar must not be raised by a login');
+  // The counter still has to work: a link that really has gone is what it exists for.
+  const dead = c.tick(); c.state.pending.shift().go('fail'); await settle(dead);
+  const dead2 = c.tick(); c.state.pending.shift().go('fail'); await settle(dead2);
+  assert.deepEqual([c.fails(), c.state.stale], [2, [true]],
+    'swallowing the 401 must not swallow a genuine outage - the bar is the only sign a frozen ' +
+    'dashboard gives that it is frozen');
+});
+
+// The 401 arm returns without touching the body. Nothing else ever reads it, so
+// the response stream stays open until fget's own deadline aborts it: the browser
+// logs a canceled request and holds a connection for the whole eight seconds,
+// every time a session expires. The two chart pollers read their text before the
+// same check (they need it to tell a reconcile 503 apart) and so never showed it.
+test('a 401 status poll does not leave its response hanging open', async () => {
+  const c = statusDriver();
+  const poll = c.tick();
+  c.state.pending.shift().go('401');
+  assert.equal(await settle(poll), 'done', 'test set-up: the 401 arm returns without painting');
+  assert.equal(c.state.drained, 1,
+    'the 401 body was never read, so it stays open until the 8s deadline aborts it - one canceled ' +
+    'request per session expiry, and browser_smoke fails any page that produces one');
+});
+
+// The chart pollers say "Couldn't load the … chart" in a toast. Behind the
+// sign-in overlay that blamed the data for a login, once per poll. Both charts
+// take the same shape, so both are driven.
+function driveChartPoll(which, resp) {
+  const toasts = [];
+  const isLat = which === 'latency';
+  const name = isLat ? 'async function refreshChart' : 'async function refreshSpeedChart';
+  const src = 'let ' + (isLat ? 'latLoadedFor="", latLoadedLive=false, chartSeq=0, latBackoffMs=0, latPoints=[]'
+                              : 'speedLoadedFor="", speedLoadedLive=false, speedSeq=0, speedBackoffMs=0, speedPoints=[]') + ';\n'
+    + extract('function isReconcile503') + '\n' + extract('function retryAfterMs') + '\n'
+    + extract('function isAuthRequired') + '\n' + extract(name) + '\n'
+    + 'return ' + (isLat ? 'refreshChart' : 'refreshSpeedChart') + ';';
+  const names = ['fget', 'tileIdle', 'chartLoadFailed', 'drawChart', 'syncLatPanel',
+    'latWindowQuery', 'speedWindowQuery', 'drawSpeed', 'syncSpeedPanel', 'spdSampled',
+    'renderSpeedTiles', 'drawQuality', 'drawBloat', '$'];
+  const impls = [async () => resp, () => false, what => toasts.push(what), () => {}, () => {},
+    () => ({ q: 'mins=60', live: true }), () => ({ q: 'mins=60', live: true }), () => {}, () => {},
+    () => {}, () => {}, () => {}, () => {}, () => ({ style: {}, classList: { toggle() {} } })];
+  return new Function(...names, src)(...impls)(true).then(() => toasts);
+}
+const failResp = { ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' };
+const authResp = { ok: false, status: 401, headers: { get: () => null }, text: async () => 'authentication required' };
+
+test('a 401 chart poll raises no "couldn’t load" toast', async () => {
+  for (const which of ['latency', 'speed']) {
+    assert.deepEqual(await driveChartPoll(which, authResp), [],
+      'the ' + which + ' poll toasted a load failure over a 401 - the sign-in overlay is what ' +
+      'answers a missing session, and the toast blamed the data for it');
+    assert.equal((await driveChartPoll(which, failResp)).length, 1,
+      'a real failure on the ' + which + ' poll must still say so, or a chart frozen on old rows ' +
+      'reads as current');
+  }
+});
+
+// The schedulers: while the overlay is up there is nothing on the page that can
+// be read or acted on, and every request they make is answered 401 forever.
+test('the poll gate stands down while the sign-in overlay is up', () => {
+  const drive = (hidden, overlayHidden) => {
+    let ran = 0;
+    const vis = new Function('document', 'loginOverlay', extract('const vis =') + '\nreturn vis;')(
+      { hidden }, { hidden: overlayHidden });
+    vis(() => { ran++; })();
+    return ran;
+  };
+  assert.equal(drive(false, true), 1, 'a visible page with no overlay must poll');
+  assert.equal(drive(true, true), 0, 'a hidden tab must not poll');
+  assert.equal(drive(false, false), 0,
+    'the pollers kept firing behind the sign-in overlay - every one of those requests is a 401, ' +
+    'and the sign-in’s own tick() is what catches the page up');
+  assert.equal(drive(true, false), 0);
+});
+
+// The two catch-up hooks - the tab coming back to the front, the browser's own
+// network coming back - fire tick() outside the timers, so they need the same
+// gate or a page sitting at the sign-in screen answers each of them with a burst
+// of 401s.
+test('a tab or a network coming back does not poll into a sign-in overlay', () => {
+  const grab = re => {
+    const m = script.match(re);
+    assert.ok(m, 'the catch-up hook this test drives is gone: ' + re);
+    return m[0];
+  };
+  const drive = (src, hidden, overlayHidden) => {
+    let ticks = 0, cb = null;
+    const reg = { addEventListener: (_e, f) => { cb = f; }, hidden };
+    new Function('document', 'window', 'loginOverlay', 'tick', src)(reg, reg, { hidden: overlayHidden }, () => ticks++);
+    cb();
+    return ticks;
+  };
+  const backToTab = grab(/document\.addEventListener\('visibilitychange'[^\n]*/);
+  assert.equal(drive(backToTab, false, true), 1, 'coming back to a signed-in tab must catch it up');
+  assert.equal(drive(backToTab, false, false), 0,
+    'coming back to a tab held at the sign-in overlay refetched every panel, and every one of ' +
+    'those requests is answered 401');
+  const backOnline = grab(/window\.addEventListener\('online'[^\n]*/);
+  assert.equal(drive(backOnline, false, true), 1, 'a link that returns must catch the dashboard up');
+  assert.equal(drive(backOnline, false, false), 0,
+    'the same burst of 401s, fired by the browser saying the network is back');
+});
+
+// Mechanical, so a timer added later cannot quietly reintroduce the flood: every
+// place that asks whether it is worth polling has to ask about the overlay too.
+test('every visibility-gated timer asks about the sign-in overlay as well', () => {
+  const sites = script.split('\n').filter(l => /document\.hidden/.test(l));
+  assert.ok(sites.length >= 5, 'the visibility gates moved - this enumeration is reading nothing');
+  for (const l of sites) {
+    assert.match(l, /loginOverlay\.hidden/,
+      'this poll gate does not consult the sign-in overlay, so it keeps issuing requests that ' +
+      '401 while the overlay is up: ' + l.trim());
+  }
+});
+
+// The documented way out of being locked out is `pingularity reset-auth`, which
+// clears the password and turns the login off on the daemon - and the overlay's
+// own hint promises the page then lets you straight in. Nothing re-read the
+// access state once the overlay was up, so it never did.
+function driveAuthRecovery(access, { overlayHidden = false, docHidden = false, signInLands = false } = {}) {
+  const src = script.match(/setInterval\(async \(\)=>\{[\s\S]*?\n\}, \d+\);/);
+  assert.ok(src, 'the sign-in overlay no longer re-reads the access state, so a login removed on ' +
+    'the daemon leaves the page asking for a password that no longer exists');
+  const calls = [];
+  const overlay = { hidden: overlayHidden };
+  let cb = null;
+  new Function('setInterval', 'document', 'loginOverlay', 'fetch', 'hideLogin', 'resumeAfterAuth', src[0])(
+    f => { cb = f; }, { hidden: docHidden }, overlay,
+    // signInLands is the race: the operator types the password into the overlay and
+    // is let in WHILE this poll's fetch is still in the air, so by the time the
+    // answer arrives the page has already come back on its own.
+    async url => { calls.push('GET ' + url);
+      return { json: async () => { if (signInLands) { overlay.hidden = true; calls.push('signed in meanwhile'); } return access; } }; },
+    () => { overlay.hidden = true; calls.push('hideLogin'); },
+    () => calls.push('resumeAfterAuth'));
+  return cb().then(() => calls);
+}
+
+test('the sign-in overlay comes down when the daemon stops asking for a login', async () => {
+  assert.deepEqual(await driveAuthRecovery({ auth_active: true, authed: false }), ['GET api/access'],
+    'the overlay must stay up while a session is still required');
+  assert.deepEqual(await driveAuthRecovery({ auth_active: false, authed: true }),
+    ['GET api/access', 'hideLogin', 'resumeAfterAuth'],
+    'after `pingularity reset-auth` the daemon wants no login at all, and the page went on ' +
+    'refusing every sign-in against a password it no longer has - only a reload got in');
+  assert.deepEqual(await driveAuthRecovery({ auth_active: true, authed: true }),
+    ['GET api/access', 'hideLogin', 'resumeAfterAuth'],
+    'a session signed in in another tab is this tab’s session too - the cookie is shared');
+  assert.deepEqual(await driveAuthRecovery({ auth_active: false }, { overlayHidden: true }), [],
+    'with no overlay up there is nothing to recover from, and this must not poll');
+  assert.deepEqual(await driveAuthRecovery({ auth_active: false }, { docHidden: true }), [],
+    'nor while the tab is in the background');
+  // The overlay is read again AFTER the await, not just before it: a sign-in that
+  // lands mid-fetch has already taken the overlay down and resumed the page, and
+  // doing it a second time refetches the access state, the settings and the whole
+  // status tick on top of the burst that just ran.
+  assert.deepEqual(await driveAuthRecovery({ auth_active: true, authed: true }, { signInLands: true }),
+    ['GET api/access', 'signed in meanwhile'],
+    'the poll resumed a page that had already resumed itself while its fetch was in the air');
+});
+
+// The locked-out operator is the one person who cannot reach /api/settings, and
+// the container flag was only ever on that payload - so the overlay's recovery
+// advice named the host, which in a container is the wrong machine, and the
+// right wording appeared only after signing in, when it no longer helps.
+function driveLoadAccess(payload, { inContainer = false } = {}) {
+  const seen = [];
+  const els = {
+    pwInfo: { dataset: { tip: pagePwTip }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    loginResetInfo: { dataset: { tip: pageLoginTip }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+  };
+  const el = () => ({ checked: false, value: '', style: {}, dataset: {},
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false } });
+  const src = 'let iperfInContainer=' + (inContainer ? 'true' : 'false')
+    + ', accessSavedLocalOnly=false, accessLanUrls=[], accessPort="9000", accessHasPassword=false;\n'
+    + extract('function resetAuthText') + '\n' + extract('function updateResetAuthHint') + '\n'
+    + extract('async function loadAccess') + '\n'
+    + 'return () => loadAccess().then(() => iperfInContainer);';
+  const run = new Function('$', 'fetch', 'renderAccessUrls', 'updateAuthFields', 'updateNetNoAuthWarn',
+    'updateQsNoAuthWarn', 'showLogin', 'hideLogin', src)(
+    id => els[id] || (els[id] = el()), async () => ({ json: async () => payload }),
+    () => {}, () => {}, () => {}, () => {},
+    () => seen.push('showLogin'), () => seen.push('hideLogin'));
+  return run().then(flag => ({ flag, seen, login: els.loginResetInfo, pw: els.pwInfo }));
+}
+
+test('a locked-out page gets the recovery advice for the machine it is actually on', async () => {
+  const locked = { auth_active: true, authed: false, local_only: true, auth_enabled: true, has_password: true };
+  const inContainer = await driveLoadAccess({ ...locked, containerized: true });
+  assert.deepEqual(inContainer.seen, ['showLogin'], 'test set-up: this is the locked-out page');
+  assert.equal(inContainer.flag, true, 'the access payload’s container flag was not read');
+  assert.match(inContainer.login.dataset.tip, /one-off container sharing the volume/,
+    'the sign-in overlay still tells a container operator to run reset-auth on the host - the one ' +
+    'copy of the advice they can reach, and the wrong machine: it opens some other database, ' +
+    'reports success, and leaves them locked out');
+  assert.match(inContainer.login.attrs['aria-label'] || '', /one-off container sharing the volume/,
+    'and a screen reader is still being read the host-only wording');
+
+  const native = await driveLoadAccess({ ...locked, containerized: false });
+  assert.equal(native.login.dataset.tip, pageLoginTip, 'a native host must see the shipped wording untouched');
+  const older = await driveLoadAccess(locked);
+  assert.equal(older.flag, false, 'an older daemon sends no flag, and a guess must not send a native operator into a container');
+  assert.equal(older.login.dataset.tip, pageLoginTip);
+
+  // The strict check reads both ways, and this is the half that costs something:
+  // /api/settings sets the same flag (`s.containerized === true`), so by the time
+  // this endpoint answers the page may already KNOW it is in a container. A
+  // payload with no field at all is silence, not a denial - taking it as false
+  // would go back to telling a container operator to run reset-auth on the host.
+  const carried = await driveLoadAccess(locked, { inContainer: true });
+  assert.equal(carried.flag, true,
+    'an access payload that says nothing about containers overwrote what the settings payload ' +
+    'had already established');
+  assert.match(carried.login.dataset.tip, /one-off container sharing the volume/,
+    'and the advice went back to naming the host, the one machine where reset-auth does nothing');
+  // A payload that does say false is a denial, and must still be believed.
+  assert.equal((await driveLoadAccess({ ...locked, containerized: false }, { inContainer: true })).flag, false,
+    'an explicit false must still be able to correct the flag');
 });

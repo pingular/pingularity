@@ -1277,7 +1277,10 @@ and persist across restarts.
   only while automatic runs are on) of the daily/monthly data the *scheduled* tests
   will use, based on what your recent runs recorded - so it is a measured lower
   bound like the data-used figure itself - and it counts neither the extra
-  triggers nor this faster cadence.
+  triggers nor this faster cadence. It does follow a speedtest **schedule**:
+  with one set, only the runs its windows leave room for are counted (plus the
+  one each window opening catches up), so confining an hourly test to office
+  hours shows the handful of tests you will actually get rather than all 24.
 - **Ookla** → the Ookla server picker (kept servers, Find by place or ID, Auto
   to preview what a run would race - the list you were looking at comes back
   when you reopen the drawer or reload the page: a searched place fetched
