@@ -47,6 +47,11 @@ function extract(startStr) {
   return script.slice(i, k);
 }
 
+// btnBusy hands the keyboard back to the button it disabled, so it reads
+// document.activeElement. The harnesses below that are about something else say
+// "nothing is focused" with this, which is what keeps the restore out of their way.
+const FOCUSLESS_DOC = (() => { const body = { tag: 'BODY' }; return { body, activeElement: body }; })();
+
 // Build a sandbox: stub the one browser API toHex needs (a canvas 2d context
 // whose fillStyle echoes what's assigned - faithful for the hex/rgb inputs toHex
 // actually receives), plus a mutable TC object for hmShade.
@@ -64,6 +69,7 @@ const DEFS = {
   spdAverages: 'function spdAverages',
   speedtestBusy: 'function speedtestBusy',
   speedtestAbortable: 'function speedtestAbortable',
+  speedtestPicksServer: 'function speedtestPicksServer',
   autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
   serverOptionText: 'const serverOptionText',
   spdExportAvgSegments: 'function spdExportAvgSegments',
@@ -575,6 +581,110 @@ test('a 401 during Quick Setup shows an INTERACTIVE login, not a dead one', () =
   assert.equal(wrap.inert, true, 'the dashboard behind must stay inert');
 });
 
+// The overlay is the only thing on screen and its Tab cycle was written out by
+// hand as the three form controls - which stepped straight over the "Locked
+// out?" bubble sitting above the username field. That bubble is the only route
+// to recovery a locked-out operator can reach (the same advice on the Access tab
+// is behind this overlay), and it was the one thing in the dialog a keyboard
+// could not get to. The trap is driven here, not read.
+function driveLoginTrap(nodes, activeElement) {
+  let handler = null;
+  const overlay = { contains: el => nodes.includes(el),
+    querySelectorAll: () => nodes,
+    addEventListener: (_ev, fn) => { handler = fn; } };
+  new Function('loginOverlay', 'document',
+    extract("loginOverlay.addEventListener('keydown'") + ');')(overlay, { activeElement });
+  const landed = [];
+  nodes.forEach(n => { n.focus = () => landed.push(n.name); });
+  return { press: (key, shiftKey) => { let defaulted = false;
+    handler({ key, shiftKey, preventDefault: () => { defaulted = true; } });
+    return { landed: landed.pop(), defaulted }; } };
+}
+const trapNode = name => ({ name, tabIndex: 0, disabled: false, offsetParent: { tag: 'DIV' } });
+
+test('the login overlay cycles through the locked-out hint, not around it', () => {
+  const info = trapNode('loginResetInfo'), user = trapNode('loginUser'),
+    pass = trapNode('loginPass'), submit = trapNode('submit');
+  const nodes = [info, user, pass, submit];   // DOM order inside the overlay
+
+  assert.equal(driveLoginTrap(nodes, submit).press('Tab', false).landed, 'loginResetInfo',
+    'Tab off Sign in wrapped to the username box, so the reset-auth hint was skipped every time round');
+  assert.equal(driveLoginTrap(nodes, info).press('Tab', true).landed, 'submit',
+    'and Shift+Tab off the hint has to reach Sign in, or the cycle only works one way');
+  // In between, the trap keeps out of the way: the browser's own Tab order is
+  // right for every step that is not a wrap.
+  assert.equal(driveLoginTrap(nodes, user).press('Tab', false).defaulted, false,
+    'the trap must only intercept the ends of the cycle');
+  // A control that is not there - the overlay hides nothing today, but the
+  // filter is what keeps a hidden or disabled one out of the cycle.
+  const gone = trapNode('hidden'); gone.offsetParent = null;
+  const off = trapNode('disabled'); off.disabled = true;
+  assert.equal(driveLoginTrap([info, user, pass, submit, gone, off], submit).press('Tab', false).landed,
+    'loginResetInfo', 'an unfocusable control must not become the end of the cycle');
+  // Focus can be outside the overlay entirely - the 401 that raised it landed
+  // while the keyboard was somewhere on the page behind - and the first Tab has
+  // to pull it in rather than walk the inert page.
+  assert.equal(driveLoginTrap(nodes, { name: 'somewhere else' }).press('Tab', false).landed, 'loginResetInfo',
+    'a Tab pressed from outside the overlay has to come into it');
+  assert.equal(driveLoginTrap(nodes, { name: 'somewhere else' }).press('Tab', true).landed, 'submit',
+    'and so does a Shift+Tab');
+  // Nothing focusable at all is not a crash: the handler runs on every Tab, and
+  // a throw here would take the keystroke - and the trap - down with it.
+  assert.doesNotThrow(() => driveLoginTrap([], { name: 'nowhere' }).press('Tab', false),
+    'an overlay with nothing to focus must let the Tab through, not throw on every press');
+  // Reached only because it is IN the overlay and carries a tabindex - the
+  // markup is half the fix.
+  const box = html.slice(html.indexOf('<div class="login-overlay"'));
+  const iInfo = box.indexOf('id="loginResetInfo"'), iUser = box.indexOf('id="loginUser"');
+  assert.ok(iInfo >= 0 && iUser >= 0, 'test set-up: both controls are inside the overlay');
+  assert.ok(iInfo < iUser, 'the hint comes before the username field, which is why the cycle has to wrap onto it');
+  assert.match(box.slice(iInfo - 60, iInfo), /tabindex="0"/, 'and it is only reachable at all because it is tabbable');
+});
+
+// Hiding the overlay blurs the form inside it and the keyboard lands on <body>.
+// A 401 arrives wherever the session happens to expire - a field in the open
+// drawer included - so signing back in dumped the reader at the top of the
+// document, out of the drawer they were editing.
+function driveLoginFocus(previously, found) {
+  const pageBody = { tag: 'BODY', children: [] };
+  const doc = { body: pageBody, activeElement: previously || pageBody,
+    querySelector: sel => found[sel] || null };
+  const overlay = { hidden: true, inert: false };
+  const api = new Function('document', 'loginOverlay', 'focusMark', '$', 'setTimeout',
+    'let _loginInerted=[];\n'
+    + extract('function showLogin') + '\n' + extract('function hideLogin') + '\n'
+    + 'return { showLogin, hideLogin };')(
+      doc, overlay,
+      // the page's own locator, so what is stashed is what refocus would look up
+      new Function('document', 'window', extract('function focusMark') + '\nreturn focusMark;')(doc, {}),
+      () => ({ focus() {} }), () => {});
+  return { doc, overlay, ...api };
+}
+
+test('signing in puts the keyboard back where the overlay found it', () => {
+  const field = { tagName: 'INPUT', id: 'setWebhook', focus() { seen.doc.activeElement = field; } };
+  const seen = driveLoginFocus(field, { '#setWebhook': field });
+  seen.showLogin();
+  seen.doc.activeElement = seen.doc.body;   // the form inside the overlay held it, and the overlay is going away
+  seen.hideLogin();
+  assert.equal(seen.doc.activeElement, field,
+    'the session expired over an open drawer and signing back in threw the reader to the top of the page');
+
+  // A page that came up asking for a password has nothing to go back to, and the
+  // fresh-page tab order is the right one - it must not invent a destination.
+  const cold = driveLoginFocus(null, {});
+  cold.showLogin();
+  cold.hideLogin();
+  assert.equal(cold.doc.activeElement, cold.doc.body, 'nothing had focus, so nothing is restored');
+
+  // The control can be gone by the time the sign-in lands (the reload behind the
+  // overlay redraws the form); missing it must not throw on the way out.
+  const stale = driveLoginFocus({ tagName: 'INPUT', id: 'setWebhook' }, {});
+  stale.showLogin();
+  stale.hideLogin();
+  assert.equal(stale.overlay.hidden, true, 'a mark that no longer resolves still leaves the overlay down');
+});
+
 test('log and CSV downloads surface an oversized result instead of failing silently (#5)', () => {
   assert.match(script, /function flashStatus\(/, 'a status-toast helper exists');
   assert.match(script, /function flashStatus\(msg\)\{[\s\S]{0,140}undoToast/, 'flashStatus writes the role=status toast');
@@ -1014,9 +1124,16 @@ function heatmapTip() {
     addEventListener(t, fn) { (this.on[t] = this.on[t] || []).push(fn); },
     getBoundingClientRect: () => ({ width: 160, height: 22, left: 0, top: 0, right: 160, bottom: 22 }) });
   const hm = mk(), tip = mk();
-  new Function('$', 'window', src)(id => (id === 'heatmap' ? hm : tip), { innerWidth: 1200 });
+  // The block also listens for page SCROLL, to keep a focus-raised tip on the cell
+  // that raised it, so the window it listens on and the document it reads focus
+  // from are stubbed here too.
+  const win = { innerWidth: 1200, on: {}, addEventListener(t, fn) { (this.on[t] = this.on[t] || []).push(fn); } };
+  const doc = { activeElement: null };
+  new Function('$', 'window', 'document', 'addEventListener', src)(
+    id => (id === 'heatmap' ? hm : tip), win, doc, win.addEventListener.bind(win));
   const fire = (type, ev) => (hm.on[type] || []).forEach(fn => fn(ev));
-  return { hm, tip, fire };
+  const scroll = () => (win.on.scroll || []).forEach(fn => fn());
+  return { hm, tip, fire, doc, scroll };
 }
 // A cell as the delegate sees it: dataset.tip plus a rect, reachable via closest.
 const hmCell = (tipText, rect) => {
@@ -1101,9 +1218,9 @@ test('Escape dismisses a focused heatmap tooltip, and only that one', () => {
   const cell = { closest: s => (s === '#heatmap' ? cell : null) };
   const doc = { activeElement: cell, addEventListener(_t, fn) { this.fn = fn; } };
   new Function('document', '$', 'loginOverlay', 'qsDecline', 'hideDataPop', 'hideUptimePop',
-    '_drawer', 'requestCloseDrawer', src + ');')(
+    '_drawer', 'requestCloseDrawer', 'dataPopOpening', 'winPickers', src + ');')(
     doc, id => els[id], { hidden: true }, () => {}, () => {}, () => {},
-    { classList: { contains: () => true } }, () => { closed++; });
+    { classList: { contains: () => true } }, () => { closed++; }, false, []);
 
   doc.fn({ key: 'Escape' });
   assert.equal(els.hmTip.hidden, true, 'Escape left the tooltip sitting over the grid');
@@ -2182,7 +2299,9 @@ test('a panel with no run left to describe blanks its cards and its caption', ()
   for (const id of cards) els[id] = { textContent: '293 Mbps', title: 'Probed on the download path' };
   els.speedWhen = { textContent: 'Running speedtest on Mock Server, Nowhere…',
     classList: { removed: [], remove(c) { this.removed.push(c); } } };
-  const clear = new Function('$', extract('function clearSpeedPanel') + '\nreturn clearSpeedPanel;')(id => els[id]);
+  // The caption goes through setSpeedWhen (which compares before it writes, so a
+  // live region is not re-announced every poll), so it comes along for the ride.
+  const clear = new Function('$', extract('function setSpeedWhen') + '\n' + extract('function clearSpeedPanel') + '\nreturn clearSpeedPanel;')(id => els[id]);
   clear();
   for (const id of cards) assert.equal(els[id].textContent, '-', `${id} kept a deleted run's number`);
   assert.equal(els.sp_jitter.title, '', 'a tooltip describing how a vanished run was measured');
@@ -2761,15 +2880,63 @@ function driveImport({ ok = true, resp = {}, fetchFails = false } = {}) {
   const noop = async () => {};
   const register = new Function('$', 'getCats', 'fetch', 'confirm', 'loadSettings',
     'loadAccess', 'formSnapshot', 'refreshStatus', 'refreshChart', 'refreshSpeedChart',
-    'refreshHeatmap', 'loadOutages',
+    'refreshHeatmap', 'loadOutages', 'document',
     'let savedBody = null;\n' + extract('function btnBusy(') + '\n' +
     extract("$('importBtn').addEventListener('click'") + ');');
   register(id => els[id], () => ['pings'], fetchStub, () => true, noop, noop,
-    () => '', () => {}, () => {}, () => {}, () => {}, noop);
+    () => '', () => {}, () => {}, () => {}, () => {}, noop, FOCUSLESS_DOC);
   sent.busyMidUpload = null;
   const origFetch = fetchStub;
   return handler().then(() => ({ file, btn, msg, sent, classes }));
 }
+
+// A button the page disables is BLURRED by the browser, and focus falls to
+// <body>: Enter on Auto, Find, Export or Import threw the reader to the top of
+// the document for however long the work took and left them there. btnBusy is
+// the one place all four go through, so it is the one place the keyboard is
+// handed back. The stub button below blurs itself the way a real one does, or
+// there would be nothing here to put right.
+function driveBtnBusy() {
+  const body = { tag: 'BODY' };
+  const doc = { body, activeElement: body };
+  const btn = { _disabled: false, _attrs: {},
+    classList: { toggle() {} },
+    setAttribute(k, v) { this._attrs[k] = v; }, removeAttribute(k) { delete this._attrs[k]; },
+    get disabled() { return this._disabled; },
+    // What the browser does, and the whole reason for the fix: disabling the
+    // focused control blurs it and the keyboard ends up on <body>.
+    set disabled(v) { this._disabled = v; if (v && doc.activeElement === this) doc.activeElement = doc.body; },
+    focus() { doc.activeElement = this; } };
+  const btnBusy = new Function('document', extract('function btnBusy(') + '\nreturn btnBusy;')(doc);
+  return { doc, btn, btnBusy };
+}
+
+test('a busy button gives the keyboard back when it comes alive again', () => {
+  const A = driveBtnBusy();
+  A.doc.activeElement = A.btn;                 // Enter was pressed on it
+  A.btnBusy(A.btn, true);
+  assert.equal(A.doc.activeElement, A.doc.body, 'test set-up: disabling really does blur it');
+  A.btnBusy(A.btn, false);
+  assert.equal(A.doc.activeElement, A.btn,
+    'an Auto race takes ten seconds and more, and the reader spent all of it - and the rest of ' +
+    'the session - tabbing back from the top of the document to the list they asked for');
+
+  // Started with the mouse, or by the page itself (the remembered Auto on a
+  // reopen): the button never held the keyboard, so it must not take it now.
+  const B = driveBtnBusy();
+  B.btnBusy(B.btn, true); B.btnBusy(B.btn, false);
+  assert.equal(B.doc.activeElement, B.doc.body, 'a button nobody was on must not grab the keyboard when it finishes');
+
+  // And a reader who moved on themselves while the work ran is left alone -
+  // pulling them back is the same rudeness in the other direction.
+  const C = driveBtnBusy();
+  const elsewhere = { tag: 'INPUT' };
+  C.doc.activeElement = C.btn;
+  C.btnBusy(C.btn, true);
+  C.doc.activeElement = elsewhere;
+  C.btnBusy(C.btn, false);
+  assert.equal(C.doc.activeElement, elsewhere, 'the keyboard was somewhere else by then and must stay there');
+});
 
 test('import hands the file to fetch instead of reading it into memory', async () => {
   const { file, sent } = await driveImport();
@@ -5358,7 +5525,7 @@ function driveServers() {
     () => {}, () => {}, () => {}, m => log.errs.push(m), () => true,
     // The real btnBusy, lifted from the page: the button-release assertions below
     // are about what it does, so a hand-written stand-in would prove nothing.
-    new Function(extract('function btnBusy') + '\nreturn btnBusy;')(), () => { log.drew++; },
+    new Function('document', extract('function btnBusy') + '\nreturn btnBusy;')(FOCUSLESS_DOC), () => { log.drew++; },
     (fn, ms) => { timers.push(ms); return setTimeout(fn, 0); });
   return { api, els, fetches, log, timers };
 }
@@ -6245,6 +6412,147 @@ test('the checked Quick Setup segment has a focus ring you can actually see', ()
   assert.ok(checkedRing, 'the CHECKED segment needs its own focus-ring colour, or the ring is accent-on-accent');
   assert.match(checkedRing[1], /outline-color:var\(--on-accent\)/,
     'the checked segment\'s ring must use the token chosen to contrast with the accent fill');
+});
+
+// The <html> element carries data-theme="retro" in the markup, so a theme block
+// wins from the very first style resolution - and nearly every one of them points
+// --logo-ping (and on Cyber and Slate --logo-ul too) at --theme-accent, which no
+// rule in this stylesheet declares: setTheme writes it, and the script is the last
+// thing in the body. Until it runs there is nothing to substitute, `fill` is
+// invalid at computed-value time and the half paints BLACK - measured on a
+// throttled first paint. The radar icon beside it has carried fallbacks for
+// exactly this reason all along; the wordmark had none.
+test('the wordmark falls back to its own SVG colours before setTheme runs', () => {
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  assert.doesNotMatch(css, /--theme-accent2?\s*:/,
+    'if the stylesheet ever declares --theme-accent itself, this whole hazard is gone and so is the need for the fallbacks');
+  const routed = [...css.matchAll(/--logo-(?:ping|ul):var\(--theme-accent2?\)/g)];
+  assert.ok(routed.length >= 5, 'the themes still route the wordmark through the JS-only accent');
+
+  const ping = /\.logo path\[fill="#8B5CF6"\]\{([^}]*)\}/.exec(css);
+  const ul = /\.logo path\[fill="#6B8EF5"\]\{([^}]*)\}/.exec(css);
+  assert.ok(ping && ul, 'the wordmark halves are still painted from the tokens');
+  assert.match(ping[1], /fill:var\(--logo-ping,#8B5CF6\)/,
+    '"Ping" needs the baked-in SVG colour as its fallback or it paints black on the first frame');
+  assert.match(ul[1], /fill:var\(--logo-ul,#6B8EF5\)/,
+    '"ularity" needs one too - Cyber and Slate route it through --theme-accent as well');
+});
+
+// .tabbar scrolls sideways when the tabs outrun it, which makes it clip
+// vertically as well, and a .tab fills its full height. The shared ring is drawn
+// 2px OUTSIDE the box, so its top and bottom edges are cut away and a focused tab
+// shows two bare vertical bars. The negative offset is the same trick .qs-seg b,
+// .fp-btn and .ipl-add already use.
+test('a focused settings tab draws its ring inside the clipping tab bar', () => {
+  const shared = /\n {2}:focus-visible\{([^}]*)\}/.exec(html);
+  assert.ok(shared, 'the shared focus ring is still there');
+  assert.match(shared[1], /outline-offset:2px/, 'the shared ring is drawn outside the box - which is the half that gets clipped');
+  const bar = /\n {2}\.tabbar\{([^}]*)\}/.exec(html);
+  assert.match(bar[1], /overflow-y:hidden/, 'the tab bar still clips vertically');
+  assert.doesNotMatch(bar[1], /padding[^;]*:[^;]*\d/, 'the bar still has no vertical padding to hold an outset ring');
+  const ring = /\n {2}\.tab:focus-visible\{([^}]*)\}/.exec(html);
+  assert.ok(ring, 'a focused tab needs its own offset or the bar cuts the ring down to two bars');
+  assert.match(ring[1], /outline-offset:-2px/, 'the ring has to be drawn inside the tab');
+});
+
+// Same clipping, one panel down: .targets is overflow-x:auto (which computes
+// overflow-y to auto too) and .targets .pill is exactly as tall as the strip. The
+// outset ring lost its top and bottom edges on every pill, and its left edge as
+// well on the first one at scrollLeft 0 - a single amber bar as the only sign of
+// where the keyboard was.
+test('a focused anchor pill draws its ring inside the scrolling strip', () => {
+  const strip = /\n {2}\.targets\{([^}]*)\}/.exec(html);
+  assert.match(strip[1], /overflow-x:auto/, 'the anchor strip still scrolls, so it still clips');
+  assert.match(strip[1], /padding-bottom:0/, 'the strip still has no vertical padding to hold an outset ring');
+  const pill = /\n {2}\.targets \.pill\{([^}]*)\}/.exec(html);
+  assert.match(pill[1], /height:24px/, 'the pills still fill the strip exactly');
+  const ring = /\n {2}\.targets \.pill:focus-visible\{([^}]*)\}/.exec(html);
+  assert.ok(ring, 'the pills need their own offset or the strip clips the ring away');
+  assert.match(ring[1], /outline-offset:-2px/, 'the ring has to be drawn inside the pill');
+});
+
+// The (i) icons wear a --line2 ring, which reads on the dark grounds but all but
+// vanishes on a pale one, so the light themes swap it for the darker --muted.
+// Parchment is a light theme too and was left out of that selector, leaving its
+// ring at 1.93:1 on the cream panel - there, but you have to hunt for it. Themes
+// are matched by their own color-scheme here rather than by name, so a light
+// theme added later cannot quietly miss the swap the same way.
+test('every light theme gets the darker (i) help-icon ring', () => {
+  const readVars = block => Object.fromEntries(
+    [...block.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-fA-F]{3,6})/g)].map(m => [m[1], m[2]]));
+  const base = readVars(html.match(/:root\{([\s\S]*?)\n {2}\}/)[1]);
+  const themes = {};
+  for (const m of html.matchAll(/html\[data-theme="([a-z]+)"\]\{([^}]*)\}/g)) {
+    const t = themes[m[1]] || (themes[m[1]] = { vars: {}, light: false });
+    Object.assign(t.vars, readVars(m[2]));
+    if (/color-scheme:\s*light/.test(m[2])) t.light = true;
+  }
+  const lightThemes = Object.keys(themes).filter(n => themes[n].light).sort();
+  assert.deepEqual(lightThemes, ['light', 'parchment'], 'the set of light themes changed - the (i) ring rule has to keep up');
+
+  const rule = /:is\(([^)]*)\) \.info\{([^}]*)\}/.exec(html);
+  assert.ok(rule, 'the light-theme (i) ring rule is still there');
+  assert.match(rule[2], /border-color:var\(--muted\)/, 'the light ring is the darker --muted, not --line2');
+  // That resting rule out-specifies the plain .info:hover/:focus, so the accent
+  // ring is re-asserted for the same themes - miss one and its (i) stops
+  // reacting to the pointer and to the keyboard alike.
+  const lit = /\n {2}([^{}]*\.info:focus)\{border-color:var\(--accent\);\}/.exec(html);
+  assert.ok(lit, 'the light themes still re-assert the accent ring on hover and focus');
+  // The pointer and the keyboard are two selectors sharing one declaration, so
+  // read them apart: a theme named in the :focus half says nothing about the
+  // :hover half, and either one on its own is enough to make the whole list look
+  // covered. The alternation steps over the commas INSIDE :is(), so the split
+  // falls only on the commas that divide one selector from the next.
+  const half = {};
+  for (const state of ['hover', 'focus']) {
+    const m = new RegExp(`(?:^|,)((?:[^,(]|\\([^()]*\\))*)\\.info:${state}`).exec(lit[1]);
+    assert.ok(m, `the light themes still re-assert the accent ring on :${state}`);
+    half[state] = m[1];
+  }
+  for (const name of lightThemes) {
+    const v = { ...base, ...themes[name].vars };
+    assert.ok(rule[1].includes(`html[data-theme="${name}"]`),
+      `${name} is a light theme and needs the darker (i) ring`);
+    for (const state of ['hover', 'focus'])
+      assert.ok(half[state].includes(`html[data-theme="${name}"]`),
+        `${name}'s resting ring outranks .info:${state}, so that selector has to name ${name} too`);
+    assert.ok(contrast(v.line2, v.panel) < 3,
+      `${name}'s default ring is already ${contrast(v.line2, v.panel).toFixed(2)}:1 - this rule would have nothing to fix`);
+    assert.ok(contrast(v.muted, v.panel) >= 3,
+      `${name}'s (i) ring is only ${contrast(v.muted, v.panel).toFixed(2)}:1 against its panel`);
+  }
+});
+
+// The selected row in the uptime/data popovers was tinted with 16% of the accent
+// under text in --fg. That reads in eight themes and not in Solarized, whose --fg
+// is under 4.5:1 against the popover ground for EVERY row before the tint lifts
+// that ground further (3.4:1 on it) - and no text token gets a tinted row to
+// 4.5:1 in every theme. Solid accent under --on-accent does: it is the pairing
+// every "on" chip already uses, and the one each theme keeps readable on purpose.
+test('the selected row in the status popovers reads in every theme', () => {
+  const readVars = block => Object.fromEntries(
+    [...block.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-fA-F]{3,6})/g)].map(m => [m[1], m[2]]));
+  const base = readVars(html.match(/:root\{([\s\S]*?)\n {2}\}/)[1]);
+  const themes = { default: base };
+  for (const m of html.matchAll(/html\[data-theme="([a-z]+)"\]\{([^}]*)\}/g))
+    themes[m[1]] = { ...base, ...(themes[m[1]] || {}), ...readVars(m[2]) };
+  assert.ok(Object.keys(themes).length >= 9, 'test set-up: every theme block found');
+
+  const ground = /\.data-pop \.row\.sel\{([^}]*)\}/.exec(html);
+  const text = /\.data-pop \.row\.sel \.k,\.data-pop \.row\.sel \.v\{([^}]*)\}/.exec(html);
+  assert.ok(ground && text, 'the selected row still declares a ground and a text colour');
+  assert.match(ground[1], /^background:var\(--accent\);$/,
+    'the selected row went back to a tint over the popover panel, which no text token reads on in Solarized');
+  assert.match(text[1], /color:var\(--on-accent\)/,
+    'text on a solid accent has to be the colour each theme picked to go on its accent');
+  assert.match(text[1], /font-weight:600/, 'the selected row carries the weight the total row uses');
+
+  const failures = [];
+  for (const [name, v] of Object.entries(themes)) {
+    const got = contrast(v['on-accent'], v.accent);
+    if (got < 4.5) failures.push(`${name}: --on-accent on --accent at ${got.toFixed(2)}:1, under AA for 12.5px text`);
+  }
+  assert.deepEqual(failures, [], `the popovers' selected row:\n  ${failures.join('\n  ')}`);
 });
 
 // --- the marked fetch, and the three downloads that exist because of it ---
@@ -7550,11 +7858,46 @@ function driveHeartbeatTest({ url = 'https://hc-ping.com/uuid', ok = true, body 
     if (fetchFails) throw new Error('network went away');
     return { ok, status: ok ? 200 : 502, text: async () => body };
   };
-  const register = new Function('$', 'fetch', 'setTimeout',
+  const register = new Function('$', 'fetch', 'setTimeout', 'document',
     extract("$('testHeartbeat').addEventListener('click'") + ');');
-  register(id => els[id], fetchStub, (fn, ms) => { timers.push({ fn, ms }); });
+  register(id => els[id], fetchStub, (fn, ms) => { timers.push({ fn, ms }); }, FOCUSLESS_DOC);
   return handler().then(() => ({ btn, msg, calls, timers }));
 }
+
+// Neither Test button goes through btnBusy - each swaps its own label for a
+// spinner - so each has to hand the keyboard back itself, and the two are driven
+// here rather than trusted to stay in step. The stub button blurs itself when it
+// is disabled, the way a real one does.
+function driveNotifyTest(which, { focused = false, url = 'https://example.test/hook' } = {}) {
+  let handler = null;
+  const pageBody = { tag: 'BODY' };
+  const doc = { body: pageBody, activeElement: pageBody };
+  const btn = { _disabled: false, innerHTML: 'Test', addEventListener: (_ev, fn) => { handler = fn; },
+    get disabled() { return this._disabled; },
+    set disabled(v) { this._disabled = v; if (v && doc.activeElement === this) doc.activeElement = doc.body; },
+    focus() { doc.activeElement = this; } };
+  const msg = { textContent: '' };
+  const els = { [which]: btn, settingsMsg: msg,
+    setHeartbeat: { value: url }, setWebhook: { value: url }, setWebhookFormat: { value: 'json' } };
+  const fetchStub = async () => ({ ok: true, status: 200, text: async () => '' });
+  const register = new Function('$', 'fetch', 'setTimeout', 'document',
+    extract("$('" + which + "').addEventListener('click'") + ');');
+  register(id => els[id], fetchStub, () => {}, doc);
+  if (focused) doc.activeElement = btn;
+  return handler().then(() => ({ btn, msg, doc }));
+}
+
+test('the Test buttons give the keyboard back once the test has been sent', async () => {
+  for (const which of ['testHeartbeat', 'testWebhook']) {
+    const pressed = await driveNotifyTest(which, { focused: true });
+    assert.equal(pressed.doc.activeElement, pressed.btn,
+      which + ': pressing Test with the keyboard threw focus to <body>, so the answer the button ' +
+      'just wrote was a whole drawer away from where the keyboard had been left');
+    const clicked = await driveNotifyTest(which);
+    assert.equal(clicked.doc.activeElement, clicked.doc.body,
+      which + ': a button nobody was on must not take the keyboard when it finishes');
+  }
+});
 
 test('the heartbeat Test button refuses an empty field instead of checking in with nothing', async () => {
   const { calls, msg, btn } = await driveHeartbeatTest({ url: '   ' });
@@ -8012,6 +8355,55 @@ test('an emptied retention box is refused rather than saved as keep-forever', ()
   assert.match(said[1][1], /outside the range it allows \(lowest 0\)/, 'a real range failure still reads as one');
   assert.equal(press(field({ valueMissing: false }, true)), 'saved', 'a box the browser accepts stops nothing');
   assert.equal(said.length, 0);
+});
+
+// Every other refusal in this Save takes the reader to what it is complaining
+// about - the blank-time gate right above it opens the Schedule tab and focuses
+// the empty box, the iperf3 gates open theirs, the number gate opens whichever
+// tab holds the bad box. This one only wrote the footer line, so "pick a day"
+// arrived in front of the Alerts pane, naming buttons that were not on screen.
+// The gate is pressed here, not read.
+function driveDayGate() {
+  const said = [];
+  const day = { name: 'day', focus() { said.push(['focused', this.name]); } };
+  const conts = { schedLatWindows: { day: { ...day, name: 'lat day' } },
+    schedSpeedWindows: { day: { ...day, name: 'speed day' } } };
+  const els = { setSchedLatEnabled: { checked: true }, setSchedSpeedEnabled: { checked: true },
+    schedLatWindows: { querySelector: sel => sel === '.days .day' ? conts.schedLatWindows.day : null },
+    schedSpeedWindows: { querySelector: sel => sel === '.days .day' ? conts.schedSpeedWindows.day : null } };
+  const gate = new Function('$', 'SCHED_FEATS', 'body', 'activateTab', 'saveFailed',
+    extract("for(const f of ['lat','speed']){ if($(SCHED_FEATS[f].en).checked && body['sched_'+f+'_windows']")
+    + '\nreturn "saved";');
+  return { said, press: (lat, speed) => { said.length = 0;
+    return gate(id => els[id], SCHED_FEATS_FOR_TESTS,
+      { sched_lat_windows: lat, sched_speed_windows: speed },
+      t => said.push(['tab', t]), m => said.push(['said', m])); } };
+}
+// The real descriptor, lifted rather than retyped: it names the checkbox and the
+// row container the gate looks up, and a copy here could drift from the page.
+const SCHED_FEATS_FOR_TESTS = new Function(extract('const SCHED_FEATS') + '\nreturn SCHED_FEATS;')();
+
+test('a schedule with no active days sends the reader to the rows it is refusing', () => {
+  const G = driveDayGate();
+  const dead = [{ days: '0000000' }], alive = [{ days: '0111110' }];
+
+  assert.equal(G.press(dead, alive), undefined, 'a schedule that can never run still stops the save');
+  assert.deepEqual(G.said[0], ['tab', 'schedule'],
+    'the refusal named day buttons on a tab the reader was not looking at, and left them there');
+  assert.deepEqual(G.said[1], ['focused', 'lat day'],
+    'and the keyboard has to land on the thing the sentence asks to be pressed');
+  assert.match(G.said[2][1], /latency schedule has no active days/);
+
+  // The speedtest schedule is the same gate one iteration later, and it has its
+  // own rows: focusing the latency ones would point at the wrong schedule.
+  assert.equal(G.press(alive, dead), undefined);
+  assert.deepEqual(G.said[1], ['focused', 'speed day'], 'the speedtest refusal must point at the speedtest rows');
+  assert.match(G.said[2][1], /speedtest schedule has no active days/);
+
+  // And a schedule that does run is not touched: no tab switch, no message, and
+  // the Save carries on to everything after it.
+  assert.equal(G.press(alive, alive), 'saved');
+  assert.deepEqual(G.said, []);
 });
 
 // setDep only GREYS a control whose parent toggle is off - its own comment says
@@ -9016,11 +9408,11 @@ test('every settings control carries a name a screen reader can announce', () =>
   // A control is named if a <label> wraps it, or aria-label/aria-labelledby
   // says so - or, weakly, if a placeholder stands in: the browser falls back
   // to it, so those fields do announce something, even though the text
-  // vanishes the moment you type. That weaker bar is deliberate; raising it is
-  // a separate pass over the login, Quick Setup and webhook fields. This
-  // cannot catch a name that computes to something USELESS (the settings rows
-  // fold their whole help paragraph into the name, measured in a browser and
-  // not fixed here) - only one that computes to nothing.
+  // vanishes the moment you type. That weaker bar is what this test enforces;
+  // WHAT the name says is checked by the two tests below - the credential and
+  // URL boxes now carry their own aria-label rather than leaning on an example
+  // value, and the drawer rows are named from their caption instead of folding
+  // the whole help paragraph in.
   const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
   const open = html.indexOf('<div class="drawer"'), close = html.indexOf('<div class="wrap">');
   assert.ok(open > 0 && close > open,
@@ -9064,6 +9456,438 @@ test('every settings control carries a name a screen reader can announce', () =>
     }
   }
   assert.deepEqual(unnamed, [], `controls with no accessible name: ${unnamed.join(', ')}`);
+});
+// --- what those names actually SAY ------------------------------------------
+//
+// A settings row is one <label> around the caption, the (i) help icon and the
+// control, and the icon carries its whole tooltip as an accessible name - so the
+// name a browser computed for the control was the caption, then several
+// sentences of help, then the pill's "Off On" pseudo-text. Measured in Chrome
+// before this: "Latency probing" announced as 448 characters, "Check every" as
+// "Check every How often to run a probe round. sec". Rows whose caption sits
+// beside the control point at it with aria-labelledby and folded the same
+// paragraph in that way. nameControlsFromCaptions runs once at startup and gives
+// each control the short name its row shows; the help keeps its own place on the
+// bubble, which is focusable and announces it on its own.
+//
+// This drives the real function against a DOM small enough to build here and
+// real enough to exercise what matters: the selectors that find the rows, the
+// clone-and-strip that drops the bubble out of the caption, and the attributes
+// it writes.
+function tinyDom(rows) {
+  const mk = spec => {
+    const node = {
+      tag: spec.tag || 'span', classes: (spec.cls || '').split(/\s+/).filter(Boolean),
+      own: spec.text || '', kids: (spec.kids || []).map(mk), attrs: Object.assign({}, spec.attrs),
+      get textContent() { return this.own + this.kids.map(k => k.textContent).join(''); },
+      hasAttribute(n) { return n in this.attrs; },
+      getAttribute(n) { return n in this.attrs ? this.attrs[n] : null; },
+      setAttribute(n, v) { this.attrs[n] = String(v); },
+      removeAttribute(n) { delete this.attrs[n]; },
+      remove() { const p = this.parent; if (p) p.kids.splice(p.kids.indexOf(this), 1); },
+      cloneNode() { const c = mk(spec); wire(c, null); return c; },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+      querySelectorAll(sel) { const out = []; for (const k of this.kids) { if (hit(k, sel)) out.push(k); out.push(...k.querySelectorAll(sel)); } return out; },
+    };
+    return node;
+  };
+  // Only the shapes the function uses: "tag", ".class", "tag.class", "tag[attr]",
+  // and comma lists of those.
+  const hit = (n, sel) => sel.split(',').map(s => s.trim()).some(one => {
+    const m = /^([a-z]*)((?:\.[\w-]+)*)(?:\[([\w-]+)\])?$/.exec(one);
+    if (!m) throw new Error('selector not supported by this stub: ' + one);
+    if (m[1] && n.tag !== m[1]) return false;
+    for (const c of m[2].split('.').filter(Boolean)) if (!n.classes.includes(c)) return false;
+    return !m[3] || m[3] in n.attrs;
+  });
+  const wire = (n, parent) => { n.parent = n.parentElement = parent; n.kids.forEach(k => wire(k, n)); return n; };
+  const roots = rows.map(r => wire(mk(r), null));
+  const walk = n => [n, ...n.kids.flatMap(walk)];
+  const all = roots.flatMap(walk);
+  return {
+    roots,
+    document: {
+      querySelectorAll: sel => all.filter(n => hit(n, sel)),
+      getElementById: id => all.find(n => n.attrs.id === id) || null,
+    },
+    byId: id => all.find(n => n.attrs.id === id),
+  };
+}
+
+test('settings rows are named by their caption, not by the whole help bubble', () => {
+  const info = tip => ({ cls: 'info', text: 'i', attrs: { 'aria-label': tip, role: 'img' } });
+  const d = tinyDom([
+    // A toggle: caption + bubble + an empty unit.
+    { tag: 'label', cls: 'srow', kids: [
+      { cls: 'lbl', text: 'Latency probing', kids: [info('Run the probe round: several sentences of help.')] },
+      { cls: 'ctl', kids: [{ tag: 'input', attrs: { id: 'setLatEnabled', type: 'checkbox' } }, { cls: 'unit' }] }] },
+    // A number box: the unit beside it is part of what the row reads.
+    { tag: 'label', cls: 'srow', kids: [
+      { cls: 'lbl', text: 'Check every', kids: [info('How often to run a probe round.')] },
+      { cls: 'ctl', kids: [{ tag: 'input', attrs: { id: 'setLatency', type: 'number' } }, { cls: 'unit', text: 'sec' }] }] },
+    // A credential field whose caption sits above it, and whose only name was
+    // the example value in its placeholder.
+    { cls: 'afield', kids: [
+      { cls: 'lbl', text: 'Password ', kids: [{ cls: 'muted', attrs: { id: 'pwState' } }, info('Set or change the login password.')] },
+      { tag: 'input', attrs: { id: 'authPass', type: 'password', placeholder: 'Set a password' } }] },
+    // A caption that points at its control from beside it.
+    { cls: 'drow', kids: [
+      { cls: 'dname', text: 'Latency', attrs: { id: 'dnameLatency' }, kids: [info('Connectivity, latency and DNS samples.')] },
+      { cls: 'ctl', kids: [{ tag: 'input', attrs: { id: 'setRetention', type: 'number', 'aria-labelledby': 'dnameLatency' } }, { cls: 'unit', text: 'days' }] }] },
+    // A caption with no bubble in it names its control correctly already.
+    { cls: 'bright-row', kids: [
+      { cls: 'lbl', text: 'Line thickness', attrs: { id: 'lblVizLw' } },
+      { tag: 'input', attrs: { id: 'vizLw', type: 'range', 'aria-labelledby': 'lblVizLw' } }] },
+    // The Appearance pane's toggles are the same row in a different wrapper.
+    { tag: 'label', cls: 'viz-toggle', kids: [
+      { cls: 'lbl', text: 'Full-width layout', kids: [info('Let the page fill the browser window.')] },
+      { cls: 'ctl', kids: [{ tag: 'input', attrs: { id: 'setWide', type: 'checkbox' } }, { cls: 'unit' }] }] },
+    // A name written by hand is never overruled.
+    { cls: 'srow-inline', kids: [
+      { cls: 'lbl', text: 'Webhook URL', kids: [info('Where alerts are POSTed as JSON.')] },
+      { tag: 'input', attrs: { id: 'setWebhook', 'aria-label': 'Alert webhook' } }] },
+    // The iperf3 server editor is the same row under its own class names, and it
+    // held the longest names on the page - #setIperfPKCS1 announced as 462
+    // characters, #setIperfBind as 304.
+    { tag: 'label', cls: 'ie-field', kids: [
+      { cls: 'ie-lbl', text: 'Legacy RSA padding', kids: [info('Forces the legacy RSA padding on for this server. Four more sentences follow.')] },
+      { cls: 'ctl', kids: [{ tag: 'input', attrs: { id: 'setIperfPKCS1', type: 'checkbox' } }, { cls: 'unit' }] }] },
+    { tag: 'label', cls: 'ie-rsa', kids: [
+      { cls: 'ie-lbl', text: 'Server RSA public key', kids: [info('Paste the server\'s RSA public key (PEM).')] },
+      { tag: 'textarea', attrs: { id: 'setIperfRSAKey' } }] },
+  ]);
+  new Function('document', extract('function nameControlsFromCaptions') + '\nreturn nameControlsFromCaptions;')(d.document)();
+
+  assert.equal(d.byId('setLatEnabled').getAttribute('aria-label'), 'Latency probing',
+    'the toggle still announces its whole help paragraph');
+  assert.equal(d.byId('setLatency').getAttribute('aria-label'), 'Check every sec',
+    'the unit beside the box belongs in the name; the help paragraph does not');
+  assert.equal(d.byId('authPass').getAttribute('aria-label'), 'Password',
+    'the credential box is named by its caption, not by the example in its placeholder');
+  assert.equal(d.byId('setRetention').getAttribute('aria-label'), 'Latency days');
+  assert.equal(d.byId('setWide').getAttribute('aria-label'), 'Full-width layout',
+    'the Appearance toggles still read their help paragraph, and the pill\'s "Off On" after it');
+  assert.equal(d.byId('setRetention').getAttribute('aria-labelledby'), null,
+    'aria-labelledby outranks aria-label, so the reference into the bubble has to go');
+  assert.equal(d.byId('vizLw').getAttribute('aria-label'), null,
+    'a caption with no bubble already names its control - leave it alone');
+  assert.equal(d.byId('vizLw').getAttribute('aria-labelledby'), 'lblVizLw');
+  assert.equal(d.byId('setWebhook').getAttribute('aria-label'), 'Alert webhook',
+    'a hand-written name was overwritten');
+  assert.equal(d.byId('setIperfPKCS1').getAttribute('aria-label'), 'Legacy RSA padding',
+    'the iperf3 server editor is skipped: its rows are .ie-field/.ie-rsa around an .ie-lbl');
+  assert.equal(d.byId('setIperfRSAKey').getAttribute('aria-label'), 'Server RSA public key',
+    'the RSA key box still reads its whole help paragraph');
+
+  // And it is wired up: the startup pass runs it, right after the one that gives
+  // the bubbles the names this one keeps out of the controls.
+  const init = extract('(function initA11y');
+  const bubbles = init.indexOf('labelInfoBubbles()'), names = init.indexOf('nameControlsFromCaptions()');
+  assert.ok(bubbles >= 0 && names > bubbles, 'startup no longer names the controls after the bubbles');
+
+  // The sweep finds its rows by class name, so the classes it names have to be
+  // the ones the page writes. The server editor is the one pane that stays
+  // closed until an iperf3 server is added, which is how it was missed.
+  const sweep = extract('function nameControlsFromCaptions');
+  assert.match(sweep, /querySelectorAll\('label\.srow, label\.viz-toggle, \.afield, \.srow-inline, \.ie-field, \.ie-rsa'\)/,
+    'the sweep stopped looking at one of the row shapes');
+  assert.match(sweep, /querySelector\('\.lbl,\.ie-lbl'\)/,
+    'the caption lookup no longer covers both caption classes');
+  assert.match(html, /<label class="ie-field"><span class="ie-lbl">/,
+    'the server editor rows changed shape - the sweep would walk past them again');
+  assert.match(html, /<label class="ie-rsa"><span class="ie-lbl">/);
+});
+
+test('the boxes with no caption of their own carry a name that is not their placeholder', () => {
+  // Their accessible name was whatever the placeholder said - measured in
+  // Chrome: #authUser announced as "admin", #authPass as "Set a password",
+  // #setHeartbeat as "https://hc-ping.com/your-uuid". Those are example values,
+  // not field names, and a placeholder is a last-resort fallback that some
+  // assistive software does not expose at all. The five boxes with no visible
+  // caption to be named from say so themselves.
+  for (const [id, name] of [['serverCity', 'Place or Ookla server ID'], ['loginUser', 'Username'],
+                            ['loginPass', 'Password'], ['qsUser', 'Username'], ['qsPass', 'Password']]) {
+    const tag = html.match(new RegExp('<input[^>]*id="' + id + '"[^>]*>'));
+    assert.ok(tag, `${id} is gone from the markup`);
+    assert.match(tag[0], new RegExp('aria-label="' + name + '"'), `${id} is back to being named by its placeholder`);
+  }
+});
+
+
+// --- what gets announced, and what does not ---------------------------------
+//
+// The drawer's own outcomes were silent. A refused or failed Save writes "your
+// changes were NOT saved" into #settingsMsg, the alert tests report into the
+// same span, export and import write theirs, and the iperf3 pane its warnings -
+// all into plain spans with no live-region semantics, so a screen-reader user
+// pressed Save and heard nothing at all. Meanwhile the log viewer WAS a polite
+// live region while lines are appended to it on every poll (measured: 39
+// insertions in 10 seconds with logging on), which reads the whole console
+// aloud for as long as the About tab is open. The two are the same mistake in
+// opposite directions.
+test('the drawer says its outcomes out loud, and the log viewer does not', () => {
+  for (const id of ['settingsMsg', 'exportMsg', 'importMsg', 'iperfMsg', 'speedWhen']) {
+    const tag = html.match(new RegExp('<span[^>]*id="' + id + '"[^>]*>'));
+    assert.ok(tag, `${id} is gone from the markup`);
+    assert.match(tag[0], /role="status"/, `${id} went back to being an unannounced span`);
+  }
+  const log = html.match(/<pre class="log-window" id="logWindow"[^>]*>/);
+  assert.ok(log, 'the log viewer is gone from the markup');
+  assert.doesNotMatch(log[0], /aria-live|role="(status|log|alert)"/,
+    'the log viewer is a live region again: it announces every line the poll appends');
+  // The two notes beside it are the things worth interrupting for, and they stay
+  // live - this is a move, not a removal.
+  assert.match(html, /id="logTrunc" role="status"/);
+  assert.match(html, /id="logStall" role="status"/);
+});
+
+// The run caption is the one live region a poller rewrites. refreshStatus and
+// syncSpeedPanel repaint it every round with the very same words - measured in a
+// browser: four writes in twelve idle seconds, zero of them a change - so
+// announcing on every write would read the last run's timestamp aloud all day.
+// setSpeedWhen compares first, leaving only the transitions: a run starting,
+// failing, finishing.
+test('the run caption is written only when it actually changes', () => {
+  const el = { textContent: '', writes: 0 };
+  Object.defineProperty(el, 'textContent', {
+    get() { return this._t || ''; }, set(v) { this._t = v; this.writes++; },
+  });
+  el.textContent = 'Fibrestream, Toronto · last 3:20 PM';
+  const set = new Function('$', extract('function setSpeedWhen') + '\nreturn setSpeedWhen;')(() => el);
+  const before = el.writes;
+  for (let i = 0; i < 5; i++) set('Fibrestream, Toronto · last 3:20 PM');
+  assert.equal(el.writes, before, 'five polls of the same caption were five announcements');
+  set('Speedtest failed: could not reach the daemon.');
+  assert.equal(el.writes, before + 1, 'a caption that really changed was not written');
+  assert.equal(el.textContent, 'Speedtest failed: could not reach the daemon.');
+  set('');
+  assert.equal(el.writes, before + 2, 'clearing the caption was skipped');
+
+  // Every writer of the plain caption goes through it, or the region starts
+  // announcing on the poll again.
+  const direct = script.match(/\$\('speedWhen'\)\.textContent\s*=/g) || [];
+  assert.deepEqual(direct, [], 'something writes the caption without comparing first');
+});
+
+// setSpeedtestRunning is the other writer: it paints the caption as MARKUP (the
+// server name is escaped into it), so setSpeedWhen's comparison cannot cover it
+// and it needs its own. refreshStatus calls it on every three-second poll for as
+// long as the run lasts, so without one the live region reads "Running speedtest
+// on <server>…" aloud every three seconds - the very thing taking aria-live off
+// the log viewer was about.
+test('the running caption is written only when it actually changes', () => {
+  const when = { classList: { remove() {} }, writes: 0 };
+  Object.defineProperty(when, 'innerHTML', {
+    get() { return this._h || ''; }, set(v) { this._h = v; this.writes++; },
+  });
+  const btn = { title: '', classList: { toggle() {} }, setAttribute() {} };
+  const els = { runSpeed: btn, speedWhen: when };
+  const defs = extract('function speedtestRunText') + '\n'
+    + extract('function speedtestBusy') + '\n'
+    + extract('function speedtestAbortable') + '\n'
+    + extract('function setSpeedtestRunning');
+  const set = new Function('$', 'esc', 'speedtestPending',
+    'let speedtestRunningNow=false, speedtestRunId=0;\n' + defs + '\nreturn setSpeedtestRunning;')(
+    id => els[id], s => String(s), false);
+  set(true, 'Fibrestream, Toronto', false, 7);
+  assert.equal(when.writes, 1, 'the first paint of a run never reached the caption');
+  for (let i = 0; i < 5; i++) set(true, 'Fibrestream, Toronto', false, 7);
+  assert.equal(when.writes, 1, 'five polls of the same run were five announcements');
+  set(true, '', true, 7);
+  assert.equal(when.writes, 2, 'a caption that really changed was not written');
+  assert.match(when.innerHTML, /Finding the nearest/);
+
+  // And that is the only place the caption is written as markup: an unguarded
+  // one would slip past the textContent check above.
+  const raw = script.match(/\$\('speedWhen'\)\.innerHTML\s*=/g) || [];
+  assert.equal(raw.length, 1, 'the caption has a second markup writer, which will not be comparing');
+  assert.match(script, /if\(\$\('speedWhen'\)\.innerHTML!==h\) \$\('speedWhen'\)\.innerHTML=h;/,
+    'the one markup write of the caption stopped comparing first');
+});
+
+// --- the coverage strip has a role that is allowed to carry its label --------
+//
+// The strip's tracks are aria-hidden pixels and its only spoken description is
+// the summary renderCov hangs on the container. The container was a plain <div>,
+// which computes as the generic role - ARIA forbids a name there, and screen
+// readers skip the name of a generic container nobody can focus, so the strip
+// read as nothing at all. role=img is what makes the label reachable. Confirmed
+// in Chrome: the node went from role "generic" to "image" with the same name.
+test('the coverage strip is announced as an image with its summary as the name', () => {
+  const el = { attrs: {}, innerHTML: '', setAttribute(n, v) { this.attrs[n] = v; } };
+  const deps = [extract('function covGrid'), extract('function covStats'), extract('function renderCov')].join('\n');
+  const render = new Function('$', 'SCHED_COV', 'collectWindows', 'schedServerSkewMs', 'DAYN', 'DOW1',
+    'minToTime', 'fmtMins', deps + '\nreturn renderCov;')(
+    () => el, { lat: 'schedLatCov' }, () => [{ days: '1111111', from: '09:00', to: '17:00' }], 0,
+    ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+    ['S', 'M', 'T', 'W', 'T', 'F', 'S'],
+    m => String(m), m => m + 'm');
+  render('lat');
+  assert.equal(el.attrs.role, 'img', 'the strip is a generic <div> again, and its label is dropped');
+  assert.match(el.attrs['aria-label'], /^Coverage: on \d+% of the week/,
+    'the summary that rides on that role is gone');
+  assert.match(el.innerHTML, /aria-hidden="true"/, 'the tracks below it are still hidden from readers');
+});
+
+// --- the popovers are no longer listboxes with a heading and a textbox in them
+//
+// role=listbox owns options and nothing else. All three popovers put more than
+// options inside: the chart pickers a custom-window <input> and the line that
+// echoes back how the typed text was read, the stats ones a heading and an input
+// too - and the two chart pickers had no name at all, so they announced as a
+// bare "list box". The options now sit in their own named listbox inside the
+// popover, and the popover is the dialog around it - a named floating box that
+// takes focus and hands it back on Escape. Dialog rather than group because the
+// trigger says what it opens with aria-haspopup, and a group is no kind of popup:
+// "has popup list box" landing a reader in a group was a promise not kept.
+test('each popover is a dialog around a named listbox of options', () => {
+  for (const id of ['dataPop', 'uptimePop']) {
+    const tag = html.match(new RegExp('<div class="data-pop" id="' + id + '"[^>]*>'));
+    assert.ok(tag, `${id} is gone from the markup`);
+    assert.match(tag[0], /role="dialog"/, `${id} claims to be a listbox or a group again`);
+    assert.match(tag[0], /aria-label="[^"]+"/, `${id} lost its name`);
+  }
+  // And the pills that open them promise exactly that - one each - and nothing
+  // on the page still promises a listbox that is no longer what opens.
+  assert.equal((script.match(/class="pill stat-up"[^`]*?aria-haspopup="dialog"/g) || []).length, 1, 'the uptime pill promises something other than the dialog it opens');
+  assert.equal((script.match(/class="pill stat-data"[^`]*?aria-haspopup="dialog"/g) || []).length, 1, 'the data pill promises something other than the dialog it opens');
+  assert.doesNotMatch(script, /aria-haspopup="listbox"|aria-haspopup','listbox'/, 'a trigger still promises a listbox');
+  // The rows, and only the rows, are wrapped by the listbox each popover builds.
+  for (const [fn, label] of [['async function showDataPop', 'Data window'], ['function showUptimePop', 'Uptime window']]) {
+    const body = extract(fn);
+    const open = body.indexOf('<div role="listbox" aria-label="' + label + '">');
+    const close = body.indexOf("'</div>'");
+    const rows = body.indexOf('role="option"');
+    const input = body.indexOf('class="win-custom"');
+    assert.ok(open >= 0, `${fn} no longer wraps its rows in a named listbox`);
+    assert.ok(rows > open && close > rows, `${fn} builds its option rows outside the listbox`);
+    assert.ok(input > close, `${fn} puts the custom-window box inside the listbox again`);
+  }
+  // And the chart pickers build theirs the same way.
+  const drop = extract('function winDropdown');
+  assert.doesNotMatch(drop, /pop\.setAttribute\('role','listbox'\)/,
+    'the chart popover claims to be the listbox again');
+  assert.match(drop, /list\.setAttribute\('role','listbox'\); list\.setAttribute\('aria-label',/,
+    'the chart popover has no named listbox in it');
+  assert.match(drop, /pop\.setAttribute\('role','dialog'\); pop\.setAttribute\('aria-label','Change the chart window'\)/,
+    'the chart popover is a roleless box again, which is not what its button promises');
+  assert.match(drop, /btn\.setAttribute\('aria-haspopup','dialog'\)/, 'the chart window button promises something other than the dialog it opens');
+  // Both of them: the pinned-range option and the presets loop. Asserting the
+  // pattern merely EXISTS let either site go back to the popover unnoticed,
+  // which orphans its options outside the listbox.
+  assert.equal((drop.match(/list\.appendChild\(o\)/g) || []).length, 2,
+    'an option is appended somewhere other than the named list');
+  assert.doesNotMatch(drop, /pop\.appendChild\(o\)/,
+    'an option is a child of the popover again, outside the listbox');
+  assert.match(drop, /row\.appendChild\(inp\); pop\.appendChild\(row\)/,
+    'the custom-window row went back inside the list');
+  // The column layout the popover used to give the options directly moved with them.
+  assert.match(html, /\.win-opts\{display:flex;flex-direction:column;gap:2px;\}/,
+    'the option list lost the layout the popover used to apply');
+});
+
+// --- the optimistic RUN caption -------------------------------------------
+//
+// Pressing RUN paints a caption straight away, before the first status poll can
+// say anything, and it said "Finding the nearest responsive server near you…"
+// whenever no Ookla server was pinned. iperf3 connects to the server the
+// operator configured: it has no candidate pool and selects nothing, which is
+// exactly why the daemon reports speedtest_auto as false for it. So an iperf3
+// user was told about a search that never happens, for up to one poll interval.
+// This is the daemon's own rule, on the page.
+test('speedtestPicksServer: only a run that will actually go looking says so', () => {
+  assert.equal(F.speedtestPicksServer('', false, false), true, 'Ookla with no pin picks a server');
+  assert.equal(F.speedtestPicksServer('', false, true), true, 'the iperf3 binary being present is not the engine');
+  assert.equal(F.speedtestPicksServer('50679', false, true), false, 'a pinned Ookla server is the choice');
+  assert.equal(F.speedtestPicksServer('', true, true), false,
+    'iperf3 connects to the configured server - there is nothing to find');
+  assert.equal(F.speedtestPicksServer('', true, false), true,
+    'iperf3 wanted but missing falls back to Ookla, which does pick');
+  assert.equal(F.speedtestPicksServer('50679', true, true), false);
+
+  // And the click path asks it, rather than reading the Ookla pin alone.
+  assert.match(script, /setSpeedtestRunning\(true, '', speedtestPicksServer\(pendingServer, iperfWanted, iperfAvailable\)\)/,
+    'the RUN button decides "auto" from the pinned server alone again');
+});
+
+
+// --- Quick Setup says which theme is selected -------------------------------
+//
+// The nine swatches carried an aria-label and nothing else: the ring around the
+// chosen one is the only thing that said which theme was picked, so a screen
+// reader heard nine identical buttons. The drawer's own theme buttons have
+// always reported it with aria-pressed; the wizard was the one place that did
+// not.
+test('the Quick Setup theme swatches report which one is chosen', () => {
+  const swatches = [...html.matchAll(/<button class="qs-sw[^"]*"[^>]*>/g)].map(m => m[0]);
+  assert.equal(swatches.length, 9, 'the swatch row changed shape - this test would check nothing');
+  for (const b of swatches) assert.match(b, /aria-pressed="(true|false)"/, 'a swatch with no selected state');
+  assert.equal(swatches.filter(b => /aria-pressed="true"/.test(b)).length, 1,
+    'exactly one swatch is the selected one');
+
+  // And the click keeps it in step, the same way it keeps the ring in step.
+  const src = extract("document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.addEventListener('click'");
+  const mk = sw => ({ dataset: { sw }, classes: new Set(sw === 'retro' ? ['on'] : []), attrs: { 'aria-pressed': String(sw === 'retro') },
+    classList: { add(c) { this.owner.classes.add(c); }, remove(c) { this.owner.classes.delete(c); },
+      toggle(c, on) { if (on) this.owner.classes.add(c); else this.owner.classes.delete(c); } },
+    setAttribute(n, v) { this.attrs[n] = v; }, addEventListener(_t, fn) { this.fn = fn; } });
+  const swatchEls = ['retro', 'dark', 'cyber'].map(mk);
+  for (const el of swatchEls) el.classList.owner = el;
+  const themed = [];
+  new Function('document', 'applyTheme', src + '));')(
+    { querySelectorAll: () => swatchEls }, t => themed.push(t));
+  swatchEls[1].fn();
+  assert.deepEqual(swatchEls.map(e => e.attrs['aria-pressed']), ['false', 'true', 'false'],
+    'clicking a swatch moved the ring but not the announced selection');
+  assert.deepEqual(swatchEls.map(e => e.classes.has('on')), [false, true, false],
+    'the ring and the announced selection disagree');
+  assert.deepEqual(themed, ['dark'], 'the click stopped previewing the theme');
+
+  // And opening the dialog moves both onto the theme already applied. The one
+  // pressed swatch in the markup is just the default: over any other saved theme
+  // it would name the wrong one, which is worse than saying nothing.
+  const open = extract("document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>{ const on=");
+  const onOpen = ['retro', 'dark', 'cyber'].map(mk);
+  for (const el of onOpen) el.classList.owner = el;
+  new Function('document', 'cur', open + ');')({ querySelectorAll: () => onOpen }, 'dark');
+  assert.deepEqual(onOpen.map(e => e.attrs['aria-pressed']), ['false', 'true', 'false'],
+    'the dialog opened over a saved theme and announced a different swatch as chosen');
+  assert.deepEqual(onOpen.map(e => e.classes.has('on')), [false, true, false],
+    'the ring and the announced selection disagree when the dialog opens');
+});
+
+// --- the backup file picker is reachable without a mouse ---------------------
+//
+// The real <input type=file> is display:none (.filebtn input), which takes it
+// out of the tab order, and a <label> is not focusable - so tabbing from the
+// Import button went straight past the picker to Save, in both directions, and
+// there was no other way in: the Import handler with no file just writes "Choose
+// an export file first." So Backup & restore's Import half could not be used
+// from the keyboard at all. The label is the button here, so it says so and
+// forwards Enter and Space to the input the same way a click already does.
+test('the import file picker can be reached and opened from the keyboard', () => {
+  const tag = html.match(/<label class="filebtn" id="importFileBtn"[^>]*>/);
+  assert.ok(tag, 'the picker label is gone from the markup');
+  assert.match(tag[0], /tabindex="0"/, 'the label is out of the tab order again');
+  assert.match(tag[0], /role="button"/, 'the label announces as something other than a button');
+
+  const src = extract("$('importFileBtn').addEventListener('keydown'");
+  let clicks = 0, prevented = 0, handler = null;
+  const els = {
+    importFileBtn: { addEventListener(_t, fn) { handler = fn; } },
+    importFile: { click() { clicks++; } },
+  };
+  new Function('$', src + ');')(id => els[id]);
+  const press = k => handler({ key: k, preventDefault() { prevented++; } });
+
+  press('Enter');
+  assert.equal(clicks, 1, 'Enter on the picker did not open the file chooser');
+  press(' ');
+  assert.equal(clicks, 2, 'Space on the picker did not open the file chooser');
+  assert.equal(prevented, 2, 'Space has to be swallowed, or it scrolls the drawer out from under you');
+  press('a'); press('Tab'); press('Escape');
+  assert.equal(clicks, 2, 'a key that is not Enter or Space opened the chooser');
+  assert.equal(prevented, 2, 'a key the picker does not handle was swallowed anyway');
 });
 
 // --- the 3s status timer stands down while a poll is in the air -------------
@@ -9525,4 +10349,539 @@ test('a locked-out page gets the recovery advice for the machine it is actually 
   // A payload that does say false is a denial, and must still be believed.
   assert.equal((await driveLoadAccess({ ...locked, containerized: false }, { inContainer: true })).flag, false,
     'an explicit false must still be able to correct the flag');
+});
+
+// --- keyboard reach in the panels --------------------------------------------
+//
+// The panels were built pointer-first, and each of these is a place where the
+// keyboard was left without a route: a popup only a mouse could put away, a
+// layout only a drag could change, a reading only a hover could produce, or a
+// control that disabled itself under the very finger holding it and dropped focus
+// to <body>, where the next Tab starts the whole page again. The tests below
+// drive the shipped handlers rather than reading the markup for attributes: an
+// aria-label proves nothing about what a key does.
+
+test('the chart-window list closes when the keyboard walks out of it', () => {
+  const src = extract("root.addEventListener('focusout'");
+  const root = { on: {}, addEventListener(t, fn) { this.on[t] = fn; }, contains: el => !!el && el.inside };
+  const pop = { hidden: false };
+  let closed = 0;
+  new Function('root', 'pop', 'close', src + ');')(root, pop, () => { closed++; pop.hidden = true; });
+  root.on.focusout({ relatedTarget: { inside: true } });
+  assert.equal(closed, 0, 'moving between the button, the options and the custom input closed the list');
+  root.on.focusout({ relatedTarget: null });
+  assert.equal(closed, 0, 'focus going nowhere at all closed a list nobody had walked out of');
+  root.on.focusout({ relatedTarget: { inside: false } });
+  assert.equal(closed, 1,
+    'Tabbing past the custom row left the list hanging over the chart with the button still ' +
+    'announcing aria-expanded="true", and no key anywhere else could put it away');
+  root.on.focusout({ relatedTarget: { inside: false } });
+  assert.equal(closed, 1, 'a list already closed was closed again');
+});
+
+const TILE = new Function(extract('function tileMoveIdx') + '\nreturn { tileMoveIdx };')();
+
+test('a dashboard tile can be moved and hidden from the keyboard', () => {
+  assert.equal(TILE.tileMoveIdx('ArrowUp', 2, 4), 1);
+  assert.equal(TILE.tileMoveIdx('ArrowDown', 2, 4), 3);
+  assert.equal(TILE.tileMoveIdx('ArrowLeft', 2, 4), 1, 'side by side in wide mode, the same move');
+  assert.equal(TILE.tileMoveIdx('Home', 2, 4), 0);
+  assert.equal(TILE.tileMoveIdx('End', 1, 4), 3);
+  assert.equal(TILE.tileMoveIdx('ArrowUp', 0, 4), -1, 'the top tile must not wrap round to the bottom');
+  assert.equal(TILE.tileMoveIdx('ArrowDown', 3, 4), -1, 'nor the bottom one to the top');
+  assert.equal(TILE.tileMoveIdx('Home', 0, 4), -1, 'a move to where it already is is not a move');
+  assert.equal(TILE.tileMoveIdx('Enter', 1, 4), -1, 'every other key belongs to whatever else is listening');
+  assert.equal(TILE.tileMoveIdx('ArrowUp', -1, 4), -1, 'a tile that is not among the visible ones moves nothing');
+
+  // The grip is the only thing that reorders a tile, so it has to be reachable and
+  // announced: it shipped as an aria-hidden span with no tabindex, which is
+  // invisible to a screen reader and unreachable by Tab.
+  const handles = html.match(/<span class="drag-handle"[^>]*>/g);
+  assert.equal(handles.length, 4, 'test set-up: one grip per panel');
+  for (const h of handles) {
+    assert.ok(!/aria-hidden/.test(h), `a grip is still hidden from assistive software: ${h}`);
+    assert.match(h, /tabindex="0"/, `a grip cannot be tabbed to: ${h}`);
+    assert.match(h, /role="button"/, `a grip is not announced as a control: ${h}`);
+    assert.match(h, /aria-label="Move the \w+ tile"/, `a grip does not name its tile: ${h}`);
+    // A name identifies a control; instructions belong in the description, which is
+    // what the tooltip becomes. Spelling the keys out in the name meant every panel
+    // heading that held a grip read the instructions out before its own title.
+    assert.match(h, /title="Drag to reorder - or focus it: the arrow keys move it, Delete hides it"/,
+      `a grip does not say what its keys do anywhere: ${h}`);
+    assert.match(h, /aria-pressed="false"/, `a grip that can be picked up must say whether it is: ${h}`);
+  }
+  // The page's own markup, so a <h2> written inside a CSS comment is not mistaken
+  // for a heading.
+  const body = html.slice(html.indexOf('</style>'), html.indexOf('<script>'));
+  for (const heading of body.match(/<h2[^>]*>[\s\S]*?<\/h2>/g)) {
+    assert.ok(!/drag-handle/.test(heading),
+      'a grip inside a heading is folded into that heading\'s name: "Downtime - past year" was ' +
+      'announced as "Move the Downtime tile: the arrow keys reorder it, Delete hides it DOWNTIME - ' +
+      'PAST YEAR", and heading-by-heading is how a screen reader user moves around this page');
+  }
+  const keys = script.slice(script.indexOf("h.addEventListener('keydown'"), script.indexOf("h.addEventListener('mousedown'"));
+  assert.match(keys, /e\.key==='Delete'\|\|e\.key==='Backspace'/, 'Delete must take the tile off the dashboard');
+  // Enter and Space are what the grip's own role promises. Unclaimed, Space is Page
+  // Down: it scrolled the tile being moved off the screen and reordered nothing.
+  assert.match(keys, /if\(e\.key==='Enter'\|\|e\.key===' '\)\{ e\.preventDefault\(\);/,
+    'Space on the grip still falls through to the browser and pages the tile away');
+  assert.match(keys, /tileGrab\(h, h\.getAttribute\('aria-pressed'\)!=='true'\)/,
+    'Enter and Space have to pick the tile up and put it down again');
+  assert.match(keys, /e\.key==='Escape'/, 'and Escape has to put a held tile back');
+  assert.match(keys, /tileDropBack\(h\)/, 'through the revert, not just by clearing the flag');
+  assert.match(script, /h\.addEventListener\('blur', \(\)=>tileLetGo\(h\)\)/,
+    'tabbing away from a held tile has to put it down, or it stays "pressed" for ever');
+  assert.match(html, /\.drag-handle\[aria-pressed="true"\]\{/,
+    'a picked-up tile looks exactly like a tile nobody is holding');
+
+  // Picking up and putting down, run for real.
+  const held = new WeakMap();
+  const secs = () => [{ dataset: { section: 'connection' } }, { dataset: { section: 'speed' } }];
+  const grip = () => ({ a: {}, focused: 0, setAttribute(k, v) { this.a[k] = v; }, getAttribute(k) { return this.a[k]; }, focus() { this.focused++; } });
+  const grab = new Function('heldOrder', 'panels', extract('function tileGrab') + '\nreturn tileGrab;')(held, secs);
+  let g = grip();
+  grab(g, true);
+  assert.equal(g.a['aria-pressed'], 'true');
+  assert.deepEqual(held.get(g), ['connection', 'speed'], 'picking a tile up remembers the order to go back to');
+  grab(g, false);
+  assert.equal(g.a['aria-pressed'], 'false');
+  assert.equal(held.has(g), false, 'putting it down forgets it, so a later Escape cannot resurrect an old order');
+  const applied = [];
+  let saved = 0;
+  const dropBack = new Function('heldOrder', 'panels', 'applyOrder', 'saveOrder',
+    extract('function tileGrab') + extract('function tileDropBack') + '\nreturn tileDropBack;')(held, secs, o => applied.push(o), () => saved++);
+  g = grip();
+  grab(g, true);
+  dropBack(g);
+  assert.deepEqual(applied, [['connection', 'speed']], 'Escape must put the tiles back in the order they were picked up from');
+  assert.equal(saved, 1, 'and save it, or a reload brings the mis-aimed arrow back');
+  assert.equal(g.focused, 1, 'and hand the grip its focus back, since moving the panels takes it away');
+  assert.equal(g.a['aria-pressed'], 'false');
+  applied.length = 0;
+  dropBack(grip());
+  assert.deepEqual(applied, [], 'Escape with nothing held rearranges nothing');
+
+  // Every arrow blurs the grip on its way to being refocused, so a blur only means
+  // the reader left if the grip is still not focused a tick later.
+  const letGo = doc => new Function('heldOrder', 'panels', 'document', 'setTimeout',
+    extract('function tileGrab') + extract('function tileLetGo') + '\nreturn tileLetGo;')(held, secs, doc, fn => fn());
+  g = grip();
+  grab(g, true);
+  letGo({ activeElement: g })(g);
+  assert.equal(g.a['aria-pressed'], 'true',
+    'moving a tile dropped it again straight away: the move blurs the grip for an instant, and taking ' +
+    'that for the reader walking off left Escape with nothing to put back');
+  letGo({ activeElement: { somewhere: 'else' } })(g);
+  assert.equal(g.a['aria-pressed'], 'false', 'but a reader who really did tab away puts the tile down');
+  assert.match(keys, /hideSection\(p\)/, 'and through the same hide the edge-drag uses, undo toast and all');
+  assert.match(keys, /moveTile\(p, h, e\.key\)/, 'the arrows must move the tile');
+  assert.match(extract('function moveTile'), /saveOrder\(\)/, 'a keyboard move must persist like a dragged one');
+  assert.match(extract('function moveTile'), /h\.focus\(\)/,
+    'Chrome drops focus when a node is moved, so the grip has to be given it back or the next arrow goes nowhere');
+  // The grip is half-transparent until hovered; a keyboard user gets no hover, so
+  // the focus ring needs the same brightening or it lands on something invisible.
+  assert.match(html, /\.drag-handle:hover,\.drag-handle:focus-visible\{/,
+    'a focused grip is still drawn at hover-less opacity');
+  // The grip is painted in the panel's bottom-right corner and Tab follows the
+  // markup, so as the panel's first child it was the first stop in every panel:
+  // the corner, then a jump back up to the heading, four times down the page.
+  // Last child puts it where it is painted.
+  for (const sec of ['connection', 'speed', 'latency', 'downtime']) {
+    const open = body.indexOf(`<div class="panel" data-section="${sec}">`);
+    assert.ok(open >= 0, `test set-up: the ${sec} panel`);
+    const panel = body.slice(open, body.indexOf('\n  </div>\n', open));
+    const grip = panel.indexOf('<span class="drag-handle"');
+    assert.ok(grip > 0, `${sec}: no grip in the panel`);
+    assert.equal(panel.slice(grip).split('</svg></span>')[1].trim(), '',
+      `${sec}: the grip is not the last thing in its panel, so Tab reaches the bottom-right corner before the content above it`);
+    assert.ok(panel.indexOf('<h2') < grip || panel.indexOf('<h2') < 0, `${sec}: the grip comes before the heading`);
+  }
+});
+
+// Hiding the last visible tile from its grip sends the keyboard to the Undo link,
+// and the toast around it hid itself six seconds later, dropping focus on <body>.
+// A toast holding the keyboard waits; it goes when the keyboard leaves. And Undo,
+// which hides it too, must hand the keyboard on to what it brought back.
+test('the undo toast waits while it holds the keyboard, and Undo hands it on', () => {
+  const src = extract('function showUndoToast');
+  const doc = { activeElement: null, getElementById: id => ({ undoToast: toast, undoHide: link, gearBtn: gear }[id]) };
+  const link = { on: {}, addEventListener(t, fn) { this.on[t] = fn; }, focus() { doc.activeElement = link; } };
+  const toast = { hidden: true, _t: null, onfocusout: null, contains: el => el === link };
+  const gear = { focus() { doc.activeElement = gear; } };
+  const grip = { focus() { doc.activeElement = grip; } };
+  const timers = [];
+  const show = new Function('document', 'setTimeout', 'clearTimeout', src + '\nreturn showUndoToast;')(
+    doc, (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, () => {});
+  const last = () => timers[timers.length - 1];
+  // A. the keyboard is on Undo when the toast's time is up: it stays, until the keyboard leaves
+  show('Tile hidden', () => grip); link.focus();
+  assert.equal(last().ms, 6000, 'test set-up: the toast is on its usual timer');
+  last().fn();
+  assert.equal(toast.hidden, false, 'the toast hid itself from under the keyboard, and focus fell to <body>');
+  assert.equal(typeof toast.onfocusout, 'function', 'and then nothing would ever take it down when focus left');
+  doc.activeElement = null; toast.onfocusout(); last().fn();   // the re-check is a tick after focusout
+  assert.equal(toast.hidden, true, 'once the keyboard has left, a toast whose time was up must go');
+  assert.equal(toast.onfocusout, null);
+  // B. Undo from the keyboard, after the toast has already chosen to wait: the
+  // keyboard goes to what came back, and the wait is called off
+  show('Tile hidden', () => grip); link.focus(); last().fn();
+  link.on.click({ preventDefault() {} });
+  assert.equal(toast.hidden, true);
+  assert.equal(doc.activeElement, grip, 'Undo hid the toast under the keyboard and focused nothing');
+  assert.equal(toast.onfocusout, null, 'a toast Undo put away is still waiting for the keyboard to leave');
+  // C. what came back cannot take focus (Reset tiles undone with the drawer shut): Settings, where Reset lives
+  const shut = { focus() {} };
+  show('Tiles reset', () => shut); link.focus();
+  link.on.click({ preventDefault() {} });
+  assert.equal(doc.activeElement, gear);
+  // D. Undo by mouse, keyboard elsewhere: nothing is moved
+  const elsewhere = {};
+  show('Tile hidden', () => grip); doc.activeElement = elsewhere;
+  link.on.click({ preventDefault() {} });
+  assert.equal(doc.activeElement, elsewhere, 'a mouse Undo must not yank focus about');
+  // E. keyboard elsewhere: the timer still hides it, as it always did
+  show('Tile hidden', () => grip); doc.activeElement = elsewhere;
+  last().fn();
+  assert.equal(toast.hidden, true);
+  assert.equal(toast.onfocusout, null, 'a toast that went on time must not leave a focusout hook behind');
+  // and the two restores say what they brought back
+  assert.match(extract('function hideSection'), /return p\.querySelector\('\.drag-handle'\)/, 'undoing a hidden tile must hand the keyboard to that tile');
+  assert.match(script, /applyHidden\(\); loadOrder\(\); redrawCharts\(\); return rb; \}\); \}\);/, 'undoing a reset must hand it to the Reset button');
+});
+
+test('any key puts the first-run coach mark away', () => {
+  const coach = extract('function showCoach');
+  assert.match(coach, /addEventListener\('pointerdown', dismissCoach, \{once:true, capture:true\}\)/,
+    'test set-up: the pointer dismissal is the one that shipped');
+  assert.match(coach, /addEventListener\('keydown', dismissCoach, \{once:true, capture:true\}\)/,
+    'no key dismissed the card, so a keyboard user had to open Settings to get rid of it - and ' +
+    'until they did it sat over the Connection panel’s refresh button, swallowing its focus ring');
+});
+
+test('a failed Quick Setup save hands the button back', () => {
+  const save = extract('async function qsSave');
+  const fail = save.slice(save.indexOf('}catch(e){'));
+  assert.match(fail, /go\.disabled=false/, 'test set-up: the failure path re-enables the button');
+  assert.match(fail, /go\.focus\(\)/,
+    'disabling the button dropped focus to <body>, outside the dialog’s own Tab trap, so the first ' +
+    'Tab left the page for the browser’s chrome');
+});
+
+test('Escape cancels a data popover that has not arrived yet', () => {
+  const src = extract("document.addEventListener('keydown', e=>{");
+  const els = { qsDlg: { hidden: true }, dataPop: { hidden: true }, uptimePop: { hidden: true },
+    hmTip: { hidden: true }, families: { querySelector: () => null } };
+  let hidden = 0, closed = 0;
+  const doc = { activeElement: null, addEventListener(_t, fn) { this.fn = fn; } };
+  new Function('document', '$', 'loginOverlay', 'qsDecline', 'hideDataPop', 'hideUptimePop',
+    '_drawer', 'requestCloseDrawer', 'dataPopOpening', 'winPickers', src + ');')(
+    doc, id => els[id], { hidden: true }, () => {}, () => { hidden++; }, () => {},
+    { classList: { contains: () => true } }, () => { closed++; }, true, []);
+  doc.fn({ key: 'Escape' });
+  assert.equal(hidden, 1,
+    'the popover is still hidden while its round trip is in the air, so Escape did nothing and the ' +
+    'answer opened what had just been dismissed');
+  assert.equal(closed, 0, 'and the same press went on to close the settings drawer behind it');
+});
+
+// A chart window picker's own Escape is bound to the picker, and the focusout
+// that closes it only sees the keyboard leave if the keyboard was ever in it. A
+// picker opened by a tap, or by a click in a browser that does not focus a
+// pressed button, was left with no key that could close it from anywhere else.
+test('Escape closes a chart window picker from anywhere on the page', () => {
+  const src = extract("document.addEventListener('keydown', e=>{");
+  const els = { qsDlg: { hidden: true }, dataPop: { hidden: true }, uptimePop: { hidden: true },
+    hmTip: { hidden: true }, families: { querySelector: () => null } };
+  let closed = 0, drawer = 0;
+  const btn = { focused: 0, focus() { this.focused++; } };
+  const picker = { pop: { hidden: false }, btn, close() { closed++; this.pop.hidden = true; } };
+  const shut = { pop: { hidden: true }, btn: {}, close() { throw new Error('closed a picker that was not open'); } };
+  const doc = { activeElement: null, addEventListener(_t, fn) { this.fn = fn; } };
+  new Function('document', '$', 'loginOverlay', 'qsDecline', 'hideDataPop', 'hideUptimePop',
+    '_drawer', 'requestCloseDrawer', 'dataPopOpening', 'winPickers', src + ');')(
+    doc, id => els[id], { hidden: true }, () => {}, () => {}, () => {},
+    { classList: { contains: () => true } }, () => { drawer++; }, false, [shut, picker]);
+  doc.fn({ key: 'Escape' });
+  assert.equal(closed, 1, 'a press outside the picker left it open');
+  assert.equal(btn.focused, 1, 'and the keyboard has to come back to the button, as from the picker\'s own Escape');
+  assert.equal(drawer, 0, 'the same press must not also close the drawer behind it');
+  doc.fn({ key: 'Escape' });
+  assert.equal(closed, 1, 'a closed picker was closed again');
+  assert.equal(drawer, 1, 'with no picker open the press has to reach the drawer as before');
+  // The pickers have to make themselves known, or there is nothing here to close.
+  assert.match(extract('function winDropdown'), /winPickers\.push\(\{pop, btn, close\}\)/,
+    'a picker the page-wide Escape does not know about cannot be closed by it');
+  assert.match(script, /const winPickers=\[\];/);
+});
+
+test('the stats popovers close when the keyboard leaves them', () => {
+  const src = extract("document.addEventListener('focusin', e=>{");
+  const els = { dataPop: { hidden: false }, uptimePop: { hidden: false } };
+  let seen = [];
+  const doc = { addEventListener(_t, fn) { this.fn = fn; } };
+  new Function('document', '$', 'dataPopOpening', 'hideDataPop', 'hideUptimePop', src + ');')(
+    doc, id => els[id], false, () => seen.push('data'), () => seen.push('uptime'));
+  const at = (...sels) => ({ target: { closest: s => (sels.includes(s) ? {} : null) } });
+
+  doc.fn(at('#dataPop'));
+  assert.deepEqual(seen, ['uptime'], 'an option inside the data popover closed it');
+  seen = [];
+  doc.fn(at('.stat-up'));
+  assert.deepEqual(seen, ['data'], 'the pill that opens a popover is part of it');
+  seen = [];
+  doc.fn(at('#netinfoRefresh'));
+  assert.deepEqual(seen, ['data', 'uptime'],
+    'Tabbing off an option walked into the Connection panel with the list still hanging under the ' +
+    'header and the pill still saying aria-expanded="true"');
+  seen = [];
+  doc.fn({ target: {} });
+  assert.deepEqual(seen, [], 'a focusin from something with no closest() threw');
+});
+
+const CHARTKEYS = new Function(extract('function chartKeyIdx') + '\n' + extract('function chartTipText')
+  + '\nreturn { chartKeyIdx, chartTipText };')();
+
+test('the charts step through their points from the keyboard', () => {
+  const k = CHARTKEYS.chartKeyIdx;
+  assert.equal(k('ArrowRight', -1, 50), 0, 'stepping onto an untouched chart starts at the first point');
+  assert.equal(k('ArrowLeft', -1, 50), 49, 'and from the other direction at the last');
+  assert.equal(k('ArrowRight', 49, 50), 49, 'the cursor stops at the end rather than wrapping round');
+  assert.equal(k('ArrowLeft', 0, 50), 0);
+  assert.equal(k('Home', 20, 50), 0);
+  assert.equal(k('End', 20, 50), 49);
+  assert.equal(k('ArrowRight', 0, 0), -1, 'an empty chart has nothing to step to');
+  assert.equal(k('Tab', 3, 50), -1, 'Tab still leaves the chart');
+  // A canvas is a picture to a screen reader and the tooltip is markup nothing
+  // announces, so the reading goes to a live region - and into the canvas's name,
+  // where it stays for whoever arrives afterwards.
+  assert.equal(CHARTKEYS.chartTipText('<div class="tt-time">9:00</div>12.5 ms<div>DNS 35 ms</div>'),
+    '9:00 12.5 ms DNS 35 ms');
+  assert.match(html, /<div class="sr-live" id="chartRead" role="status" aria-live="polite"><\/div>/,
+    'the stepped-to reading went nowhere a screen reader listens: rewriting the name of the ' +
+    'element that already has focus fires no event, so the step was silent');
+  assert.match(html, /\.sr-live\{position:absolute;[^}]*clip-path:inset\(50%\);/,
+    'the region has to be off screen rather than hidden - display:none is never announced');
+  const canvas = { id: 'chart', a: {}, setAttribute(k, v) { this.a[k] = v; } };
+  const live = { textContent: 'stale' };
+  const $stub = id => (id === 'chartRead' ? live : { hidden: false });
+  new Function('$', 'CHART_LABEL', extract('function chartTipText') + extract('function chartSay') + '\nreturn chartSay;')(
+    $stub, { chart: 'Latency to the anchors over time' })(canvas, { points: [1, 2, 3] }, 1, '<b>9:00</b> 12.5 ms');
+  assert.equal(live.textContent, 'Point 2 of 3: 9:00 12.5 ms', 'the step has to be spoken');
+  assert.equal(canvas.a['aria-label'], 'Latency to the anchors over time. Point 2 of 3: 9:00 12.5 ms',
+    'and the name still has to carry it for anyone who arrives at the chart later');
+  new Function('$', 'CHART_LABEL', 'latHover', 'redrawLat', 'linkHover',
+    'let chartKeyed=null, chartKeyTip=false;' + extract('function chartKeyOff') + '\nreturn chartKeyOff;')($stub, { chart: 'Latency' }, -1, () => {}, () => {})(canvas);
+  assert.equal(live.textContent, '', 'and putting the readout away must leave nothing behind to be re-read');
+  for (const id of ['chart', 'speedChart', 'qualityChart', 'bloatChart']) {
+    const tag = html.match(new RegExp(`<canvas id="${id}"[^>]*>`))[0];
+    assert.match(tag, /tabindex="0"/, `${id} takes no focus, so no key can reach it: ${tag}`);
+  }
+  assert.match(extract('function chartSay'), /setAttribute\('aria-label'/, 'the stepped-to point must go into the canvas name');
+  assert.match(extract('function chartKeyOff'), /\$\('chartTip'\)\.hidden=true/, 'Escape must put the readout away');
+  assert.match(script, /CHART_LABEL\['chart'\]=\$\('chart'\)\.getAttribute\('aria-label'\)/,
+    'the shipped name has to be kept, or the stepped one is built on "undefined"');
+  assert.match(script, /CHART_LABEL\[id\]=\$\(id\)\.getAttribute\('aria-label'\)/, 'the same for the three speedtest charts');
+  // The tooltip hangs off the point, since keyboard navigation moves no cursor.
+  const XY = new Function(extract('function chartPointXY') + '\nreturn { chartPointXY };')();
+  assert.deepEqual(XY.chartPointXY({ getBoundingClientRect: () => ({ left: 100, top: 50, height: 200 }) },
+    { points: [{ ts: 7 }], X: t => t * 3 }, 0), { clientX: 121, clientY: 150 });
+  const lat = script.slice(script.indexOf("CHART_LABEL['chart']="), script.indexOf("$('chart').addEventListener('blur'"));
+  assert.match(lat, /latHover=i; redrawLat\(\)/, 'stepping must move the latency chart’s own cursor');
+  assert.match(lat, /showChartTip\(html, chartPointXY\(/, 'and put the tooltip on the point');
+  assert.match(lat, /chartSay\(\$\('chart'\)/, 'and say it');
+  const spd = script.slice(script.indexOf('for(const [id, plotOf] of'), script.indexOf("$(id).addEventListener('blur'"));
+  assert.match(spd, /focusRun\(spdData\[/, 'Enter on a stepped point must open the same run a click opens');
+  assert.match(spd, /showChartTip\(html, chartPointXY\(/, 'the three speedtest charts anchor theirs the same way');
+  assert.match(spd, /chartSay\(\$\(id\)/, 'and say theirs too');
+  assert.equal((script.match(/addEventListener\('blur', \(\)=>chartBlur\(/g) || []).length, 2,
+    'tabbing off a chart must take its readout down with it');
+  // The pointer and the keyboard show the same latency reading, from one place.
+  const LT = new Function('fmtTime', 'dnsShown', extract('function latTip') + '\nreturn { latTip };');
+  assert.equal(LT(() => '9:00', true).latTip({ t: 1, lat: 12.5, dns: 35 }),
+    '<div class="tt-time">9:00</div>12.5 ms<div>DNS 35 ms</div>');
+  assert.equal(LT(() => '9:00', false).latTip({ t: 1, lat: 12.5, dns: 35 }),
+    '<div class="tt-time">9:00</div>12.5 ms', 'a hidden DNS line stays hidden');
+  assert.match(extract('function latHoverAt'), /showChartTip\(latTip\(/, 'the hover tooltip must be the same one');
+});
+
+// Blur is not only the keyboard leaving. A mouse press on one chart focuses it and
+// blurs the chart an earlier click left focused, and that chart's blur put the
+// whole readout away - including the tooltip the pointer had just drawn on the
+// chart it is actually over. On the latency chart, where a click does nothing
+// else, pressing to steady a reading threw it away. Blur may take back only what
+// the keyboard drew; the pointer's own mouseleave cleans up after the pointer.
+test('a chart losing focus takes back only the readout the keyboard drew', () => {
+  const src = 'let chartKeyed=null, chartKeyTip=false;' + extract('function chartPtrDrew') + extract('function chartBlur') +
+    extract('function chartKeyOff') + '\nreturn { blur: chartBlur, ptr: chartPtrDrew, off: chartKeyOff, ' +
+    'key(id){ chartKeyed=id; chartKeyTip=true; }, at(){ return [chartKeyed, chartKeyTip]; } };';
+  const run = (steps, latHover = 5) => {
+    const tip = { hidden: false }, live = { textContent: 'Point 3 of 9' }, calls = [];
+    const H = new Function('$', 'CHART_LABEL', 'latHover', 'redrawLat', 'linkHover', src)(
+      id => (id === 'chartTip' ? tip : live), { chart: 'Latency', speedChart: 'Speed', qualityChart: 'Quality' }, latHover,
+      () => calls.push('redrawLat'), i => calls.push('linkHover(' + i + ')'));
+    const canvases = {};
+    const cv = id => canvases[id] || (canvases[id] = { id, a: { 'aria-label': 'stepped' }, setAttribute(k, v) { this.a[k] = v; } });
+    steps(H, cv);
+    return { tip: tip.hidden ? 'hidden' : 'shown', live: live.textContent, calls, label: id => cv(id).a['aria-label'], at: H.at() };
+  };
+  // Mouse only: the pointer drew the tooltip and the cursor, a press on another chart blurs this one.
+  let r = run((H, cv) => H.blur(cv('chart')));
+  assert.equal(r.tip, 'shown', 'blur hid the tooltip the pointer had just drawn on the chart it is over');
+  assert.deepEqual(r.calls, [], 'and cleared a cursor the pointer drew');
+  assert.equal(r.label('chart'), 'Latency', 'the shipped name comes back regardless');
+  assert.equal(r.live, '', 'the announcement is always the keyboard\'s to take back');
+  // Keyboard only: a step, then Tab away - everything the step drew must go.
+  r = run((H, cv) => { H.key('chart'); H.blur(cv('chart')); });
+  assert.equal(r.tip, 'hidden', 'tabbing off a chart left the stepped-to tooltip up');
+  assert.deepEqual(r.calls, ['redrawLat'], 'and left its cursor drawn');
+  assert.deepEqual(r.at, [null, false]);
+  r = run((H, cv) => { H.key('speedChart'); H.blur(cv('speedChart')); });
+  assert.equal(r.tip, 'hidden');
+  assert.deepEqual(r.calls, ['linkHover(-1)'], 'the speedtest charts share one cursor, and it must go too');
+  // A step on the latency chart, then the pointer over a speedtest chart and a press there:
+  // the tooltip is the pointer's now and stays; the latency cursor was the keyboard's and goes.
+  r = run((H, cv) => { H.key('chart'); H.ptr('speedChart'); H.blur(cv('chart')); });
+  assert.equal(r.tip, 'shown', 'the pointer\'s tooltip over the other chart was torn down');
+  assert.deepEqual(r.calls, ['redrawLat'], 'the keyboard\'s own cursor stayed behind');
+  assert.deepEqual(r.at, [null, false]);
+  // A step on a speedtest chart, then the pointer over another of the three: same cursor, so
+  // the pointer owns it all and blur touches nothing but the name.
+  r = run((H, cv) => { H.key('speedChart'); H.ptr('qualityChart'); H.blur(cv('speedChart')); });
+  assert.equal(r.tip, 'shown');
+  assert.deepEqual(r.calls, [], 'blur cleared the cursor the pointer had just drawn on the linked chart');
+  assert.equal(r.label('speedChart'), 'Speed');
+  r = run((H, cv) => { H.key('chart'); H.ptr('chart'); H.blur(cv('chart')); });
+  assert.deepEqual([r.tip, r.calls], ['shown', []], 'the pointer drawing over the stepped chart takes the readout over');
+  // Blur of some other chart leaves a keyboard readout that is not its own alone.
+  r = run((H, cv) => { H.key('chart'); H.blur(cv('speedChart')); });
+  assert.deepEqual([r.tip, r.calls, r.at], ['shown', [], ['chart', true]]);
+  // Escape still puts away whatever is showing, and forgets the step.
+  r = run((H, cv) => { H.key('chart'); H.off(cv('chart')); });
+  assert.deepEqual([r.tip, r.calls, r.at], ['hidden', ['redrawLat'], [null, false]]);
+  // Wired: the pointer takes over as it draws, the steps note what they drew, blur is the guarded one.
+  for (const [fn, id] of [['latHoverAt', 'chart'], ['spdHoverAt', 'speedChart'], ['qHoverAt', 'qualityChart'], ['bloatHoverAt', 'bloatChart']]) {
+    assert.match(extract('function ' + fn), new RegExp('^function ' + fn + '\\(e\\)\\{\\s*chartPtrDrew\\(\'' + id + '\'\\)'),
+      fn + ' draws without taking the readout over, so the next blur would tear it down');
+  }
+  const lat = script.slice(script.indexOf("CHART_LABEL['chart']="), script.indexOf("$('chart').addEventListener('blur'"));
+  assert.match(lat, /chartSay\(\$\('chart'\), latPlot, i, html\);\s*chartKeyed='chart'; chartKeyTip=true;/, 'a latency step must note what it drew');
+  const spd = script.slice(script.indexOf('for(const [id, plotOf] of'), script.indexOf("$(id).addEventListener('blur'"));
+  assert.match(spd, /chartSay\(\$\(id\), plot, i, html\);\s*chartKeyed=id; chartKeyTip=true;/, 'so must a speedtest step');
+  assert.equal((script.match(/addEventListener\('blur', \(\)=>chartKeyOff\(/g) || []).length, 0,
+    'a blur bound straight to chartKeyOff tears down the pointer\'s readout again');
+});
+
+test('a runs-table row offers the keyboard the run its click pins', async () => {
+  const rows = await renderRuns([{ ts: 1788290400 }]);
+  assert.match(rows, /<button class="run-pick" type="button" title="Show this run on the chart">/,
+    'the row that pins a run on the chart had nothing in it the keyboard could reach - rows take no ' +
+    'focus, and only the delete button was in the tab order');
+  const handler = script.slice(script.indexOf("$('runsBody').addEventListener('click'"), script.indexOf("$('runsToggle').addEventListener"));
+  assert.match(handler, /focusRunOnChart\(\+row\.dataset\.ts\)/,
+    'the button rides the row click, so the mouse and the keyboard cannot pin different runs');
+  // It has to look like the cell text it replaced, or the table grows a column of
+  // little grey buttons.
+  assert.match(html, /\.runs-table td \.run-pick\{background:none;border:0;padding:0;font:inherit;color:inherit/,
+    'the timestamp button is drawn as a button, not as the cell text');
+});
+
+test('the pagers keep the keyboard when a button goes dead at the end of the list', () => {
+  for (const which of ['runs', 'outages']) {
+    const isRuns = which === 'runs';
+    const els = {}, focused = [];
+    const $ = id => (els[id] = els[id] || { id, textContent: '', disabled: false, focus() { focused.push(this.id); } });
+    const prev = $(isRuns ? 'runsPrev' : 'outagesPrev'), next = $(isRuns ? 'runsNext' : 'outagesNext');
+    const toggle = $(isRuns ? 'runsToggle' : 'outagesToggle');
+    const doc = { activeElement: null };
+    const name = isRuns ? 'updateRunsPager' : 'updateOutagesPager';
+    const mk = (page, perPage, total) => new Function('$', 'document',
+      (isRuns ? `let runsPage=${page}, runsPerPage=${perPage}, runsTotal=${total};\n`
+              : `let outagesPage=${page}, outagesPerPage=${perPage}, outagesTotal=${total};\n`)
+      + extract(`function ${name}`) + `\nreturn ${name};`)($, doc);
+
+    doc.activeElement = prev;
+    mk(1, 10, 152)();
+    assert.deepEqual(focused, [next.id],
+      `${which}: paging back to the first page disabled the button under the reader’s finger and ` +
+      'dropped focus to <body>, so the next Tab restarted from the top of the page');
+    focused.length = 0;
+    doc.activeElement = next;
+    mk(16, 10, 152)();
+    assert.deepEqual(focused, [prev.id], `${which}: same at the far end of the list`);
+    focused.length = 0;
+    doc.activeElement = next;
+    mk(1, 10, 5)();
+    assert.deepEqual(focused, [toggle.id],
+      `${which}: with a single page neither button is live, so the keyboard belongs to the toggle above the table`);
+    focused.length = 0;
+    doc.activeElement = { id: 'somewhereElse', disabled: false };
+    mk(1, 10, 152)();
+    assert.deepEqual(focused, [], `${which}: a reader who was reading elsewhere must not be pulled into the pager`);
+    prev.disabled = next.disabled = false;
+  }
+});
+
+test('a failed delete gives the keyboard back to the button that failed', () => {
+  const mk = overlay => new Function('loginOverlay',
+    extract('function refocusDeleteBtn') + '\nreturn { refocusDeleteBtn };')(overlay);
+  const btn = () => ({ isConnected: true, disabled: false, n: 0, focus() { this.n++; } });
+  let b = btn();
+  mk({ hidden: true }).refocusDeleteBtn(b);
+  assert.equal(b.n, 1,
+    'a refused delete left focus on <body>: no focus ring anywhere, and the button to try again was ' +
+    'the one Tab skipped over in both directions');
+  b = btn(); b.disabled = true;
+  mk({ hidden: true }).refocusDeleteBtn(b);
+  assert.equal(b.n, 0, 'focusing a still-disabled button is a silent no-op');
+  b = btn(); b.isConnected = false;
+  mk({ hidden: true }).refocusDeleteBtn(b);
+  assert.equal(b.n, 0, 'a button whose table was rebuilt under it is gone');
+  b = btn();
+  mk({ hidden: false }).refocusDeleteBtn(b);
+  assert.equal(b.n, 0, 'a 401 puts the reader in the password field - do not pull them back out of it');
+
+  // Handing the keyboard back is only half of it: the button painted its focus by
+  // recolouring the glyph and killing the page's ring, and that recolour is a hue
+  // swap of nearly the same brightness (about 1.2:1) - nothing at all in forced
+  // colours - so the button that got focus back still looked like it had not.
+  const ring = html.match(/\n  \.run-del:focus-visible\{[^}]*\}/)[0];
+  assert.ok(!/outline:none/.test(ring), `a focused delete button paints no ring: ${ring}`);
+  assert.match(html, /\n  \.run-del:hover\{[^}]*\}/, 'and hover keeps its own recolour, ringless');
+
+  for (const [from, to] of [["$('runsBody').addEventListener('click'", "$('runsToggle').addEventListener"],
+    ["$('events').addEventListener('click'", 'function updateOutagesPager']]) {
+    const h = script.slice(script.indexOf(from), script.indexOf(to));
+    assert.equal((h.match(/refocusDeleteBtn\(btn\)/g) || []).length, 2,
+      'both the refused answer and the network error have to hand the keyboard back');
+  }
+});
+
+test('a focus-raised heatmap tooltip follows the page when it scrolls', () => {
+  const { hm, tip, doc, scroll } = heatmapTip();
+  let rect = { left: 40, top: 284, bottom: 300, width: 16, height: 16 };
+  const cell = { dataset: { tip: '2026-02-03: 1 outage(s), 1h 10m down' },
+    getBoundingClientRect: () => rect, closest: s => ((s === '.cell' || s === '#heatmap') ? cell : null) };
+  (hm.on.focusin || []).forEach(fn => fn({ target: cell }));
+  assert.equal(tip.hidden, false, 'test set-up: focusing a day raises its tooltip');
+  assert.equal(tip.style.top, '314px', 'test set-up: anchored under the cell');
+
+  doc.activeElement = cell;
+  rect = { ...rect, top: 100, bottom: 116 };   // activating the day scrolled the outage row into view
+  scroll();
+  assert.equal(tip.style.top, '130px',
+    'the tooltip stayed at its old viewport spot - .hm-tip is position:fixed and focus never leaves ' +
+    'the cell, so it sat on top of the outage rows the activation had just gone to find');
+
+  // A tip the POINTER raised has a pointer to move it, and mousemove does; nothing
+  // focused in the grid means this is not ours to re-place. The focused thing can
+  // still carry a dataset.tip of its own - every info glyph on the page does - so
+  // it is the grid that decides, not the presence of a tooltip string.
+  doc.activeElement = { dataset: { tip: 'an info bubble somewhere else' },
+    getBoundingClientRect: () => ({ left: 900, top: 700, bottom: 716 }), closest: () => null };
+  rect = { ...rect, top: 10, bottom: 26 };
+  scroll();
+  assert.equal(tip.style.top, '130px', 'a scroll with the keyboard somewhere else dragged the heatmap tooltip to it');
+  doc.activeElement = null;
+  scroll();
+  assert.equal(tip.style.top, '130px', 'a wheel scroll under a still pointer moved a tooltip the pointer owns');
 });

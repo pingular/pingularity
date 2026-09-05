@@ -172,9 +172,13 @@
   .bar h1{margin:0;display:inline-flex;align-items:center;}
   .bar h1 .logo{height:29.44px;width:auto;display:block;flex:none;}
   /* The wordmark is painted from the tokens, not its own fill attributes, so a theme (or the
-     user's Appearance pickers) can recolour each half. */
-  .logo path[fill="#8B5CF6"]{fill:var(--logo-ping);}
-  .logo path[fill="#6B8EF5"]{fill:var(--logo-ul);}
+     user's Appearance pickers) can recolour each half. Nearly every theme points those tokens
+     at --theme-accent, which nothing in this stylesheet defines - setTheme fills it in, and the
+     script only runs at the end of the body. Until then there is nothing to substitute and each
+     half would fall back to fill's initial BLACK, which is what a slow first paint showed. The
+     fallbacks below hold the baked-in SVG colours for that frame, exactly as the radar icon does. */
+  .logo path[fill="#8B5CF6"]{fill:var(--logo-ping,#8B5CF6);}
+  .logo path[fill="#6B8EF5"]{fill:var(--logo-ul,#6B8EF5);}
   /* Header radar icon: three hues that track the theme exactly like the favicon -
      the faint rings and inner signal arc take the "up" hue, the middle arc and
      centre dot the accent, the outer arc the accent2. Fallbacks hold the baked-in
@@ -329,6 +333,11 @@
     color:var(--muted);padding:8px 15px;font:inherit;font-size:12px;text-transform:uppercase;
     letter-spacing:.6px;cursor:pointer;transition:color .15s,border-color .15s;}
   .tab:hover{color:var(--fg);}
+  /* A tab fills the bar's full height, and the bar clips vertically because it
+     scrolls sideways when the tabs outrun it - so the shared ring's +2px offset is
+     cut away top and bottom and only two bare vertical bars survive. Tuck the ring
+     just inside the tab instead, the idiom the other controls in this file use. */
+  .tab:focus-visible{outline-offset:-2px;}
   .tab.active{color:var(--fg);border-bottom-color:var(--accent);}
   /* Update-available cue: a glowing accent dot on the About tab and the gear,
      so a pending update is visible even with the drawer collapsed. */
@@ -896,10 +905,14 @@
   /* .info sets display:inline-flex, which outranks the UA [hidden] rule. */
   .info.conn-off[hidden]{display:none;}
   /* On the light themes the --line2 ring all but vanishes; give the icon the
-     (darker) muted ring + a faint fill so it reads as a control. The resting rule
-     out-specifies .info:hover/:focus, so re-assert the accent ring for those. */
-  html[data-theme="light"] .info{border-color:var(--muted);background:color-mix(in srgb,var(--muted) 12%,transparent);}
-  html[data-theme="light"] .info:hover, html[data-theme="light"] .info:focus{border-color:var(--accent);}
+     (darker) muted ring + a faint fill so it reads as a control. Both light grounds
+     are named here: Parchment's cream stock is as pale as Light's, and its --line2
+     tan on it comes out at about 1.9:1 - the ring is there but you have to look for
+     it. The resting rule out-specifies .info:hover/:focus, so re-assert the accent
+     ring for those. */
+  :is(html[data-theme="light"],html[data-theme="parchment"]) .info{border-color:var(--muted);background:color-mix(in srgb,var(--muted) 12%,transparent);}
+  :is(html[data-theme="light"],html[data-theme="parchment"]) .info:hover,
+  :is(html[data-theme="light"],html[data-theme="parchment"]) .info:focus{border-color:var(--accent);}
   @media (max-width:600px){ .info>.tip{width:min(250px,86vw);left:auto;right:0;} .lbl .info>.tip,.ie-lbl .info>.tip,.netinfo .info:not(.conn-off)>.tip{position:fixed;left:8px !important;right:auto !important;top:auto;bottom:12px;width:min(250px,86vw);} }
 
   /* ---- Ookla server picker: the saved pane above, the search results below ---- */
@@ -1072,14 +1085,26 @@
   .panel h2{margin:0 0 14px;font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.9px;
     display:flex;align-items:center;gap:10px;}
   /* Drag-to-rearrange: a grip handle starts the drag; the panel itself isn't
-     draggable otherwise, so charts/buttons stay interactive. */
+     draggable otherwise, so charts/buttons stay interactive. The grip is a
+     SIBLING of its panel's heading, never a child of it: a heading is named by
+     everything inside it, so a grip in there gets read out ahead of the title
+     every time a screen reader walks the page by headings, which is how most of
+     them move around a page like this one. It sits in the panel's corner either
+     way - the position is absolute against the panel, not the heading. It is the
+     panel's LAST child, not its first: it is painted in the bottom-right corner,
+     and Tab follows the markup, so as the first child it was the first stop in
+     every panel - the corner, then a jump back up to the heading. */
   .drag-handle{position:absolute;bottom:var(--corner-y);right:var(--corner-x);z-index:2;
     display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
     border-radius:7px;background:var(--bg2);border:1px solid var(--line2);color:var(--muted);
     font-size:13px;line-height:1;cursor:grab;opacity:.5;user-select:none;-webkit-user-select:none;
     transition:opacity .15s,border-color .15s,color .15s;}
   .drag-handle svg{display:block;}
-  .drag-handle:hover{opacity:1;border-color:var(--accent);color:var(--accent);}
+  .drag-handle:hover,.drag-handle:focus-visible{opacity:1;border-color:var(--accent);color:var(--accent);}
+  /* Picked up from the keyboard. The pressed state is what a screen reader reads
+     back; this is the same thing for eyes. */
+  .drag-handle[aria-pressed="true"]{opacity:1;border-color:var(--accent);color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 22%,var(--bg2));}
   /* Chart show/hide toggles, right-aligned on the "show all runs" row beside the
      charts, so they stay put (and never overlap the table) when the runs section
      opens. The row's padding-right leaves the bottom-right corner tools (save-image button
@@ -1239,6 +1264,9 @@
     text-transform:none;letter-spacing:0;font-weight:400;}
   .win-pop[hidden]{display:none;}
   .win-pop.up{top:auto;bottom:calc(100% + 6px);} /* flipped above the button - see place() */
+  /* The options sit in their own listbox element inside the popover, so the
+     column layout the popover used to apply to them directly lives here. */
+  .win-opts{display:flex;flex-direction:column;gap:2px;}
   .win-pop .opt{display:flex;justify-content:space-between;align-items:center;gap:12px;
     background:none;border:none;color:var(--fg);font:inherit;font-size:12px;
     text-align:left;padding:6px 9px;border-radius:7px;cursor:pointer;}
@@ -1293,6 +1321,11 @@
      pill row and the handle share a height and baseline. line-height:1 makes the
      content box exactly 12px (24 - 10 padding - 2 border), centring the label. */
   .targets .pill{white-space:nowrap;flex:none;height:24px;line-height:1;}
+  /* Same clipping as the settings tabs: the pills fill the strip exactly and the
+     strip scrolls, so an outset ring loses its top and bottom edges - and its left
+     edge too on the first pill, which leaves one lonely bar as the only sign of
+     where the keyboard is. Draw the ring inside the pill. */
+  .targets .pill:focus-visible{outline-offset:-2px;}
   .targets .pv{display:inline-block;min-width:52px;text-align:right;font-variant-numeric:tabular-nums;}
   .targets::-webkit-scrollbar{height:6px;}
   .targets::-webkit-scrollbar-thumb{background:var(--line2);border-radius:3px;}
@@ -1380,8 +1413,17 @@
   .data-pop .row .v{font-variant-numeric:tabular-nums;}
   .data-pop .row.all{border-top:1px solid var(--line);margin-top:4px;padding-top:6px;font-weight:600;}
   .data-pop .row:hover{background:color-mix(in srgb,var(--fg) 9%,transparent);}
-  .data-pop .row.sel{background:color-mix(in srgb,var(--accent) 16%,transparent);}
-  .data-pop .row.sel .k,.data-pop .row.sel .v{color:var(--accent);}
+  /* The picked row is set the way every "on" chip is (.day.on, .cat.on, the engine
+     toggle): solid accent under --on-accent, the one pairing each theme keeps
+     readable on purpose, and onAccent() recomputes for a user-picked accent. A 16%
+     accent tint cannot get there in every theme whatever the text: accent text on
+     it is two shades of one colour (3.6:1 on Retro), and Solarized's --fg is too
+     dim for its own ground before the tint lifts it - 4.1:1 on the plain rows
+     beside this one, 3.4:1 on the tint - against the 4.5:1 these 12.5px rows need.
+     Solid accent reads 5.2:1 there, its tightest theme, 5.4:1 on Parchment, 6.1:1
+     on Light and 7:1 or better on the rest. */
+  .data-pop .row.sel{background:var(--accent);}
+  .data-pop .row.sel .k,.data-pop .row.sel .v{color:var(--on-accent);font-weight:600;}
   .data-pop .win-custom{margin-top:5px;padding:6px 7px 0;}
   .data-pop .win-custom input{width:100%;box-sizing:border-box;}
   /* The uptime popover's coverage caveat. A sentence, so it needs a width to wrap
@@ -1513,6 +1555,11 @@
      white tint composites to nothing and the row hover simply doesn't exist. Same idiom
      as .win-pop .opt:hover / .data-pop .row:hover. */
   .runs-table tbody tr[data-ts]{cursor:pointer;}
+  /* Clicking a row shows that run on the chart, which left the keyboard nothing to
+     press: rows take no focus. The timestamp is a button so there is something to
+     tab to, wearing the cell's own type - the affordance is still the whole row,
+     not a second control competing with it. */
+  .runs-table td .run-pick{background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;vertical-align:baseline;}
   .runs-table tbody tr:hover{background:color-mix(in srgb,var(--fg) 5%,transparent);}
   /* Row linked to a hovered/clicked speed-chart point. */
   .runs-table tbody tr.run-hl,
@@ -1522,7 +1569,14 @@
   td.act,th.act{padding:4px 6px;text-align:center;width:1%;} /* delete column: runs + outages tables */
   .run-del{display:inline-flex;align-items:center;justify-content:center;background:none;border:0;color:var(--muted);cursor:pointer;line-height:0;padding:4px 6px;border-radius:6px;transition:color .12s,background .12s;}
   .run-del svg{width:14px;height:14px;display:block;}
-  .run-del:hover,.run-del:focus-visible{color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent);outline:none;}
+  .run-del:hover{color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent);}
+  /* Keyboard focus reddens the same way but KEEPS the page's focus ring. The
+     recolour alone is a hue swap of nearly equal brightness - about 1.2:1 against
+     the grey it replaces - and in forced colours it is not drawn at all, so a
+     button that had just been handed the keyboard looked exactly like one that
+     had not. That is worst here of all places: a refused delete puts focus back on
+     this button and there is nothing else on the row to say so. */
+  .run-del:focus-visible{color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent);}
   .run-del:disabled{opacity:.4;cursor:default;}
 
   /* Square cells stretched (via 1fr tracks + container aspect-ratio set in JS)
@@ -1562,6 +1616,11 @@
     font-size:12.5px;color:var(--fg);background:color-mix(in srgb,var(--down) 16%,var(--panel));
     border-top:1px solid color-mix(in srgb,var(--down) 55%,transparent);}
   /* Brief undo toast after a tile is hidden by edge-drag (easy to do by accident). */
+  /* Said, not shown: a polite live region for a readout that otherwise exists only
+     as a picture (the chart cursor). Off screen rather than display:none or
+     hidden, neither of which is announced at all. */
+  .sr-live{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;
+    clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;}
   /* Sized on its text and then capped: anchored at left:50%, shrink-to-fit sizes a
      sentence-long message against the half viewport to its right - a narrow column
      on a phone. */
@@ -1976,7 +2035,7 @@
             </div>
             <div>
               <div class="server-search fp-find">
-                <input type="text" id="serverCity" placeholder="Place or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
+                <input type="text" id="serverCity" aria-label="Place or Ookla server ID" placeholder="Place or Ookla server ID" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search">
                 <button class="btn" id="serverSearchBtn" type="button" title="List the Ookla servers near a place, fastest first - or type a server's Ookla ID to pin exactly that one"><span class="btn-lbl">Find</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
                 <button class="btn" id="serverAuto" type="button" title="Show what Auto would pick right now: every candidate city's servers, deduplicated and pinged, fastest first. Pings only - no speedtest runs, and nothing is chosen"><span class="btn-lbl">Auto</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
               </div>
@@ -2081,7 +2140,7 @@
 • Edit changes its address and credentials.
 • Port defaults to 5201.">i</span></span>
           <div class="fp-list fp-kept ipl" id="iperfServerList"></div>
-          <span class="muted" id="iperfMsg" style="font-size:12px;min-height:1em"></span>
+          <span class="muted" role="status" id="iperfMsg" style="font-size:12px;min-height:1em"></span>
           <!-- I1: never blocks Save - a loopback target is legitimate natively and the
                operator may know better; the bubble only explains why it will refuse
                connections from a bridged container. Toggled by updateIperfLoopbackWarn. -->
@@ -2208,7 +2267,7 @@ Delete now clears all three.">i</span></span>
           <button class="btn" id="exportBtn" type="button"><span class="btn-lbl">Export</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
         </div>
         <span class="muted card-foot">Exports the selected categories as one JSON file. <b>No passwords are exported</b> - not your login, not your iperf3 servers'. Restoring here keeps the iperf3 passwords already saved on this machine; on a different machine you re-enter them. <b>Your webhook and heartbeat URLs are included</b>, and those act as credentials - keep the file private.</span>
-        <span class="muted card-foot" id="exportMsg"></span>
+        <span class="muted card-foot" role="status" id="exportMsg"></span>
         <div class="bk-sep"></div>
         <div class="bk-row">
           <div class="bk-label">Import</div>
@@ -2222,11 +2281,11 @@ Delete now clears all three.">i</span></span>
           </div>
           <div class="bk-actions">
             <button class="btn" id="importBtn" type="button"><span class="btn-lbl">Import</span><span class="btn-busy btn-spin" aria-hidden="true"></span></button>
-            <label class="filebtn" id="importFileBtn"><span class="flabel" id="importFileName">Choose file…</span><input type="file" id="importFile" accept="application/json,.json"></label>
+            <label class="filebtn" id="importFileBtn" role="button" tabindex="0"><span class="flabel" id="importFileName">Choose file…</span><input type="file" id="importFile" accept="application/json,.json"></label>
           </div>
         </div>
         <span class="muted card-foot">Imports selected categories from the file, data is merged, existing rows kept, config overwrites your settings.</span>
-        <span class="muted card-foot" id="importMsg"></span>
+        <span class="muted card-foot" role="status" id="importMsg"></span>
       </section>
       </div><!-- /retention (Data) pane: stored-data + backup cards -->
       <div class="tabpane tab-uniform" data-tab="alerts">
@@ -2518,7 +2577,12 @@ Applies live and persists.">i</span></span>
               <button class="log-ic" id="logDownload" type="button" title="Download logs" aria-label="Download logs">⤓</button>
               <button class="log-ic" id="logClear" type="button" title="Clear logs" aria-label="Clear logs"></button>
             </div>
-            <pre class="log-window" id="logWindow" aria-live="polite" tabindex="0">Open this tab to load recent logs…</pre>
+            <!-- Not a live region. Lines are appended on every poll, one to three a
+                 second with logging on, and a polite region would read every one of
+                 them aloud for as long as this tab is open. The two notes below say
+                 the things that are worth interrupting for, and they are the live
+                 regions. The viewer is focusable, so it can be read on purpose. -->
+            <pre class="log-window" id="logWindow" tabindex="0">Open this tab to load recent logs…</pre>
             <div class="log-trunc" id="logTrunc" role="status" hidden></div>
             <div class="log-stall" id="logStall" role="status" hidden>⚠&#xFE0E; Log stream stalled - the lines above are not live. Still retrying.</div>
           </div>
@@ -2528,7 +2592,12 @@ Applies live and persists.">i</span></span>
       <div class="drawer-actions">
         <button class="btn" id="saveSettings">Save</button>
         <button class="btn ghost" id="discardSettings" type="button">Discard</button>
-        <span class="muted" id="settingsMsg"></span>
+        <!-- role=status: this span is where a refused or failed Save says so, and
+             where the alert tests report back. Without it the single most important
+             outcome in the drawer - your changes were NOT saved - was silent for
+             anyone not looking at this corner. Same for the export, import and
+             iperf3 messages below. -->
+        <span class="muted" role="status" id="settingsMsg"></span>
         <button class="btn ghost" id="resetSettings" type="button" title="Puts every setting back to how it shipped, except your access and security settings - those are left alone">Reset to defaults</button>
         <button class="btn ghost" id="resetLayout" type="button">Reset tiles</button>
       </div>
@@ -2540,6 +2609,7 @@ Applies live and persists.">i</span></span>
 <!-- &#xFE0E; after ⚠/ℹ (here, the warn bubbles, and the netinfo JS) pins the glyph to text style so it takes the theme's CSS colour - phones otherwise draw it as a fixed-colour emoji. -->
 <div class="stale-bar" id="staleBar" role="status" hidden>⚠&#xFE0E; Pingularity isn't answering - showing data from <span id="staleSince">-</span></div>
 <div class="toast" id="undoToast" role="status" hidden></div>
+<div class="sr-live" id="chartRead" role="status" aria-live="polite"></div>
 <div class="login-overlay" id="loginOverlay" role="dialog" aria-modal="true" aria-label="Sign in" hidden>
   <form class="login-box" id="loginForm">
     <h2>Pingularity</h2>
@@ -2548,8 +2618,8 @@ Applies live and persists.">i</span></span>
          needs it, someone locked out, is the one person who cannot read it. -->
     <p class="muted login-sub">Sign in to continue
       <span class="info" tabindex="0" id="loginResetInfo" data-tip="Locked out? Run pingularity reset-auth on the host to clear it and disable auth - this page then lets you straight in, and you can set a new password under Settings &gt; Access.">i</span></p>
-    <input type="text" id="loginUser" autocomplete="username" placeholder="Username" value="admin" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next">
-    <input type="password" id="loginPass" autocomplete="current-password" placeholder="Password" autofocus>
+    <input type="text" id="loginUser" aria-label="Username" autocomplete="username" placeholder="Username" value="admin" maxlength="128" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next">
+    <input type="password" id="loginPass" aria-label="Password" autocomplete="current-password" placeholder="Password" autofocus>
     <button class="btn" type="submit">Sign in</button>
     <span class="login-err" id="loginErr" role="alert"></span>
   </form>
@@ -2557,7 +2627,7 @@ Applies live and persists.">i</span></span>
 <div class="del-zone l" id="delZoneL">✕</div>
 <div class="del-zone r" id="delZoneR">✕</div>
 
-<div class="data-pop" id="dataPop" role="listbox" aria-label="Speedtest data usage by window" hidden></div>
+<div class="data-pop" id="dataPop" role="dialog" aria-label="Speedtest data usage by window" hidden></div>
 
 <!-- First-run Quick Setup. Server-gated (quick_setup_pending in /api/status):
      fresh installs only, once. X and Esc decline - the answer is persisted and
@@ -2581,8 +2651,8 @@ Applies live and persists.">i</span></span>
     </div>
     <div class="qs-note" id="qsAccNote">The safe default. Nothing is reachable from other devices.</div>
     <div class="qs-pw" id="qsPw">
-      <input type="text" id="qsUser" placeholder="Username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="120">
-      <input type="password" id="qsPass" placeholder="Password" maxlength="72">
+      <input type="text" id="qsUser" placeholder="Username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="120" aria-label="Username">
+      <input type="password" id="qsPass" placeholder="Password" maxlength="72" aria-label="Password">
     </div>
     <!-- Network access with both fields left blank is the choice that installs a
          passwordless, network-reachable daemon, and this dialog is where it is
@@ -2594,15 +2664,15 @@ Applies live and persists.">i</span></span>
     <div>
       <div class="qs-rl">Theme</div>
       <div class="qs-them" id="qsTheme">
-        <button class="qs-sw on" data-sw="retro" title="Retro" aria-label="Retro theme"></button>
-        <button class="qs-sw" data-sw="dark" title="Dark" aria-label="Dark theme"></button>
-        <button class="qs-sw" data-sw="light" title="Light" aria-label="Light theme"></button>
-        <button class="qs-sw" data-sw="amoled" title="AMOLED" aria-label="AMOLED theme"></button>
-        <button class="qs-sw" data-sw="cyber" title="Cyber" aria-label="Cyber theme"></button>
-        <button class="qs-sw" data-sw="slate" title="Slate" aria-label="Slate theme"></button>
-        <button class="qs-sw" data-sw="solarized" title="Solarized" aria-label="Solarized theme"></button>
-        <button class="qs-sw" data-sw="parchment" title="Parchment" aria-label="Parchment theme"></button>
-        <button class="qs-sw" data-sw="ember" title="Ember" aria-label="Ember theme"></button>
+        <button class="qs-sw on" data-sw="retro" title="Retro" aria-label="Retro theme" aria-pressed="true"></button>
+        <button class="qs-sw" data-sw="dark" title="Dark" aria-label="Dark theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="light" title="Light" aria-label="Light theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="amoled" title="AMOLED" aria-label="AMOLED theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="cyber" title="Cyber" aria-label="Cyber theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="slate" title="Slate" aria-label="Slate theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="solarized" title="Solarized" aria-label="Solarized theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="parchment" title="Parchment" aria-label="Parchment theme" aria-pressed="false"></button>
+        <button class="qs-sw" data-sw="ember" title="Ember" aria-label="Ember theme" aria-pressed="false"></button>
       </div>
     </div>
     <div>
@@ -2615,26 +2685,30 @@ Applies live and persists.">i</span></span>
     <div class="qs-err" id="qsErr" role="alert"></div>
   </div>
 </div>
-<div class="data-pop" id="uptimePop" role="listbox" aria-label="Uptime by window" hidden></div>
+<div class="data-pop" id="uptimePop" role="dialog" aria-label="Uptime by window" hidden></div>
 <div class="hm-tip" id="hmTip" hidden></div>
 <div class="hm-tip" id="chartTip" hidden></div>
 
 <div class="wrap">
 
   <div class="panel" data-section="connection">
-    <span class="drag-handle" title="Drag to reorder" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
     <button class="conn-refresh" id="netinfoRefresh" type="button" title="Refresh connection info" aria-label="Refresh connection info"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
     <span class="info conn-off" id="netinfoOffMark" tabindex="0" hidden role="img" aria-label="Connection info is off" data-tip="Connection info is off, so this panel is not refreshing on its own - what you see is whatever was last looked up.
 The refresh button beside this still works if you want a one-off look.
 Turn it back on in Settings → Latency.">!</span>
     <div class="netinfo" id="netinfo"><span class="muted">Loading…</span></div>
     <div class="warn-bubble" id="netinfoWarn" role="status" aria-live="polite"></div>
+    <span class="drag-handle" title="Drag to reorder - or focus it: the arrow keys move it, Delete hides it" tabindex="0" role="button" aria-pressed="false" aria-label="Move the Connection tile"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
   </div>
 
   <div class="panel" data-section="speed">
-    <h2><span class="drag-handle" title="Drag to reorder" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
+    <h2>
       <button id="runSpeed" class="btn speed-run" aria-label="Run a speedtest now" title="Run a speedtest now"><span class="run-lbl">RUN</span><span class="run-spin btn-spin" aria-hidden="true"></span></button>
-      <span class="muted" id="speedWhen"></span>
+      <!-- role=status: a manual run that fails says so here and nowhere else, so
+           without it the outcome of pressing RUN was silent. The pollers rewrite
+           this caption every round with the same words, which a live region would
+           read out every time - setSpeedWhen writes it only when it changes. -->
+      <span class="muted" role="status" id="speedWhen"></span>
       <span class="h2-tools"><span class="info chart-tip" tabindex="0"  data-tip="What each speedtest measures (click a chart point to read it):
 • Download / Upload - how fast data flows in and out (Mbps; higher is better).
 • Ping - round-trip delay to the test server (ms; lower is better).
@@ -2655,9 +2729,9 @@ Turn it back on in Settings → Latency.">!</span>
         <div class="value" id="sp_bloat_dn">-</div></div>
       <div class="card"><div class="label">↑ Bufferbloat</div><div class="value" id="sp_bloat_up">-</div></div>
     </div>
-    <canvas id="speedChart" role="img" aria-label="Download and upload speed over time" style="height:200px;margin-top:8px"></canvas>
-    <canvas id="qualityChart" role="img" aria-label="Ping and jitter over time" style="height:102px"></canvas>
-    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:168px"></canvas>
+    <canvas id="speedChart" role="img" aria-label="Download and upload speed over time" style="height:200px;margin-top:8px" tabindex="0"></canvas>
+    <canvas id="qualityChart" role="img" aria-label="Ping and jitter over time" style="height:102px" tabindex="0"></canvas>
+    <canvas id="bloatChart" role="img" aria-label="Bufferbloat - extra delay under load - over time" style="height:168px" tabindex="0"></canvas>
     <div class="runs-bar">
       <button class="btn ghost" id="runsToggle" type="button" aria-expanded="false" aria-controls="runsSection">Show all runs ▾</button>
       <!-- Averages over exactly the rows the charts to the right are drawing; painted by
@@ -2700,10 +2774,11 @@ Turn it back on in Settings → Latency.">!</span>
         </table>
       </div>
     </div>
+    <span class="drag-handle" title="Drag to reorder - or focus it: the arrow keys move it, Delete hides it" tabindex="0" role="button" aria-pressed="false" aria-label="Move the Speed tile"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
   </div>
 
   <div class="panel" data-section="latency">
-    <h2><span class="drag-handle" title="Drag to reorder" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>Lowest round-trip across anchors
+    <h2>Lowest round-trip across anchors
       <span class="h2-tools"><span class="info chart-tip" tabindex="0"  data-tip="What's on this chart:
 • Latency line - how long it takes to reach the nearest of Cloudflare, Google or Quad9. Your distance to the internet's edge, not to a particular site.
 • DNS line - how long a name lookup takes on the DNS server this machine uses. Gaps mean lookups were failing, or the DNS check was off.
@@ -2713,12 +2788,13 @@ Turn it back on in Settings → Latency.">!</span>
       <span class="win-dd" id="latencyWindow" style="margin-left:0"></span></span>
     </h2>
     <button class="chart-save" type="button" data-chart-save="latency" title="Save this chart as an image" aria-label="Save this chart as an image"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="3.6"/></svg></button>
-    <canvas id="chart" role="img" aria-label="Latency to the anchors over time, with DNS lookup time"></canvas>
+    <canvas id="chart" role="img" aria-label="Latency to the anchors over time, with DNS lookup time" tabindex="0"></canvas>
     <div class="targets" id="targets"></div>
+    <span class="drag-handle" title="Drag to reorder - or focus it: the arrow keys move it, Delete hides it" tabindex="0" role="button" aria-pressed="false" aria-label="Move the Latency tile"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
   </div>
 
   <div class="panel" data-section="downtime">
-    <h2><span class="drag-handle" title="Drag to reorder" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>Downtime - past year</h2>
+    <h2>Downtime - past year</h2>
     <div class="heatmap" id="heatmap"></div>
     <button class="btn ghost" id="outagesToggle" type="button" style="margin-top:12px" aria-expanded="false" aria-controls="outagesSection">Show recent outages ▾</button>
     <div id="outagesSection" style="display:none">
@@ -2738,6 +2814,7 @@ Turn it back on in Settings → Latency.">!</span>
         <tbody id="events"><tr><td class="muted" colspan="4">No events recorded yet.</td></tr></tbody>
       </table>
     </div>
+    <span class="drag-handle" title="Drag to reorder - or focus it: the arrow keys move it, Delete hides it" tabindex="0" role="button" aria-pressed="false" aria-label="Move the Downtime tile"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><circle cx="7.5" cy="4.5" r="2.2"/><circle cx="16.5" cy="4.5" r="2.2"/><circle cx="7.5" cy="12" r="2.2"/><circle cx="16.5" cy="12" r="2.2"/><circle cx="7.5" cy="19.5" r="2.2"/><circle cx="16.5" cy="19.5" r="2.2"/></svg></span>
   </div>
 </div>
 
@@ -3175,6 +3252,10 @@ function localeDayFirst(){
 // which is also the only place the plotted dates appear, since no chart here
 // draws a time axis.
 // Returns {range, set}: set() is how anything else applies a selection.
+// Every chart window picker on the page, for the page-wide Escape (with the
+// other overlays, further down). A picker's own Escape is bound to the picker,
+// so it hears nothing pressed anywhere else.
+const winPickers=[];
 function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
   const root=$(rootId), ranges=!!(opts&&opts.ranges);
   const cap = () => { const r=maxFn?maxFn():0; return r>0 ? Math.min(r, MAX_WIN_MINS) : MAX_WIN_MINS; };
@@ -3187,9 +3268,18 @@ function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
 
   const btn=document.createElement('button');
   btn.type='button'; btn.className='chart-win';
-  btn.setAttribute('aria-haspopup','listbox'); btn.setAttribute('aria-expanded','false');
+  btn.setAttribute('aria-haspopup','dialog'); btn.setAttribute('aria-expanded','false');
   const pop=document.createElement('div');
-  pop.className='win-pop'; pop.setAttribute('role','listbox'); pop.hidden=true;
+  // The popover is not the list. It also holds the custom-window box and the line
+  // that echoes back how that text was read, and a listbox owning a textbox and a
+  // paragraph is a shape assistive software is entitled to mangle - it was also
+  // announced as a nameless "list box". The options get their own named listbox
+  // inside it; see render(). What the button opens is a dialog - a named floating
+  // box that takes focus and hands it back on Escape - and that is what it says it
+  // opens: a wrapper with no role, or a group, is no kind of popup, so the promise
+  // in aria-haspopup would not match what a reader lands in.
+  pop.className='win-pop'; pop.hidden=true;
+  pop.setAttribute('role','dialog'); pop.setAttribute('aria-label','Change the chart window');
   root.append(btn,pop);
 
   // The button label has to stay short: it sits in a nowrap panel header next
@@ -3211,13 +3301,16 @@ function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
   };
   function render(){
     pop.innerHTML='';
+    const list=document.createElement('div');
+    list.className='win-opts'; list.setAttribute('role','listbox'); list.setAttribute('aria-label','Chart window');
+    pop.appendChild(list);
     if(sel.kind==='range'){
       const o=document.createElement('button');
       o.type='button'; o.className='opt sel';
       o.setAttribute('role','option'); o.setAttribute('aria-selected','true');
       o.innerHTML=`<span>${esc(shortLabel(sel))}</span><span class="tick" aria-hidden="true">✓</span>`;
       o.addEventListener('click', ()=>{ close(); btn.focus(); });
-      pop.appendChild(o);
+      list.appendChild(o);
     }
     // Offer nothing the retention cap will quietly shorten: picking "1 year"
     // with 30 days kept looked like it worked and silently became 30 days.
@@ -3233,7 +3326,7 @@ function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
       o.setAttribute('role','option'); o.setAttribute('aria-selected', on);
       o.innerHTML=`<span>${l}</span><span class="tick" aria-hidden="true">✓</span>`;
       o.addEventListener('click', ()=>choose({kind:'win', mins:m}));
-      pop.appendChild(o);
+      list.appendChild(o);
     }
     const row=document.createElement('div'); row.className='win-custom';
     const inp=document.createElement('input');
@@ -3291,8 +3384,23 @@ function winDropdown(rootId, key, presets, def, onChange, maxFn, opts){
   }
   function open(){ render(); pop.hidden=false; btn.setAttribute('aria-expanded','true'); place(); }
   function close(){ pop.hidden=true; btn.setAttribute('aria-expanded','false'); }
+  winPickers.push({pop, btn, close});
   btn.addEventListener('click', ()=>{ pop.hidden ? open() : close(); });
   document.addEventListener('click', e=>{ if(!root.contains(e.target)) close(); });
+  // A list the keyboard has walked out of is closed, the same way a click outside
+  // closes it. Tabbing past the custom row used to leave the options hanging over
+  // the chart with the button still announcing aria-expanded="true", and there was
+  // no way back short of Shift+Tab into it or the mouse: the Escape below is bound
+  // to this element, so it never hears a key pressed anywhere else on the page
+  // (the page-wide Escape handler covers a picker the keyboard was never in).
+  // relatedTarget is where focus is GOING, so moving between the button, the
+  // options and the input keeps the list up; a focusout with nowhere to go (the
+  // window losing focus, a press on empty page) leaves it to the click handler
+  // above rather than closing a list nobody has left.
+  root.addEventListener('focusout', e=>{
+    if(pop.hidden || !e.relatedTarget || root.contains(e.relatedTarget)) return;
+    close();
+  });
   root.addEventListener('keydown', e=>{
     if(e.key==='Escape' && !pop.hidden){ e.stopPropagation(); close(); btn.focus(); return; }
     if(e.key!=='ArrowDown' && e.key!=='ArrowUp') return;
@@ -3682,17 +3790,29 @@ function refreshSection(id){
   function applyHidden(){ const h=getHidden(); panels().forEach(p=>p.classList.toggle('section-hidden', h.includes(p.dataset.section))); }
   function hideSection(p){ const id=p.dataset.section; if(!id) return; const h=getHidden();
     if(!h.includes(id)){ h.push(id); lsSet('hiddenSections', JSON.stringify(h)); } p.classList.add('section-hidden');
-    showUndoToast('Tile hidden', ()=>unhideSection(id)); }
+    showUndoToast('Tile hidden', ()=>{ unhideSection(id); return p.querySelector('.drag-handle'); }); }
   // redrawCharts repaints at the restored size (the canvas was 0-sized while
   // hidden); refreshSection is what fills the cache it paints from, since this
   // tile has not been polling while it was away.
   function unhideSection(id){ lsSet('hiddenSections', JSON.stringify(getHidden().filter(x=>x!==id))); applyHidden(); redrawCharts(); refreshSection(id); }
   // Destructive layout changes that are easy to trigger by accident (edge-drag
   // hide, Reset tiles) offer a brief Undo with their own restore action.
+  // The toast is also where the keyboard is put when the tile it just hid was the
+  // last one showing (the grip's Delete), and a toast that went on hiding itself
+  // from under the focus dropped the reader on the page body - the very fall the
+  // hide was steering round. So it holds still while it has focus and goes once
+  // focus has left it; and Undo, which hides it too, hands the keyboard to what
+  // it brought back (onUndo returns that), or to Settings when that is not on
+  // screen, rather than to nothing.
   function showUndoToast(message, onUndo){ const tb=document.getElementById('undoToast'); if(!tb) return;
     tb.innerHTML=message+' · <a href="#" id="undoHide">Undo</a>'; tb.hidden=false;
-    document.getElementById('undoHide').addEventListener('click', e=>{ e.preventDefault(); onUndo(); tb.hidden=true; });
-    clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 6000); }
+    document.getElementById('undoHide').addEventListener('click', e=>{ e.preventDefault();
+      const had=tb.contains(document.activeElement), back=onUndo(); tb.hidden=true; tb.onfocusout=null;
+      if(!had) return;
+      if(back && back.focus) back.focus();
+      if(document.activeElement!==back) document.getElementById('gearBtn').focus(); });
+    const dismiss=()=>{ if(tb.contains(document.activeElement)){ tb.onfocusout=()=>setTimeout(dismiss, 0); return; } tb.onfocusout=null; tb.hidden=true; };
+    clearTimeout(tb._t); tb.onfocusout=null; tb._t=setTimeout(dismiss, 6000); }
   function applyOrder(ids){ const by={}; panels().forEach(p=>{ if(p.dataset.section) by[p.dataset.section]=p; });
     const ordered=ids.filter(id=>by[id]).map(id=>by[id]);
     panels().forEach(p=>{ if(!ids.includes(p.dataset.section)) ordered.push(p); });
@@ -3723,7 +3843,93 @@ function refreshSection(id){
     showZones(false);
     if(del && d) hideSection(d); else if(d) saveOrder();
   }
+  // Where an arrow key sends a tile: its neighbour among the VISIBLE tiles, or the
+  // end of the row for Home/End. -1 for a key that moves nothing, including a move
+  // that would fall off either end - the list does not wrap, so holding an arrow
+  // parks the tile at the top or the bottom instead of cycling it round.
+  function tileMoveIdx(key, i, n){
+    let j;
+    if(key==='ArrowUp'||key==='ArrowLeft') j=i-1;
+    else if(key==='ArrowDown'||key==='ArrowRight') j=i+1;
+    else if(key==='Home') j=0;
+    else if(key==='End') j=n-1;
+    else return -1;
+    return (j<0||j>=n||j===i||i<0) ? -1 : j;
+  }
+  // The keyboard's version of the grip. Dragging is a pointer gesture with no
+  // keyboard equivalent at all, and the handle was hidden from assistive software
+  // on top of that, so the dashboard's layout - the order of the tiles and which
+  // of them are on it - could only be changed with a mouse or a finger; the one
+  // keyboard control was Reset tiles, which throws the whole arrangement away.
+  // The handle is now a focusable button named for its tile - the keys it answers
+  // are in the tooltip beside the name, which is where a reader looks for how to
+  // work a control - the arrows move the tile among the ones that are showing,
+  // and Delete takes it off with the same undoable toast the edge-drag offers.
+  // Focus follows the tile: the panel moves as a whole node, which takes the
+  // focused handle with it, and Chrome drops focus on a move, so it is put back
+  // explicitly.
+  function moveTile(p, h, key){
+    const vis=panels().filter(x=>!x.classList.contains('section-hidden'));
+    const j=tileMoveIdx(key, vis.indexOf(p), vis.length);
+    if(j<0) return false;
+    const at=vis[j];
+    if(j<vis.indexOf(p)) wrap.insertBefore(p, at); else wrap.insertBefore(p, at.nextElementSibling);
+    saveOrder(); h.focus();
+    return true;
+  }
+  // Picking a tile up. The grip is announced as a button, so Enter and Space have
+  // to mean something on it - a button that answers neither is a promise the page
+  // does not keep, and Space left unclaimed reaches the browser as Page Down,
+  // which sends the tile you are holding off the bottom of the screen. They pick
+  // the tile up and put it down again. The pressed state is the half that carries:
+  // it is read back on the control the reader is already sitting on. While a tile
+  // is up, Escape returns the dashboard to the order it was picked up from, so an
+  // arrow that went the wrong way costs one key rather than a hunt back. The
+  // arrows move a tile whether or not it was picked up first - picking it up says
+  // "and put this back if I get it wrong", it is not a gate in front of them.
+  const heldOrder = new WeakMap();
+  function tileGrab(h, on){
+    h.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if(on) heldOrder.set(h, panels().map(x=>x.dataset.section).filter(Boolean));
+    else heldOrder.delete(h);
+  }
+  function tileDropBack(h){
+    const was=heldOrder.get(h);
+    tileGrab(h, false);
+    if(!was) return;
+    // applyOrder moves the panels, which drops focus in Chrome exactly as a single
+    // move does, so the grip is handed it back the same way.
+    applyOrder(was); saveOrder(); h.focus();
+  }
+  // Tabbing away puts the tile down. But every arrow key blurs the grip for an
+  // instant on its way to being refocused (Chrome drops focus on a node it moves),
+  // so a blur by itself is not the reader leaving, and treating it as one would
+  // put the tile down after its first move and leave Escape nothing to put back.
+  // The question is asked a tick later, once the grip either has focus again or
+  // really has lost it.
+  function tileLetGo(h){ setTimeout(()=>{ if(document.activeElement!==h) tileGrab(h, false); }, 0); }
   panels().forEach(p=>{ const h=p.querySelector('.drag-handle'); if(!h) return;
+    h.addEventListener('keydown', e=>{
+      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); tileGrab(h, h.getAttribute('aria-pressed')!=='true'); return; }
+      // Escape only belongs to a tile that is actually being held; with nothing up
+      // it has to carry on to whatever else is listening (the settings drawer).
+      if(e.key==='Escape'){ if(h.getAttribute('aria-pressed')!=='true') return; e.stopPropagation(); tileDropBack(h); return; }
+      if(e.key==='Delete'||e.key==='Backspace'){
+        e.preventDefault();
+        // Hand the keyboard to a tile that is still there before this one goes
+        // display:none under it; the Undo link is the only thing left to offer
+        // when it was the last one showing, and the toast holds still for as long
+        // as it has the keyboard (showUndoToast).
+        const vis=panels().filter(x=>!x.classList.contains('section-hidden'));
+        const i=vis.indexOf(p), nxt=vis[i+1]||vis[i-1];
+        hideSection(p);
+        const to=(nxt&&nxt.querySelector('.drag-handle'))||document.getElementById('undoHide');
+        if(to) to.focus();
+        return;
+      }
+      if(moveTile(p, h, e.key)) e.preventDefault();
+    });
+    h.addEventListener('blur', ()=>tileLetGo(h));
     h.addEventListener('mousedown', ()=>{ p.draggable=true; });
     p.addEventListener('dragstart', e=>{ dragged=p; delMode=0; p.classList.add('dragging');
       e.dataTransfer.effectAllowed='move'; try{ e.dataTransfer.setData('text/plain',''); }catch(_){ } showZones(true); });
@@ -3749,7 +3955,7 @@ function refreshSection(id){
     // the visible ones have been polling all along.
     try{ (JSON.parse(prevHidden)||[]).forEach(id=>refreshSection(id)); }catch(_){}
     showUndoToast('Tiles reset', ()=>{ lsSet('sectionOrder', prevOrder); lsSet('hiddenSections', prevHidden);
-      applyHidden(); loadOrder(); redrawCharts(); }); });
+      applyHidden(); loadOrder(); redrawCharts(); return rb; }); });
 })();
 
 // Duration as the two largest meaningful units, cascading up through minutes,
@@ -4158,6 +4364,12 @@ function showCoach(){
   // swallows (the power button, a chart) still counts; dismissCoach is
   // idempotent if Settings already dismissed it.
   document.addEventListener('pointerdown', dismissCoach, {once:true, capture:true});
+  // The keyboard's version of that first interaction, and the only one it had:
+  // without it the card could be got rid of only by opening Settings, and until
+  // then it sat over the top-right of the first panel - the refresh button and the
+  // DNS info bubble - so tabbing to either of those put the focus ring under it.
+  // Any key, not just Escape, for the same reason the pointer takes any press.
+  document.addEventListener('keydown', dismissCoach, {once:true, capture:true});
   $('powerBtn').classList.add('coach-pulse-pwr'); $('gearBtn').classList.add('coach-pulse-set');
 }
 
@@ -4343,7 +4555,14 @@ async function qsSave(){
     const t=document.documentElement.dataset.theme; if(t) lsSet('theme',t); // the preview becomes the saved pick
     await loadSettings(); loadAccess();
     qsClose();
-  }catch(e){ $('qsErr').textContent=String(e.message||e); go.disabled=false; }
+  }catch(e){ $('qsErr').textContent=String(e.message||e); go.disabled=false;
+    // Disabling the button while the save is in flight takes focus off it - Chrome
+    // gives it to <body> the moment a focused control goes disabled - and the
+    // dialog's Tab trap cannot help from there, because it listens on the dialog
+    // and body is outside it: the first Tab left the page for the browser's own
+    // chrome. Whoever pressed Enter on this button gets it back, next to the error
+    // that has just appeared under it.
+    go.focus(); }
 }
 // qsBootLocalOnly = how the install booted (access_local_only from status). When
 // it booted network-reachable (e.g. -access network in a container), the operator
@@ -4381,7 +4600,11 @@ function showQuickSetup(){
   // the port they just opened. This also sets the note and password visibility.
   segChoose.qsAcc(qsBootLocalOnly ? 0 : 1, false);
   const cur=document.documentElement.dataset.theme||'retro';
-  document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.classList.toggle('on', b.dataset.sw===cur));
+  // aria-pressed alongside the ring: the ring is the only thing that said which
+  // theme is chosen, so a screen reader heard nine identical swatches. The
+  // drawer's own theme buttons have always reported it this way.
+  document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>{ const on=b.dataset.sw===cur;
+    b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
   $('qsUse').innerHTML=qsUseNote(qsSchedSel, qsSpeedIntervalS);
   $('qsDim').hidden=false; $('qsDlg').hidden=false;
   // Inert the rest of the page so Tab can't escape the dialog into the dashboard
@@ -4455,7 +4678,8 @@ $('qsDlg').addEventListener('keydown', e=>{
   else if(!e.shiftKey && (a===last || !dlg.contains(a))){ e.preventDefault(); first.focus(); }
 });
 document.querySelectorAll('#qsTheme .qs-sw').forEach(b=>b.addEventListener('click',()=>{
-  document.querySelectorAll('#qsTheme .qs-sw').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  document.querySelectorAll('#qsTheme .qs-sw').forEach(x=>{ x.classList.remove('on'); x.setAttribute('aria-pressed','false'); });
+  b.classList.add('on'); b.setAttribute('aria-pressed','true');
   applyTheme(b.dataset.sw); // live preview, charts included; saved only by Start monitoring
 }));
 $('qsX').addEventListener('click', qsDecline);
@@ -4463,12 +4687,27 @@ $('qsGo').addEventListener('click', qsSave);
 
 // Escape closes whatever's open. Nested popovers (win-pop, the data popover's
 // input) stopPropagation on their own Escape, so this only fires when focus is
-// outside them: closes the data popover if open, otherwise the settings drawer.
+// outside them: closes an open chart window picker, else the data popover if
+// open, otherwise the settings drawer.
 document.addEventListener('keydown', e=>{
   if(e.key!=='Escape') return;
   if(!loginOverlay.hidden) return; // login is a required blocker on top - Esc must not reach the dialog behind it
   if(!$('qsDlg').hidden){ qsDecline(); return; } // Quick Setup: Esc = dismiss, keep the defaults
-  if(!$('dataPop').hidden){ const p=$('families').querySelector('.stat-data'); hideDataPop(); if(p) p.focus(); return; }
+  // A chart window picker left open with the keyboard somewhere else - opened by
+  // a tap, or by a click in a browser that does not focus a pressed button - so
+  // its own Escape never hears the press and no focusout ever saw the keyboard
+  // leave. It floats above the popovers below, so it goes first; focus returns
+  // to its button, as it does from the picker's own Escape.
+  const wp=winPickers.find(p=>!p.pop.hidden);
+  if(wp){ wp.close(); wp.btn.focus(); return; }
+  // dataPopOpening, not hidden alone: the popover stays hidden while the round trip
+  // that fills it is in the air, so a press during the wait did nothing at all and
+  // the answer, when it landed, opened what Escape had just dismissed. An outside
+  // click has always cancelled a pending open; this is the same for the keyboard.
+  // Focus only moves when something was actually on screen to leave - during the
+  // wait the reader has not been taken anywhere to be brought back from.
+  if(!$('dataPop').hidden || dataPopOpening){ const shown=!$('dataPop').hidden, p=$('families').querySelector('.stat-data');
+    hideDataPop(); if(shown && p) p.focus(); return; }
   if(!$('uptimePop').hidden){ const p=$('families').querySelector('.stat-up'); hideUptimePop(); if(p) p.focus(); return; }
   // A heatmap tooltip raised by FOCUS has no pointer to move away: short of
   // tabbing off the cell or the grid repainting under it, nothing a keyboard user
@@ -4553,8 +4792,17 @@ async function showDataPop(anchor){
   const rows=[['24h',u['24h']],['7d',u['7d']],['all',u.all]];
   const lbl={'24h':'1d','7d':'7d','all':'All time'};
   if(dataCustomMins>0){ if(u.custom!=null) dataCustomBytes=u.custom; rows.push(['custom',dataCustomBytes]); lbl.custom=fmtWin(dataCustomMins); }
+  // The heading and the custom-window box are NOT options, so they stay outside
+  // the list: a listbox that owns a heading and a textbox is a shape assistive
+  // software is entitled to mangle. The popover itself is the named dialog: a
+  // floating box that takes focus and hands it back on Escape, holding more than
+  // options - which is also what the pill promises with aria-haspopup="dialog". A
+  // group is no kind of popup, so with that role the promise and the thing a reader
+  // landed in did not match.
   pop.innerHTML='<h4>Speedtest data used</h4>'+
+    '<div role="listbox" aria-label="Data window">'+
     rows.map(([k,v])=>`<div class="row${k==='all'?' all':''}${k===dataWindow?' sel':''}" role="option" aria-selected="${k===dataWindow}" tabindex="-1" data-win="${k}"><span class="k">${lbl[k]}</span><span class="v">${bytesStr(v)}</span></div>`).join('')+
+    '</div>'+
     '<div class="win-custom"><input id="dataCustomInput" placeholder="custom: 45m, 12h, 3d…" aria-label="Custom data window, e.g. 12h or 3d"></div>';
   const inp=pop.querySelector('#dataCustomInput');
   if(dataWindow==='custom') inp.value=fmtWin(dataCustomMins);
@@ -4703,10 +4951,15 @@ function showUptimePop(anchor){
   const rows=[['24h',u['24h'],uc['24h']],['7d',u['7d'],uc['7d']],['all',u.all,uc.all]];
   const lbl=Object.assign({}, UP_LBL);
   if(uptimeCustomMins>0){ rows.push(['custom',lastUptimeCustom,lastUptimeCustomCov]); lbl.custom=fmtWin(uptimeCustomMins); }
+  // The heading, the custom-window box and the coverage caveat are not options,
+  // so the list is only the rows - see showDataPop for why. The popover itself is
+  // the named dialog around them, matching the pill's aria-haspopup.
   pop.innerHTML='<h4>Uptime</h4>'+
+    '<div role="listbox" aria-label="Uptime window">'+
     // Every row carries its own coverage: an unmonitored window reads "-" here too,
     // so switching windows can never turn a dash into a confident 100.000%.
     rows.map(([k,v,c])=>`<div class="row${k==='all'?' all':''}${k===uptimeWindow?' sel':''}" role="option" aria-selected="${k===uptimeWindow}" tabindex="-1" data-win="${k}" title="${upCovNote(c)}"><span class="k">${lbl[k]}</span><span class="v">${(v!=null&&!upUnmeasured(c))?upPctG(v):'-'}</span></div>`).join('')+
+    '</div>'+
     '<div class="win-custom"><input id="uptimeCustomInput" placeholder="custom: 45m, 12h, 3d…" aria-label="Custom uptime window, e.g. 12h or 3d"></div>'+
     // The caveat for the window the pill is showing, spelled out under the input.
     upCovFoot((rows.find(([k])=>k===uptimeWindow)||[])[2], lbl[uptimeWindow]);
@@ -4758,6 +5011,23 @@ $('uptimePop').addEventListener('keydown', e=>{
 });
 document.addEventListener('click', e=>{
   if(!e.target.closest('#uptimePop') && !e.target.closest('.stat-up')) hideUptimePop();
+});
+// Both of these are listbox popups hung off a pill, and a popup closes when the
+// keyboard walks out of it. Tabbing off an option used to carry on into the
+// Connection panel with the list still hanging under the header and the pill still
+// announcing aria-expanded="true", so the only ways to put it away were Escape -
+// which also yanks focus back to the pill from wherever the reader had got to -
+// and the mouse. A press during a pending open counts as open too (see
+// dataPopOpening), or the answer would arrive over a page the reader has left.
+// focusin on the document rather than focusout on the popover, because the pill
+// row is rebuilt on every status poll: that drops focus to nobody at all for an
+// instant, and a list nobody has walked out of should survive it - refreshStatus
+// puts focus back on the replacement pill, which arrives here as an ordinary
+// focusin on .stat-data.
+document.addEventListener('focusin', e=>{
+  const t=e.target; if(!t || !t.closest) return;
+  if((!$('dataPop').hidden || dataPopOpening) && !t.closest('#dataPop') && !t.closest('.stat-data')) hideDataPop();
+  if(!$('uptimePop').hidden && !t.closest('#uptimePop') && !t.closest('.stat-up')) hideUptimePop();
 });
 
 // Settings tabs: show the named pane (also used to reset to the default on open).
@@ -4896,6 +5166,11 @@ function setStale(on){
   if(on) $('staleSince').textContent = lastStatusAt ? new Date(lastStatusAt).toLocaleTimeString() : 'before startup';
   $('staleBar').hidden=!on;
 }
+// setSpeedWhen writes the run caption. #speedWhen is a live region (role=status)
+// and the pollers repaint it on every round with the very same words, so writing
+// it unconditionally would announce the last run's time again every few seconds.
+// Comparing first leaves only the transitions - starting, failing, finishing.
+function setSpeedWhen(text){ const el=$('speedWhen'); if(el.textContent!==text) el.textContent=text; }
 // A failed manual speedtest's message: shown in #speedWhen and kept across status
 // polls (which would otherwise overwrite it with the previous run's timestamp)
 // until a run newer than speedRunErrSince actually completes.
@@ -5079,10 +5354,10 @@ async function refreshStatus() {
     // power button), so on most installs the marker is on more than it is off and
     // stops reading as a warning. It stays in the title, the accessible name and
     // the popover, which is where the caveat can be stated rather than hinted.
-    : `<span class="pill stat-up" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('uptimePop').hidden}" aria-label="${upAria}" title="${upTitle}">${pulseIco} ${upTxt}</span>`;
+    : `<span class="pill stat-up" role="button" tabindex="0" aria-haspopup="dialog" aria-expanded="${!$('uptimePop').hidden}" aria-label="${upAria}" title="${upTitle}">${pulseIco} ${upTxt}</span>`;
   const statPills = dnsPill+upPill+
     `<span class="pill stat-rt">${clockIco} ${fmtDur(s.runtime_seconds)}</span>`+
-    `<span class="pill stat-data" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="${!$('dataPop').hidden}" aria-label="Speedtest data used ${bytesStr(dataBarValue(s))} over ${dataWindowLabel()}, open usage breakdown" title="Speedtest data used over ${dataWindowLabel()} - click for the breakdown by window">${dot('⇅')} ${bytesStr(dataBarValue(s))}</span>`;
+    `<span class="pill stat-data" role="button" tabindex="0" aria-haspopup="dialog" aria-expanded="${!$('dataPop').hidden}" aria-label="Speedtest data used ${bytesStr(dataBarValue(s))} over ${dataWindowLabel()}, open usage breakdown" title="Speedtest data used over ${dataWindowLabel()} - click for the breakdown by window">${dot('⇅')} ${bytesStr(dataBarValue(s))}</span>`;
   $('families').innerHTML = famPills + statPills;
   // preventScroll: this restores focus after a background poll re-renders the pills;
   // a plain focus() would scroll the pill into view and yank the viewport back to it
@@ -5132,7 +5407,7 @@ async function refreshStatus() {
   if (speedRunErr && s.speed && s.speed.ts > speedRunErrSince) speedRunErr='';
   if (!s.speedtest_running && !speedtestPending) {
     if (speedRunErr) {
-      $('speedWhen').textContent = speedRunErr;
+      setSpeedWhen(speedRunErr);
       $('speedWhen').classList.add('run-err'); // error red, not muted metadata
     } else if (s.speed && !speedFrozen()) {
       // Pinned to a span, syncSpeedPanel owns this caption - a countdown to the
@@ -5147,7 +5422,7 @@ async function refreshStatus() {
         const nextTs = s.speedtest_next_ts || (s.speed.ts + s.speed_interval_s);
         if (nextTs*1000 > Date.now()) when += ' · next '+fmtTime(nextTs);
       }
-      $('speedWhen').textContent = when;
+      setSpeedWhen(when);
     } else if (s.speed_known && !s.speed && !speedFrozen()) {
       // No run to describe, so say so rather than keep the last one. Only on a poll
       // that vouches for having READ the history, though: a daemon whose store read
@@ -5231,7 +5506,7 @@ function clearSpeedPanel(){
   // standing over a dash they describe a measurement that isn't on screen.
   $('sp_jitter').title = $('sp_loss').title = '';
   $('speedWhen').classList.remove('run-err');
-  $('speedWhen').textContent='';
+  setSpeedWhen('');
 }
 // --- Save a chart as an image ---------------------------------------------
 // Re-runs the SAME draw code at a higher backing resolution and captures the
@@ -6441,9 +6716,9 @@ function syncSpeedPanel(fresh){
     if(last) setSpeedTiles(last);
     else clearSpeedPanel(); // same blanking; the caption it clears is rewritten just below
     $('speedWhen').classList.remove('run-err');
-    $('speedWhen').textContent = !fresh ? 'loading range…'
+    setSpeedWhen(!fresh ? 'loading range…'
       : last ? (last.server?last.server+' · ':'')+'last in range '+fmtTime(last.ts)
-             : 'no runs in this range';
+             : 'no runs in this range');
   } else if(live){
     live.remove(); // an option that no longer applies is removed, not disabled
     // The caption and cards were showing the pinned span; refreshStatus owns
@@ -6510,14 +6785,19 @@ applyChartVis();
 // hover handlers read, so taps/drags on a chart inspect points like a mouse
 // does (touch has no mousemove; passive listeners keep page scroll working).
 const touchPt = h => e => { const t=e.touches[0]; if(t) h({clientX:t.clientX, clientY:t.clientY, currentTarget:e.currentTarget}); };
+// What a latency point says, in one place: the pointer and the keyboard show the
+// same reading, and the keyboard also speaks it (see chartTipText below).
+function latTip(p){
+  const dnsLine = (dnsShown && p.dns!=null) ? '<div>DNS '+p.dns.toFixed(0)+' ms</div>' : '';
+  return '<div class="tt-time">'+fmtTime(p.t)+'</div>'+(p.lat!=null? p.lat.toFixed(1)+' ms' : '<span style="color:var(--down)">down</span>')+dnsLine;
+}
 function latHoverAt(e){
+  chartPtrDrew('chart');
   if(!latPlot||!latPlot.points.length){ $('chartTip').hidden=true; return; }
   const {bi,bd}=nearestIdx(latPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
   if(bi<0||bd>60){ if(latHover>=0){ latHover=-1; redrawLat(); } $('chartTip').hidden=true; return; }
   if(bi!==latHover){ latHover=bi; redrawLat(); }
-  const p=latPlot.points[bi];
-  const dnsLine = (dnsShown && p.dns!=null) ? '<div>DNS '+p.dns.toFixed(0)+' ms</div>' : '';
-  showChartTip('<div class="tt-time">'+fmtTime(p.t)+'</div>'+(p.lat!=null? p.lat.toFixed(1)+' ms' : '<span style="color:var(--down)">down</span>')+dnsLine, e);
+  showChartTip(latTip(latPlot.points[bi]), e);
 }
 $('chart').addEventListener('mousemove', latHoverAt);
 $('chart').addEventListener('touchstart', touchPt(latHoverAt), {passive:true});
@@ -6569,6 +6849,7 @@ function runTip(p){
   return h;
 }
 function spdHoverAt(e){
+  chartPtrDrew('speedChart');
   if(!spdPlot||!spdPlot.points.length){ $('chartTip').hidden=true; return; }
   const {bi,bd}=nearestIdx(spdPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
   if(bi<0||bd>60){ linkHover(-1); $('chartTip').hidden=true; return; }
@@ -6608,6 +6889,7 @@ function chartClickAt(plot){ return e=>{
 $('speedChart').addEventListener('click', e=>chartClickAt(spdPlot)(e));
 $('qualityChart').addEventListener('click', e=>chartClickAt(qPlot)(e));
 function bloatHoverAt(e){
+  chartPtrDrew('bloatChart');
   if(!bloatPlot||!bloatPlot.points.length){ $('chartTip').hidden=true; return; }
   const {bi,bd}=nearestIdx(bloatPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
   if(bi<0||bd>60){ linkHover(-1); $('chartTip').hidden=true; return; }
@@ -6618,6 +6900,125 @@ $('bloatChart').addEventListener('touchstart', touchPt(bloatHoverAt), {passive:t
 $('bloatChart').addEventListener('touchmove', touchPt(bloatHoverAt), {passive:true});
 $('bloatChart').addEventListener('mouseleave', ()=>{ linkHover(-1); $('chartTip').hidden=true; });
 $('bloatChart').addEventListener('click', e=>chartClickAt(bloatPlot)(e));
+
+// Reading a data point from the keyboard. Every per-point figure on these four
+// charts - the time and latency here, a run's whole speed/quality/bufferbloat
+// tooltip there - came out of mousemove and click alone: the canvases took no
+// focus and answered no key, so someone driving this page from the keyboard had
+// the shape of the line and nothing else, while the heatmap beside them has had
+// focusable days and Enter since it was built. Left and Right step from point to
+// point, Home/End jump to the ends, Enter opens the stepped-to run in the table
+// exactly as a click does, and Escape puts the readout away without moving focus -
+// the same bargain the heatmap tooltip strikes.
+//
+// Where the step lands. -1 for a key that is not one of ours, so the handler can
+// leave everything else alone. Stepping onto a chart nothing has touched yet
+// starts at the end the key is coming from, not at point 0 for both directions.
+function chartKeyIdx(key, cur, n){
+  if(n<1) return -1;
+  if(key==='ArrowRight') return cur<0 ? 0 : Math.min(n-1, cur+1);
+  if(key==='ArrowLeft') return cur<0 ? n-1 : Math.max(0, cur-1);
+  if(key==='Home') return 0;
+  if(key==='End') return n-1;
+  return -1;
+}
+// The tooltip hangs off the point itself, because keyboard navigation moves no
+// cursor to hang it off (showChartTip still flips it away from the window edges).
+function chartPointXY(canvas, plot, i){
+  const r=canvas.getBoundingClientRect(), p=plot.points[i];
+  return {clientX: r.left + plot.X(p.t!==undefined?p.t:p.ts), clientY: r.top + r.height/2};
+}
+// A canvas is a picture to a screen reader and the tooltip beside it is markup
+// nothing announces, so the reading is said twice over. The live region is the
+// half that actually speaks: changing the NAME of an element that already holds
+// focus fires no event, and no reader re-reads a name on its own, least of all on
+// a picture. The name is rewritten as well, for whoever arrives at the chart after
+// the step or asks what has focus - it is where the reading still is a moment
+// later. Same words either way, tags stripped.
+function chartTipText(html){ return String(html).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
+const CHART_LABEL={};   // each canvas's shipped aria-label, to build the stepped one on
+function chartSay(canvas, plot, i, html){
+  const say='Point '+(i+1)+' of '+plot.points.length+': '+chartTipText(html);
+  canvas.setAttribute('aria-label', CHART_LABEL[canvas.id]+'. '+say);
+  // The chart's own name is not repeated here: focus is already on it, so the
+  // reader has just said it, and every step would say it again.
+  const live=$('chartRead'); if(live) live.textContent=say;
+}
+// Put the readout away: the tooltip, the cursor it drew, and both copies of the
+// reading. Emptying the live region says nothing out loud, which is the point -
+// there is nothing left to read. Focus stays where it is: Escape here dismisses
+// what is showing, it does not eject anyone from the chart.
+function chartKeyOff(canvas){
+  $('chartTip').hidden=true;
+  if(CHART_LABEL[canvas.id]!=null) canvas.setAttribute('aria-label', CHART_LABEL[canvas.id]);
+  const live=$('chartRead'); if(live) live.textContent='';
+  if(canvas.id==='chart'){ if(latHover>=0){ latHover=-1; redrawLat(); } }
+  else linkHover(-1);
+  chartKeyed=null; chartKeyTip=false;
+}
+// Losing focus is not only the keyboard leaving. A mouse press on one chart
+// focuses it, which blurs whichever chart an earlier click left focused - and a
+// blur that put the whole readout away tore down the tooltip the pointer had just
+// drawn on the chart it is actually over. On the latency chart, where a click
+// does nothing else, pressing to steady a reading threw the reading away until
+// the next nudge. The pointer and the keyboard draw the same tooltip and cursors,
+// so the keyboard's are noted as a step draws them - chartKeyed is the canvas
+// whose cursor it drew, chartKeyTip says the tooltip is that step's too - and the
+// pointer's hover handlers take them over as they draw (chartPtrDrew; its own
+// mouseleave cleans up after it). Blur then takes back only what is still the
+// keyboard's: the name and the announcement always, since only a step writes
+// them; the cursor and the tooltip only while the pointer has not drawn over them.
+// Escape is unchanged - it asks for whatever is showing to go.
+let chartKeyed=null, chartKeyTip=false;
+// The latency chart has a cursor of its own and the three speedtest charts share
+// one (linkHover), so the pointer on any of those three takes over a keyboard
+// cursor on any of them. The tooltip is the pointer's wherever it has drawn.
+function chartPtrDrew(id){ chartKeyTip=false; if(chartKeyed!==null && (chartKeyed==='chart')===(id==='chart')) chartKeyed=null; }
+function chartBlur(canvas){
+  if(CHART_LABEL[canvas.id]!=null) canvas.setAttribute('aria-label', CHART_LABEL[canvas.id]);
+  const live=$('chartRead'); if(live) live.textContent='';
+  if(chartKeyed!==canvas.id) return;
+  if(chartKeyTip) $('chartTip').hidden=true;
+  if(canvas.id==='chart'){ if(latHover>=0){ latHover=-1; redrawLat(); } }
+  else linkHover(-1);
+  chartKeyed=null; chartKeyTip=false;
+}
+CHART_LABEL['chart']=$('chart').getAttribute('aria-label')||'';
+$('chart').addEventListener('keydown', e=>{
+  if(e.key==='Escape'){ if($('chartTip').hidden) return; e.stopPropagation(); chartKeyOff($('chart')); return; }
+  const n=(latPlot&&latPlot.points)?latPlot.points.length:0;
+  const i=chartKeyIdx(e.key, latHover, n);
+  if(i<0) return;
+  e.preventDefault();
+  latHover=i; redrawLat();
+  const html=latTip(latPlot.points[i]);
+  showChartTip(html, chartPointXY($('chart'), latPlot, i));
+  chartSay($('chart'), latPlot, i, html);
+  chartKeyed='chart'; chartKeyTip=true;
+});
+$('chart').addEventListener('blur', ()=>chartBlur($('chart')));
+// The three speedtest charts share one cursor, one tooltip and one selection (see
+// linkHover), so they share the keys too: a step on any of them moves all three.
+for(const [id, plotOf] of [['speedChart',()=>spdPlot],['qualityChart',()=>qPlot],['bloatChart',()=>bloatPlot]]){
+  CHART_LABEL[id]=$(id).getAttribute('aria-label')||'';
+  $(id).addEventListener('keydown', e=>{
+    if(e.key==='Escape'){ if($('chartTip').hidden) return; e.stopPropagation(); chartKeyOff($(id)); return; }
+    const plot=plotOf(), n=(plot&&plot.points)?plot.points.length:0;
+    // Enter/Space on a stepped-to point opens its run in the table, which is what
+    // a click on the same point does on a fine pointer (see chartClickAt).
+    if((e.key==='Enter'||e.key===' ') && spdHover>=0 && spdData.length){
+      e.preventDefault(); focusRun(spdData[Math.min(spdHover, spdData.length-1)].ts); return; }
+    const i=chartKeyIdx(e.key, spdHover, n);
+    if(i<0) return;
+    e.preventDefault();
+    linkHover(i);
+    const html=runTip(plot.points[i]);
+    showChartTip(html, chartPointXY($(id), plot, i));
+    chartSay($(id), plot, i, html);
+    chartKeyed=id; chartKeyTip=true;
+  });
+  $(id).addEventListener('blur', ()=>chartBlur($(id)));
+}
 // Clicking away from a selected run - anywhere outside the charts and the runs section -
 // clears it (the charts and the row clicks manage the selection themselves).
 // The panel's own chrome does not count as away. The runs bar (the Show/Hide runs
@@ -6636,6 +7037,7 @@ $('bloatChart').addEventListener('click', e=>chartClickAt(bloatPlot)(e));
 // event target has no ancestors left to match against.
 document.addEventListener('click', e=>{ if(pinnedRunTs==null) return; if(e.target.closest('#speedChart,#qualityChart,#bloatChart,#runsSection,.runs-bar,#speedWindow,#speedLive')) return; clearSelection(); });
 function qHoverAt(e){
+  chartPtrDrew('qualityChart');
   if(!qPlot||!qPlot.points.length){ $('chartTip').hidden=true; return; }
   const {bi,bd}=nearestIdx(qPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
   if(bi<0||bd>60){ linkHover(-1); $('chartTip').hidden=true; return; }
@@ -6810,7 +7212,7 @@ async function loadRuns(force){
   $('runsBody').innerHTML = runs.length ? runs.map(r=>`
     <tr data-ts="${r.ts}">
       <td class="act"><button class="run-del" type="button" data-ts="${r.ts}"${r.round_ts?` data-round="${r.round_ts}"`:''} title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
-      <td class="mono">${fmtTime(r.ts)}</td>
+      <td class="mono"><button class="run-pick" type="button" title="Show this run on the chart">${fmtTime(r.ts)}</button></td>
       <td class="mono">${spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
       <td class="mono">${spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
       <td class="mono">${pingMeasured(r)?num1(r.ping_ms):'-'}</td>
@@ -6925,8 +7327,21 @@ function updateRunsPager(){
   const pages=Math.max(1, Math.ceil(runsTotal/runsPerPage));
   if(runsPage>pages) runsPage=pages;
   $('runsPageInfo').textContent = runsTotal ? `Page ${runsPage} / ${pages} · ${runsTotal} runs` : 'No runs';
+  // The button you paged with is exactly the one that goes dead when you reach the
+  // end of the list, and a disabled control cannot hold focus: Chrome hands it to
+  // <body>, the focus ring disappears and the next Tab starts again from the top of
+  // the page. Read who has the keyboard BEFORE the flags change - afterwards there
+  // is nothing left to read - and give it to whichever button is still live, or to
+  // the toggle that opened the table when a single page leaves neither of them.
+  // Every other self-disabling control here does as much (the power button, Save,
+  // the row deletes); the pagers were the ones that did not.
+  const held=document.activeElement;
   $('runsPrev').disabled = runsPage<=1;
   $('runsNext').disabled = runsPage>=pages;
+  if(held && held.disabled && (held===$('runsPrev') || held===$('runsNext'))){
+    const to = held===$('runsPrev') ? $('runsNext') : $('runsPrev');
+    (to.disabled ? $('runsToggle') : to).focus();
+  }
 }
 // runsGoTo moves the pager only if the page it asks for actually arrives. The
 // counter used to move first and the load was allowed to fail in silence, so
@@ -6944,6 +7359,18 @@ async function runsGoTo(page){
 $('runsPrev').addEventListener('click', ()=>{ if(runsPage>1) runsGoTo(runsPage-1); });
 $('runsNext').addEventListener('click', ()=>{ if(runsPage < Math.ceil(runsTotal/runsPerPage)) runsGoTo(runsPage+1); });
 $('runsPerPage').addEventListener('change', ()=>{ runsPerPage=parseInt($('runsPerPage').value)||10; runsPage=1; loadRuns(); });
+// A delete that FAILED has to give the keyboard back. The button is disabled while
+// the request is in flight, and a disabled control cannot hold focus - Chrome hands
+// it to <body> - so once the alert was dismissed nothing on the page carried a
+// focus ring and the button you would press to try again was the one Tab skipped
+// over, in both directions. The success paths below already move focus to the row
+// that slid up into the deleted one's place; this is the same courtesy for the
+// paths that leave the row exactly where it was. Not when the login overlay has
+// taken over, though: a 401 puts the reader in the password field, which is where
+// they need to be.
+function refocusDeleteBtn(btn){
+  if(btn && btn.isConnected && !btn.disabled && loginOverlay.hidden) btn.focus();
+}
 // Per-row delete (delegated, since rows are re-rendered each load). Confirms,
 // then refreshes everything keyed off speed history: the table, the speed/
 // quality/bloat charts, and the status cards (the deleted run may be the latest).
@@ -6982,7 +7409,7 @@ $('runsBody').addEventListener('click', async e=>{
   runsBusy=true; // hold off the live refresh until this rebuild is ours
   try{
     const r=await fetch('api/speed/runs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ts})});
-    if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); return; }
+    if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); refocusDeleteBtn(btn); return; }
     if(pinnedRunTs===ts) pinnedRunTs=null;
     const wasPlotted=pinPlotted();
     await loadRuns(true); await refreshSpeedChart(true); dropGhostPin(wasPlotted); refreshStatus();
@@ -6997,7 +7424,7 @@ $('runsBody').addEventListener('click', async e=>{
     // done something they had not.
     let gone=1; try{ const d=await r.json(); gone=(d && typeof d.deleted==='number') ? d.deleted : 1; }catch(e){}
     const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : (gone===0 ? 'That run was already gone' : 'Run deleted'); tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
-  }catch(err){ btn.disabled=false; alert('Delete failed'); }
+  }catch(err){ btn.disabled=false; alert('Delete failed'); refocusDeleteBtn(btn); }
   finally{ runsBusy=false; }
 });
 $('runsToggle').addEventListener('click', async () => {
@@ -7152,7 +7579,7 @@ $('events').addEventListener('click', async e=>{
   btn.disabled=true;
   try{
     const r=await fetch('api/outages/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ts})});
-    if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); return; }
+    if(!r.ok){ btn.disabled=false; alert(await r.text()||'Delete failed'); refocusDeleteBtn(btn); return; }
     await loadOutages(); refreshHeatmap(); refreshStatus();
     const left=$('events').querySelectorAll('.run-del');
     (left[Math.min(idx,left.length-1)]||$('outagesToggle')).focus();
@@ -7165,14 +7592,19 @@ $('events').addEventListener('click', async e=>{
     // different word.
     let gone=1; try{ const d=await r.json(); gone=(d && typeof d.deleted==='number') ? d.deleted : 1; }catch(e){}
     const tb=$('undoToast'); if(tb){ tb.textContent = gone===0 ? 'That outage was already gone' : 'Outage deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
-  }catch(err){ btn.disabled=false; alert('Delete failed'); }
+  }catch(err){ btn.disabled=false; alert('Delete failed'); refocusDeleteBtn(btn); }
 });
 function updateOutagesPager(){
   const pages=Math.max(1, Math.ceil(outagesTotal/outagesPerPage));
   if(outagesPage>pages) outagesPage=pages;
   $('outagesPageInfo').textContent = outagesTotal ? `Page ${outagesPage} / ${pages} · ${outagesTotal} events` : 'No events';
+  const held=document.activeElement;   // the same end-of-the-list focus drop as the runs pager above
   $('outagesPrev').disabled = outagesPage<=1;
   $('outagesNext').disabled = outagesPage>=pages;
+  if(held && held.disabled && (held===$('outagesPrev') || held===$('outagesNext'))){
+    const to = held===$('outagesPrev') ? $('outagesNext') : $('outagesPrev');
+    (to.disabled ? $('outagesToggle') : to).focus();
+  }
 }
 // Same rules as runsGoTo: a page that did not load is not a page you are on, and
 // the page to go back to is the one whose rows are showing.
@@ -7381,6 +7813,21 @@ function drawHeatmap(){
     const r=c.getBoundingClientRect();
     tip.textContent=c.dataset.tip; tip.hidden=false; place({clientX:r.left, clientY:r.bottom}); });
   hm.addEventListener('focusout', ()=>{ tip.hidden=true; });
+  // A tip raised by FOCUS is anchored to the cell's viewport rect, and .hm-tip is
+  // position:fixed, so nothing moves it when the PAGE moves under it: activating a
+  // day pages the outages table and smooth-scrolls the highlighted row into view,
+  // and the bubble was left behind at its old coordinates, sitting over the very
+  // rows the activation had just gone to find. Focus never leaves the cell there,
+  // so focusout never fires either. Follow the cell for as long as it holds the
+  // keyboard; a pointer-raised tip is left alone, since mousemove re-places that
+  // one and a wheel scroll under a still pointer should not make it jump.
+  addEventListener('scroll', ()=>{
+    if(tip.hidden) return;
+    const c=document.activeElement;
+    if(!c || !c.closest || !c.closest('#heatmap') || !c.dataset.tip) return;
+    const r=c.getBoundingClientRect();
+    place({clientX:r.left, clientY:r.bottom});
+  }, {passive:true});
 })();
 
 // setSpeedtestRunning toggles the Speed panel's running indicator (button label
@@ -7424,7 +7871,9 @@ function setSpeedtestRunning(running, server, isAuto, runId){
     : speedtestAbortable(speedtestPending, speedtestRunningNow, speedtestRunId)
       ? 'Speedtest running - click to stop' : 'Speedtest starting…';
   b.setAttribute('aria-label', lbl); b.title = lbl;
-  if(running){ $('speedWhen').classList.remove('run-err'); $('speedWhen').innerHTML=speedtestRunText(server, isAuto); }
+  // Same comparison as setSpeedWhen, on the markup this one writes.
+  if(running){ $('speedWhen').classList.remove('run-err');
+    const h=speedtestRunText(server, isAuto); if($('speedWhen').innerHTML!==h) $('speedWhen').innerHTML=h; }
 }
 
 // Whether a click on the RUN button means "stop that". It must be exactly the
@@ -7443,6 +7892,13 @@ function setSpeedtestRunning(running, server, isAuto, runId){
 // an unknown id is busy but not abortable: the button reads as starting and a
 // click does nothing until the id arrives.
 function speedtestBusy(pending, running){ return !!(pending || running); }
+// Whether the run about to start will go looking for a server, which is the one
+// thing the optimistic caption claims before the first poll can answer. The
+// daemon's own rule (see the speedtest_auto it reports): no pinned Ookla server,
+// AND not iperf3 - iperf3 connects to the server the operator configured, it has
+// no candidate pool and picks nothing, so promising to find the nearest
+// responsive one described something that never happens.
+function speedtestPicksServer(serverId, wantsIperf, iperfOk){ return serverId==='' && !(wantsIperf && iperfOk); }
 function speedtestAbortable(pending, running, runId){ return speedtestBusy(pending, running) && runId>0; }
 
 let speedtestPending=false; // suppress a stale poll's not-running while the manual POST is in flight (see refreshStatus)
@@ -7470,7 +7926,7 @@ $('runSpeed').addEventListener('click', async () => {
   // Instant feedback using the loaded settings; the poll then keeps it accurate.
   speedRunErr=''; speedRunErrSince=lastSpeedTs; // only a run newer than now clears the error
   speedtestPending=true;
-  setSpeedtestRunning(true, '', pendingServer==='');
+  setSpeedtestRunning(true, '', speedtestPicksServer(pendingServer, iperfWanted, iperfAvailable));
   let errText='';
   try {
     const r=await fetch('api/speedtest',{method:'POST',headers:{'Content-Type':'application/json'}});
@@ -9673,11 +10129,23 @@ $('exportBtn').addEventListener('click', async ()=>{
 // click for the same reason the import handler already disabled itself: a repeat
 // send would upload the whole file again into a half-applied import. aria-busy
 // carries the same state to a screen reader, which cannot see the swap.
+//
+// Disabling a button also BLURS it, and the browser has nowhere to put the
+// keyboard but <body> - so Enter on Auto, Find, Export or Import threw the
+// reader to the top of the document for however long the work took (Auto races
+// every candidate city: ten seconds and more) and left them there, with the
+// answer they asked for a screenful of tabs away. Give the button its focus
+// back when it comes alive again, on refocus's terms: only if it was this
+// button the disable blurred, and only if nothing else has taken the keyboard
+// since - a reader who moved on themselves must not be dragged back.
 function btnBusy(b, on){
   if(!b) return;
   b.classList.toggle('busy', on);
+  if(on) b._hadFocus = document.activeElement===b;
   b.disabled = on;
   if(on) b.setAttribute('aria-busy','true'); else b.removeAttribute('aria-busy');
+  if(!on && b._hadFocus){ b._hadFocus=false;
+    if(!document.activeElement || document.activeElement===document.body) b.focus({preventScroll:true}); }
 }
 // Transient status via the shared role=status toast (announced to screen readers).
 function flashStatus(msg){ const tb=$('undoToast'); if(!tb) return; tb.textContent=msg; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 6000); }
@@ -9697,6 +10165,17 @@ $('importFile').addEventListener('change', ()=>{ const f=$('importFile').files[0
   $('importFileName').textContent = f ? f.name : 'Choose file…';
   $('importFileBtn').classList.toggle('has-file', !!f);
   $('importFileBtn').title = f ? f.name : ''; });
+// The real <input type=file> is display:none (see .filebtn), which takes it out
+// of the tab order, and a <label> is not focusable - so the only way to reach
+// the chooser was a mouse, and Import had nothing to import for anyone else.
+// The label IS the button here, so make it one: focusable, announced as a
+// button by its own text, and opening on Enter or Space the same chooser a
+// click already opens. Space is swallowed so it doesn't scroll the drawer.
+$('importFileBtn').addEventListener('keydown', e=>{
+  if(e.key!=='Enter' && e.key!==' ') return;
+  e.preventDefault();
+  $('importFile').click();
+});
 $('importBtn').addEventListener('click', async ()=>{
   const c=getCats('importCats'), f=$('importFile').files[0], msg=$('importMsg');
   if(!c.length){ msg.textContent='Select at least one category.'; return; }
@@ -9813,6 +10292,11 @@ function renderCov(feat){
   // facts ride on the container as a label - percent avoids the rounded lies: 1-50 real
   // minutes reads "<1%", a near-full week with a real gap reads ">99%", never a false 0/100.
   const pctTxt = st.on===10080 ? '100' : st.pct===0 ? '<1' : st.pct===100 ? '>99' : st.pct;
+  // role=img is what makes that label reachable. A plain <div> is a generic
+  // element, which is not allowed to carry a name at all, and screen readers
+  // skip the one on a container nobody can focus - so the strip's only spoken
+  // description was silently dropped and the whole thing read as nothing.
+  el.setAttribute('role','img');
   el.setAttribute('aria-label', st.on===0 ? 'Coverage: never on - no active time selected'
     : 'Coverage: on '+pctTxt+'% of the week'+(st.gap ? ', longest off-gap '+st.gap.from+' to '+st.gap.to+' ('+fmtMins(st.gap.mins)+')' : ', no off-hours'));
   el.innerHTML=h; return st;
@@ -10102,7 +10586,14 @@ function saveFailed(text){
   }
   // An enabled schedule whose windows have no active days never runs - block it
   // rather than silently disabling probing/speedtests behind an "on" toggle.
+  // Save can be pressed from any tab, and "pick a day" in front of the Alerts
+  // pane names controls that are not on screen - so go where the message is
+  // pointing, as the gates either side do. There is no one field at fault here
+  // (the whole row has no days), so the keyboard lands on the first day button:
+  // the thing the sentence is asking to be pressed.
   for(const f of ['lat','speed']){ if($(SCHED_FEATS[f].en).checked && body['sched_'+f+'_windows'].every(w=>!w.days.includes('1'))){
+    activateTab('schedule');
+    const day=$(SCHED_FEATS[f].cont).querySelector('.days .day'); if(day) day.focus();
     saveFailed('The '+(f==='lat'?'latency':'speedtest')+' schedule has no active days - pick a day or turn it off.'); return; } }
   // A number outside its own declared range, or a required box left empty:
   // refuse rather than post a value the field's reader will quietly turn into
@@ -10246,12 +10737,17 @@ $('testWebhook').addEventListener('click', async () => {
   const url=$('setWebhook').value.trim();
   const msg=$('settingsMsg');
   if(!url){ msg.textContent='Enter a webhook URL first.'; return; }
-  const b=$('testWebhook'); b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
+  // This one spins by hand rather than through btnBusy, so it also has to hand
+  // the keyboard back itself: the disable below blurs the button and drops focus
+  // to <body> (see btnBusy).
+  const b=$('testWebhook'); const hadFocus=document.activeElement===b;
+  b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
   try{
     const r=await fetch('api/notify/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url, format:$('setWebhookFormat').value})});
     msg.textContent = r.ok ? 'Test alert sent - check your channel.' : ('Test failed: '+await r.text());
   }catch(e){ msg.textContent='Test failed.'; }
   b.disabled=false; b.innerHTML=t;
+  if(hadFocus && (!document.activeElement || document.activeElement===document.body)) b.focus({preventScroll:true});
   // Clear only what this click wrote. A prefix match also caught the heartbeat
   // button's messages, wiping them seconds early when both were pressed.
   const shown=msg.textContent; setTimeout(()=>{ if(msg.textContent===shown) msg.textContent=''; },4000);
@@ -10264,12 +10760,17 @@ $('testHeartbeat').addEventListener('click', async () => {
   const url=$('setHeartbeat').value.trim();
   const msg=$('settingsMsg');
   if(!url){ msg.textContent='Enter a heartbeat URL first.'; return; }
-  const b=$('testHeartbeat'); b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
+  // This one spins by hand rather than through btnBusy, so it also has to hand
+  // the keyboard back itself: the disable below blurs the button and drops focus
+  // to <body> (see btnBusy).
+  const b=$('testHeartbeat'); const hadFocus=document.activeElement===b;
+  b.disabled=true; const t=b.innerHTML; b.innerHTML='<span class="btn-spin"></span>';
   try{
     const r=await fetch('api/notify/heartbeat/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
     msg.textContent = r.ok ? 'Heartbeat sent - your watchdog just checked in.' : ('Test failed: '+await r.text());
   }catch(e){ msg.textContent='Test failed.'; }
   b.disabled=false; b.innerHTML=t;
+  if(hadFocus && (!document.activeElement || document.activeElement===document.body)) b.focus({preventScroll:true});
   // Clear only the line this click wrote - a Save or the webhook test may have replaced
   // it by now, and the success line does not start with "Test" to match on.
   const shown=msg.textContent; setTimeout(()=>{ if(msg.textContent===shown) msg.textContent=''; },4000);
@@ -10278,7 +10779,15 @@ $('testHeartbeat').addEventListener('click', async () => {
 // --- Access / authentication --------------------------------------------
 const loginOverlay=$('loginOverlay');
 let _loginInerted=[];
+// Where the keyboard was when the overlay took over. A 401 lands wherever the
+// session happens to expire - including on a field in the open drawer - and
+// hiding the overlay blurs the form inside it, which leaves focus on <body>:
+// signing back in dumped the reader at the top of the document, out of the
+// drawer they were editing. Read as a locator (focusMark), not as an element,
+// because resumeAfterAuth may reload and redraw the form underneath it.
+let _loginFocusMark=null;
 function showLogin(){ if(loginOverlay.hidden){ loginOverlay.hidden=false;
+  _loginFocusMark=focusMark();   // null when nothing had focus: a page that came up asking for a password has nowhere to go back to
   // The overlay being presented is the active blocker and MUST be interactive:
   // clear any inert another modal left on it (Quick Setup used to inert every
   // body child, including this hidden overlay, and never restored it - a 401 mid
@@ -10291,15 +10800,28 @@ function showLogin(){ if(loginOverlay.hidden){ loginOverlay.hidden=false;
   _loginInerted=[...document.body.children].filter(el=>el!==loginOverlay && !el.inert);
   _loginInerted.forEach(el=>el.inert=true);
   setTimeout(()=>$('loginPass').focus(),50); } }
-function hideLogin(){ loginOverlay.hidden=true; _loginInerted.forEach(el=>el.inert=false); _loginInerted=[]; }
-// Focus trap: this overlay blocks the whole app, so Tab must cycle within its
-// three controls rather than escaping to the (inert) page behind it.
+function hideLogin(){ loginOverlay.hidden=true; _loginInerted.forEach(el=>el.inert=false); _loginInerted=[];
+  // Put the keyboard back only after the inert above is lifted, or the element
+  // being aimed at is still inside a subtree nothing can focus. Not through
+  // refocus: focus is on the form being hidden and not yet on <body>, so its
+  // "only if the redraw took it" guard would read that as somebody else holding
+  // the keyboard and decline.
+  const want=_loginFocusMark; _loginFocusMark=null;
+  if(want){ const el=document.querySelector(want); if(el && el.focus && !el.disabled) el.focus({preventScroll:true}); } }
+// Focus trap: this overlay blocks the whole app, so Tab must cycle within it
+// rather than escaping to the (inert) page behind it. Computed from the DOM the
+// way Quick Setup's trap is, not written out as a list of three: the "Locked
+// out?" bubble sits above the username field and a hard-coded cycle stepped
+// straight over it, so the one route out of being locked out was the one thing
+// in this dialog a keyboard could not reach.
 loginOverlay.addEventListener('keydown', e=>{
   if(e.key!=='Tab') return;
-  const f=[$('loginUser'), $('loginPass'), loginOverlay.querySelector('button[type=submit]')];
+  const f=[...loginOverlay.querySelectorAll('button,input,[tabindex]')].filter(el=>
+    el.tabIndex>=0 && !el.disabled && el.offsetParent!==null);
+  if(!f.length) return;
   const first=f[0], last=f[f.length-1], a=document.activeElement;
-  if(e.shiftKey && a===first){ e.preventDefault(); last.focus(); }
-  else if(!e.shiftKey && a===last){ e.preventDefault(); first.focus(); }
+  if(e.shiftKey && (a===first || !loginOverlay.contains(a))){ e.preventDefault(); last.focus(); }
+  else if(!e.shiftKey && (a===last || !loginOverlay.contains(a))){ e.preventDefault(); first.focus(); }
 });
 // Any 401 means auth is required / the session expired - surface the overlay
 // globally so every existing call site triggers it without per-call checks.
@@ -10906,8 +11428,45 @@ function tick(){ refreshStatus(); refreshChart(); refreshSpeedChart(); refreshHe
 function labelInfoBubbles(){
   document.querySelectorAll('.info[data-tip]').forEach(el=>{ if(!el.hasAttribute('aria-label')){ el.setAttribute('role','img'); el.setAttribute('aria-label', el.dataset.tip); } });
 }
+// nameControlsFromCaptions gives each settings control the short name its row
+// shows, because the name it computed for itself was the whole help bubble. A
+// row is one <label> around the caption, the (i) icon and the control, and the
+// icon now carries the entire tooltip as its own name - so the control's name
+// was caption + several sentences of help + the toggle's "Off On" pseudo-text,
+// read out in full before every field. The help still has a place: the bubble
+// is focusable and announces it on its own. Rows whose caption sits beside the
+// control rather than wrapping it point at it with aria-labelledby and have the
+// same problem, so the computed name replaces that reference. Idempotent, and
+// it never overrules a name already written by hand.
+//
+// The iperf3 server editor is the same row in its own class names (.ie-field or
+// .ie-rsa around an .ie-lbl caption), so it is swept too. It is easy to miss
+// because it is CLOSED until someone adds a server - closed, not absent: anyone
+// configuring an iperf3 server is looking straight at it, and its nine fields
+// carried the longest names on the page.
+function nameControlsFromCaptions(){
+  const flat = el => { const c=el.cloneNode(true); c.querySelectorAll('.info').forEach(i=>i.remove());
+    return c.textContent.replace(/\s+/g,' ').trim(); };
+  // The unit beside the box ("sec", "days") is part of what the row reads, so it
+  // stays in the name; an empty one (the toggles) adds nothing.
+  const name = (ctl, parts) => { const n=parts.filter(Boolean).join(' ');
+    if(!ctl || !n || ctl.hasAttribute('aria-label')) return;
+    ctl.setAttribute('aria-label', n); ctl.removeAttribute('aria-labelledby'); };
+  document.querySelectorAll('label.srow, label.viz-toggle, .afield, .srow-inline, .ie-field, .ie-rsa').forEach(row=>{
+    const lbl=row.querySelector('.lbl,.ie-lbl'); if(!lbl) return;
+    const unit=row.querySelector('.unit');
+    name(row.querySelector('input,select,textarea'), [flat(lbl), unit?flat(unit):'']);
+  });
+  document.querySelectorAll('input[aria-labelledby],select[aria-labelledby],textarea[aria-labelledby]').forEach(ctl=>{
+    const src=document.getElementById(ctl.getAttribute('aria-labelledby'));
+    if(!src || !src.querySelector('.info')) return;   // a caption with no bubble already names it correctly
+    const unit=ctl.parentElement && ctl.parentElement.querySelector('.unit');
+    name(ctl, [flat(src), unit?flat(unit):'']);
+  });
+}
 (function initA11y(){
   labelInfoBubbles();
+  nameControlsFromCaptions(); // after labelInfoBubbles: the bubbles it names are the ones this leaves out
   document.querySelectorAll('.tab[data-tab]').forEach(t=>{ const n=t.dataset.tab;
     if(!t.id) t.id='tab-'+n;
     const pane=document.querySelector('.tabpane[data-tab="'+n+'"]'); if(!pane) return;
