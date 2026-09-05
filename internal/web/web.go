@@ -1042,6 +1042,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	speed, serr := s.store.LatestSpeed(ctx)
 	if serr != nil {
+		// Swallowed on purpose: one unreadable poll is not worth failing the whole
+		// status payload over. But the nil it leaves behind then looks exactly like
+		// "no test has ever finished", and the dashboard acts on that second meaning
+		// - it empties the speed panel. speed_known below carries the difference, so
+		// a locked or busy database cannot blank a panel describing runs that are all
+		// still on disk.
 		s.log.Debug("status read failed", "op", "latest_speed", "err", serr)
 	}
 
@@ -1081,6 +1087,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"uptime_7d":         uptime.D7.Ratio(),
 		"targets":           targets,
 		"speed":             speed,          // nil until the first test completes
+		"speed_known":       serr == nil,    // whether that nil is a fact: false when THIS poll could not read the history
 		"speedtest":         s.speed != nil, // whether manual triggering is available
 		"speedtest_running": speedRunning,
 		"speedtest_run_id":  speedRun, // 0 when idle; pass back to abort THIS run
@@ -1555,10 +1562,10 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 		cw.Write([]string{
 			time.Unix(sp.TS, 0).UTC().Format(time.RFC3339),
 			// A direction that wasn't measured (down-only/up-only/partial run) has a
-			// nil byte pointer; its scalar Mbps is 0, which as "0.00" reads as a
-			// catastrophic measured result rather than "not tested". Byte-presence is
-			// the measured signal (as the tiles/Prometheus already use), so blank the
-			// cell when it's absent.
+			// nil byte pointer AND a zero Mbps, which as "0.00" reads as a catastrophic
+			// measured result rather than "not tested" - so blank the cell on that pair,
+			// the same test the tiles and /metrics apply. See csvMbps for why the byte
+			// pointer cannot carry it alone.
 			csvMbps(sp.DownMbps, sp.DownBytes),
 			csvMbps(sp.UpMbps, sp.UpBytes),
 			csvPing(sp.PingMS),
@@ -3105,6 +3112,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		v, err := s.settings.Update(r.Context(), pat)
 		if err != nil {
+			// A value the operator typed and can retype: its message names the
+			// remedy, so it has to reach them. Routing it through internalError
+			// answered "internal server error" - the panic handler's own words -
+			// which reads as a daemon fault and hides the fix.
+			if errors.Is(err, settings.ErrInvalid) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			s.internalError(w, err)
 			return
 		}
@@ -4888,17 +4903,30 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprintf(w, "pingularity_speed_last_run_bytes{direction=\"up\"} %d\n", *sp.UpBytes)
 			}
 		}
-		// Emit each per-run figure ONLY when the run actually measured it, using the
-		// same evidence the *_bytes gauges gate on: a direction the engine skipped
-		// (e.g. speed_direction="down" skips upload) has no *_bytes and a zeroed
-		// speed, so emitting 0.0 would read as a real reading and fire a permanent
-		// false "below threshold" alert. Render absence instead.
-		if sp.DownBytes != nil {
+		// Emit each per-run figure ONLY when the run actually measured it: a
+		// direction the engine skipped (e.g. speed_direction="down" skips upload)
+		// has no *_bytes and a zeroed speed, so emitting 0.0 would read as a real
+		// reading and fire a permanent false "below threshold" alert. Render
+		// absence instead.
+		//
+		// The byte count is the evidence for a ZERO, not for the figure itself. A
+		// row whose byte columns are gone but whose throughput is a real number was
+		// measured: that is what a database from before those columns carries, and a
+		// restored backup whose speed rows had none, and a row the at-rest integer
+		// repair NULLed. The dashboard cards and the CSV export both show such a run,
+		// and /metrics was the last surface still hiding it - so a scrape read "no
+		// speedtest data" beside a dashboard reading 323 Mbps. This is the surface
+		// that moved; the other two were already right. pingularity_speed_last_run_bytes
+		// above keeps gating on the bytes alone, because it reports the byte count
+		// itself, and that really is missing.
+		downMeasured := sp.DownBytes != nil || sp.DownMbps > 0
+		upMeasured := sp.UpBytes != nil || sp.UpMbps > 0
+		if downMeasured {
 			fmt.Fprintln(w, "# HELP pingularity_speed_download_mbps Last measured download speed (Mbit/s); absent when the run did not measure download.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_download_mbps gauge")
 			fmt.Fprintf(w, "pingularity_speed_download_mbps %g\n", sp.DownMbps)
 		}
-		if sp.UpBytes != nil {
+		if upMeasured {
 			fmt.Fprintln(w, "# HELP pingularity_speed_upload_mbps Last measured upload speed (Mbit/s); absent when the run did not measure upload.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_upload_mbps gauge")
 			fmt.Fprintf(w, "pingularity_speed_upload_mbps %g\n", sp.UpMbps)
@@ -4938,13 +4966,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		// Prometheus base-unit siblings alongside the human-friendly _mbps/_ms/_percent
 		// gauges above: bytes/second, seconds, and a 0..1 loss ratio, for dashboards
-		// that follow the naming conventions. Same source values, converted.
-		if sp.DownBytes != nil {
+		// that follow the naming conventions. Same source values, converted - which
+		// is why they reuse the same measured tests rather than restating them: these
+		// are the _mbps numbers in other units, not a reading of the byte counters,
+		// and docs/metrics.md tells a dashboard to pick whichever unit system it
+		// wants. A pair that could disagree about presence would make that a lie.
+		if downMeasured {
 			fmt.Fprintln(w, "# HELP pingularity_speed_download_bytes_per_second Last measured download throughput (bytes/second).")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_download_bytes_per_second gauge")
 			fmt.Fprintf(w, "pingularity_speed_download_bytes_per_second %g\n", sp.DownMbps*1e6/8)
 		}
-		if sp.UpBytes != nil {
+		if upMeasured {
 			fmt.Fprintln(w, "# HELP pingularity_speed_upload_bytes_per_second Last measured upload throughput (bytes/second).")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_upload_bytes_per_second gauge")
 			fmt.Fprintf(w, "pingularity_speed_upload_bytes_per_second %g\n", sp.UpMbps*1e6/8)
@@ -5560,9 +5592,14 @@ func iptr(i *int64) string {
 
 // csvMbps renders a directional throughput for CSV, blank when that direction
 // wasn't measured (nil byte pointer) so an untested direction isn't exported as a
-// real "0.00". Byte-presence is the measured signal (same as the tiles/metrics).
+// real "0.00". Byte-presence is the measured signal - the same rule the tiles and
+// /metrics apply - but only alongside a zero figure, because a nil byte count is
+// also what an old row carries: the columns are absent on a database from before
+// they existed, on a restored backup that had none, and on rows the at-rest integer
+// repair strips. A throughput above zero is its own evidence, and blanking those
+// left the export missing runs the dashboard's own chart still draws a line for.
 func csvMbps(mbps float64, bytes *int64) string {
-	if bytes == nil {
+	if bytes == nil && mbps <= 0 {
 		return ""
 	}
 	return strconv.FormatFloat(mbps, 'f', 2, 64)

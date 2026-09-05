@@ -557,6 +557,21 @@ type Controller struct {
 // defaults. A successful Reload (SIGHUP / post-import) clears the condition.
 var ErrSettingsUnavailable = errors.New("settings: initial load failed; refusing to persist over stored config")
 
+// ErrInvalid marks a patch the OPERATOR must fix - a value the form sent that
+// this package refuses - as against a store failure they can do nothing about.
+// The two used to be indistinguishable to a caller, so the API layer answered
+// both with the same generic 500 and the sentence naming the remedy never
+// reached the person who had to act on it. Callers test with errors.Is and
+// report err.Error() itself.
+var ErrInvalid = errors.New("invalid setting")
+
+// invalidPatch carries such a sentence. It wraps rather than prefixes so the
+// text stays exactly what the operator needs to read - "invalid setting: ..."
+// in front of it says nothing they cannot see.
+type invalidPatch struct{ error }
+
+func (invalidPatch) Is(target error) bool { return target == ErrInvalid }
+
 // Crypter seals the secrets that have to be kept recoverable (see internal/secret).
 // Only the iperf3 server passwords go through it: iperf3 needs them in the clear at
 // test time, so unlike the dashboard login they can't be hashed.
@@ -1600,7 +1615,7 @@ func (c *Controller) Update(ctx context.Context, p Patch) (Values, error) {
 	if p.IperfServers != nil {
 		for _, t := range p.IperfServers {
 			if secret.Sealed(strings.TrimSpace(t.Password)) {
-				return Values{}, fmt.Errorf("iperf3 password may not begin with the reserved %q prefix; choose a different password", secret.Prefix)
+				return Values{}, invalidPatch{fmt.Errorf("iperf3 password may not begin with the reserved %q prefix; choose a different password", secret.Prefix)}
 			}
 		}
 	}

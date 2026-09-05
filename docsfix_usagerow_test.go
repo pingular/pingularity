@@ -183,14 +183,17 @@ func TestFailedUsageRowIsFilteredOutOfTheAPIButStillCounted(t *testing.T) {
 		}
 	}
 
-	// The UI's measured-signal is unchanged and still byte-presence, which is
-	// WHY the row had to be filtered rather than given null speeds (see the
-	// schema comment at store.go's failed column).
+	// A byte count still makes a zero speed read as a measurement in the UI,
+	// which is WHY the row had to be filtered rather than given null speeds (see
+	// the schema comment at store.go's failed column). The gate also accepts a
+	// positive speed with no byte count at all - an old row that measured before
+	// those columns existed - but that arm cannot rescue an accounting row,
+	// whose speeds are exactly zero.
 	ui, err := os.ReadFile(uiPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", uiPath, err)
 	}
-	if !strings.Contains(string(ui), `if(key==='down_mbps') return p.download_bytes!=null && isNum(p[key]);`) {
+	if !strings.Contains(string(ui), `if(key==='down_mbps') return isNum(p[key]) && (p.download_bytes!=null || p[key]>0);`) {
 		t.Errorf("%s: spMeasured's byte-presence gate changed - recheck the README bullet and this test's premise", uiPath)
 	}
 }

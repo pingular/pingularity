@@ -2175,23 +2175,23 @@
             <span class="dname" id="dnameLatency">Latency
               <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest.
 Delete now clears all three.">i</span></span>
-            <span class="ctl"><input type="number" id="setRetention" step="1" min="0" aria-labelledby="dnameLatency"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setRetention" step="1" min="0" required aria-labelledby="dnameLatency"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delLatency" type="button">Delete now</button>
           </div>
           <div class="drow">
             <span class="dname" id="dnameSpeed">Speed
               <span class="info" tabindex="0" data-tip="Speedtest history. Tests are infrequent, so a long window is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setSpeedRet" step="1" min="0" aria-labelledby="dnameSpeed"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setSpeedRet" step="1" min="0" required aria-labelledby="dnameSpeed"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delSpeed" type="button">Delete now</button>
           </div>
           <div class="drow">
             <span class="dname" id="dnameDowntime">Downtime
               <span class="info" tabindex="0" data-tip="Outage history - it feeds the downtime heatmap, the outages list and the uptime figure. Outages are tiny, so a long window like 365 is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setDowntime" step="1" min="0" aria-labelledby="dnameDowntime"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setDowntime" step="1" min="0" required aria-labelledby="dnameDowntime"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delDowntime" type="button">Delete now</button>
           </div>
         </div>
-        <p class="card-foot muted">How long each dataset is kept before old rows are pruned. <b>0 = keep forever.</b></p>
+        <p class="card-foot muted">How long each dataset is kept before old rows are pruned. <b>0 = keep forever.</b> Each box needs a number - to keep everything, type 0 rather than clearing it.</p>
       </section>
       <section class="data-card">
         <div class="data-card-h"><h3>Backup &amp; restore</h3></div>
@@ -4872,6 +4872,15 @@ function chartLoadFailed(what){ const tb=$('undoToast'); if(!tb) return; tb.text
 // body as a fallback - so the chart pollers can swallow the toast and honour the
 // backoff. Pure/sync so it's unit-tested; never applied to POST/mutating requests.
 function isReconcile503(r, body){ return !!r && r.status===503 && ((r.headers && r.headers.get('Retry-After')!=null) || /restoring a backup/i.test(body||'')); }
+// A 401 to a background poller is the daemon ANSWERING - it wants a session, and
+// the fetch wrapper has just raised the sign-in overlay over the whole page. Read
+// as a failed load it put "Pingularity isn't answering" and "Couldn't load the …
+// chart" up behind that overlay, blaming the link and the data for a login, over a
+// daemon that replied at once. So the pollers swallow it exactly as they swallow
+// the reconcile 503 above: nothing to count, and nothing to say that the overlay
+// is not already saying. Whatever a poll missed is refetched by the tick() the
+// sign-in fires. Pure/sync so it's unit-tested.
+function isAuthRequired(r){ return !!r && r.status===401; }
 // Retry-After here is delta-seconds; clamp it (and default to the server's 2s when
 // it's absent or garbage) so a hostile header can't wedge the poll loop.
 function retryAfterMs(h){ const s=parseInt(h,10); return (s>0?Math.min(s,60):2)*1000; }
@@ -4914,7 +4923,18 @@ async function refreshStatus() {
   // overlap the 3s timer's poll, and the timer stands down until every one of
   // them is back - see the timer for why it waits at all.
   statusInFlight++;
-  let s; try { s = await (await fget('api/status'+(_q.length?'?'+_q.join('&'):''), 8000)).json(); }
+  let s; try { const r=await fget('api/status'+(_q.length?'?'+_q.join('&'):''), 8000);
+    // Not a failed poll: see isAuthRequired. Counted, this reached two and raised
+    // the stale bar's "isn't answering" behind the sign-in overlay - about a daemon
+    // that had just answered. The body isn't JSON either, so it only ever got here
+    // by way of the parse throwing into the catch below.
+    // Drained on the way out: nobody else reads this body, and an unread
+    // response stream stays open until fget's own 8s deadline aborts it - so
+    // every session expiry left one canceled request in the network log and one
+    // connection slot pinned for eight seconds. The chart pollers never showed
+    // this because they read the text already, to tell a reconcile 503 apart.
+    if(isAuthRequired(r)){ try{ await r.text(); }catch(_){} return; }
+    s = await r.json(); }
   catch(e) { if(my!==statusSeq) return; if(++staleFails>=2) setStale(true); return; }
   finally { statusInFlight--; }
   if(my!==statusSeq) return;
@@ -5128,6 +5148,13 @@ async function refreshStatus() {
         if (nextTs*1000 > Date.now()) when += ' · next '+fmtTime(nextTs);
       }
       $('speedWhen').textContent = when;
+    } else if (s.speed_known && !s.speed && !speedFrozen()) {
+      // No run to describe, so say so rather than keep the last one. Only on a poll
+      // that vouches for having READ the history, though: a daemon whose store read
+      // fails serves that same empty speed in an ordinary 200, and blanking on it
+      // would empty the panel over a database still full of runs - with nothing else
+      // on the page to contradict it, since the request itself succeeded.
+      clearSpeedPanel();
     }
     // setSpeedtestRunning also writes this caption, and while a span is pinned
     // the branch above is skipped - so a SCHEDULED run would leave it reading
@@ -5155,10 +5182,12 @@ function setupCanvas(c){ const dpr=(window.devicePixelRatio||1)*exportScale, w=c
 // setSpeedTiles paints the seven cards above the speed chart. Called with the
 // newest run overall while the window is live, and with the newest run inside
 // the span while one is pinned; a null run leaves the placeholders alone.
-// A speed direction is "measured" only when its byte-count evidence is present.
-// An unmeasured direction (e.g. a download-only run does no upload) renders "-"
-// rather than a misleading "0 Mbps". bytes is the matching download_bytes/
-// upload_bytes, absent (undefined/null) when that direction did not run.
+// A speed direction is unmeasured when its byte-count evidence is absent AND its
+// throughput is zero. An unmeasured direction (e.g. a download-only run does no
+// upload) renders "-" rather than a misleading "0 Mbps". bytes is the matching
+// download_bytes/upload_bytes, absent (undefined/null) when that direction did not
+// run - or on an old row that measured the direction before those columns existed,
+// which is why a positive figure counts on its own (see spMeasured).
 // mbpsText/pingText are the tiles' own number formatting, lifted out of them so the
 // range-average pills on the runs bar can render through the SAME helpers. They are
 // the only two speed formatters the panel has, and that is the point: a second
@@ -5172,7 +5201,7 @@ function pingText(p){ return p ? p.toFixed(1)+' ms' : '-'; }
 // over a window of runs does not have that resolution, and printing 22.1 implies
 // it does. Same "0 means not probed" rule.
 function pingAvgText(p){ return p ? Math.round(p)+' ms' : '-'; } // ping_ms==0 means "not probed" (matches /metrics gating); a real speedtest ping is never 0
-function speedTileMbps(mbps, bytes){ return bytes==null ? '-' : mbpsText(mbps); }
+function speedTileMbps(mbps, bytes){ return bytes==null && !(mbps>0) ? '-' : mbpsText(mbps); }
 function setSpeedTiles(sp){
   if(!sp) return;
   $('dl').textContent = speedTileMbps(sp.down_mbps, sp.download_bytes);
@@ -5187,6 +5216,22 @@ function setSpeedTiles(sp){
     $('sp_jitter').title = $('sp_loss').title = qd ? 'Probed on the '+qd : ''; }
   $('sp_bloat_dn').textContent = bloatDirText(sp.idle_ms, sp.loaded_down_ms);
   $('sp_bloat_up').textContent = bloatDirText(sp.idle_ms, sp.loaded_up_ms);
+}
+// clearSpeedPanel puts the cards and the caption back to the empty state the page
+// loads with. Two things end up here, and neither had anything to write them before:
+// a poll that reports no completed run at all - a fresh install, or the speed history
+// just deleted, where the chart and the runs table repaint themselves but the cards
+// and the "<server> - last <time>" line were left describing a run that no longer
+// exists - and a run that finished without storing a row and without an error (an
+// abort of the first-ever run), where setSpeedtestRunning's "Running speedtest on ..."
+// had nothing to replace it and stood over an idle RUN button until a reload.
+function clearSpeedPanel(){
+  for(const id of ['dl','ul','sp_ping','sp_jitter','sp_loss','sp_bloat_dn','sp_bloat_up']) $(id).textContent='-';
+  // and the two tooltips that describe HOW those numbers were measured: left
+  // standing over a dash they describe a measurement that isn't on screen.
+  $('sp_jitter').title = $('sp_loss').title = '';
+  $('speedWhen').classList.remove('run-err');
+  $('speedWhen').textContent='';
 }
 // --- Save a chart as an image ---------------------------------------------
 // Re-runs the SAME draw code at a higher backing resolution and captures the
@@ -5290,7 +5335,14 @@ function saveChartImage(kind){
     out.toBlob(b=>{
       if(!b){ const tb=$('undoToast'); if(tb){ tb.textContent='Could not export image'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); } return; }
       const u=URL.createObjectURL(b), a=document.createElement('a');
-      a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+      a.href=u; a.download=name;
+      // This anchor exists only to start the download, but its click is a real
+      // click event on document.body - and the page has several click-away
+      // handlers listening there, the speed panel's pinned-run one among them.
+      // Saving the chart therefore dropped the pin a moment after the image was
+      // written, from a click the reader never made. Keep it to itself.
+      a.addEventListener('click', ev=>ev.stopPropagation());
+      document.body.appendChild(a); a.click(); a.remove();
       // Revoke on the next frame: revoking synchronously can cancel the
       // download in some browsers before it has read the blob.
       setTimeout(()=>URL.revokeObjectURL(u), 60000);
@@ -5517,8 +5569,16 @@ let chartThresh={down:0,up:0,ping:0,bloatDown:0,bloatUp:0};
 // threshLine draws a dashed horizontal reference line at value `val` in the
 // series colour. Skipped when off (<=0) or above the plotted ceiling (so it
 // never draws off-canvas).
-function threshLine(x,l,r,Y,val,maxV,col){
-  if(!(val>0)||val>maxV) return;
+// clip is for a caller whose Y already clamps to that ceiling: there the line has
+// somewhere to go, so a limit above everything on screen is drawn along the top
+// edge instead of being dropped. The bufferbloat chart is the case - it refuses on
+// purpose to let a far-away limit own its axis, and with the line dropped as well
+// nothing was left to say "your limit is above everything here", which made its
+// Appearance switch look broken. Callers whose Y does not clamp leave clip off and
+// keep the old behaviour, deliberately: the quality chart wants its ping limit to
+// appear only as ping climbs toward it.
+function threshLine(x,l,r,Y,val,maxV,col,clip){
+  if(!(val>0)||(val>maxV&&!clip)) return;
   const yy=Y(val); x.save();
   x.strokeStyle=col; x.globalAlpha=.5; x.lineWidth=1; x.setLineDash([5,4]);
   x.beginPath(); x.moveTo(l,yy); x.lineTo(r,yy); x.stroke();
@@ -5702,6 +5762,9 @@ async function refreshChart(force){
       // off Retry-After before the next poll rather than crying "load failed".
       let body=''; try{ body=await r.text(); }catch(_){}
       if(isReconcile503(r, body)){ if(my===chartSeq) latBackoffMs=retryAfterMs(r.headers.get('Retry-After')); return; }
+      // Same for a 401 (see isAuthRequired): the sign-in overlay is what answers
+      // it, not a toast saying the chart failed to load.
+      if(isAuthRequired(r)) return;
       throw 0;
     }
     d=await r.json()||[];
@@ -5808,15 +5871,25 @@ function chartDot(x,cx,cy,color){ x.beginPath(); x.arc(cx,cy,3,0,Math.PI*2); x.f
 // or partial iperf3 run leaves the untested direction's byte count absent while its
 // throughput stays 0; drawing that 0 would read as a real "0 Mbps" reading rather than
 // "not tested". Byte presence is the same measured-signal the tiles use.
-// Whether a point counts as "measured" for the fill/area gate. The speed directions
-// require their byte field, so a keep-partial run's 0-filled direction shows a gap
-// rather than a zero-valley. Any other keyed series - the bufferbloat bands, keyed
+// Byte presence ALONE was too strong, though. Rows exist whose throughput is real and
+// whose byte columns are not: a database carried over from before those columns, a
+// restored backup whose speed rows had none, and the at-rest repair that NULLs a byte
+// column it cannot read while leaving down_mbps alone. Those runs were hidden from
+// the cards, the line, the table, the CSV and the range averages - while the chart's
+// ceiling went on scaling to the very value it was refusing to draw, which is the tell
+// that this shape was never considered rather than ruled out. So a positive throughput
+// counts on its own: the case the rule exists for reports exactly 0, never a figure.
+// Whether a point counts as "measured" for the fill/area gate. A speed direction
+// counts when it has a byte field OR a throughput above zero, so a keep-partial
+// run's 0-filled direction still shows a gap rather than a zero-valley while a
+// row that measured a real speed before the byte columns existed is drawn. Any
+// other keyed series - the bufferbloat bands, keyed
 // 'v' on {ts,v} points - only needs a finite value: demanding upload_bytes there
 // rejected every bloat point, so the bands (fill + median line) never drew and only
 // the spike stems showed.
 function spMeasured(p,key){
-  if(key==='down_mbps') return p.download_bytes!=null && isNum(p[key]);
-  if(key==='up_mbps') return p.upload_bytes!=null && isNum(p[key]);
+  if(key==='down_mbps') return isNum(p[key]) && (p.download_bytes!=null || p[key]>0);
+  if(key==='up_mbps') return isNum(p[key]) && (p.upload_bytes!=null || p[key]>0);
   return isNum(p[key]);
 }
 // The ping half of that predicate. ping_ms==0 is the "not probed" sentinel, not a
@@ -5837,7 +5910,7 @@ function pingMeasured(p){ return isNum(p.ping_ms) && p.ping_ms>0; }
 // one case, and it matters: spanOne pads a lone run into two points so the line has
 // width, and averaging that would count the only run in the range twice.
 //
-// down/up reuse spMeasured, the same byte-presence predicate the chart's fill, the
+// down/up reuse spMeasured, the same measured-or-not predicate the chart's fill, the
 // tooltip and the runs table gate on. So the average covers precisely the points the
 // area is drawn from: a direction that shows on screen as a gap cannot slip into the
 // number sitting beside it, and a download-only run still contributes its download
@@ -6210,8 +6283,8 @@ function drawBloatChart(points){
     bar(p.dn,p.dnX,Ydn,TC.bdown,TC.bdownFill,false);
   }
   // Alert thresholds: upload above the centre, download below - same added-ms scale.
-  if(TC.thrBup) threshLine(x,pad.l,w-pad.r,Yup,chartThresh.bloatUp,maxV,TC.bup);
-  if(TC.thrBdown) threshLine(x,pad.l,w-pad.r,Ydn,chartThresh.bloatDown,maxV,TC.bdown);
+  if(TC.thrBup) threshLine(x,pad.l,w-pad.r,Yup,chartThresh.bloatUp,maxV,TC.bup,true);
+  if(TC.thrBdown) threshLine(x,pad.l,w-pad.r,Ydn,chartThresh.bloatDown,maxV,TC.bdown,true);
   bloatPlot={points,X,top:pad.t,bot:bot};
   if(mine) drawXAxis(x, points, 'ts', X, w, bot, pad.l, pad.r);
   { const cs=cursorSpan(h,mine), sy=c.offsetTop, sx=cursorX(points,X); if(sx!=null) drawCursor(x, sx, cs.top, cs.bot, true, sy);
@@ -6294,6 +6367,9 @@ async function refreshSpeedChart(force){
       // off Retry-After before the next poll rather than crying "load failed".
       let body=''; try{ body=await r.text(); }catch(_){}
       if(isReconcile503(r, body)){ if(my===speedSeq) speedBackoffMs=retryAfterMs(r.headers.get('Retry-After')); return; }
+      // Same for a 401 (see isAuthRequired): the sign-in overlay is what answers
+      // it, not a toast saying the chart failed to load.
+      if(isAuthRequired(r)) return;
       throw 0;
     }
     // The server thins a window holding more than ~1500 runs and says so in these
@@ -6350,6 +6426,10 @@ function syncSpeedPanel(fresh){
     if(!live){
       live=document.createElement('button');
       live.type='button'; live.className='btn ghost live-btn';
+      // Identified, because the class is not this button's alone: the latency
+      // panel builds its Live button the same way, and the click-away rule that
+      // spares this panel's own chrome has to be able to tell them apart.
+      live.id='speedLive';
       live.textContent='Live';
       live.title='Back to the rolling window';
       live.addEventListener('click', backToLive);
@@ -6359,10 +6439,7 @@ function syncSpeedPanel(fresh){
     // An empty span blanks the cards rather than leaving the previous window
     // numbers sitting above an empty chart.
     if(last) setSpeedTiles(last);
-    else { for(const id of ['dl','ul','sp_ping','sp_jitter','sp_loss','sp_bloat_dn','sp_bloat_up']) $(id).textContent='-';
-    // and the two tooltips that describe HOW those numbers were measured: left
-    // standing over a dash they describe a measurement that isn't on screen.
-    $('sp_jitter').title = $('sp_loss').title = ''; }
+    else clearSpeedPanel(); // same blanking; the caption it clears is rewritten just below
     $('speedWhen').classList.remove('run-err');
     $('speedWhen').textContent = !fresh ? 'loading range…'
       : last ? (last.server?last.server+' · ':'')+'last in range '+fmtTime(last.ts)
@@ -6543,7 +6620,21 @@ $('bloatChart').addEventListener('mouseleave', ()=>{ linkHover(-1); $('chartTip'
 $('bloatChart').addEventListener('click', e=>chartClickAt(bloatPlot)(e));
 // Clicking away from a selected run - anywhere outside the charts and the runs section -
 // clears it (the charts and the row clicks manage the selection themselves).
-document.addEventListener('click', e=>{ if(pinnedRunTs==null) return; if(e.target.closest('#speedChart,#qualityChart,#bloatChart,#runsSection')) return; clearSelection(); });
+// The panel's own chrome does not count as away. The runs bar (the Show/Hide runs
+// button, the average pills, the chart toggles, the save button) sits outside
+// #runsSection, and the window picker and its Live button sit up in the heading, so
+// every one of them used to drop the pin on the way past - hiding a chart lost the
+// highlight from the table still on screen, and on touch, where a tap PINS the point
+// and "Show all runs" is the follow-on action named above, that button opened the
+// table with nothing highlighted in it.
+// The Live button is named by its own id, not by .live-btn: the latency panel
+// builds one with the identical class, and THAT one is away - a control in
+// another panel, which has always dropped the pin and still must. Scoping it to
+// the speed panel instead would not work, because by the time this listener runs
+// the button has taken itself off the page (its handler goes back to the rolling
+// window, and syncSpeedPanel removes an option that no longer applies), so the
+// event target has no ancestors left to match against.
+document.addEventListener('click', e=>{ if(pinnedRunTs==null) return; if(e.target.closest('#speedChart,#qualityChart,#bloatChart,#runsSection,.runs-bar,#speedWindow,#speedLive')) return; clearSelection(); });
 function qHoverAt(e){
   if(!qPlot||!qPlot.points.length){ $('chartTip').hidden=true; return; }
   const {bi,bd}=nearestIdx(qPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
@@ -6686,6 +6777,7 @@ let runsPage=1, runsPerPage=10, runsTotal=0;
 // needs covering.
 let runsBusy=false;
 let runsSeq=0; // only the newest in-flight runs poll repaints the table (see refreshStatus)
+let runsLoadedPage=1; // the page whose rows are actually on screen - where runsGoTo goes back to
 async function loadRuns(force){
   // Behind a hidden tile there is nobody to read the rebuild - the sibling
   // outages table has refused this since it was written. Callers that change
@@ -6697,13 +6789,27 @@ async function loadRuns(force){
   try{ const r=await fetch(`api/speed/runs?limit=${runsPerPage}&offset=${(runsPage-1)*runsPerPage}`);
     if(!r.ok) throw 0;
     data=await r.json();
-  }catch(e){ chartLoadFailed('runs table'); listLoadFailed('runsBody', 'runsPageInfo', ['runsPrev','runsNext'], 24, 'runs'); return false; }
-  if(my!==runsSeq) return;
+  // The rule just below, applied to a failure as well as to an answer: a request
+  // a newer one has overtaken is not the page anyone is on, so it says nothing
+  // and counts as no failure. Reporting anyway put "Not loaded" and two disabled
+  // buttons over rows a newer load had just fetched, and pulled the counter off
+  // them onto a page that was only ever asked for - and nothing repaints a table
+  // whose counter is not on page 1, so that pager stayed dead.
+  }catch(e){ if(my!==runsSeq) return true;
+    chartLoadFailed('runs table'); listLoadFailed('runsBody', 'runsPageInfo', ['runsPrev','runsNext'], 24, 'runs'); return false; }
+  // A newer load has taken over, so this answer is not painted - but it is not a
+  // failure either, and telling the two apart is the whole of what runsGoTo asks
+  // here: it puts the page counter back when a load says it did not arrive, and
+  // the counter now belongs to whoever superseded us. Nothing disables Prev/Next
+  // while a page is in flight, so two quick clicks on Next used to end with the
+  // third page's rows under a "Page 1" caption, Prev drawn enabled but inert, and
+  // Next stepping backwards.
+  if(my!==runsSeq) return true;
   const runs=data.runs||[]; runsTotal=data.total||0;
   if(runs.length===0 && runsPage>1){ runsPage--; return loadRuns(force); } // page emptied (e.g. after delete)
   $('runsBody').innerHTML = runs.length ? runs.map(r=>`
     <tr data-ts="${r.ts}">
-      <td class="act"><button class="run-del" type="button" data-ts="${r.ts}" title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
+      <td class="act"><button class="run-del" type="button" data-ts="${r.ts}"${r.round_ts?` data-round="${r.round_ts}"`:''} title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
       <td class="mono">${fmtTime(r.ts)}</td>
       <td class="mono">${spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
       <td class="mono">${spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
@@ -6730,6 +6836,7 @@ async function loadRuns(force){
     </tr>`).join('')
     : `<tr><td class="muted" colspan="24">No runs recorded yet.</td></tr>`;
   updateRunsPager();
+  runsLoadedPage=runsPage; // these rows are this page's; a load that fails later comes back here
   applyRunHighlight(pinnedRunTs);
   return true; // the page arrived - see runsGoTo/outagesGoTo
 }
@@ -6826,9 +6933,13 @@ function updateRunsPager(){
 // the caption and the rows stayed on the old page while the counter had moved
 // on - and with only this endpoint failing there was no way back: Next's own
 // guard was already false and Prev was drawn disabled.
+// Where "back" is has to be the page whose rows are on screen, not the page this
+// click started from: with two clicks in the air the page a click started from
+// can be one that was only ever asked for, and parking the counter there leaves
+// a pager nothing puts right again.
 async function runsGoTo(page){
-  const was=runsPage; runsPage=page;
-  if(!await loadRuns(true)) runsPage=was;
+  runsPage=page;
+  if(!await loadRuns(true)) runsPage=runsLoadedPage;
 }
 $('runsPrev').addEventListener('click', ()=>{ if(runsPage>1) runsGoTo(runsPage-1); });
 $('runsNext').addEventListener('click', ()=>{ if(runsPage < Math.ceil(runsTotal/runsPerPage)) runsGoTo(runsPage+1); });
@@ -6851,9 +6962,17 @@ $('runsBody').addEventListener('click', async e=>{
   // A Best-of round that kept its losers is several rows, and deleting the
   // run's own row takes them all (the daemon cascades on round_ts). Say so:
   // the count cannot be known before the click - the other servers may sit on
-  // a page that is not loaded - but the fact that they go is always true, and
-  // the toast below reports what actually went.
-  if(!confirm('Delete this speedtest run? Any other servers measured in the same round go with it. This cannot be undone.')) return;
+  // a page that is not loaded - but the fact that they go is true of the row
+  // the round belongs to, and the toast below reports what actually went.
+  //
+  // Not of a MEMBER row, though (data-round, the '· round' rows): the cascade is
+  // keyed on the deleted run's own timestamp, and a member's round_ts names the
+  // winner rather than itself, so the daemon takes that one row and leaves the
+  // round standing. The one sentence for every row promised, on exactly the rows
+  // where it was untrue, that a round the reader was not deleting would go too.
+  if(!confirm(btn.dataset.round
+    ? 'Delete this speedtest run? It is one server of a Best-of round another server won, so the rest of that round stays. This cannot be undone.'
+    : 'Delete this speedtest run? Any other servers measured in the same round go with it. This cannot be undone.')) return;
   // Remember this button's row position: loadRuns() rebuilds the whole tbody, so
   // after the delete we put keyboard focus on the run that slid up into its place
   // (or the toggle if the page emptied) - same focus-after-rebuild courtesy the
@@ -6977,6 +7096,7 @@ $('heatmap').addEventListener('click', async e=>{
 });
 let outagesPage=1, outagesPerPage=10, outagesTotal=0;
 let outagesSeq=0; // only the newest in-flight outages poll repaints the table (see refreshStatus)
+let outagesLoadedPage=1; // the page whose rows are on screen - same job as runsLoadedPage
 // An outage row is deletable exactly when it's a closing 'up' event - the same
 // predicate the server enforces (ts=? AND type='up'). A repair can null an outage's
 // duration (has_duration=false, shown as '-') without changing that it still closes
@@ -6996,8 +7116,9 @@ async function loadOutages(force){
   try{ const r=await fget(`api/events?limit=${outagesPerPage}&offset=${(outagesPage-1)*outagesPerPage}`);
     if(!r.ok) throw 0;
     data=await r.json();
-  }catch(e){ chartLoadFailed('outages list'); listLoadFailed('events', 'outagesPageInfo', ['outagesPrev','outagesNext'], 4, 'events'); return false; }
-  if(my!==outagesSeq) return;
+  }catch(e){ if(my!==outagesSeq) return true;   // superseded, so not this reader's failure - same reason as loadRuns
+    chartLoadFailed('outages list'); listLoadFailed('events', 'outagesPageInfo', ['outagesPrev','outagesNext'], 4, 'events'); return false; }
+  if(my!==outagesSeq) return true;   // superseded, not failed - same reason as loadRuns
   const ev=data.events||[]; outagesTotal=data.total||0;
   if(ev.length===0 && outagesPage>1){ outagesPage--; return loadOutages(force); } // page emptied
   const evMark=$('events').contains(document.activeElement) ? focusMark() : null;
@@ -7008,6 +7129,7 @@ async function loadOutages(force){
         <td>${e.type==='up'&&e.has_duration?fmtDur(e.duration_s):'-'}</td></tr>`).join('')
     : '<tr><td class="muted" colspan="4">No events recorded yet.</td></tr>';
   updateOutagesPager();
+  outagesLoadedPage=outagesPage;
   refocus(evMark);   // the 60s poll rebuilds this tbody under a still hand too
   return true; // the page arrived - see runsGoTo/outagesGoTo
 }
@@ -7034,7 +7156,15 @@ $('events').addEventListener('click', async e=>{
     await loadOutages(); refreshHeatmap(); refreshStatus();
     const left=$('events').querySelectorAll('.run-del');
     (left[Math.min(idx,left.length-1)]||$('outagesToggle')).focus();
-    const tb=$('undoToast'); if(tb){ tb.textContent='Outage deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
+    // The daemon reports what it actually removed, the way the runs delete above
+    // does. Zero means the outage was already gone - deleted in another tab, or
+    // swept by retention, in the minute between this table's refresh and the
+    // click - and saying "Outage deleted" there told the reader they had just
+    // done something they had not. A count ABOVE one is still one outage: the
+    // recovery takes its "Link down" markers with it, so only zero is worth a
+    // different word.
+    let gone=1; try{ const d=await r.json(); gone=(d && typeof d.deleted==='number') ? d.deleted : 1; }catch(e){}
+    const tb=$('undoToast'); if(tb){ tb.textContent = gone===0 ? 'That outage was already gone' : 'Outage deleted'; tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
   }catch(err){ btn.disabled=false; alert('Delete failed'); }
 });
 function updateOutagesPager(){
@@ -7044,10 +7174,11 @@ function updateOutagesPager(){
   $('outagesPrev').disabled = outagesPage<=1;
   $('outagesNext').disabled = outagesPage>=pages;
 }
-// Same rule as runsGoTo: a page that did not load is not a page you are on.
+// Same rules as runsGoTo: a page that did not load is not a page you are on, and
+// the page to go back to is the one whose rows are showing.
 async function outagesGoTo(page){
-  const was=outagesPage; outagesPage=page;
-  if(!await loadOutages()) outagesPage=was;
+  outagesPage=page;
+  if(!await loadOutages()) outagesPage=outagesLoadedPage;
 }
 $('outagesPrev').addEventListener('click', ()=>{ if(outagesPage>1) outagesGoTo(outagesPage-1); });
 $('outagesNext').addEventListener('click', ()=>{ if(outagesPage < Math.ceil(outagesTotal/outagesPerPage)) outagesGoTo(outagesPage+1); });
@@ -7394,6 +7525,21 @@ const NETINFO_OFF_TIPS = {
 // going to run. Same shape as speedtestAbortable - if two places describe one
 // condition, they eventually disagree.
 function netinfoIdleReason(off, mon){ return off ? 'setting' : (!mon ? 'paused' : null); }
+// Whether a snapshot has nothing in it to draw. Deliberately the union of every
+// field the rows below are built from, so the two cannot drift: the old test
+// asked only for a public IPv4, an error or a DNS egress, and that called a
+// perfectly healthy IPv6-only host empty. Its identity branch leaves the v4
+// address blank on purpose (internal/netinfo: there is no IPv4) and fills in the
+// v6 address, ISP, city and Cloudflare PoP with no error, while the DNS egress
+// appears only once the resolver echo has answered at least once. A complete
+// snapshot therefore sat unread behind "gathering…" while the panel asked the
+// daemon for it again every three seconds for as long as the host stayed v6-only.
+function netinfoEmpty(n){
+  if(!n) return true;
+  const ex=n.exit||{};
+  return !(n.public_ip || n.public_ipv6 || n.error || n.dns_upstream || (n.dns_configured&&n.dns_configured.length)
+        || n.isp || n.city || n.country || n.cf_colo || ex.ip || ex.loc || ex.next_ip || ex.next_name);
+}
 
 function syncNetinfoOffMark(){
   const m=$('netinfoOffMark'); if(!m) return; // may run before the panel exists
@@ -7420,7 +7566,7 @@ async function refreshNetinfo(force) {
   if(!force && my!==netinfoSeq) return;
   const el=$('netinfo');
   syncNetinfoOffMark(); // one call, ahead of every return below
-  if(!n||(!n.public_ip&&!n.error&&!n.dns_upstream)){
+  if(netinfoEmpty(n)){
     if(netinfoIdleReason(netinfoOff, monitoring)){
       // Nothing cached, and nothing coming: no automatic lookup will run, so the
       // fast poll below would spin every 3s forever waiting for a snapshot that
@@ -8536,13 +8682,21 @@ const FIELDS=[
 // on Save instead of re-quantizing (a CLI-set "-retain 6h" renders as 0 days,
 // and blindly sending 0 back would mean "keep forever").
 const secOrig={};
-function setField(id,kind,v){ switch(kind){
+// What each field was LOADED with, keyed by input id and already in the shape
+// the API speaks - filled by every path that fills the form: a settings GET, a
+// Save's own response, and Reset to defaults. It is what Save posts for a field
+// whose parent toggle has greyed it out (see settingsBody), which is why it is
+// re-read through getField rather than stored raw: whatever the reader would
+// have answered the moment the form was loaded is exactly the value to send.
+const fieldOrig={};
+function setField(id,kind,v,fb){ switch(kind){
   case 'bool': $(id).checked=!!v; break;
   case 'min': secOrig[id]={raw:v||0, shown:Math.round((v||0)/60)}; $(id).value=secOrig[id].shown; break;
   case 'day': secOrig[id]={raw:v||0, shown:Math.round((v||0)/86400)}; $(id).value=secOrig[id].shown; break;
   case 'float': $(id).value=v||0; break;
   case 'text': $(id).value=v||''; break;
-  default: { const el=$(id); el.value=v; if(el.tagName==='SELECT'&&el.selectedIndex<0&&el.options.length) el.selectedIndex=0; } } }
+  default: { const el=$(id); el.value=v; if(el.tagName==='SELECT'&&el.selectedIndex<0&&el.options.length) el.selectedIndex=0; } }
+  fieldOrig[id]=getField(id,kind,fb); }
 // intOf reads a number input as a whole number, or NaN when it holds nothing
 // usable. Number, not parseInt: "1e3" is valid floating-point syntax that a
 // number input accepts and checkValidity passes (1000 being a whole number in
@@ -8569,7 +8723,7 @@ function getField(id,kind,fb){ switch(kind){
 // setFields loads every descriptor-driven field from a settings object and
 // refreshes the dependent UI (schedule enable state, warnings, data estimate).
 function setFields(s){
-  FIELDS.forEach(([id,key,kind])=> setField(id,kind,s[key]));
+  FIELDS.forEach(([id,key,kind,fb])=> setField(id,kind,s[key],fb));
   // Only recompute the server-clock skew when the payload actually carries the
   // clock (GET/POST responses do; the Reset-to-defaults object does not). Otherwise
   // Reset would null the skew and the schedule "now" marker would fall back to
@@ -8580,7 +8734,9 @@ function setFields(s){
   updateSchedDisabled(); updateConflictWarnings(); updateSpeedEstimate(); syncDiscardLosersDep();
 }
 // setDep greys + disables a control that depends on another being on. Informational only:
-// the saved value is preserved and takes effect again once the parent is back on.
+// the value is preserved and takes effect again once the parent is back on - including one
+// typed just before the greying, which Save still posts. The one thing a greyed box cannot
+// pass on is a number its own min/max refuse; settingsBody sends fieldOrig for that.
 // Best of 1 measures one server, so there are no losers to discard or keep -
 // the checkbox's own tooltip said as much while the checkbox stayed live.
 function syncDiscardLosersDep(){
@@ -9489,7 +9645,9 @@ async function downloadVia(url, fallbackName){
     // reaches for right before doing something risky.
     const b=await r.blob();
     const u=URL.createObjectURL(b), a=document.createElement('a');
-    a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+    a.href=u; a.download=name;
+    a.addEventListener('click', ev=>ev.stopPropagation()); // a download trigger, not a click on the page (see saveChartImage)
+    document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(u), 60000);
     return 'ok';
   }catch(_){ return 'fail'; }
@@ -9661,6 +9819,7 @@ function renderCov(feat){
 }
 function updateConflictWarnings(){
   const lat=renderCov('lat'); renderCov('speed');
+  updateSpeedEstimate(); // the estimate counts the speedtest windows now, and this runs on every window edit
   // Exact coverage replaces the old single-row 24/7 check: multi-window
   // round-the-clock schedules no longer warn falsely, and the gate keys off
   // the gap itself (not the rounded percent, which hides gaps under 50 min).
@@ -9671,7 +9830,7 @@ function updateConflictWarnings(){
   $('schedWarn').classList.toggle('show', c); $('notifyWarn').classList.toggle('show', c);
 }
 $('setSchedLatEnabled').addEventListener('change', ()=>{ updateSchedDisabled(); updateConflictWarnings(); });
-$('setSchedSpeedEnabled').addEventListener('change', updateSchedDisabled);
+$('setSchedSpeedEnabled').addEventListener('change', ()=>{ updateSchedDisabled(); updateSpeedEstimate(); }); // turning the schedule on or off changes how many runs a day fit
 $('setWebhook').addEventListener('input', updateConflictWarnings);
 let speedAvgDown=0, speedAvgUp=0;
 // How many servers the runs behind those averages actually measured (from the
@@ -9682,6 +9841,27 @@ let speedAvgDown=0, speedAvgUp=0;
 // one round's bytes for a link about to carry N of them.
 let speedAvgServers=1;
 const EST_RUN_DOWN=200e6, EST_RUN_UP=120e6; // rough per-run fallback before any test has run
+// How many scheduled runs a day the SPEEDTEST SCHEDULE actually leaves room for.
+// Without a schedule that is simply a day divided by the interval, but a
+// schedule gates the scheduler (Controller.SpeedAllowed), and the estimate used
+// to ignore it - so a 60-minute interval confined to 09:00-17:00 on weekdays
+// still claimed 24 tests and a full month of bytes, roughly four times what a
+// metered link would carry, in a figure the README calls a lower bound.
+//
+// Counted by walking the same weekly grid the coverage strip is drawn from,
+// because a slot that comes due outside a window is DEFERRED, not dropped: the
+// scheduler re-checks while it waits and fires the moment the window opens,
+// without moving its anchor (see Loop in scheduler.go). So each window pays for
+// one catch-up run at its opening plus one per interval inside it, which
+// scaling by coverage alone would undercount.
+function schedRunsPerDay(min){
+  if(!$('setSchedSpeedEnabled').checked) return 1440/min;
+  const g=covGrid(collectWindows('speed'));
+  let runs=0, due=0;
+  for(let i=0;i<10080;i++){ if(!g[(i/1440)|0][i%1440]) continue;
+    if(i>=due){ runs++; due=i+min; } }
+  return runs/7;
+}
 function updateSpeedEstimate(){
   const el=$('speedDataEst'); if(!el) return;
   // The estimate is Ookla-flavored (internet data per run); iperf3 typically
@@ -9689,7 +9869,7 @@ function updateSpeedEstimate(){
   if($('setSpeedEngine').checked){ el.classList.add('hidden'); return; }
   if(!$('setStEnabled').checked){ el.classList.add('hidden'); return; }
   const min=Math.max(1, intOf($('setSpeed').value)||60);
-  const runs=86400/(min*60);
+  const runs=schedRunsPerDay(min);
   const have=speedAvgDown>0||speedAvgUp>0;
   const pD=have?speedAvgDown:EST_RUN_DOWN, pU=have?speedAvgUp:EST_RUN_UP;
   // A Best-of round measures N servers per scheduled test. A RECORDED average
@@ -9705,8 +9885,11 @@ function updateSpeedEstimate(){
   // arithmetic behind them so a changed interval or server count visibly moves
   // it. The leading ~ already says "approximate", so nothing else needs to;
   // only a figure with no measurements behind it is worth calling out.
+  // A narrow window can leave well under one run a day, and "0 tests/day" beside
+  // a non-zero pile of bytes is a contradiction - say "<1" there instead.
+  const rt = runs>0 && runs<0.5 ? '<1' : String(Math.round(runs));
   $('speedDataEstText').innerHTML='<b>'+bytesStr(d)+' down</b> + <b>'+bytesStr(u)+' up</b> per day, <b>'+bytesStr(mo)+'/month</b> \u00b7 '+
-    Math.round(runs)+' test'+(Math.round(runs)===1?'':'s')+'/day'+(bestOf?' \u00d7 '+n+' servers':'')+(have?'':' \u00b7 not yet measured');
+    rt+' test'+(rt==='1'||rt==='<1'?'':'s')+'/day'+(bestOf?' \u00d7 '+n+' servers':'')+(have?'':' \u00b7 not yet measured');
   // Above four servers a round is a serious amount of data on a metered link.
   // The GLYPH says so, not the tint: several themes put --warn close enough to
   // --accent that the warn fill and the ordinary fill are the same colour to
@@ -9748,7 +9931,28 @@ function settingsBody(){
             iperf_server: iperfActiveSrv ? iperfActiveSrv.addr : '',
             iperf_servers: iperfServers.filter(s=>!s._del && s.addr).map(s=>({label:s.label, addr:s.addr, bind:s.bind||'', ipver:s.ipver||'auto',
               auth:!!s.auth, username:s.username||'', rsa_key:s.rsa_key||'', pkcs1:!!s.pkcs1, password:s.password||''})) };
-  FIELDS.forEach(([id,key,kind,fb])=> b[key]=getField(id,kind,fb));
+  // A greyed field is still the user's edit (see setDep) - what its box holds
+  // is posted like any other - with one exception: a box holding a number the
+  // field itself refuses. Typing 0 into "Check every" or 99999 into "Run every"
+  // and then turning the parent toggle off used to send that number anyway,
+  // straight past the range gate, and the daemon clamped it into range, so 5s
+  // became 1s and 60 min became 24h with the drawer closing on success. Those
+  // are values nobody typed, so send what the field was LOADED with instead.
+  // Asked of `validity` rather than checkValidity(): a disabled input is not a
+  // candidate for constraint validation, so checkValidity() answers true
+  // however bad the box is, while validity.valid still reports what the field's
+  // own min/max say - and for the intervals those bounds ARE the daemon's
+  // clamp, which it publishes and applySettings copies in. Only a refused
+  // number is replaced, never an in-range one: an edit made while the field was
+  // live is a real edit, and overwriting it here would both throw the typed
+  // number away and hide it from the dirty check (formSnapshot is this body),
+  // so the drawer would close without ever asking about it. The key is sent
+  // either way rather than omitted: this is a PATCH, and an omitted key keeps
+  // the STORED value, which would quietly undo Reset to defaults for every
+  // control the defaults themselves grey out (Automatic ships off).
+  FIELDS.forEach(([id,key,kind,fb])=>{ const el=$(id);
+    b[key] = (el && el.disabled && el.validity && !el.validity.valid && id in fieldOrig)
+      ? fieldOrig[id] : getField(id,kind,fb); });
   b.sched_lat_enabled=$('setSchedLatEnabled').checked; b.sched_lat_windows=collectWindows('lat');
   b.sched_speed_enabled=$('setSchedSpeedEnabled').checked; b.sched_speed_windows=collectWindows('speed');
   return b;
@@ -9759,13 +9963,21 @@ let saveInFlight=false;
 // invalidNumberField is the first number input the BROWSER already judges out
 // of range - every one of them declares its own min/max in the markup, so this
 // asks the field rather than re-deriving the rule. Disabled fields are skipped:
-// they are not the user's to fix and are not posted.
+// they are not the user's to fix, and they cannot be focused to be fixed. The
+// skip is belt and braces anyway - the browser bars a disabled input from
+// constraint validation, so checkValidity answers true however bad the box is -
+// and a bad number in one cannot escape that way either: settingsBody reads the
+// same fields' `validity` and posts what they were loaded with instead.
 //
 // It exists because the fallbacks that read these fields are lenient by design
 // (getField's 'int'/'day' fall back rather than reject), so a negative number
 // did not bounce - it went in as a number nobody meant. -5 days of retention
 // became 0, which the daemon reads as KEEP FOREVER: the opposite of what was
-// typed, saved with a closing drawer and no message.
+// typed, saved with a closing drawer and no message. An EMPTY retention box did
+// exactly the same thing for the same reason - getField's 'day' has no
+// shipping-default fallback, so blank became 0 became forever - which is why
+// those three inputs are `required`: an empty required box fails checkValidity,
+// so this catches it and the save stops on the same message path.
 function invalidNumberField(list){
   for(const el of list||[]){
     if(el && !el.disabled && typeof el.checkValidity === 'function' && !el.checkValidity()) return el;
@@ -9892,15 +10104,19 @@ function saveFailed(text){
   // rather than silently disabling probing/speedtests behind an "on" toggle.
   for(const f of ['lat','speed']){ if($(SCHED_FEATS[f].en).checked && body['sched_'+f+'_windows'].every(w=>!w.days.includes('1'))){
     saveFailed('The '+(f==='lat'?'latency':'speedtest')+' schedule has no active days - pick a day or turn it off.'); return; } }
-  // A number outside its own declared range: refuse rather than post a value
-  // the field's reader will quietly turn into something else. Take the user to
-  // it, the way the server-address gates do.
+  // A number outside its own declared range, or a required box left empty:
+  // refuse rather than post a value the field's reader will quietly turn into
+  // something else. Take the user to it, the way the server-address gates do.
+  // The two are told apart because they are different mistakes - "outside the
+  // range it allows" in front of a box holding nothing at all is a puzzle.
   { const bad=invalidNumberField(_drawer.querySelectorAll('input[type=number]'));
     if(bad){
       const pane=bad.closest('.tabpane');
       if(pane && pane.dataset.tab) activateTab(pane.dataset.tab);
       bad.focus();
-      saveFailed(fieldName(bad)+' is outside the range it allows'+(bad.min!==''?' (lowest '+bad.min+(bad.max!==''?', highest '+bad.max:'')+')':'')+' - fix it before saving.');
+      saveFailed(bad.validity && bad.validity.valueMissing
+        ? fieldName(bad)+' is empty - type a number before saving.'
+        : fieldName(bad)+' is outside the range it allows'+(bad.min!==''?' (lowest '+bad.min+(bad.max!==''?', highest '+bad.max:'')+')':'')+' - fix it before saving.');
       return;
     } }
   const msg=$('settingsMsg'); msg.textContent='Saving…';
@@ -10011,6 +10227,14 @@ $('resetSettings').addEventListener('click', () => {
   $('setFade').value=100; applyFade(100);
   $('setWide').checked=false; applyWide(false, true);
   applyCorners(false); // sets the checkbox itself
+  // The colour overrides are appearance too, and they were the ones left
+  // standing: the page kept its custom background, top-bar dots and chart
+  // colours through a reset that announced defaults had been loaded, and Save
+  // wrote them all back. One object each, so UI colours, Top bar and Chart
+  // customization all go together - the per-section "Reset to theme" buttons
+  // clear their own keys, this clears the lot.
+  palettePrefs=defaultPalette(); applyPalette(); syncPaletteControls();
+  vizPrefs=defaultViz(); applyViz(); syncVizControls();
   $('setSpeedEngine').checked = iperfWanted && iperfAvailable; updateEngineUI();
   // Bump before the write, not after: the list load started above is already in
   // flight and its failure compares this number the moment it lands.
@@ -10098,13 +10322,34 @@ window.fetch=async(...a)=>{
   return r;
 };
 
+// What a Save says when the session died before it: postAccess writes it, and
+// resumeAfterAuth clears exactly it once there is a session again. The daemon's
+// own words there are "authentication required", which reads as a refusal of the
+// settings rather than of the session, and left standing after the sign-in it
+// made a signed-in page show an auth error over a Save that would now work.
+const AUTH_EXPIRED_MSG='Your session expired - sign in, then click Save again.';
+// Called when the daemon will take us again: after a sign-in, and when the login
+// is removed out of band (see the recovery poll below). Pull server truth and
+// restart the polls - but leave the settings drawer alone when it holds unsaved
+// edits. The 401 that raises the overlay lands wherever the session happens to
+// expire, including mid-edit and on the Save itself, and refetching then paints
+// the server's values over everything typed since. openDrawer refuses that same
+// wipe on a dirty form and requestCloseDrawer asks first; signing back in must
+// not be the one path that discards without a word.
+function resumeAfterAuth(){
+  // The Save the expiry refused takes the same click now, so its refusal must not
+  // stay on screen with the button still red.
+  if($('settingsMsg').textContent===AUTH_EXPIRED_MSG){ $('settingsMsg').textContent=''; $('saveSettings').classList.remove('err'); }
+  if(savedBody==='' || formSnapshot()===savedBody){ loadAccess(); loadSettings(); }
+  tick();
+}
 $('loginForm').addEventListener('submit', async e=>{
   e.preventDefault();
   const err=$('loginErr'); err.textContent='';
   try{
     const r=await _fetch('api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:$('loginUser').value.trim(),password:$('loginPass').value})});
-    if(r.ok){ $('loginPass').value=''; hideLogin(); loadAccess(); loadSettings(); tick(); }
+    if(r.ok){ $('loginPass').value=''; hideLogin(); resumeAfterAuth(); }
     // 429 = the per-IP limiter tripped; even the right password is refused for
     // a bit, so don't call it invalid and push the user toward a reset.
     else err.textContent = r.status===429 ? 'Too many attempts - wait a moment and try again' : 'Invalid username or password';
@@ -10159,6 +10404,13 @@ function updateResetAuthHint(){
 // loadAccess populates the Access tab and shows the login overlay if required.
 async function loadAccess(){
   let a; try{ a=await (await fetch('api/access')).json(); }catch(_){ return; }
+  // The container flag rides on this endpoint as well as on the settings one,
+  // because the reset-auth advice in the overlay is needed exactly when there is
+  // no session to read /api/settings with - see accessStatus. Strict boolean: an
+  // older daemon sends no field at all, and a guess must not send a native
+  // operator into a container.
+  if(typeof a.containerized==='boolean') iperfInContainer=a.containerized;
+  updateResetAuthHint();
   $('setNetAccess').checked=!a.local_only;
   accessSavedLocalOnly=!!a.local_only; // the warn bubble is for PENDING cut-offs only, not the already-saved state
   $('localOnlyWarn').classList.remove('show');
@@ -10187,6 +10439,24 @@ async function loadAccess(){
   // password state isn't enforced, so it must not lock anyone out.
   if(a.auth_active && !a.authed) showLogin(); else hideLogin();
 }
+// While the overlay is up this is the ONE thing the page keeps asking for: the
+// access state, from the endpoint that answers without a session. The documented
+// way out of being locked out is `pingularity reset-auth`, which clears the
+// password and turns the login off on the daemon - and the hint beside "Sign in
+// to continue" promises "this page then lets you straight in". It did not.
+// Nothing re-read /api/access once the overlay was up, so the page went on asking
+// for a password the daemon no longer had and refused every attempt as invalid,
+// with the whole dashboard inert behind it and a reload the only way through.
+// Asking again is also how a tab picks up a session signed in somewhere else -
+// the cookie is shared - and the verdict is loadAccess's own, so the two cannot
+// disagree about when the overlay comes down.
+setInterval(async ()=>{
+  if(document.hidden || loginOverlay.hidden) return;
+  let a; try{ a=await (await fetch('api/access')).json(); }catch(_){ return; }
+  // Re-checked after the await: a sign-in may have landed while it was in flight,
+  // and that path has already resumed the page.
+  if(!loginOverlay.hidden && !(a.auth_active && !a.authed)){ hideLogin(); resumeAfterAuth(); }
+}, 5000);
 // updateAuthFields greys/enables the username+password block to match the
 // "Require login" toggle.
 function updateAuthFields(){
@@ -10589,12 +10859,17 @@ $('logCopy').addEventListener('click', async ()=>{
 // change that a Clear in another tab produces and went on displaying - and copying -
 // lines the operator had already wiped. A poll with nothing new costs one small
 // conditional request.
-setInterval(()=>{ if(!document.hidden
+setInterval(()=>{ if(!document.hidden && loginOverlay.hidden
   && $('drawer').classList.contains('open')
   && document.querySelector('.tabpane[data-tab="about"]').classList.contains('active')) loadLogs(); }, 2500);
 async function postAccess(body){
   try{ const r=await fetch('api/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok){ $('settingsMsg').textContent=await r.text(); return false; }
+    // A 401 here is the session having expired between opening the drawer and
+    // saving, not the server rejecting the settings: the fetch wrapper is raising
+    // the sign-in overlay as this line runs. Say that instead of the daemon's
+    // "authentication required", which reads as a refusal of what was typed - and
+    // give resumeAfterAuth one exact string to clear once the sign-in is done.
+    if(!r.ok){ $('settingsMsg').textContent = r.status===401 ? AUTH_EXPIRED_MSG : await r.text(); return false; }
     // A save can succeed and still not do what it looks like it does - today:
     // local-only cannot keep out visitors a declared reverse proxy delivers as
     // local connections. The server says so in the response warnings; show it in
@@ -10642,13 +10917,19 @@ function labelInfoBubbles(){
 })();
 loadAccess(); loadSettings(); tick(); // the coachmark shows from refreshStatus, once the install id is known
 // Periodic refreshes skip while the tab is hidden (no point polling a dashboard
-// nobody is looking at); becoming visible again triggers an immediate catch-up.
-const vis = fn => () => { if(!document.hidden) return fn(); };
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) tick(); });
+// nobody is looking at) and while the sign-in overlay is up - every one of those
+// requests is a 401, forever, on a page whose only live control is the sign-in
+// form. Nothing behind the overlay can be read or acted on until there is a
+// session again, so the polls wait for one: the sign-in's tick() catches every
+// panel up at once, exactly as the visibility gate here already does. While the
+// overlay is up the page still asks /api/access on its own cadence (above), which
+// is the one endpoint that answers without a session.
+const vis = fn => () => { if(!document.hidden && loginOverlay.hidden) return fn(); };
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && loginOverlay.hidden) tick(); });
 // The browser knows the moment its own network returns - catch up immediately
 // instead of waiting out the polling cycles. (Server-side outages don't fire
 // this; those are caught by the stale-recovery hook in refreshStatus.)
-window.addEventListener('online', ()=>tick());
+window.addEventListener('online', ()=>{ if(loginOverlay.hidden) tick(); });
 // The status poll is given 8s to answer (fget's deadline, for a link that has
 // gone dead rather than refused) but this timer fires every 3s, and it used to
 // start the next poll regardless. The sequence guard in refreshStatus then took
@@ -10791,14 +11072,14 @@ function speedPollMs(){ if(speedBackoffMs){ const b=speedBackoffMs; speedBackoff
 setInterval(vis(refreshHeatmap), 60000);
 setInterval(vis(refreshNetinfo), 60000);
 // Outages are infrequent; refresh on the same slow cadence, only while shown.
-setInterval(()=>{ if(!document.hidden && $('outagesSection').style.display!=='none') loadOutages(); }, 60000);
+setInterval(()=>{ if(!document.hidden && loginOverlay.hidden && $('outagesSection').style.display!=='none') loadOutages(); }, 60000);
 // The runs table on the same cadence, for the same reason. Following the newest
 // run's timestamp catches every INSERT and no DELETE: a run removed in another
 // tab, or pruned by retention, sat there as a ghost row indefinitely - and its
 // delete button reported success for a run that had been gone for minutes.
 // runsFollowLive holds still for a reader who has paged back or is mid-delete,
 // and keeps the keyboard where it was.
-setInterval(()=>{ if(!document.hidden) runsFollowLive(); }, 60000);
+setInterval(()=>{ if(!document.hidden && loginOverlay.hidden) runsFollowLive(); }, 60000);
 // Repaint from cache at the new canvas size - the data doesn't change with the
 // window, and resize fires continuously during a drag (no refetch storm).
 window.addEventListener('resize', redrawCharts);

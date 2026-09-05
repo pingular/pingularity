@@ -369,10 +369,11 @@ func TestMetricsSpeedByteGauges(t *testing.T) {
 }
 
 // Unmeasured-is-absent: the per-run speed_download_mbps/upload_mbps/ping_ms
-// gauges must appear ONLY when that quantity was measured (download/upload gated
-// on their *_bytes evidence, ping on a non-zero reading). A direction the engine
-// skipped must NOT emit a 0.0 gauge, which would fire a permanent false
-// "below threshold" alert.
+// gauges must appear ONLY when that quantity was measured (a direction needs
+// either its *_bytes evidence or a throughput above zero - see
+// TestMetricsKeepsAMeasuredSpeedWithNoByteCounts for the second half; ping needs a
+// non-zero reading). A direction the engine skipped has neither, and must NOT emit
+// a 0.0 gauge, which would fire a permanent false "below threshold" alert.
 func TestMetricsSpeedMbpsGatedOnMeasurement(t *testing.T) {
 	stats.ResetForTest()
 

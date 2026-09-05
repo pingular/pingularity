@@ -1185,6 +1185,18 @@ func (s *Server) accessStatus(r *http.Request) map[string]any {
 		"auth_active":       active,                       // enforced - drives the overlay
 		"has_password":      s.settings.HasPassword(),
 		"authed":            authed,
+		// Which machine the locked-out recovery command has to be run on. The
+		// dashboard's "forgot the password?" advice differs for a container -
+		// `pingularity` lives in the image and its database on the volume, so "on
+		// the host" opens some other database, reports success, and leaves the
+		// login exactly where it was - and the copy of that advice in the sign-in
+		// overlay is the only one a locked-out operator can reach. The page used
+		// to learn this from /api/settings, which needs the very session they do
+		// not have, so the right wording appeared only once it was useless. This
+		// endpoint is what the overlay renders from, so the flag belongs on it.
+		// Safe outside the session block below: it says how this daemon is
+		// packaged, not who runs it, where it lives, or anything it holds.
+		"containerized": s.InContainer,
 	}
 	// The username, port, and LAN URLs feed the access-settings tab. This
 	// endpoint is reachable without a session (the overlay needs the flags
