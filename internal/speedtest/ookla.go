@@ -292,9 +292,10 @@ func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder)
 	if ooklaTransportHook != nil {
 		base = ooklaTransportHook(base)
 	}
-	// Beneath the panic containment, so a panic is still converted to an error
-	// before it reaches us, and above nothing else - this must see the real
-	// status the server returned.
+	// The ping cap goes on whatever transport the echoes actually ride, the
+	// hook's stand-in included, and beneath the containment below so a panic
+	// under it is still an error by the time it reaches us.
+	base = pingDrainTransport{base: base}
 	// ABOVE the panic containment, not below it. panicSafeTransport converts a
 	// panic under the real transport into an error; a recorder beneath it would
 	// be unwound straight past (it has no recover of its own) and would report
@@ -522,6 +523,72 @@ func (t recordingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 	t.rec.note(resp.StatusCode, nil)
 	return resp, err
+}
+
+// pingDrainTransport caps what a ranking or race ping reads off each echo's
+// body at probeDrainCap - the probes' cap, for the probes' reason. The
+// library's HTTPPing takes the latency the moment the headers land and then
+// copies the whole body to io.Discard, and nothing obliges a candidate to
+// answer with the 9 bytes a real bundle serves: a catalogue entry, a redirect
+// target or a captive portal that keeps writing held the ping reading at line
+// rate until its context expired - cityPingTimeout for a racer, the whole
+// bestOfSelectionBudget for a ranking ping, because this client carries no
+// Timeout of its own (it cannot; see cityPingTimeout) - racePingParallel of
+// them at once, and with the first echo's copy eating the whole probe set the
+// server came out unscored as well as expensive. Measured against a peer paced
+// to ~16 MB/s: 108 MB off ONE racer inside cityPingTimeout, none of it in the
+// run's byte accounting, which only the transfer chunk readers feed. That gap
+// is honest only while it is bounded and small - the data-used figure is
+// documented as a lower bound over a list of exclusions, each with its size -
+// so the answer is the cap, not a new counter, and what a capped ping still
+// costs is named in that list.
+//
+// The ping's own context is the discriminator (pingDrainContext), never the
+// method or the path: the download chunks are GETs on this same transport and
+// their body IS the measurement, and the path is server-supplied - a redirect
+// re-enters here with whatever URL the peer chose, while the marker rides
+// every hop of the ping's request and nothing else. A body within the cap is
+// read whole, exactly as before, so the connection goes back to the pool and
+// the echoes that follow are timed as they always were. One past it is closed
+// short of EOF, and what that costs is net/http's call, not the cap's: the
+// transport drains a body closed early for up to 256 KiB or 50 ms in the hope
+// of keeping the connection (maxPostCloseReadBytes in transport.go's
+// readLoop), and drops it only when that fails. So a page-sized body at
+// latency.txt is still read whole and its connection kept - all eleven echoes
+// down one socket, the cap merely sparing the ping the wait - while a peer
+// that never stops is read the cap plus that drain per echo and costs a fresh
+// dial each time; its sample was taken when the headers landed either way.
+// The probes' throwaway client pays the same drain. Measured on go1.27
+// against the paced peer: 320 KiB out per echo, 3.6 MB over a ping's eleven,
+// thirty times under the unbounded figure and a few megabytes per candidate
+// at worst, none of it counted; docs/metrics.md names it at that size.
+type pingDrainTransport struct {
+	base http.RoundTripper
+}
+
+// pingDrainKey is the context key pingDrainContext sets; see pingDrainTransport.
+type pingDrainKey struct{}
+
+// pingDrainContext marks ctx so every request made under it - the echoes of
+// one PingTestContext call, redirect hops included - is read no further than
+// probeDrainCap.
+func pingDrainContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, pingDrainKey{}, true)
+}
+
+func (t pingDrainTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || req.Context().Value(pingDrainKey{}) == nil {
+		return resp, err
+	}
+	resp.Body = cappedBody{Reader: io.LimitReader(resp.Body, probeDrainCap), Closer: resp.Body}
+	return resp, nil
+}
+
+// cappedBody is a response body read through a limit and closed as itself.
+type cappedBody struct {
+	io.Reader
+	io.Closer
 }
 
 // starvationCeiling bounds what counts as the starvation signature: at most one
@@ -3862,9 +3929,10 @@ var (
 
 // ooklaPing is the ranking latency probe, a swap-a-var seam (like ooklaDownload/
 // ooklaUpload) so rankedServers' selection logic - which reachable/failed server
-// wins - is testable without a live server.
+// wins - is testable without a live server. The context is marked so the
+// client's transport caps what each echo reads (see pingDrainTransport).
 var ooklaPing = func(ctx context.Context, srv *ookla.Server, cb func(time.Duration)) error {
-	return srv.PingTestContext(ctx, cb)
+	return srv.PingTestContext(pingDrainContext(ctx), cb)
 }
 
 // uploadSpent is the data an upload attempt actually pushed across the (possibly
