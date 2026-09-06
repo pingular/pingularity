@@ -72,6 +72,13 @@ CREATE TABLE IF NOT EXISTS pauses_quarantine (
     ts         INTEGER NOT NULL,   -- a pause row held aside because its END reaches further past the repairing clock than any believable disagreement
     duration_s INTEGER NOT NULL    -- see repairFutureReachingPausesAt: held, not deleted, so a corrected clock can give it back
 );
+-- Sought by ts on two paths that hold the single writer: the import's per-row
+-- dedup probe, and the future-pause repair's twin lookup for every live pause,
+-- inside one transaction at every Open. Without it each seek scans the table -
+-- importing N held rows costs N squared, the repair costs pauses times
+-- quarantine, and every other writer arriving meanwhile waits out busy_timeout
+-- and drops its row.
+CREATE INDEX IF NOT EXISTS idx_pauses_quarantine_ts ON pauses_quarantine(ts);
 
 CREATE TABLE IF NOT EXISTS speed (
     ts           INTEGER NOT NULL,
@@ -824,11 +831,20 @@ func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
 	// already live) never re-touches a row it just created. max() keeps the LONGER
 	// span; MAX() collapses several held rows at one ts. Only exonerated held rows
 	// (end within the horizon) participate, in the merge and the insert alike.
+	//
+	// A twin that itself reaches past the horizon is neither merged into nor
+	// counted as "already live": its span is the longer by construction (it ends
+	// beyond the horizon, the exonerated row ends inside it), so max() would keep
+	// the twin, the held copy would be deleted below as represented, and the MOVE
+	// OUT would then hold the twin aside - the span the clock just vouched for gone
+	// from both tables, and only the row no clock will ever exonerate left. The
+	// exonerated row is inserted beside such a twin, and the twin alone moves out.
 	resMerge, err := tx.Exec(`UPDATE pauses SET duration_s = max(duration_s,
 			(SELECT MAX(q.duration_s) FROM pauses_quarantine q
 			 WHERE q.ts = pauses.ts AND q.ts + q.duration_s <= ?))
-		WHERE EXISTS (SELECT 1 FROM pauses_quarantine q
-			WHERE q.ts = pauses.ts AND q.ts + q.duration_s <= ?)`, horizon, horizon)
+		WHERE ts + duration_s <= ?
+		  AND EXISTS (SELECT 1 FROM pauses_quarantine q
+			WHERE q.ts = pauses.ts AND q.ts + q.duration_s <= ?)`, horizon, horizon, horizon)
 	if err != nil {
 		recordDBErr(err)
 		return fmt.Errorf("merge quarantined pauses: %w", err)
@@ -836,8 +852,8 @@ func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
 	resIn, err := tx.Exec(`INSERT INTO pauses (ts, duration_s)
 		SELECT q.ts, MAX(q.duration_s) FROM pauses_quarantine q
 		WHERE q.ts + q.duration_s <= ?
-		  AND NOT EXISTS (SELECT 1 FROM pauses p WHERE p.ts = q.ts)
-		GROUP BY q.ts`, horizon)
+		  AND NOT EXISTS (SELECT 1 FROM pauses p WHERE p.ts = q.ts AND p.ts + p.duration_s <= ?)
+		GROUP BY q.ts`, horizon, horizon)
 	if err != nil {
 		recordDBErr(err)
 		return fmt.Errorf("restore quarantined pauses: %w", err)
