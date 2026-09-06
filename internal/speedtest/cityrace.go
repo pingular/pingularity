@@ -226,7 +226,10 @@ var racePing = func(ctx context.Context, s *ookla.Server) {
 	var best time.Duration
 	// The error is deliberately ignored: a probe set that ended early still
 	// measured whatever it measured, and that is a real reading of this server.
-	_ = s.PingTestContext(ctx, keepFastestPing(&best))
+	// Marked so the transport caps each echo's body (see pingDrainTransport):
+	// the timeout above bounds a server that goes quiet, the cap one that
+	// keeps talking.
+	_ = s.PingTestContext(pingDrainContext(ctx), keepFastestPing(&best))
 	s.Latency = best
 }
 
