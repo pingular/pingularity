@@ -366,7 +366,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			// reverse proxy the TCP peer is the proxy and all clients share one
 			// bucket; SetTrustedProxies switches the key to the proxy-appended
 			// X-Forwarded-For hop (a spoofable header must never gate this alone).
-			if user, pass, hasBasic := r.BasicAuth(); hasBasic && s.logins.blocked(s.limiterKey(r)) && !s.knownGood(user, pass) {
+			if user, pass, hasBasic := r.BasicAuth(); hasBasic && s.logins.blocked(s.limiterKey(r)) && !s.knownGood(s.authCreds(), user, pass) {
 				stats.Inc("web.limiter_trips")
 				s.log.Warn("auth rate-limited (too many failed attempts)", "ip", clientIP(r))
 				http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
@@ -481,11 +481,11 @@ func (s *Server) metricsTokenOK(r *http.Request) bool {
 // authed reports whether the request carries a valid session cookie or correct
 // HTTP Basic credentials. Failed Basic attempts feed the per-IP rate limiter.
 func (s *Server) authed(r *http.Request) bool {
-	hash := s.settings.AuthHash()
-	if hash == "" {
+	cred := s.authCreds()
+	if cred.hash == "" {
 		return false
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil && verifyToken(c.Value, s.settings.AuthUser(), s.tokenKey(), s.settings.SessionEpoch()) {
+	if c, err := r.Cookie(sessionCookie); err == nil && verifyToken(c.Value, cred.user, s.tokenKey(cred.hash), s.settings.SessionEpoch()) {
 		return true
 	}
 	if user, pass, ok := r.BasicAuth(); ok {
@@ -495,11 +495,11 @@ func (s *Server) authed(r *http.Request) bool {
 		// only credentials matching the cached known-good fingerprint pass, with
 		// no bcrypt work, and the block stays armed for everyone else.
 		if !s.logins.reserve(key) {
-			return s.knownGood(user, pass)
+			return s.knownGood(cred, user, pass)
 		}
-		if s.checkPassword(user, pass) {
+		if s.checkPassword(cred, user, pass) {
 			s.logins.ok(key)
-			s.rememberGood(user, pass)
+			s.rememberGood(cred, pass)
 			return true
 		}
 		s.logins.releaseFail(key)
@@ -551,8 +551,28 @@ var dummyHash = sync.OnceValue(func() []byte {
 	return h
 })
 
-// checkPassword verifies a username/password against the stored credentials.
-func (s *Server) checkPassword(user, pass string) bool {
+// authCreds is the login name and password hash as they stood at one instant,
+// read together. A password check runs against one authCreds, and everything
+// the check earns - the known-good fingerprint, the session token - is keyed
+// on that same value, never on a fresh read. The distinction matters because
+// a bcrypt compare takes tens of milliseconds and a password change can commit
+// in the middle of it. Re-reading afterwards handed a login that had proved
+// the OLD password a token MACed under the NEW hash, and cached the old
+// password as known-good under the new hash, so it kept passing the limiter's
+// escape valve with no bcrypt work at all: the change meant to lock that
+// password out had instead vouched for it. Keyed on the version it proved, a
+// straddling login can earn nothing that outlives the change. Callers that
+// hold importMu (no change can land under them) simply read a fresh one.
+type authCreds struct{ user, hash string }
+
+func (s *Server) authCreds() authCreds {
+	user, hash := s.settings.AuthCreds()
+	return authCreds{user, hash}
+}
+
+// checkPassword verifies a username/password against cred, the stored
+// credentials as the caller read them.
+func (s *Server) checkPassword(cred authCreds, user, pass string) bool {
 	bcryptAcquire()
 	defer bcryptRelease()
 	// Force the lazy dummy hash BEFORE looking at the username, so the one-time
@@ -562,16 +582,25 @@ func (s *Server) checkPassword(user, pass string) bool {
 	// a right one cost compare - a fresh username oracle, just inverted, handed
 	// to whoever gets the first login attempt in after a restart.
 	dh := dummyHash()
-	if user != s.settings.AuthUser() {
+	if user != cred.user {
 		// Burn an equivalent bcrypt compare anyway: returning early would let
 		// an attacker probe for valid usernames via response timing.
 		_ = bcrypt.CompareHashAndPassword(dh, []byte(pass))
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(s.settings.AuthHash()), []byte(pass)) == nil
+	if bcrypt.CompareHashAndPassword([]byte(cred.hash), []byte(pass)) != nil {
+		return false
+	}
+	// The compare ran against cred, and cred may be stale by now: a change that
+	// committed while bcrypt was working replaced it. Everything the caller
+	// keys on cred is dead already in that case, but it is about to answer 200
+	// and hand out a cookie, so refuse - the password just proved is not the
+	// password any more.
+	return s.authCreds() == cred
 }
 
-// tokenKey is the HMAC key for session tokens. It mixes the bcrypt hash (so a
+// tokenKey is the HMAC key for session tokens under hash, the bcrypt hash a
+// token is issued under or verified against. It mixes that hash (so a
 // password change still invalidates every outstanding token) with SessionKey, an
 // independent secret derived from the key file (0600, beside the DB, NOT in it).
 // Keying on the hash ALONE let anyone holding a raw copy of the database - a
@@ -579,12 +608,11 @@ func (s *Server) checkPassword(user, pass string) bool {
 // both live in the settings table; adding the key-file-bound secret closes that,
 // because a DB-only copy carries no key file. When SessionKey is unset (an
 // ephemeral :memory: server), it falls back to the hash alone.
-func (s *Server) tokenKey() string {
-	h := s.settings.AuthHash()
+func (s *Server) tokenKey(hash string) string {
 	if len(s.SessionKey) == 0 {
-		return h
+		return hash
 	}
-	return h + "\x00" + string(s.SessionKey)
+	return hash + "\x00" + string(s.SessionKey)
 }
 
 // issueToken builds a stateless session token: base64(expiry|user).HMAC, keyed
@@ -741,29 +769,32 @@ func credFingerprint(user, pass, hash string) []byte {
 }
 
 // rememberGood caches the fingerprint of credentials that just passed a bcrypt
-// check, so knownGood can wave them through a rate-limiter block later.
-func (s *Server) rememberGood(user, pass string) {
-	fp := credFingerprint(user, pass, s.settings.AuthHash())
+// check, so knownGood can wave them through a rate-limiter block later. cred is
+// the version that check ran against (see authCreds).
+func (s *Server) rememberGood(cred authCreds, pass string) {
+	fp := credFingerprint(cred.user, pass, cred.hash)
 	s.logins.mu.Lock()
 	s.logins.good = fp
 	s.logins.mu.Unlock()
 }
 
 // knownGood reports whether the credentials match the last pair that passed a
-// bcrypt check under the current password hash. Constant-time and bcrypt-free,
+// bcrypt check under cred's password hash. Constant-time and bcrypt-free,
 // it lets valid callers (a Prometheus scrape, the operator) bypass a limiter
 // block without giving attackers CPU-cost work. Empty until the first success
 // after startup, so a block can still catch a valid caller once per restart.
 // The username must also match the current one: a rename leaves the hash (and
 // thus the cached fingerprint) unchanged, so without this a stale fingerprint
 // would keep vouching for the old username that checkPassword now rejects.
-func (s *Server) knownGood(user, pass string) bool {
+func (s *Server) knownGood(cred authCreds, user, pass string) bool {
 	s.logins.mu.Lock()
 	cached := s.logins.good
 	s.logins.mu.Unlock()
-	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(s.settings.AuthUser())) == 1
-	fpOK := cached != nil && hmac.Equal(cached, credFingerprint(user, pass, s.settings.AuthHash()))
-	return userOK && fpOK
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cred.user)) == 1
+	fpOK := cached != nil && hmac.Equal(cached, credFingerprint(user, pass, cred.hash))
+	// The same last look checkPassword takes: a fingerprint that matched under
+	// a hash since replaced vouches for nothing.
+	return userOK && fpOK && s.authCreds() == cred
 }
 
 // hostAllowed implements the DNS-rebinding guard's Host check. Admitted without
@@ -1007,8 +1038,9 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			}
 			// A new hash invalidates the old session token (its key changed), so
 			// re-issue the cookie - which also logs in whoever just set it.
-			s.setSessionCookie(w, s.secureCookie(r))
-			s.rememberGood(s.settings.AuthUser(), in.Password)
+			cred := s.authCreds()
+			s.setSessionCookie(w, s.secureCookie(r), cred)
+			s.rememberGood(cred, in.Password)
 			s.log.Info("auth password set", "user", s.settings.AuthUser(), "enabled", s.settings.AuthEnabled())
 		} else {
 			// No password change: apply just the username and the enable toggle.
@@ -1036,7 +1068,7 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			// password branch does. POST /api/access is gated when auth is active, so
 			// reaching a successful rename means the caller was authenticated.
 			if renamed && s.settings.AuthActive() {
-				s.setSessionCookie(w, s.secureCookie(r))
+				s.setSessionCookie(w, s.secureCookie(r), s.authCreds())
 			}
 			// The known-good fingerprint embeds the username, so the cached
 			// pair died with the old name - and during a limiter block the
@@ -1048,7 +1080,7 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			// no-proof rename+enable from the disabled state must never seed
 			// the cache with an unverified value.
 			if renamed && stepUpVerified {
-				s.rememberGood(s.settings.AuthUser(), in.CurrentPassword)
+				s.rememberGood(s.authCreds(), in.CurrentPassword)
 			}
 		}
 		// The caveat below describes a CHANGE, so it is gated on the posture actually
@@ -1137,20 +1169,21 @@ func (s *Server) requireStepUp(w http.ResponseWriter, r *http.Request, currentPa
 		return false, false
 	}
 	key := s.limiterKey(r)
+	cred := s.authCreds()
 	if !s.logins.reserve(key) {
 		// Budget spent: only the cached known-good credential passes, with no
 		// bcrypt work - the same escape valve login has, so an attacker sharing
 		// the bucket can't lock the operator out.
-		if !s.knownGood(s.settings.AuthUser(), currentPassword) {
+		if !s.knownGood(cred, cred.user, currentPassword) {
 			stats.Inc("web.limiter_trips")
 			http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
 			return false, false
 		}
 		return true, true // matched a pair that passed bcrypt earlier
 	}
-	if s.checkPassword(s.settings.AuthUser(), currentPassword) {
+	if s.checkPassword(cred, cred.user, currentPassword) {
 		s.logins.ok(key)
-		s.rememberGood(s.settings.AuthUser(), currentPassword)
+		s.rememberGood(cred, currentPassword)
 		return true, true
 	}
 	s.logins.releaseFail(key)
@@ -1390,19 +1423,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user := strings.TrimSpace(in.Username)
 	key := s.limiterKey(r)
+	cred := s.authCreds()
 	if !s.logins.reserve(key) {
 		// Budget spent (recorded failures + in-flight evaluations): only cached
 		// known-good credentials pass - no bcrypt work, and the block stays armed
 		// for everyone else. Behind a shared proxy bucket one attacker must not
 		// lock out valid logins.
-		if !s.knownGood(user, in.Password) {
+		if !s.knownGood(cred, user, in.Password) {
 			stats.Inc("web.limiter_trips")
 			http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
 			return
 		}
-	} else if s.checkPassword(user, in.Password) {
+	} else if s.checkPassword(cred, user, in.Password) {
 		s.logins.ok(key)
-		s.rememberGood(user, in.Password)
+		s.rememberGood(cred, in.Password)
 	} else {
 		s.logins.releaseFail(key)
 		stats.Inc("web.login_fail")
@@ -1410,7 +1444,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
 		return
 	}
-	s.setSessionCookie(w, s.secureCookie(r))
+	s.setSessionCookie(w, s.secureCookie(r), cred)
 	s.log.Info("login", "user", s.settings.AuthUser())
 	writeJSON(w, map[string]bool{"ok": true})
 }
@@ -1457,11 +1491,11 @@ func (s *Server) peerTrusted(r *http.Request) bool {
 	return s.logins.trustedPeer(ip)
 }
 
-// setSessionCookie issues a fresh session cookie for the current credentials.
-// secure marks it Secure so it never rides a plaintext request; callers pass
-// s.secureCookie(r).
-func (s *Server) setSessionCookie(w http.ResponseWriter, secure bool) {
-	tok := issueToken(s.settings.AuthUser(), s.tokenKey(), s.settings.SessionEpoch(), time.Now())
+// setSessionCookie issues a fresh session cookie for cred, the credentials the
+// caller just proved or set (see authCreds). secure marks it Secure so it never
+// rides a plaintext request; callers pass s.secureCookie(r).
+func (s *Server) setSessionCookie(w http.ResponseWriter, secure bool, cred authCreds) {
+	tok := issueToken(cred.user, s.tokenKey(cred.hash), s.settings.SessionEpoch(), time.Now())
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/", HttpOnly: true, Secure: secure,
 		SameSite: http.SameSiteStrictMode, MaxAge: int(sessionTTL.Seconds()),
@@ -1490,7 +1524,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// permanently logged out. A request with no (or a stale) cookie has nothing
 	// to revoke; it just gets the clearing cookie.
 	if c, err := r.Cookie(sessionCookie); err == nil &&
-		verifyToken(c.Value, s.settings.AuthUser(), s.tokenKey(), s.settings.SessionEpoch()) {
+		verifyToken(c.Value, s.settings.AuthUser(), s.tokenKey(s.settings.AuthHash()), s.settings.SessionEpoch()) {
 		// Persisted so the revocation survives a restart (see BumpSessionEpoch). A
 		// failed persist still revokes the live process; log it - the durability
 		// guarantee is best-effort until the next successful write.

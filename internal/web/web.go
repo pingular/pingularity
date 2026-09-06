@@ -2996,8 +2996,9 @@ func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
 	// lock out the very browser that just set it - re-issue the cookie so the
 	// operator stays signed in.
 	if ans.AuthHash != "" {
-		s.setSessionCookie(w, s.secureCookie(r))
-		s.rememberGood(s.settings.AuthUser(), in.Password)
+		cred := s.authCreds()
+		s.setSessionCookie(w, s.secureCookie(r), cred)
+		s.rememberGood(cred, in.Password)
 	}
 	s.log.Info("quick setup applied", "speedtest", ans.SpeedtestEnabled, "local_only", ans.LocalOnly, "auth", s.settings.AuthActive())
 	writeJSON(w, map[string]any{"ok": true})
