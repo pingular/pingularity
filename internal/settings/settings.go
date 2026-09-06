@@ -120,6 +120,12 @@ const (
 	// the API, not shown in the UI: the feature is meant to just work, and the
 	// runs table's "challenger" tag is how it shows.
 	keySpeedChallengeEvery = "speed_challenge_every"
+	// keyEngineSplit records that the direction/retries split has been applied to
+	// this table: the iperf3 pair was seeded from the shared speed_* pair once
+	// (when there was one), and an absent iperf3 key now means "left at the
+	// default", not "pre-split". A birth marker says the same of a table (see
+	// splitApplied). Bookkeeping (installStateKeys), never exported.
+	keyEngineSplit = "engine_split_done"
 	// Per-server network path + RSA auth (bind, ipver, auth, username, password, rsa
 	// key) live inside each IperfTarget, serialized in keyIperfServers - not as their
 	// own keys - so they're scoped to the server they belong to.
@@ -383,7 +389,8 @@ type Values struct {
 	// Direction and Retries are PER-ENGINE: the Ookla and iperf3 tabs each carry their
 	// own, so tuning one engine never disturbs the other. The Speed* pair is Ookla's,
 	// the Iperf* pair is iperf3's; a pre-split install seeds the iperf3 pair from the
-	// old shared speed_* values on first load (see overlay).
+	// old shared speed_* values on first load, and writes them back so that happens
+	// once (see overlay and recordMigrations).
 	//
 	// Direction is which directions to test: "both" | "down" | "up" | "bidir".
 	// "both" runs download then upload; "bidir" runs both at once (--bidir) to expose
@@ -781,6 +788,7 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	m[keyIperfServers] = raw
 	c.seedSessionEpoch(m)
 	c.vals = normalize(overlay(def, m))
+	c.recordMigrations(ctx, m, c.vals)
 	// Passwords saved before encryption existed are still in the clear on disk: seal
 	// them now, so enabling this doesn't quietly leave the old ones exposed forever.
 	if legacy {
@@ -961,9 +969,21 @@ func overlay(v Values, m map[string]string) Values {
 	// iperf3 direction is per-engine now. Migrate only when the key is truly ABSENT
 	// (a pre-split install), seeding from the old shared speed_direction; a present
 	// key - even empty - is taken as-is so a round-trip is exact.
+	//
+	// Absence alone cannot say pre-split, though. The table is a sparse overlay
+	// (see Update), so on a post-split install the iperf3 key is absent exactly
+	// when the operator never moved it off the default - while speed_direction
+	// stayed in service as Ookla's own. Read that way, the seed ran again at every
+	// boot and handed iperf3 whatever Ookla had last been set to, silently, and
+	// the next save pinned it. The split marker settles it: recordMigrations
+	// writes it (with the seeded pair) the first time a table without it loads,
+	// and from then on an absent iperf3 key means the default. A table born on
+	// a split build says as much through its birth marker before that first
+	// load, which spares it a seed it never needed (splitApplied).
+	split := splitApplied(m)
 	if val, ok := m[keyIperfDirection]; ok {
 		v.IperfDirection = val
-	} else if val := m[keySpeedDirection]; val != "" {
+	} else if val := m[keySpeedDirection]; val != "" && !split {
 		v.IperfDirection = val
 	}
 	if b, ok := pbool(m[keyIperfUDP]); ok {
@@ -979,10 +999,11 @@ func overlay(v Values, m map[string]string) Values {
 		v.SpeedRetries = n
 	}
 	// iperf3 retries is per-engine now; seed from the old shared speed_retries when a
-	// pre-split install has no iperf_retries key.
+	// pre-split install has no iperf_retries key - pre-split meaning the split
+	// marker is absent, for the reason given at the direction above.
 	if n, ok := atoi(m[keyIperfRetries]); ok {
 		v.IperfRetries = n
-	} else if n, ok := atoi(m[keySpeedRetries]); ok {
+	} else if n, ok := atoi(m[keySpeedRetries]); ok && !split {
 		v.IperfRetries = n
 	}
 	if val, ok := m[keyIperfCongest]; ok {
@@ -1104,6 +1125,7 @@ func (c *Controller) reload(ctx context.Context) (wasLoaded bool, err error) {
 	// distinguishable ErrLegacyReseal on a reseal failure.
 	c.broadcast(v)
 	c.initErr.Store(false)
+	c.recordMigrations(ctx, m, v)
 	// A config import can restore passwords in the clear (an older export still
 	// carries them, and mergeImportedIperfPasswords keeps them). Re-seal them
 	// here, same as New does on first load, so an import doesn't leave passwords
@@ -1123,6 +1145,109 @@ func (c *Controller) reload(ctx context.Context) (wasLoaded bool, err error) {
 		}
 	}
 	return wasLoaded, nil
+}
+
+// splitApplied reports whether the direction/retries split has been applied to
+// the table m was read from, so that an absent iperf3 key means "left at the
+// default" and not "still sharing Ookla's value". The split marker says so
+// outright. The birth marker (KeyInstallBornVersion) says so too, and it is the
+// one that matters on a table the split marker has not reached yet: a store
+// born on a split build and last run by a build that did not record the split.
+// Such a store carries the Ookla pair and no iperf3 pair for the ordinary
+// reason - the operator set Ookla and left iperf3 alone - and reading that as
+// pre-split would copy Ookla's values under iperf3's keys one last time, for
+// good, on precisely the installs the leak had been biting. The birth marker
+// rules it out: it is younger than the split (the split is older than any
+// tagged release; the marker arrived in 0.70), it is stamped only on a store
+// the daemon watched come into existence, and a backup cannot carry it in
+// (settingsExportDeny), so no pre-split build ever wrote to a store that wears
+// it. Even the markers the early releases stamped on stores they did not
+// create (see KeyInstallBornVersion) hold here: those stores read NOT
+// established, so they held no configuration at all - no shared speed_* pair
+// from before the split - and whatever they carry now was saved by a split
+// build.
+//
+// A store with neither marker predates the birth marker, or its stamp never
+// landed, and nothing on disk says whether it also predates the split; it is
+// seeded, and one that did not need it pays the same copy once, where it shows
+// in the iperf3 tab and setting it back sticks.
+func splitApplied(m map[string]string) bool {
+	if _, split := m[keyEngineSplit]; split {
+		return true
+	}
+	_, born := m[KeyInstallBornVersion]
+	return born
+}
+
+// recordMigrations writes back what the legacy reads in overlay and loadSchedule
+// just seeded, so each legacy source is consulted once. m is the AllSettings
+// snapshot the load read, v the normalized result now in effect. Without this
+// a seed re-ran at every load, and since Update never writes a submitted value
+// that matches both its shipped default and the running value, the per-feature
+// key stayed absent for as long as the operator left it alone: the iperf3 pair
+// took Ookla's values at every restart, and on an upgraded database that had
+// loaded with no window, "schedule off" could not be saved (the off toggle
+// matched the default and the running value and wrote nothing, so the legacy
+// toggle turned it back on at the next boot - now with a window to gate on).
+//
+// Two sources, two triggers. The old single-window schedule keys and master
+// toggle are never written again, so their presence is itself the signal: any
+// load that seeded a per-feature schedule key from them writes that key under
+// its own name, and an import that brings the legacy keys back gets the same
+// treatment. speed_direction and speed_retries stayed in service as Ookla's
+// own, so for the iperf3 pair the trigger is whether the split has been
+// applied (splitApplied): a table with neither the split marker nor a birth
+// marker has not had it, and this write applies it - the seeded pair, when
+// there was one, and the marker - after which an absent iperf3 key means the
+// default. A table with only the birth marker gets the split marker and
+// nothing for iperf3. A fresh install gets the marker at its first boot for
+// the same reason; it is bookkeeping (installStateKeys), not configuration.
+//
+// Every load runs this, the reset-auth command's included (main builds that
+// controller through New, with zero defaults): like the legacy password
+// re-seal beside it, it writes only what the daemon's own next load would
+// write from the same rows - the seeded values come from the rows, and
+// normalize bounds them by constants, not by the defaults it loaded with.
+//
+// The values are already live (New and Reload apply before writing, as with
+// the legacy password re-seal); a failed write is said on stderr - the logger
+// may not be up yet - and the next load repeats the same seed from the same
+// rows and tries again.
+func (c *Controller) recordMigrations(ctx context.Context, m map[string]string, v Values) {
+	fk := formKeys(v)
+	kv := map[string]string{}
+	if _, split := m[keyEngineSplit]; !split {
+		kv[keyEngineSplit] = "1"
+	}
+	if !splitApplied(m) {
+		if _, ok := m[keyIperfDirection]; !ok && m[keySpeedDirection] != "" {
+			kv[keyIperfDirection] = fk[keyIperfDirection]
+		}
+		if _, ok := m[keyIperfRetries]; !ok {
+			if _, ok := atoi(m[keySpeedRetries]); ok {
+				kv[keyIperfRetries] = fk[keyIperfRetries]
+			}
+		}
+	}
+	_, legacyToggle := pbool(m[keyScheduleEnabled])
+	for _, s := range [][3]string{
+		{keySchedLatEnabled, keySchedLatWindows, keySchedLatDays},
+		{keySchedSpeedEnabled, keySchedSpeedWindows, keySchedSpeedDays},
+	} {
+		enKey, winKey, legacyDays := s[0], s[1], s[2]
+		if _, ok := m[enKey]; !ok && legacyToggle {
+			kv[enKey] = fk[enKey]
+		}
+		_, legacyWindow := m[legacyDays]
+		if _, ok := m[winKey]; !ok && legacyWindow {
+			kv[winKey] = fk[winKey]
+		}
+	}
+	// An empty kv is the common case (nothing seeded, marker present) and
+	// SetSettingsDiff writes nothing for it.
+	if _, err := c.store.SetSettingsDiff(ctx, kv); err != nil {
+		fmt.Fprintf(os.Stderr, "pingularity: WARNING: could not record migrated settings: %v - they are in effect; the next settings load tries again\n", err)
+	}
 }
 
 // Getters (each safe for concurrent use).
@@ -2256,6 +2381,10 @@ var installStateKeys = map[string]bool{
 	KeyInstallBornVersion: true,
 	keyAuthSessEpoch:      true, // auth_session_epoch    - logout revocation, session state
 	"first_seen_ts":       true, // the monitoring anchor - evidence, not config
+	// engine_split_done - the direction/retries split has been applied to this
+	// table (recordMigrations). Every install gets it at its first boot, fresh
+	// ones included, so it says nothing about whether anyone configured it.
+	keyEngineSplit: true,
 	// Legacy telemetry identity/state (feature removed; only on older DBs).
 	"telemetry_id": true, "telemetry_install_id": true, "telemetry_salt": true,
 	"telemetry_id_born_at": true, "telemetry_consent_version": true,

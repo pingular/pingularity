@@ -93,7 +93,14 @@ func TestLoadWithoutSpeedServersKey(t *testing.T) {
 	if raw, ok := after[keySpeedServers]; ok {
 		t.Errorf("loading wrote %q (%q); a read must not persist the key", keySpeedServers, raw)
 	}
-	// Nothing else may move either - the load is a read.
+	// The split marker is the one row a load adds (recordMigrations), and it is
+	// bookkeeping the establishment check ignores (installStateKeys), so it can
+	// not make this install read as configured. Nothing else may move - the load
+	// is a read.
+	if _, ok := after[keyEngineSplit]; !ok {
+		t.Errorf("loading did not record the split marker %q", keyEngineSplit)
+	}
+	delete(after, keyEngineSplit)
 	if !reflect.DeepEqual(after, seed) {
 		t.Errorf("loading rewrote the settings rows\n want %v\n got  %v", seed, after)
 	}

@@ -5644,6 +5644,12 @@ var settingsExportDeny = map[string]bool{
 	// decision, say) trusts a birth nobody witnessed. Denied in BOTH directions
 	// by this one list, so neither an export nor a crafted file can move it.
 	"install_born_version": true,
+	// The settings layer's note that it has applied its per-engine direction and
+	// retries split to THIS table (settings.recordMigrations). It describes the
+	// destination's rows, not the backup's: the destination writes its own at
+	// boot, and one riding in from another install could only suppress a seed the
+	// destination still owed itself.
+	"engine_split_done": true,
 	// Who may reach the dashboard at all. Install-scoped in the strongest sense:
 	// it describes ONE host's network posture - whether that machine's port is
 	// safe to answer on - and says nothing about the history in the file.
