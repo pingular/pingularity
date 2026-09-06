@@ -125,3 +125,62 @@ func TestOpenDeduplicatesQuarantineOnRepeatedMoveOut(t *testing.T) {
 		t.Errorf("pauses hold %v after the second move-out, want empty: the future-reaching row belongs in quarantine", kept)
 	}
 }
+
+// The merge must not land on a twin that is itself future-reaching. Such a twin's
+// span is the longer by construction - it ends past the horizon, the exonerated
+// held row ends inside it - so max() kept the twin, the held copy was then deleted
+// as "represented", and the move-out held the twin aside: the span the clock had
+// just vouched for was gone from both tables, and only the row no plausible clock
+// will ever exonerate remained. An exonerated held row is inserted BESIDE such a
+// twin; the twin alone moves out.
+func TestOpenRestoresExoneratedSpanBesideFutureReachingTwin(t *testing.T) {
+	path := t.TempDir() + "/twin.db"
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	now := time.Now().Unix()
+	ts := now - 7200
+	future := int64(maxPauseDuration - 1) // a live row at the same second, reaching a decade ahead
+	seedQuarantine(t, s, ts, 7000)        // fully past: a plausible clock exonerates it
+	seedLegacyPause(t, s, ts, future)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	stats.ResetForTest()
+	s2, err := openAt(path, now)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if kept := pauseDurations(t, s2, "pauses"); len(kept) != 1 || kept[0] != 7000 {
+		t.Errorf("pauses hold %v after restoring beside a future-reaching twin, want [7000]: the exonerated "+
+			"span must be inserted next to the twin, not merged into it with max() and then lost when the twin moves out", kept)
+	}
+	if held := pauseDurations(t, s2, "pauses_quarantine"); len(held) != 1 || held[0] != future {
+		t.Errorf("quarantine holds %v, want only the future-reaching twin [%d]", held, future)
+	}
+	if got := stats.Lifetime().Counters["db.pause_rows_merged"]; got != 0 {
+		t.Errorf("db.pause_rows_merged = %d, want 0: a twin no clock can vouch for is not a span to merge into", got)
+	}
+	if got := stats.Lifetime().Counters["db.pause_rows_restored"]; got != 1 {
+		t.Errorf("db.pause_rows_restored = %d, want 1: the exonerated span went back into coverage", got)
+	}
+
+	// Second open changes nothing: the restored span is past, the twin stays held.
+	if err := s2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s3, err := openAt(path, now)
+	if err != nil {
+		t.Fatalf("third open: %v", err)
+	}
+	defer s3.Close()
+	if kept := pauseDurations(t, s3, "pauses"); len(kept) != 1 || kept[0] != 7000 {
+		t.Errorf("second open changed pauses to %v, want the same [7000]", kept)
+	}
+	if held := pauseDurations(t, s3, "pauses_quarantine"); len(held) != 1 || held[0] != future {
+		t.Errorf("second open changed the quarantine to %v, want the same [%d]", held, future)
+	}
+}
