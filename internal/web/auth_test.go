@@ -1309,7 +1309,7 @@ func TestStepUpRateLimited(t *testing.T) {
 	if got := counter("web.limiter_trips"); got == 0 {
 		t.Fatal("limiter_trips did not count the blocked step-up")
 	}
-	if s.checkPassword("admin", "pwned") {
+	if s.checkPassword(s.authCreds(), "admin", "pwned") {
 		t.Fatal("a refused guess changed the stored credential")
 	}
 	// The operator's real password rides the known-good escape valve through
@@ -1364,7 +1364,7 @@ func TestUnverifiedRenameEnableDoesNotSeedKnownGood(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("unverified cached value passed a blocked step-up: %d %s", w.Code, w.Body)
 	}
-	if s.checkPassword("eve", "pwned") {
+	if s.checkPassword(s.authCreds(), "eve", "pwned") {
 		t.Fatal("the blocked request changed the stored credential")
 	}
 }
@@ -1403,7 +1403,7 @@ func TestVerifiedRenameDisableKeepsEscapeValve(t *testing.T) {
 	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"secret2","password":"secret3"}`); w.Code != http.StatusOK {
 		t.Fatalf("legitimate step-up after verified rename+disable/re-enable: %d %s", w.Code, w.Body)
 	}
-	if !s.checkPassword("bob", "secret3") {
+	if !s.checkPassword(s.authCreds(), "bob", "secret3") {
 		t.Fatal("the verified step-up did not apply the change")
 	}
 }
@@ -1425,7 +1425,7 @@ func TestAccessChangeRequiresCurrentPassword(t *testing.T) {
 			t.Fatalf("POST %s: %d, want 403 without the current password", body, w.Code)
 		}
 	}
-	if !s.checkPassword("admin", "orig") || s.checkPassword("admin", "pwned") {
+	if !s.checkPassword(s.authCreds(), "admin", "orig") || s.checkPassword(s.authCreds(), "admin", "pwned") {
 		t.Fatal("a refused request must leave the stored credential untouched")
 	}
 	if s.settings.AuthUser() != "admin" || !s.settings.AuthActive() {
@@ -1439,7 +1439,7 @@ func TestAccessChangeRequiresCurrentPassword(t *testing.T) {
 	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"orig","password":"new2"}`); w.Code != http.StatusOK {
 		t.Fatalf("password change with step-up: %d %s", w.Code, w.Body)
 	}
-	if !s.checkPassword("admin", "new2") || s.checkPassword("admin", "orig") {
+	if !s.checkPassword(s.authCreds(), "admin", "new2") || s.checkPassword(s.authCreds(), "admin", "orig") {
 		t.Fatal("step-up password change did not take")
 	}
 	if w := doSession(t, s, h, "POST", "/api/access", `{"current_password":"new2","username":"bob"}`); w.Code != http.StatusOK {
@@ -1561,10 +1561,10 @@ func TestQuickSetupRefusesAccessChangeWhenAuthActive(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("credential rotation via quick-setup returned %d, want 403", w.Code)
 	}
-	if s.checkPassword("attacker", "pwned") {
+	if s.checkPassword(s.authCreds(), "attacker", "pwned") {
 		t.Fatal("attacker credentials were applied - the step-up bypass is open")
 	}
-	if !s.checkPassword("admin", "secret") {
+	if !s.checkPassword(s.authCreds(), "admin", "secret") {
 		t.Fatal("original admin password was changed")
 	}
 

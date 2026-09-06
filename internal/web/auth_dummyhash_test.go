@@ -81,7 +81,7 @@ func TestWrongUsernameTakesAsLongAsWrongPassword(t *testing.T) {
 	// forces the value while checkPassword forces it unconditionally;
 	// TestCheckPasswordForcesTheDummyHashUnconditionallyBeforeAnyBcryptWork is
 	// what pins that, and the comment on it explains why this test cannot.
-	s.checkPassword("admin", "wrong")
+	s.checkPassword(s.authCreds(), "admin", "wrong")
 
 	// Minimum of a few runs: bcrypt work is CPU-bound, so the fastest sample is
 	// the least polluted by scheduling noise on a loaded CI box.
@@ -89,7 +89,7 @@ func TestWrongUsernameTakesAsLongAsWrongPassword(t *testing.T) {
 		lo := time.Duration(1<<63 - 1)
 		for i := 0; i < 3; i++ {
 			start := time.Now()
-			if s.checkPassword(user, pass) {
+			if s.checkPassword(s.authCreds(), user, pass) {
 				t.Fatalf("checkPassword(%q, %q) accepted bad credentials", user, pass)
 			}
 			if d := time.Since(start); d < lo {

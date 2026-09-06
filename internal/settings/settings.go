@@ -1340,6 +1340,14 @@ func (c *Controller) AuthActive() bool {
 	return v.AuthEnabled && v.AuthHash != ""
 }
 
+// AuthCreds returns the login name and password hash out of one snapshot, so a
+// caller checking a password holds a pair that belongs together even while a
+// change is landing.
+func (c *Controller) AuthCreds() (user, hash string) {
+	v := c.get()
+	return v.AuthUser, v.AuthHash
+}
+
 // HasPassword reports whether a password has been set.
 func (c *Controller) HasPassword() bool { return c.get().AuthHash != "" }
 
