@@ -1038,9 +1038,6 @@ func (p *program) run(ctx context.Context) {
 	p.log.Info("pingularity stopped")
 }
 
-// runPruner deletes old data once at startup and hourly thereafter. Latency
-// samples, speed history, and outages each use their own retention window; a
-// window of 0 keeps that data forever.
 // seedKnownCounters initializes the fixed, known operational counters, the
 // float sums behind exported duration families (via stats.SeedF), and the
 // enumerable failure/trigger families) to 0 at startup, so a first event after a
@@ -1418,6 +1415,10 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 	}
 }
 
+// runPruner deletes old data hourly, after a startup grace. Latency samples,
+// speed history, and outages each use their own retention window; a window of
+// 0 keeps that data forever. A pass is skipped while settings have never
+// loaded, since the windows would then be nobody's choice.
 func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 	// cutoff returns the prune-before time for a window (epoch = keep forever).
 	cutoff := func(d time.Duration) time.Time {
@@ -1427,6 +1428,21 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		return time.Now().Add(-d)
 	}
 	prune := func() {
+		// The windows come from the controller, and one whose boot read failed
+		// answers with the compiled-in defaults, not the operator's stored
+		// values: a "keep forever" reads as thirty days, a ten-year window as
+		// one. The monitor and scheduler run on those defaults on purpose - a
+		// wrong probe interval costs nothing until the retry loop wins - but
+		// this reading drives a DELETE, and the places already refusing to act
+		// on an unloaded controller (settings writes, the web guard, the
+		// first-run hold) refuse for exactly that reason. So does this. It is
+		// the same bargain as the grace below and Prune's own clock guards: the
+		// ticker repeats and the retry loop's Reload flips Loaded, so waiting
+		// costs a delayed tidy-up and acting costs history.
+		if !set.Loaded() {
+			p.log.Warn("prune skipped until settings load; the retention windows would be the compiled-in defaults")
+			return
+		}
 		n, err := p.store.Prune(ctx, cutoff(set.Retention()), cutoff(set.SpeedRetention()), cutoff(set.DowntimeRetention()))
 		if err != nil {
 			p.log.Error("prune", "err", err)
@@ -1451,7 +1467,7 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		return
 	}
 	prune()
-	t := time.NewTicker(time.Hour)
+	t := time.NewTicker(pruneInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -1468,6 +1484,11 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 // than NTP needs on a working network, and irrelevant on a healthy clock since
 // the work is a no-op cleanup either way.
 var pruneStartupGrace = 10 * time.Minute
+
+// pruneInterval is how often the pruner runs after that first pass. A variable
+// for the same reason as the grace: a test that needs to see a later pass
+// cannot wait an hour for it.
+var pruneInterval = time.Hour
 
 // sleepCtx waits d, reporting false if the context was cancelled first.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
