@@ -135,8 +135,9 @@ func TestExportDeniesSettingsSecretKeys(t *testing.T) {
 	// backup). The quick-setup pair is denied for a different reason than the
 	// hash: the answer and the offer clock belong to the INSTALL - a restored
 	// mid-offer backup must not reopen the dialog on (or hold monitoring of)
-	// an established destination.
-	secretKeys := []string{keyAuthHash, keyQuickSetup, keyQuickSetupOffer}
+	// an established destination. The split marker is the table's own note that
+	// its migration ran; a destination writes its own at boot.
+	secretKeys := []string{keyAuthHash, keyQuickSetup, keyQuickSetupOffer, keyEngineSplit}
 
 	seed := map[string]string{
 		keyDigestFreq: "daily", // a non-secret control that MUST survive export
