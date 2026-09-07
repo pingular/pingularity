@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingular/pingularity/internal/logfilter"
 	"github.com/pingular/pingularity/internal/stats"
 )
 
@@ -652,5 +653,40 @@ func TestExitFailureWarnsOncePerEpisode(t *testing.T) {
 	m.cachedExit(context.Background(), "1403")
 	if got := h.warns(); got != 2 {
 		t.Fatalf("first failure of a NEW episode logged %d warns total, want 2 (the bust re-arms the Warn)", got)
+	}
+}
+
+// The exit target is the operator's own hostname or address, so the line that
+// says it could not be used must carry it under a key the PII mask replaces -
+// "target" is the probe anchor's built-in name elsewhere and the mask leaves
+// that alone. Both branches are reached without asking a resolver anything: an
+// address literal is resolved in-process, and an IPv6-only one has no IPv4
+// answer to give.
+func TestExitTargetIsMaskedInLogs(t *testing.T) {
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		return nil, errors.New("no raw socket")
+	})
+	for _, tc := range []struct{ name, target, warn string }{
+		{"loopback", "127.0.0.1", "resolves to a loopback/link-local address"},
+		{"unresolved", "2001:db8::1", "did not resolve to IPv4"},
+	} {
+		var masked []string
+		log := slog.New(logfilter.NewCapture(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn},
+			func(_, m string) { masked = append(masked, m) }))
+		m := NewManager(log)
+		m.ExitTargetFn = func() string { return tc.target }
+		m.cachedExit(context.Background(), "1403")
+		line := ""
+		for _, l := range masked {
+			if strings.Contains(l, tc.warn) {
+				line = l
+			}
+		}
+		if line == "" {
+			t.Fatalf("%s: the exit-target warning was not logged; masked lines: %q", tc.name, masked)
+		}
+		if strings.Contains(line, tc.target) || !strings.Contains(line, "exit_target="+logfilter.Redacted) {
+			t.Fatalf("%s: the exit target must be masked under exit_target: %s", tc.name, line)
+		}
 	}
 }
