@@ -2703,6 +2703,8 @@ func normalize(v Values) Values {
 	// reconnect/degraded speedtests never fire) with no window to explain why. Treat
 	// "enabled but empty" as "no restriction" - force the flag off so the gate reads
 	// as unscheduled (always allowed), which is what an empty allow-list means here.
+	// sanitizeWindows has already dropped every window that selects no weekday -
+	// the same never-active state wearing a row - so this covers that shape too.
 	if v.SchedLatEnabled && len(v.SchedLatWindows) == 0 {
 		v.SchedLatEnabled = false
 	}
@@ -2944,14 +2946,26 @@ func mergeIperfPasswords(incoming, stored []IperfTarget) []IperfTarget {
 }
 
 // sanitizeWindows normalizes each window's day mask and clamps its minutes,
-// dropping any past the per-feature cap.
+// dropping any past the per-feature cap and any whose mask selects no weekday.
 func sanitizeWindows(ws []Window) []Window {
 	if len(ws) > maxWindows {
 		ws = ws[:maxWindows]
 	}
-	out := make([]Window, len(ws))
-	for i, w := range ws {
-		out[i] = Window{Days: normDays(w.Days), Start: clampMin(w.Start), End: clampMin(w.End)}
+	out := make([]Window, 0, len(ws))
+	for _, w := range ws {
+		days := normDays(w.Days)
+		// A well-formed mask with every day off is a window that can never be
+		// active: beside a live window it adds nothing, and on its own it is the
+		// "no windows" state wearing a row - which normalize's empty-list guard
+		// counts as a window, leaving the toggle on and the whole feature gated
+		// off with nothing to say why. Drop it here, as the dashboard drops such
+		// a row before it posts, so the guard sees the empty list it was written
+		// for. A malformed mask is a different case: normDays reads that as every
+		// day, not as no day.
+		if !strings.Contains(days, "1") {
+			continue
+		}
+		out = append(out, Window{Days: days, Start: clampMin(w.Start), End: clampMin(w.End)})
 	}
 	return out
 }
