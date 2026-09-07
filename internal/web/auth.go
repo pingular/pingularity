@@ -238,8 +238,10 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// A restore publishes the backup's settings before its safety repair runs, so
-		// for that window the box is configured by whatever the backup said - possibly
+		// A restore's config rows are committed before anything reloads them, and
+		// from the first of those rows any reload - the restore's own, or a signal
+		// that lands before it - publishes them, so for that window the box may be
+		// configured by whatever the backup said - possibly
 		// "no login, reachable from the network". Refuse everything rather than judge
 		// the request against settings nobody on this machine chose: loopback cannot
 		// tell a local browser from a same-host reverse proxy, so no narrower test
@@ -248,9 +250,11 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// import itself is admitted before the handler raises this flag, so an
 		// in-flight restore never locks itself out.
 		//
-		// 503 with a short Retry-After, not 403: the window is seconds wide, and this
-		// tells the dashboard (and a load balancer) to come back rather than to report
-		// the box as forbidden. /healthz and /readyz answer throughout, above.
+		// 503 with a short Retry-After, not 403: the window runs to the end of the
+		// safety repair - seconds for one of our own exports, whose config is written
+		// last, longer for a backup that leads with it - and this tells the dashboard
+		// (and a load balancer) to come back rather than to report the box as
+		// forbidden. /healthz and /readyz answer throughout, above.
 		if s.reconciling.Load() {
 			w.Header().Set("Retry-After", "2")
 			http.Error(w, "restoring a backup; try again shortly", http.StatusServiceUnavailable)

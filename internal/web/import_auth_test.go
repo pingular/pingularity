@@ -44,8 +44,8 @@ func importConfig(t *testing.T, s *Server, rows string) *httptest.ResponseRecord
 }
 
 // importConfigWithHook runs an import and fires hook once the request is under
-// way, so a concurrent settings write can be placed inside the window between the
-// handler's pre-import snapshot and its post-reload repair.
+// way but before it snapshots the login state, so a settings write can be placed
+// where a real one lands when it beats a restore to the lock.
 func importConfigWithHook(t *testing.T, s *Server, rows string, hook func()) *httptest.ResponseRecorder {
 	t.Helper()
 	importMidHook = hook
