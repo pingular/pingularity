@@ -307,3 +307,79 @@ func TestRefreshSeesTheNetworkChangeAcrossAnIPv6OnlyInterlude(t *testing.T) {
 		})
 	}
 }
+
+// A process start is the one moment nothing in memory says which network the
+// panel's carried-forward values answer for: prev is the zero Info, so the
+// public-IP comparison above has nothing to compare, and every restart read as
+// a return to the same network. The last speed run's resolver egress was then
+// published as current on whatever network the daemon came up on - stamped
+// into every speed row taken there, and kept for as long as the live egress
+// lookup failed (a captive portal, a filtered echo), because each fetch reads
+// it back from the snapshot the one before published. The persisted row
+// carries the public IP it was recorded on, which is the answer memory cannot
+// give; where that cannot answer either - the row predates an IPv4 of its own,
+// or this fetch found none - the carry stands, being all the panel has. Same
+// key the ISP fill from that row already uses. No network.
+func TestFetchDropsThePersistedResolverFromAnotherNetworkOnAColdStart(t *testing.T) {
+	oldV4, oldV6 := ipv4Client, ipv6Client
+	defer func() { ipv4Client, ipv6Client = oldV4, oldV6 }()
+	ipv6Client = canned(500, "")
+	hermetic(t)
+	ctx := context.Background()
+
+	entry := &DNSEntry{IP: "192.0.2.53", Provider: "AS64497 Old Resolver", Location: "Toronto, CA"}
+	for _, tc := range []struct {
+		name    string
+		liveIP  string // what the IP echo answers this fetch ("" = it fails too)
+		lastIP  string // the public IPv4 the persisted speed row was recorded on
+		wantDNS bool
+	}{
+		{"another network", "198.51.100.7", "203.0.113.5", false},
+		{"same network", "198.51.100.7", "198.51.100.7", true},
+		{"persisted row has no address", "198.51.100.7", "", true},
+		{"no address this fetch either", "", "203.0.113.5", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.liveIP == "" {
+				ipv4Client = canned(500, "")
+			} else {
+				ipv4Client = canned(200, tc.liveIP)
+			}
+			// A fresh Manager is a fresh process: no snapshot, only the store.
+			m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			m.http = canned(500, "") // /cdn-cgi/trace and the geo providers fail
+			m.LastKnownFn = func() *Info {
+				return &Info{PublicIP: tc.lastIP, ISP: "AS64496 Old Telecom", DNSUpstream: entry}
+			}
+
+			info := m.fetch(ctx)
+			// With no live address at all the panel IS the persisted row, down to
+			// the IP on show, so its resolver belongs with it.
+			wantIP := tc.liveIP
+			if wantIP == "" {
+				wantIP = tc.lastIP
+			}
+			if info.PublicIP != wantIP {
+				t.Fatalf("setup: PublicIP=%q, want %s", info.PublicIP, wantIP)
+			}
+			if got := info.DNSUpstream != nil; got != tc.wantDNS {
+				t.Fatalf("DNSUpstream after a cold start = %+v, want carried=%v", info.DNSUpstream, tc.wantDNS)
+			}
+			if tc.wantDNS {
+				if *info.DNSUpstream != *entry {
+					t.Errorf("DNSUpstream = %+v, want the carried %+v", *info.DNSUpstream, *entry)
+				}
+				return
+			}
+			// The row that was dropped must not come back on the next fetch:
+			// publishing it is what used to make the carry permanent.
+			m.mu.Lock()
+			m.info = info
+			m.mu.Unlock()
+			if next := m.fetch(ctx); next.DNSUpstream != nil {
+				t.Errorf("the dropped resolver returned on the next fetch: %+v - the carry outlives the snapshot "+
+					"that dropped it", next.DNSUpstream)
+			}
+		})
+	}
+}
