@@ -616,10 +616,35 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 		// nothing at a keyless third party's expense. A still-blank CITY keeps
 		// retrying unbounded as before - || short-circuits, so it never spends
 		// the claim - because a blank city means the lookup did not land at all.
-		if prev.PublicIP == ip4 && prev.ISP != "" {
+		//
+		// The reuse is keyed on the IP alone. A blank cached ISP means the Cymru
+		// lookup failed for this same address - the snapshot was flagged "isp
+		// lookup failed" and Loop is retrying it every errRetryStale - which is
+		// a reason to ask Cymru again, not to forget the city, coordinate and
+		// hostname the address already has. Keying the reuse on the ISP as well
+		// sent every one of those retries down the IP-change path below, where
+		// geo and rDNS run unguarded: one failed round-trip published an empty
+		// city at 0,0, which drops the ISP origin from auto server selection,
+		// and the keyless geo providers were asked again on every retry for an
+		// address whose placement was already known - the spend the coordinate
+		// throttle above exists to avoid.
+		sameIP := prev.PublicIP == ip4
+		if sameIP {
 			ip4ISP, ip4Host = prev.ISP, prev.Hostname
 			ip4City, ip4Ctry = prev.City, prev.Country
 			ip4Lat, ip4Lon = prev.Lat, prev.Lon
+		}
+		// Team Cymru origin ASN + name as "AS#### Name" (the conventional whois
+		// AS-org form) so asnFromOrg (exit discovery, below) keeps working.
+		if ip4ISP == "" {
+			if asn := cymruASN(ctx, ip4); asn != "" {
+				ip4ISP = "AS" + asn
+				if name := cymruASNName(ctx, asn); name != "" {
+					ip4ISP += " " + name
+				}
+			}
+		}
+		if sameIP {
 			if ip4City == "" || (ip4Lat == 0 && ip4Lon == 0 && m.coordRetryDue(ip4)) {
 				city, ctry, la, lo, ok := publicIPGeo(ctx, m, ip4)
 				if ok {
@@ -633,14 +658,6 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 				ip4Host = ptrLookup(ctx, ip4)
 			}
 			return
-		}
-		// Team Cymru origin ASN + name as "AS#### Name" (the conventional whois
-		// AS-org form) so asnFromOrg (exit discovery, below) keeps working.
-		if asn := cymruASN(ctx, ip4); asn != "" {
-			ip4ISP = "AS" + asn
-			if name := cymruASNName(ctx, asn); name != "" {
-				ip4ISP += " " + name
-			}
 		}
 		if city, ctry, la, lo, ok := publicIPGeo(ctx, m, ip4); ok {
 			ip4City, ip4Ctry, ip4Lat, ip4Lon = city, ctry, la, lo
