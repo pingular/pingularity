@@ -112,6 +112,15 @@ type Manager struct {
 	v4MissSince time.Time
 	v4MissLast  time.Time
 
+	// lastIPv4 is the public IPv4 the current network was last known by. It is
+	// the published snapshot's PublicIP whenever that is set, and outlives it
+	// through an IPv6-only snapshot, which blanks PublicIP on purpose (there is
+	// no IPv4) - because the exit cache, and the PoP and resolver entries a
+	// failed lookup carries forward, all answer for the network that address
+	// was seen on, and whether IPv4 came back on the SAME network is a question
+	// the blank cannot answer. Read through knownIPv4. Guarded by mu.
+	lastIPv4 string
+
 	// coordTriedIP/coordTriedAt throttle the cached-city COORDINATE recovery:
 	// the public IP it last ran for, and when. Without a throttle the recovery
 	// never cancels, because publicIPGeo answers ok=true for a city it cannot
@@ -186,6 +195,20 @@ func (m *Manager) Get() Info {
 	return m.info
 }
 
+// knownIPv4 returns the public IPv4 the current network is identified by: the
+// published snapshot's, or - while an IPv6-only snapshot has blanked it - the
+// last one published before that. "" when no IPv4 has ever been published.
+// refresh and fetchGen compare a fresh IPv4 against it to tell a network change
+// from a return to the same network.
+func (m *Manager) knownIPv4() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.info.PublicIP != "" {
+		return m.info.PublicIP
+	}
+	return m.lastIPv4
+}
+
 // Refresh fetches fresh info and caches it. Fast fields are published first;
 // the slow exit traceroute is resolved afterward and patched in, so the
 // Connection panel isn't blank for the duration of the trace.
@@ -206,7 +229,15 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 		return
 	}
 	gen := m.nextGen()
-	prevIP := m.Get().PublicIP
+	// The address the current network was last known by, kept across an
+	// IPv6-only snapshot, which blanks PublicIP on purpose (see knownIPv4).
+	// Compared against the published PublicIP alone, an IPv6-only interlude
+	// read as "no previous IP", so IPv4 coming back on a DIFFERENT network was
+	// no change at all: the old network's router was carried into the new
+	// snapshot, the bust below never ran, and every failed retrace on the new
+	// network re-stamped that router fresh - the very state the bust exists to
+	// prevent, reached by a detour.
+	prevIP := m.knownIPv4()
 	i := m.fetchGen(ctx, gen)
 	// A changed public IP is a changed network: the last known exit answers for
 	// the OLD path, so do not carry it into this snapshot - publish with no exit
@@ -223,6 +254,9 @@ func (m *Manager) refresh(ctx context.Context, force bool) {
 	if m.claimPublish(gen) {
 		m.info = i
 		markFresh(i)
+		if i.PublicIP != "" {
+			m.lastIPv4 = i.PublicIP // the network this snapshot's exit, PoP and resolver answer for
+		}
 	}
 	m.mu.Unlock()
 	m.log.Info("netinfo refreshed", "ip", i.PublicIP, "isp", i.ISP)
@@ -574,7 +608,8 @@ func (m *Manager) fetch(ctx context.Context) Info { return m.fetchGen(ctx, m.nex
 // gen is this fetch's refresh generation: it gates the IPv4-miss run-state write
 // so an out-of-order older fetch can't corrupt the run a newer one advanced.
 func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
-	prev := m.Get() // last-good snapshot, to carry forward on transient failures
+	prev := m.Get()         // last-good snapshot, to carry forward on transient failures
+	prevIP := m.knownIPv4() // the IPv4 that snapshot's network was known by, even while prev is IPv6-only
 	info := Info{UpdatedAt: time.Now().Unix()}
 
 	var (
@@ -842,7 +877,22 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 	// "" there legitimately means "no IPv6". Both fallbacks copy the entry:
 	// prev.DNSUpstream aliases the pointer inside the published snapshot (Get
 	// copies the struct, not the entry), so mutating it here would race readers.
-	if dns == nil {
+	//
+	// The carry is for a failure on the SAME network. A changed public IPv4 is
+	// a changed network - the rule refresh applies to the exit cache - and the
+	// previous snapshot's PoP and resolver egress answer for the old one, so on
+	// a change a failed lookup leaves the row hidden until one lands rather
+	// than publishing the old network's values as current. Carried across,
+	// they were stamped into every speed row taken on the new network, and
+	// because each fetch reads them back from the snapshot the last one
+	// published they stayed on a network where the lookup keeps failing
+	// (1.1.1.1 blocked, the egress echo filtered) until it succeeded, if it
+	// ever did. The resolver's cached provider and host are still reused above
+	// when its egress IP proves unchanged - that is the check a public-IP
+	// comparison cannot make, and this gate covers only an entry no live lookup
+	// vouched for.
+	ipChanged := ip4 != "" && prevIP != "" && ip4 != prevIP
+	if dns == nil && !ipChanged {
 		if prev.DNSUpstream != nil { // resolver egress lookup failed
 			cp := *prev.DNSUpstream
 			dns = &cp
@@ -867,8 +917,8 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 			}
 		}
 	}
-	if colo == "" {
-		colo = prev.CFColo // Cloudflare /cdn-cgi/trace failed
+	if colo == "" && !ipChanged {
+		colo = prev.CFColo // Cloudflare /cdn-cgi/trace failed on the same network
 	}
 	// Exit discovery is traceroute-based and runs on Linux, macOS, and Windows; on
 	// platforms without a native trace, record why (like the IPv6-only case above).

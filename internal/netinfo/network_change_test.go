@@ -155,3 +155,155 @@ func TestFetchKeepsCachedGeoWhileOnlyTheISPLookupFails(t *testing.T) {
 		t.Errorf("geo queries = %d with the whole identity cached, want 0", geo.count())
 	}
 }
+
+// A changed public IP is a changed network, and the previous snapshot's
+// Cloudflare PoP and resolver egress answer for the old one. When their live
+// lookups fail on the new network - a link still settling is exactly when they
+// do - the rows hide until a lookup lands, as the Exit row already does.
+// Carried across, the old values were published as current, stamped into every
+// speed row taken on the new network, and, because each fetch reads them back
+// from the last published snapshot, kept for as long as the lookups kept
+// failing there. The speed-history fallback is the old network's too. On the
+// SAME network the carry stands: a transient miss must not vanish a row.
+// No network.
+func TestFetchDropsColoAndResolverCarryOnAnIPChange(t *testing.T) {
+	oldV4, oldV6 := ipv4Client, ipv6Client
+	defer func() { ipv4Client, ipv6Client = oldV4, oldV6 }()
+	ipv6Client = canned(500, "")
+	hermetic(t)
+	ctx := context.Background()
+
+	entry := &DNSEntry{IP: "192.0.2.53", Provider: "AS64497 Old Resolver", Location: "Toronto, CA"}
+	for _, tc := range []struct {
+		name    string
+		prev    Info
+		last    func() *Info
+		ip      string
+		colo    string // want
+		wantDNS bool
+	}{
+		{"previous snapshot", Info{PublicIP: "203.0.113.5", ISP: "AS64496 Old Telecom", CFColo: "YYZ", DNSUpstream: entry},
+			nil, "198.51.100.7", "", false},
+		{"speed history", Info{PublicIP: "203.0.113.5", ISP: "AS64496 Old Telecom"},
+			func() *Info { return &Info{PublicIP: "203.0.113.5", DNSUpstream: entry} }, "198.51.100.7", "", false},
+		{"same network", Info{PublicIP: "203.0.113.5", ISP: "AS64496 Old Telecom", CFColo: "YYZ", DNSUpstream: entry},
+			nil, "203.0.113.5", "YYZ", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ipv4Client = canned(200, tc.ip)
+			m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			m.http = canned(500, "") // /cdn-cgi/trace and the geo providers fail
+			m.LastKnownFn = tc.last
+			tc.prev.UpdatedAt = time.Now().Unix()
+			m.mu.Lock()
+			m.info = tc.prev
+			m.mu.Unlock()
+
+			info := m.fetch(ctx)
+			if info.PublicIP != tc.ip {
+				t.Fatalf("setup: PublicIP=%q, want %s", info.PublicIP, tc.ip)
+			}
+			if info.CFColo != tc.colo {
+				t.Errorf("CFColo = %q, want %q", info.CFColo, tc.colo)
+			}
+			if got := info.DNSUpstream != nil; got != tc.wantDNS {
+				t.Errorf("DNSUpstream = %+v, want carried=%v", info.DNSUpstream, tc.wantDNS)
+			}
+			if tc.wantDNS && info.DNSUpstream != nil && *info.DNSUpstream != *entry {
+				t.Errorf("DNSUpstream = %+v, want the carried %+v", *info.DNSUpstream, *entry)
+			}
+		})
+	}
+}
+
+// The comparison that spots a changed network has to survive an IPv6-only
+// interlude. That snapshot blanks PublicIP on purpose (there is no IPv4), and
+// read as "no previous IP" it made a return on a DIFFERENT IPv4 network no
+// change at all: the old network's router was carried into the new snapshot,
+// the exit-cache bust never ran, and every failed retrace on the new network
+// re-stamped the old router fresh under the no-flicker rule - the state the
+// direct IPv4-to-IPv4 guard exists to prevent. The PoP carry reads the same
+// address. A return on the SAME IPv4 is not a change, and keeps both.
+// No network: the trace is stubbed to fail, as it does on a host with no raw
+// socket.
+func TestRefreshSeesTheNetworkChangeAcrossAnIPv6OnlyInterlude(t *testing.T) {
+	oldV4, oldV6 := ipv4Client, ipv6Client
+	defer func() { ipv4Client, ipv6Client = oldV4, oldV6 }()
+	hermetic(t)
+	stubTrace(t, func(context.Context, [4]byte, int, time.Duration) ([]tHop, error) {
+		return nil, errors.New("no raw socket")
+	})
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name    string
+		back    string
+		changed bool
+	}{
+		{"different network", "192.0.2.55", true},
+		{"same network", "198.51.100.7", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			m.http = canned(404, "")
+			m.ExitTargetFn = func() string { return "1.1.1.1" }
+
+			// Network A, dual stack. Plant the exit A's trace found and the PoP
+			// serving it.
+			ipv4Client, ipv6Client = canned(200, "198.51.100.7"), canned(200, "2001:db8::1234")
+			m.Refresh(ctx)
+			m.traceMu.Lock()
+			m.exit = &ExitInfo{Name: "network-a-router", IP: "203.0.113.9"}
+			m.tracedFor, m.attemptedFor, m.traceAt = "1.1.1.1", "1.1.1.1", time.Now()
+			m.traceMu.Unlock()
+			m.mu.Lock()
+			m.info.CFColo = "YYZ"
+			m.mu.Unlock()
+
+			// IPv4 dies; after v6FlipAfter of misses the identity flips to IPv6-only.
+			ipv4Client = canned(500, "")
+			m.mu.Lock()
+			m.v4MissSince, m.v4MissLast = time.Now().Add(-v6FlipAfter-time.Minute), time.Now()
+			m.mu.Unlock()
+			m.Refresh(ctx)
+			if got := m.Get(); got.PublicIP != "" || got.ExitUnavailable == "" {
+				t.Fatalf("setup: expected the IPv6-only flip, got ip=%q exit_unavailable=%q", got.PublicIP, got.ExitUnavailable)
+			}
+
+			// IPv4 comes back. The exit cache has long expired, so a retrace runs
+			// - and fails.
+			m.traceMu.Lock()
+			m.traceAt = time.Now().Add(-2 * exitCacheFor)
+			m.traceMu.Unlock()
+			ipv4Client = canned(200, tc.back)
+			m.Refresh(ctx)
+
+			got := m.Get()
+			if got.PublicIP != tc.back {
+				t.Fatalf("setup: expected the IPv4 identity back as %s, got %q", tc.back, got.PublicIP)
+			}
+			m.traceMu.Lock()
+			cached := m.exit
+			m.traceMu.Unlock()
+			if tc.changed {
+				if got.Exit != nil {
+					t.Errorf("the new network publishes the old network's exit router: %+v", got.Exit)
+				}
+				if cached != nil {
+					t.Errorf("exit cache survived the IPv6-only interlude and the network change: %+v - every failed "+
+						"retrace re-stamps it fresh, so it never recovers", cached)
+				}
+				if got.CFColo != "" {
+					t.Errorf("CFColo = %q on the new network, want the old network's PoP dropped", got.CFColo)
+				}
+				return
+			}
+			if got.Exit == nil || got.Exit.Name != "network-a-router" {
+				t.Errorf("a return on the same network must keep its exit on display, got %+v", got.Exit)
+			}
+			if got.CFColo != "YYZ" {
+				t.Errorf("CFColo = %q on the same network, want the carried YYZ", got.CFColo)
+			}
+		})
+	}
+}
