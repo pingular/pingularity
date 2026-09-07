@@ -176,10 +176,12 @@ type Server struct {
 	// wrong for a password-only rotation - which keeps the username by design, so
 	// the password hash moved while the name did not.
 	importMu sync.Mutex
-	// reconciling is true while imported settings are live but the safety repair has
-	// not finished. The guard treats it as local-only, because during that window
-	// the box is running on whatever the backup said - and a backup taken from an
-	// open machine says "no login, reachable from the network".
+	// reconciling is true from the moment a restore starts landing the backup's
+	// config rows until the safety repair has finished. The guard refuses the
+	// window, because from the first row on the box can be running on whatever
+	// the backup said - the reconcile's own reload makes it live, and so does a
+	// reload signal that lands before it - and a backup taken from an open
+	// machine says "no login, reachable from the network".
 	reconciling atomic.Bool
 
 	// OnLogClear, when set, runs after the /api/logs clear branch empties the
@@ -193,14 +195,14 @@ type Server struct {
 	// goroutines/FDs and, more importantly, so two restores can't fight over
 	// SQLite's single writer, where whichever one loses the wait lands
 	// half-finished (see maxConcurrentImports). Note this is NOT what
-	// importMu above covers: an import takes importMu only after its rows are
-	// already committed, for the settings reconcile, and only when the backup
-	// carried the config category (the importedConfig branch in handleImport).
-	// The two other holders, handleAccess and handleQuickSetup, take it to keep
-	// the access and first-run answers from interleaving with that reconcile;
-	// neither one restores rows. So importMu was never held across the row writes
-	// where the contention happens. Lazily built (importGate) so a struct-literal
-	// Server still gates.
+	// importMu above covers: an import takes importMu for the settings
+	// reconcile, from its first config row to the end of the repair, and only
+	// when the backup carries the config category at all (the importedConfig
+	// branch in handleImport). The two other holders, handleAccess and
+	// handleQuickSetup, take it to keep the access and first-run answers from
+	// interleaving with that reconcile; neither one restores rows. So importMu
+	// was never what serialized the row writes where the contention happens.
+	// Lazily built (importGate) so a struct-literal Server still gates.
 	importSemOnce sync.Once
 	importSem     chan struct{}
 
@@ -3267,10 +3269,11 @@ var dataCategories = []struct{ cat, key, table string }{
 	{"config", "config", "settings"},
 }
 
-// importMidHook is called by handleImport just after it snapshots the pre-import
-// login state. Test seam only (nil in production): the interesting window for a
-// concurrent credential change is between that snapshot and the post-reload
-// repair, and it is otherwise reachable only by racing.
+// importMidHook is called by handleImport as the restore starts, just before it
+// reaches the config category and snapshots the pre-import login state. Test seam
+// only (nil in production): a credential change that completes right there is
+// what the repairs must not write back over, and from the snapshot onwards
+// importMu holds every other credential writer off until the reconcile is done.
 var importMidHook func()
 
 // importReconcileBudget bounds the post-commit reconcile. It runs detached from
@@ -3278,6 +3281,20 @@ var importMidHook func()
 // writes, short enough that a wedged write cannot hold importMu indefinitely.
 // A var only so tests can exhaust the budget deliberately.
 var importReconcileBudget = 30 * time.Second
+
+// RestoreInFlight reports whether a restore is between its first committed
+// config row and the end of its safety repair - the window in which the stored
+// settings are the backup's and only that repair stands between them and a
+// restart adopting the backup's login. Shutdown reads it before it gives up on
+// the background workers and closes the store; see RestoreDrainBudget.
+func (s *Server) RestoreInFlight() bool { return s.reconciling.Load() }
+
+// RestoreDrainBudget is the longest that window can last once the rows are
+// committed: the reconcile's own ceiling plus the fresh one the last-resort
+// restore of the pre-import login keys deliberately gets. Nothing in the
+// handler outlasts it, so a shutdown that has waited this long has waited long
+// enough.
+func RestoreDrainBudget() time.Duration { return importReconcileBudget + importRestoreBudget }
 
 // importRestoreBudget bounds the last-resort restore of the pre-import
 // auth/access keys after the reload has failed for good. Deliberately NOT the
@@ -3647,6 +3664,26 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "another import is already in progress; try again shortly", http.StatusTooManyRequests)
 		return
 	}
+	// A restore's reconcile must FINISH (see the importedConfig branch below):
+	// once the backup's config is committed, its repairs are all that stand
+	// between the stored settings and a restart adopting the backup's login
+	// name beside this machine's password hash. It is detached from the client
+	// for that reason, but against a shutdown it was covered only by
+	// srv.Shutdown's 3s grace - unlike the manual speedtest and the exit
+	// re-trace, it rode nothing Serve waits on - and one reconcile write waiting
+	// out busy_timeout is longer than that grace: Serve returned with the
+	// reconcile still running, main closed the store under it, and the write
+	// that puts the operator's own login name back failed on a closed handle.
+	// So the handler rides serveWG like those two, and is refused once shutdown
+	// has begun. The request context still follows the run context
+	// (BaseContext), so the row phase stops at shutdown exactly as before; only
+	// the reconcile is drained.
+	if s.serveCtx != nil && s.serveCtx.Err() != nil {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	s.serveWG.Add(1)
+	defer s.serveWG.Done()
 	// The most destructive endpoint (INSERT OR REPLACE settings + live Reload),
 	// so it needs the same content-type CSRF guard the other mutating routes get
 	// via decodeJSONBody - which this handler bypasses to stream a large body.
@@ -3744,12 +3781,15 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// The login state BEFORE any config lands. A backup carries the login settings
 	// but never the password hash (settingsExportDeny), so applying it verbatim can
 	// leave this box in a state its own credentials do not fit - and the endpoint
-	// that would fix that is itself behind the login. Captured here, repaired after
-	// the reload below.
+	// that would fix that is itself behind the login. Captured as the config
+	// category is reached, before its first row lands (see the loop), repaired
+	// after the reload below.
 	var preAuthActive, preAuthEnabled, preHasPassword, preLocalOnly bool
 	var preAuthUser string
-	// Test seam: lets a test place a concurrent credential write exactly inside the
-	// window between this snapshot and the repair below. Nil in production.
+	// Test seam: lets a test place a credential write immediately before the
+	// snapshot, which is the only place a real one can now land during a restore -
+	// POST /api/access takes importMu, and the loop below holds it from the first
+	// config row to the end of the reconcile. Nil in production.
 	if importMidHook != nil {
 		importMidHook()
 	}
@@ -3795,15 +3835,38 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		if dc.cat == "config" && !importedConfig {
+			importedConfig = true
+			// From the first config row on, the destination's identity is in
+			// flux: the backup's login settings are in the database and any
+			// reload makes them live - the reconcile's own, or a reload signal
+			// (SIGHUP, `systemctl reload`) that lands before it. So the lock, the
+			// pre-import snapshot and the guard's reconcile gate all go up HERE,
+			// before that row lands, not after the commit. Taken afterwards, the
+			// snapshot described the backup whenever a reload signal had beaten
+			// the reconcile to it; every repair then read "nothing changed", and
+			// the box was left with a foreign login name beside its own hash and
+			// login switched off, with a clean 200 and no warning. The lock is
+			// held to the end of the request: for our own exports (config written
+			// last) that is the reconcile alone; a backup carrying config first
+			// holds it for the rest of its restore, and a credential change or a
+			// Quick Setup answer waits that long rather than interleaving.
+			s.importMu.Lock()
+			defer s.importMu.Unlock()
+			preAuthActive = s.settings.AuthActive()
+			preAuthEnabled = s.settings.AuthEnabled()
+			preHasPassword = s.settings.HasPassword()
+			preAuthUser = s.settings.AuthUser()
+			preLocalOnly = s.settings.AccessLocalOnly()
+			s.reconciling.Store(true)
+			defer s.reconciling.Store(false)
+		}
 		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, progress)
 		result[dc.cat] += n // latency spans two tables (samples + dns); sum them
 		if sawTS {
 			if cur, ok := oldestTS[dc.cat]; !ok || minTS < cur {
 				oldestTS[dc.cat] = minTS // oldest across every table of the category
 			}
-		}
-		if dc.cat == "config" {
-			importedConfig = true
 		}
 		if err != nil {
 			var tooBig *importElementTooLargeError
@@ -3845,32 +3908,23 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		// Everything from here is RECONCILE, and it must finish. It runs on a
 		// context detached from the client's: once a category has committed, hanging
 		// up mid-restore used to leave the live controller and the stored settings
-		// disagreeing, with a restart quietly adopting the backup's values. Bounded,
-		// so a wedged write cannot pin the lock.
+		// disagreeing, with a restart quietly adopting the backup's values. Not
+		// derived from the run context either - a shutdown must not cancel the
+		// repairs, which are what stands between the committed backup and a restart
+		// adopting its login; the handler is on serveWG (see the top) so Serve
+		// drains them before the store closes. Bounded, so a wedged write cannot
+		// pin the lock.
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(r.Context()), importReconcileBudget)
 		defer rcancel()
 
-		// One writer at a time. Holding this across the whole reconcile is what lets
-		// the repair below KNOW that a username it did not expect came from the
-		// backup: nothing else can change credentials in between.
-		s.importMu.Lock()
-		defer s.importMu.Unlock()
-
-		// Snapshot here, not at parse time. The imported rows are already in the
-		// database but not yet in the live controller, so these still describe the
-		// destination's own settings - and taking them under the lock means they
-		// cannot go stale before the repair reads them.
-		preAuthActive = s.settings.AuthActive()
-		preAuthEnabled = s.settings.AuthEnabled()
-		preHasPassword = s.settings.HasPassword()
-		preAuthUser = s.settings.AuthUser()
-		preLocalOnly = s.settings.AccessLocalOnly()
-
-		// From the reload until the repair finishes, the box is running on whatever
-		// the backup said. Refuse remote requests for that window rather than
-		// publishing an unprotected configuration and repairing it afterwards.
-		s.reconciling.Store(true)
-		defer s.reconciling.Store(false)
+		// importMu, the pre-import snapshot and the guard's reconcile gate have
+		// been held since the first config row (see the loop). One writer at a
+		// time is what lets the repair below KNOW that a username it did not
+		// expect came from the backup: nothing else can change credentials in
+		// between, and the snapshot cannot describe anything but the destination's
+		// own settings. The gate refuses remote requests until the repair is done,
+		// rather than publishing an unprotected configuration and repairing it
+		// afterwards.
 
 		rerr := s.settings.Reload(rctx)
 		if rerr != nil {

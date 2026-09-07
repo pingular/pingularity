@@ -209,7 +209,9 @@ and `-d '{…}'` where a body is listed below.
   (413), 8 MiB per batch held in memory. In a file from Pingularity's own
   exporter, config is applied last, so a data failure can't half-change your
   settings; a hand-built or third-party file is applied in *its* key order, so put
-  `config` last yourself)
+  `config` last yourself. A restore that arrives once the daemon has begun shutting
+  down is refused with `503` rather than half-applied; one already in flight holds
+  the shutdown open until the login/access repairs that follow it have finished)
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 - `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
 

@@ -19,7 +19,8 @@ import (
 
 // exhaustReconcileBudget makes the reconcile context arrive already expired,
 // which is what an earlier reconcile overrunning the shared budget looks like
-// from Reload's point of view (the budget starts before importMu is acquired).
+// from Reload's point of view (the budget is created where the reconcile begins,
+// after the category loop has committed the backup's rows).
 func exhaustReconcileBudget(t *testing.T) {
 	t.Helper()
 	old := importReconcileBudget

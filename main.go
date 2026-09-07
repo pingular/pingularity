@@ -161,6 +161,53 @@ func (p *program) Start(s service.Service) error {
 	return nil
 }
 
+// shutdownWorkerGrace bounds the ordinary wait for the background workers at
+// shutdown. Loops return almost instantly on cancel; only an in-flight
+// speedtest can approach it, and it honors ctx.
+const shutdownWorkerGrace = 4 * time.Second
+
+// stopWait is how long Stop waits for run to finish before it returns and lets
+// the process exit. It has to stay ABOVE drainWorkers' own worst case, or the
+// exit beats the store close it is there to allow - which is the whole point of
+// waiting at all. Paid only when run really is still draining: p.done closes
+// the moment it returns.
+func stopWait() time.Duration {
+	return shutdownWorkerGrace + web.RestoreDrainBudget() + time.Second
+}
+
+// drainWorkers waits for the background workers to stop, so run's deferred
+// store.Close does not land under one of them (a final InsertSpeed / Prune /
+// status read on a closed handle). Bounded, so a wedged worker cannot hang
+// shutdown forever - and skipping the graceful close is safe anyway, the WAL is
+// crash-consistent.
+//
+// One worker is allowed to outlast that bound. A restore that has committed the
+// backup's config rows is mid-repair, and that repair is all that stands between
+// those rows and a restart pairing the backup's login NAME with this machine's
+// password hash - a lockout the operator gets no warning about, on a box whose
+// only fix is behind the login that no longer works. A single repair write
+// waiting out SQLite's busy timeout already outruns the grace above, so giving
+// up here and closing the store under it produces exactly the state the repair
+// exists to prevent. The web server drains the handler; this drains the web
+// server. Nothing else is ever waited for that long: every other worker has
+// returned before the grace, and the restore window closes on its own budget.
+func drainWorkers(done <-chan struct{}, restoreDraining func() bool, log *slog.Logger) {
+	select {
+	case <-done:
+		return
+	case <-time.After(shutdownWorkerGrace):
+	}
+	if restoreDraining != nil && restoreDraining() {
+		log.Warn("shutdown: a restore is still putting the login settings back; waiting for it before closing the store")
+		select {
+		case <-done:
+			return
+		case <-time.After(web.RestoreDrainBudget()):
+		}
+	}
+	log.Warn("shutdown: background workers did not stop in time; closing store anyway")
+}
+
 func (p *program) run(ctx context.Context) {
 	// A daemon whose web server died has no dashboard, API, or /metrics - it must
 	// exit non-zero so the service manager restarts/flags it instead of it running
@@ -264,18 +311,13 @@ func (p *program) run(ctx context.Context) {
 			}
 		})
 	}
+	// Set once the web server exists (see below): reports whether a restore is
+	// still repairing the login settings, which drainWorkers waits out.
+	var restoreDraining func() bool
 	defer func() {
 		done := make(chan struct{})
 		go func() { bg.Wait(); close(done) }()
-		// Bounded below Stop's 5s wait on p.done so the close normally finishes
-		// first. Loops return almost instantly on cancel; only an in-flight
-		// speedtest can approach this, and it honors ctx. Even if a worker wedges,
-		// skipping the graceful close is safe - the WAL is crash-consistent.
-		select {
-		case <-done:
-		case <-time.After(4 * time.Second):
-			p.log.Warn("shutdown: background workers did not stop in time; closing store anyway")
-		}
+		drainWorkers(done, restoreDraining, p.log)
 	}()
 
 	// Records raised before the log level is known cannot be emitted yet: the
@@ -1019,6 +1061,8 @@ func (p *program) run(ctx context.Context) {
 			}
 		}
 	}
+	// The drain at the top of run needs this before it gives up on the workers.
+	restoreDraining = srv.RestoreInFlight
 	spawn(func() {
 		// Serve returns nil on a graceful shutdown, so any error here is real
 		// (port already in use, bad -listen, ...). Fatal: print straight to stderr
@@ -1921,7 +1965,7 @@ func (p *program) Stop(s service.Service) error {
 	}
 	select {
 	case <-p.done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(stopWait()):
 	}
 	return nil
 }
