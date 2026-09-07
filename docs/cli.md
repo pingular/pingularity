@@ -19,7 +19,9 @@ The service commands (`install`, `start`, `stop`, `restart`, `uninstall`) need
 `sudo` (an elevated prompt on Windows). On macOS so does `status`: launchd shows
 a system daemon only to root, so run unelevated it reports `unknown` and points
 at `pingularity healthz`, which asks the daemon itself. On Linux and Windows
-`status` answers any user.
+`status` answers any user. Flags passed to `install` reach the daemon exactly as
+typed: on systemd the unit escapes a `%`, `$` or backslash in a value, which
+systemd would otherwise expand or choke on.
 
 `reset-auth` opens the database as it is: a path that is missing, empty or not
 a database is refused, and a database that will not open is left where it
