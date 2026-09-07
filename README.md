@@ -570,10 +570,25 @@ consequences worth knowing before you need them:
   a hard power-off mid-write - would otherwise crash-loop the service forever, so
   instead the daemon renames it and its `-wal`/`-shm` sidecars to
   `pingularity.db.<UTC timestamp>.corrupt`, starts again on an empty store, and logs
-  which file it moved. Nothing is deleted, so the old data is still there to inspect
-  or hand to a recovery tool - but the dashboard comes back blank, and the
-  quarantined copy keeps taking up its space until you remove it. This is the
-  failure a periodic **Export** exists for.
+  which file it moved - wherever in the file the damage sits, not only in the
+  page the first statement reads, and whether or not enough of it survives to
+  still look like a database. Monitoring carries on: the daemon knows this is no
+  first run (it just moved your database aside), so it does not ask Quick Setup
+  again or hold measuring for the 48h consent grace. The exception is an install
+  torn while it was still *on* its first run - one that had never answered Quick
+  Setup - and only when the old file can still say so: that comes back held, and
+  offers the dialog again, because it never consented to anything. Nothing is
+  deleted, so the old data is still there to inspect or hand to a recovery tool -
+  but the dashboard comes back blank, every saved setting (login, network access,
+  thresholds, notifications) is back at its default, so the box is local-only
+  with no password until you set it up again, and the quarantined copy keeps
+  taking up its space until you remove it. This is the failure a periodic
+  **Export** exists for. What the daemon will *not* do is touch a `-db` path that
+  is not a file at all: a directory (the easy slip - `-db /var/lib/pingularity`
+  for the file inside it) or a symlink is refused with an error naming what it
+  found, rather than re-permissioned or renamed - `-db` is never followed through
+  a link, so point it at the file itself. `reset-auth` never sets a file aside
+  either - it opens the database as it is, or refuses.
 - **Restoring a backup where login was enabled?** The export carries the
   "login on" preference but never the password, so on a machine that doesn't
   already have one the restore leaves login **off**, **forces access to

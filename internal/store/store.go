@@ -494,78 +494,118 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 	} else {
 		db.SetMaxOpenConns(4)
 	}
-	// Applying the base schema, the additive column migrations, and the index
-	// cleanup is one operation we may need to run twice: once on the existing
-	// file, then again on a freshly rebuilt one if the first attempt reveals the
-	// file is corrupt (see the recovery below).
-	if err := applySchema(db); err != nil {
+	// Applying the base schema, the additive column migrations, the index
+	// cleanup and the at-Open data repairs is one operation we may need to run
+	// twice: once on the existing file, then again on a freshly rebuilt one if
+	// the first attempt reveals the file is corrupt (see the recovery below).
+	initialize := func(db *sql.DB) error {
+		if err := applySchema(db); err != nil {
+			return err
+		}
+		// Repair what an OLDER build's unvalidated InsertPause left behind. The
+		// PauseSpanSane guards hold every NEW write and import to one rule, but a row
+		// already on disk answers to nobody: applySchema migrates columns, not data,
+		// and Prune's straddle rule deliberately keeps any pause whose END is still
+		// inside retention - so an epoch-boot span persisted before the guard existed
+		// keeps zeroing coverage for up to a retention year after the upgrade.
+		if err := repairInsanePausesAt(db, nowU); err != nil {
+			return err
+		}
+		// And the events-table twin: outage lengths a pre-guard import let in, plus a
+		// count of the unreadable types sitting beside them (reported, never deleted -
+		// see the function).
+		if err := reportUnreadableEventTypes(db); err != nil {
+			return err
+		}
+		if err := repairInsaneEventDurations(db); err != nil {
+			return err
+		}
+		// And the typing door's own residue: values no read can convert, in the
+		// whole-number columns the import allowlist guards but nothing migrated. Unlike
+		// the two repairs above (cheap point deletes on small tables), this one full-scans
+		// samples/dns/speed with typeof() on every Open before the listener binds, so it
+		// is gated on a persisted, versioned generation marker: run it once per DB, stamp
+		// the generation on success, and skip it forever after. The clock-dependent future-
+		// pause repair below is deliberately NOT gated - its verdict changes with the clock.
+		if gen, err := repairGeneration(db); err != nil {
+			return err
+		} else if gen < intColumnRepairGen {
+			if err := repairUnreadableIntColumns(db); err != nil {
+				return err
+			}
+			if err := stampRepairGeneration(db, intColumnRepairGen); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := initialize(db); err != nil {
 		// A malformed or truncated main DB (typically a hard power-off mid-
-		// checkpoint) makes the first statement fail with "database disk image is
+		// checkpoint) makes a statement fail with "database disk image is
 		// malformed" or "file is not a database". Under systemd's Restart=always
 		// this crash-loops forever on the same bad file and monitoring never
 		// recovers. For a file-backed store, move the corrupt DB (and its WAL/SHM
 		// sidecars) ASIDE - never delete user data - and rebuild an empty store so
-		// the daemon comes back up monitoring. A :memory: store or a non-corruption
-		// error still fails fast.
+		// the daemon comes back up monitoring. The net covers every step of
+		// initialize, not only the schema: that step reads just sqlite_master, so
+		// a torn page in a table the repairs scan sailed past it and surfaced as
+		// "malformed" from the repair instead - the same file, the same crash
+		// loop, but with nothing set aside. A :memory: store or a
+		// non-corruption error still fails fast.
 		if path == ":memory:" || !dbCorrupt(err) {
 			db.Close()
 			return nil, err
 		}
+		// Ask the doomed file, while it is still open, whether the install it
+		// belonged to had got past its first run. See firstRunInDoomedDB.
+		firstRun := firstRunInDoomedDB(db)
 		db.Close()
 		stats.Inc("db.corrupt")
 		moved, qerr := quarantineCorruptDB(path)
 		if qerr != nil {
 			return nil, qerr
 		}
-		log.Printf("pingularity: database %s is corrupt (%v); moved aside to %s and rebuilt an empty store", path, err, moved)
+		lost := "monitoring continues on it, but the history and every saved setting (login, network access, thresholds, notifications) are gone with the old file"
+		if firstRun {
+			lost = "the old file was still inside its first-run offer, so the rebuilt store starts over as one: nothing is being measured until Quick Setup is answered or its 48h grace runs out"
+		}
+		log.Printf("pingularity: database %s is corrupt (%v); moved aside to %s and rebuilt an empty store - %s", path, err, moved, lost)
 		if db, err = sql.Open("sqlite", buildDSN(path)); err != nil {
 			return nil, fmt.Errorf("open db (post-recovery): %w", err)
 		}
 		db.SetMaxOpenConns(4) // file-backed: recovery only runs for path != ":memory:"
-		if err := applySchema(db); err != nil {
+		if err := initialize(db); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("rebuild after corruption: %w", err)
 		}
-	}
-	// Repair what an OLDER build's unvalidated InsertPause left behind. The
-	// PauseSpanSane guards hold every NEW write and import to one rule, but a row
-	// already on disk answers to nobody: applySchema migrates columns, not data,
-	// and Prune's straddle rule deliberately keeps any pause whose END is still
-	// inside retention - so an epoch-boot span persisted before the guard existed
-	// keeps zeroing coverage for up to a retention year after the upgrade.
-	if err := repairInsanePausesAt(db, nowU); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// And the events-table twin: outage lengths a pre-guard import let in, plus a
-	// count of the unreadable types sitting beside them (reported, never deleted -
-	// see the function).
-	if err := reportUnreadableEventTypes(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := repairInsaneEventDurations(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// And the typing door's own residue: values no read can convert, in the
-	// whole-number columns the import allowlist guards but nothing migrated. Unlike
-	// the two repairs above (cheap point deletes on small tables), this one full-scans
-	// samples/dns/speed with typeof() on every Open before the listener binds, so it
-	// is gated on a persisted, versioned generation marker: run it once per DB, stamp
-	// the generation on success, and skip it forever after. The clock-dependent future-
-	// pause repair below is deliberately NOT gated - its verdict changes with the clock.
-	if gen, err := repairGeneration(db); err != nil {
-		db.Close()
-		return nil, err
-	} else if gen < intColumnRepairGen {
-		if err := repairUnreadableIntColumns(db); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if err := stampRepairGeneration(db, intColumnRepairGen); err != nil {
-			db.Close()
-			return nil, err
+		// The rebuilt store belongs to an install that already existed - the
+		// database just moved aside was its - and it has to say so. An empty
+		// store reads as a brand-new install to the first-run decision, which
+		// then seeded a fresh offer clock and held monitoring for the whole
+		// consent grace: two days of measuring nothing on a box that consented
+		// long ago, the boot notice claiming a first run, and the health
+		// endpoint green throughout. The install anchor is the evidence that
+		// decision reads (settings.EstablishedInStore): as far as this store can
+		// vouch for it, monitoring began at the rebuild.
+		//
+		// Unless the old file said otherwise while it could still be read. An
+		// install still INSIDE its first-run offer has consented to nothing
+		// yet, and anchoring one would start it probing with the defaults and
+		// retire the Quick Setup dialog it was never shown. So the anchor is
+		// withheld only on that positive evidence, and a file too damaged to
+		// answer keeps monitoring: a database ruined past reading is far more
+		// often one that had been written to for months than one three hours
+		// old, holding wrongly costs two days of the measurement this daemon
+		// exists to do, and releasing wrongly costs what the offer's own 48h
+		// expiry would have done anyway - minus the dialog, which is the part
+		// worth avoiding when it can be.
+		if !firstRun {
+			if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+				ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+				firstSeenKey, strconv.FormatInt(nowU, 10)); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("anchor rebuilt store: %w", err)
+			}
 		}
 	}
 	// Tighten on-disk permissions to owner-only: the driver creates files 0644
@@ -1180,6 +1220,30 @@ func dbCorrupt(err error) bool {
 		strings.Contains(msg, "not a database") ||
 		strings.Contains(msg, "corrupt") ||
 		strings.Contains(msg, "disk image")
+}
+
+// firstRunInDoomedDB asks a database that is about to be set aside whether the
+// install it belonged to was still inside its first-run offer - the window in
+// which nothing has been measured and nobody has answered Quick Setup. Only a
+// positive answer counts: the offer clock is on disk, and neither the answered
+// marker nor the install anchor is. Everything else - an install that answered,
+// one old enough to carry an anchor, a settings table too torn to read, a file
+// SQLite cannot make sense of at all - reads as false, because the rebuild's
+// question is "may I keep monitoring", and only proof that consent was never
+// given may stop it.
+//
+// One read of the smallest table in the file, on the handle that just failed:
+// the damage sits somewhere, but rarely everywhere, and asking the file beats
+// assuming for it.
+func firstRunInDoomedDB(db *sql.DB) bool {
+	var offered, settled int
+	if err := db.QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM settings WHERE key = 'quick_setup_offer_since'),
+		EXISTS(SELECT 1 FROM settings WHERE key IN ('quick_setup_done', ?))`,
+		firstSeenKey).Scan(&offered, &settled); err != nil {
+		return false
+	}
+	return offered != 0 && settled == 0
 }
 
 // quarantineCorruptDB moves a corrupt database and its WAL/SHM sidecars aside to
