@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -321,4 +322,38 @@ func flagDefaultsEntry(text, flag string) (string, bool) {
 		return strings.Join(entry, "\n"), true
 	}
 	return "", false
+}
+
+// The help's last example pairs the one root-only command, `sudo pingularity
+// install`, with a concrete directory - and rendered that directory from the
+// euid of whoever was reading the help. Help is read unelevated, so the line
+// named the reader's per-user data dir for a service that runs as root and
+// resolves the machine-wide path (internal/config's rule, pinned there for
+// darwin and linux). An operator who tried the daemon in the foreground first
+// and then installed was told the two share a directory: the empty dashboard
+// that followed read as lost data, and a backup aimed where the help pointed
+// missed the service's database. uninstall already refuses to guess a path for
+// this reason; the install example CAN know, because no -db is passed in it.
+func TestHelpInstallExampleNamesTheServiceDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("run unelevated: the defect is what an ordinary reader sees, and as root the two paths coincide")
+	}
+	var serviceDir string
+	switch runtime.GOOS {
+	case "darwin":
+		serviceDir = filepath.Join("/Library/Application Support", "pingularity")
+	case "windows":
+		t.Skip("windows resolves one machine-wide path regardless of euid")
+	default:
+		serviceDir = "/var/lib/pingularity"
+	}
+	usageText := captureUsage(t)
+	m := regexp.MustCompile(`(?m)^\s*sudo pingularity install\s+#.*DB -> (.+?), UI on :9000\s*$`).FindStringSubmatch(usageText)
+	if m == nil {
+		t.Fatalf("the curated help has no `sudo pingularity install ... DB -> <dir>` example; the layout this test reads changed:\n%s", usageText)
+	}
+	if m[1] != serviceDir {
+		t.Errorf("`pingularity help` says `sudo pingularity install` puts the database in %q; the service it registers runs as root and uses %q (the reader's own default, which the -db row already names, is %q)",
+			m[1], serviceDir, filepath.Dir(config.DefaultDBPath()))
+	}
 }

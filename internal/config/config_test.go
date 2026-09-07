@@ -1,7 +1,9 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -487,5 +489,20 @@ func TestAccessFlag(t *testing.T) {
 				t.Errorf("Access=%q, want %q", got.Access, c.want)
 			}
 		})
+	}
+}
+
+// ServiceDBPath is DefaultDBPath's answer for root: the path the installed
+// service resolves, whoever asks. `pingularity help` prints it in its install
+// example, and help is read unelevated, so the per-user answer would name a
+// directory the service never touches.
+func TestServiceDBPathIsTheRootDefault(t *testing.T) {
+	got := ServiceDBPath()
+	want := defaultDBPath(runtime.GOOS, 0, os.Getenv("ProgramData"), "")
+	if got != want {
+		t.Fatalf("ServiceDBPath() = %q, want the root default %q", got, want)
+	}
+	if runtime.GOOS != "windows" && strings.HasPrefix(got, os.TempDir()) {
+		t.Fatalf("ServiceDBPath() = %q fell through to the temp dir; root has a machine-wide path on every unix", got)
 	}
 }

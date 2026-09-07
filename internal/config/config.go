@@ -128,6 +128,15 @@ func DefaultDBPath() string {
 	return defaultDBPath(runtime.GOOS, os.Geteuid(), os.Getenv("ProgramData"), userConfigDir)
 }
 
+// ServiceDBPath returns the default the installed service resolves: the
+// machine-wide path DefaultDBPath picks for root, whoever asks. `pingularity
+// help` names it in its install example, and help is read unelevated, where
+// DefaultDBPath answers for the reader rather than for the service the command
+// it illustrates is about to register.
+func ServiceDBPath() string {
+	return defaultDBPath(runtime.GOOS, 0, os.Getenv("ProgramData"), "")
+}
+
 // defaultDBPath is the OS decision split out so every branch is unit-testable on
 // any host. userConfigDir is os.UserConfigDir()'s result, or "" if it errored.
 func defaultDBPath(goos string, euid int, programData, userConfigDir string) string {
