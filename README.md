@@ -501,7 +501,7 @@ tarball, a `go build`, or a fresh binary you dropped in yourself.
 ```bash
 sudo cp pingularity /usr/local/bin/
 sudo pingularity install    # no flags - DB goes to /var/lib/pingularity, UI on :9000 (loopback-only until you turn Network access on); starts the service
-pingularity status          # running | stopped | not installed
+pingularity status          # running | stopped | not installed (macOS: with sudo, see below)
 ```
 
 The database path and its directory are chosen and created automatically. On
@@ -522,12 +522,16 @@ equivalent, and re-running `install` is not one: over a service that already
 exists it fails with an "already exists" error and leaves the flags it was
 installed with exactly as they were - on macOS, on Windows, and on a systemd
 unit this CLI installed alike. Wherever `/etc/default` isn't an option, then,
-changing a flag means `uninstall` first, then `install` with the new set. Manage
-with `pingularity start | stop | restart | status | uninstall`. On Linux and macOS a
-reload signal (`sudo systemctl reload pingularity`, or `kill -HUP <pid>`)
-re-reads settings from the database without restarting - how you pick up an
-out-of-band change like `reset-auth`, and the way back from the `503` a daemon
-serves when it couldn't load its settings at all. Windows has no reload signal;
+changing a flag means `uninstall` first, then `install` with the new set.
+Manage with `pingularity start | stop | restart | status | uninstall`. On macOS
+`status` needs `sudo` like the rest: launchd shows a system daemon only to root,
+so run unelevated it reports the state as `unknown` and points at
+`pingularity healthz`, which asks the daemon itself. On Linux and Windows
+`status` answers any user. On Linux and macOS a reload signal (`sudo systemctl
+reload pingularity`, or `kill -HUP <pid>`) re-reads settings from the database
+without restarting - how you pick up an out-of-band change like `reset-auth`,
+and the way back from the `503` a daemon serves when it couldn't load its
+settings at all. Windows has no reload signal;
 restart the service there.
 
 Alongside the database sit `logs.txt` (the log viewer's ring, so it survives a

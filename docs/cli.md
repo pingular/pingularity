@@ -15,6 +15,12 @@ pingularity healthz          probe a running instance's /healthz; exit 0 = healt
 pingularity version          print version
 ```
 
+The service commands (`install`, `start`, `stop`, `restart`, `uninstall`) need
+`sudo` (an elevated prompt on Windows). On macOS so does `status`: launchd shows
+a system daemon only to root, so run unelevated it reports `unknown` and points
+at `pingularity healthz`, which asks the daemon itself. On Linux and Windows
+`status` answers any user.
+
 `reset-auth` opens the database as it is: a path that is missing, empty or not
 a database is refused, and a database that will not open is left where it
 stands - it never creates a database and never sets one aside (that recovery is

@@ -2433,15 +2433,36 @@ func runCmd(args []string) error {
 	return s.Run()
 }
 
+// launchdStatusBlindFor reports whether a "stopped" status reading taken on
+// this OS by this user cannot see the daemon it asked about. kardianos asks
+// `launchctl list <name>`, and launchd answers for the CALLER's domain: root
+// sees the system domain, where `install` put the daemon; an ordinary user sees
+// only their own login session, where it never was. On that miss the library
+// falls back to "the plist exists, so: stopped" - a confident answer for a
+// service that may well be running, and the one this CLI printed for a daemon
+// answering /healthz. Both halves matter: elevated, launchd does answer, and a
+// stopped reading is then the truth to act on. Only macOS is blind at all -
+// systemd's is-active and the Windows SCM tell any caller the same thing.
+func launchdStatusBlindFor(goos string, euid int) bool {
+	return goos == "darwin" && euid != 0
+}
+
+// launchdStatusBlind asks that of the running process. A var, so a test can
+// stand on either side of it without root or a Mac.
+var launchdStatusBlind = func() bool { return launchdStatusBlindFor(runtime.GOOS, os.Geteuid()) }
+
 // effectiveControlAction downgrades `restart` to `start` when the service is
 // known to be stopped. Only a POSITIVE stopped status does this: on any status
 // error (not installed, no permission, platform quirk) the original action
 // proceeds so the user sees the real error instead of a misleading start one.
+// A stopped reading from a caller that cannot see the daemon
+// (launchdStatusBlind) is not positive either - it is the plist existing - so
+// restart stays restart there and launchd gets to say "permission denied".
 func effectiveControlAction(action string, s service.Service) string {
 	if action != "restart" {
 		return action
 	}
-	if st, err := s.Status(); err == nil && st == service.StatusStopped {
+	if st, err := s.Status(); err == nil && st == service.StatusStopped && !launchdStatusBlind() {
 		return "start"
 	}
 	return action
@@ -2508,6 +2529,13 @@ func controlCmd(action string, args []string) error {
 		}
 		if err != nil {
 			return err
+		}
+		// Unelevated on macOS, "stopped" only means the plist exists (see
+		// launchdStatusBlind). Say what is known and where the truth is: root's
+		// view of launchd, or the daemon itself.
+		if st == service.StatusStopped && launchdStatusBlind() {
+			fmt.Printf("pingularity: unknown - launchd shows the system daemon only to root; run `%s`, or `pingularity healthz` to ask the daemon itself\n", elevate("pingularity status"))
+			return nil
 		}
 		fmt.Println("pingularity:", statusString(st))
 		return nil
@@ -2947,7 +2975,9 @@ These flags only seed the initial values - almost everything (intervals,
 thresholds, retention, alert webhooks, …) is adjustable live in the settings
 drawer and persists across restarts.
 
-Service commands (install/start/stop/uninstall) must be run %s.
+Service commands (install/start/stop/restart/uninstall) must be run %s.
+On macOS that goes for status too: launchd shows the system daemon only to
+root, so run unelevated it reports the state as unknown rather than guessing.
 
 Examples:
   pingularity                  # run in foreground; UI on http://localhost:9000

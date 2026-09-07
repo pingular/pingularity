@@ -23,6 +23,11 @@ func (f fakeStatusService) Status() (service.Status, error) { return f.st, f.err
 // status may downgrade - an errored status must leave restart alone so the
 // real error (not installed, no permission) surfaces from the restart itself.
 func TestEffectiveControlAction(t *testing.T) {
+	// A sighted caller: the stopped reading is trusted. (The blind macOS case
+	// has its own test.)
+	orig := launchdStatusBlind
+	launchdStatusBlind = func() bool { return false }
+	t.Cleanup(func() { launchdStatusBlind = orig })
 	cases := []struct {
 		name   string
 		action string
