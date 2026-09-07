@@ -4038,8 +4038,10 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 				warnings = append(warnings, "This backup uses the login name "+strconv.Quote(imported)+
 					", but backups never include the password. Your existing login name and password were kept, "+
 					"so you are not locked out. Change them in the Access tab if you meant to switch.")
+				// Both are login names, so they ride under keys the PII mask hides as
+				// it hides "user".
 				s.log.Warn("imported config would have renamed the login account; kept the existing one",
-					"imported", imported, "kept", preAuthUser)
+					"imported_user", imported, "kept_user", preAuthUser)
 			}
 		}
 		// A backup that turns login OFF on a box that HAD a working login would leave

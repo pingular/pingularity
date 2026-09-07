@@ -612,7 +612,10 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 		case !ok:
 			fellBackWhy = "unresolved"
 			if ctx.Err() == nil { // don't blame the target when the caller aborted
-				m.log.Warn("exit target did not resolve to IPv4; tracing the default path", "target", want)
+				// Logged as exit_target, not "target": that key is the probe anchor's
+				// built-in name elsewhere and the PII mask leaves it alone, while this
+				// is a hostname the operator typed.
+				m.log.Warn("exit target did not resolve to IPv4; tracing the default path", "exit_target", want)
 			}
 		case isInternalTraceTarget(v):
 			// A target resolving to loopback or link-local would traceroute the host
@@ -622,7 +625,7 @@ func (m *Manager) cachedExit(ctx context.Context, ourASN string) *ExitInfo {
 			// gateway is legitimate and the trust model already equates dashboard
 			// access with local-network reach.
 			fellBackWhy = "internal"
-			m.log.Warn("exit target resolves to a loopback/link-local address; tracing the default path", "target", want)
+			m.log.Warn("exit target resolves to a loopback/link-local address; tracing the default path", "exit_target", want)
 		default:
 			target = v
 		}

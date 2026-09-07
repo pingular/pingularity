@@ -47,6 +47,18 @@ var piiKeys = map[string]bool{
 	// disk-persisted ring where an unmasked value would otherwise live forever.
 	"winner":       true, // best-of winning server label
 	"winner_label": true, // city-race winning origin label (a place name)
+	// More of the same material under keys of its own. The first three were
+	// already being logged and simply were not on this list; the last three had
+	// to be renamed at the call site first, because the key each used could not
+	// be masked: "target" is the probe anchor's built-in name everywhere else
+	// and has to stay readable, and "imported"/"kept" are words a count could
+	// just as well have used.
+	"label":         true, // city-race origin label, the place name winner_label carries
+	"url":           true, // speedtest server URL: its hostname names the sponsor and metro the label hid
+	"allowed_hosts": true, // -allow-host: the operator's own public domain, the value "host" hides
+	"exit_target":   true, // the exit-trace target the operator typed, a hostname or address
+	"imported_user": true, // login name a backup carried in
+	"kept_user":     true, // the login name kept instead; both are what "user" hides
 }
 
 // Capture formats every record twice - once with full detail, once with PII
@@ -167,7 +179,16 @@ func redact(a slog.Attr) slog.Attr {
 // names the server the "server" key hid; a Go *net.DNSError names both the
 // resolver and the queried host, and the ASN lookup queries the exit hop's own
 // reversed octets, so one error string can defeat "router_ip" and "dns" at once.
-var errKeys = map[string]bool{"err": true, "error": true}
+// The rule is the shape of the value, not the spelling of the key: the upload
+// recorder's summary ends in the last transport error and rides under "detail"
+// beside a censored "server"; the auto-select report keeps each candidate's
+// error under head_err and rival_err; a failed import reload logs its two
+// errors by name. TestEveryLogKeyIsClassified walks every logging call in the
+// tree so the next such key cannot arrive unclassified.
+var errKeys = map[string]bool{
+	"err": true, "error": true,
+	"detail": true, "head_err": true, "rival_err": true, "reload_err": true, "restore_err": true,
+}
 
 var (
 	reIPv4    = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
