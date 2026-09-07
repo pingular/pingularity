@@ -4642,8 +4642,20 @@ var (
 // measurePacketLoss returns the loss percentage (0..100) against the chosen
 // server, or nil when the measurement is unsupported or yields no data.
 func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
+	// Aim where the rest of the run aims (serverDestination), not at the
+	// catalogue Host alone. A server resolved by ID - the pin of a Best-of
+	// round, a pin missing from the fetched list, a starred server the race
+	// never reached - comes back from api/ios-config.php with Host="" and only
+	// its URL to dial, and nothing downstream fills Host in: probeEndpoint
+	// rewrites the URL alone. Dialled verbatim, that empty host failed on the
+	// spot, so a pinned or starred run never carried a loss figure however
+	// well its server supported the probe; and keyed verbatim, every such
+	// server shared one cooldown entry, so two failures against one of them
+	// silenced the probe for all of them. The cooldown below is keyed on the
+	// same destination, so an entry names the server it was earned against.
+	dest := serverDestination(srv)
 	plMu.Lock()
-	st := plMap[srv.Host]
+	st := plMap[dest]
 	if st == nil {
 		// Bound the map: it'd otherwise grow one entry per distinct server forever.
 		// When large, drop entries not in an active cooldown (no state worth keeping).
@@ -4656,7 +4668,7 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 			}
 		}
 		st = &plState{}
-		plMap[srv.Host] = st
+		plMap[dest] = st
 	}
 	skip := st.skipUntil != 0 && time.Now().Unix() < st.skipUntil
 	plMu.Unlock()
@@ -4667,8 +4679,8 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 
 	pctx, cancel := context.WithTimeout(ctx, packetLossSampleDuration+time.Second)
 	defer cancel()
-	// Both dialers carry the SSRF dial guard: srv.Host is third-party catalogue
-	// data like every other destination this file reaches, and left nil the
+	// Both dialers carry the SSRF dial guard: the destination is third-party
+	// catalogue data like every other one this file reaches, and left nil the
 	// analyzer builds bare dialers of its own, so its TCP sampler connect and
 	// UDP sends would bypass the guard entirely. probeDialControl rather than
 	// probeDialGuard so allowLoopbackProbes relaxes this path too. The timeout
@@ -4689,7 +4701,7 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 	// a couple of fds living until the next GC, bounded and finalizer-reclaimed, not
 	// an unbounded leak, so we accept it rather than fork.
 	// TODO: drop this note once a released speedtest-go closes those conns on cancel.
-	_ = analyzer.RunWithContext(pctx, srv.Host, func(pl *transport.PLoss) {
+	_ = analyzer.RunWithContext(pctx, dest, func(pl *transport.PLoss) {
 		if v := pl.LossPercent(); v >= 0 { // -1 means no packets acknowledged yet
 			f := v
 			loss = &f
