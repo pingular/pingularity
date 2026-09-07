@@ -309,7 +309,21 @@ func Open(path string) (*Store, error) {
 	// stale clock, the corrected one installed as the baseline, and no step
 	// ever visible afterwards to trigger the re-judgement.
 	now := time.Now()
-	return openAtClock(path, now.Unix(), now)
+	return openAtClock(path, now.Unix(), now, false)
+}
+
+// OpenExisting opens the database at path as it is. It never creates one and
+// never sets one aside: nothing at the path, an empty file, or a file that is
+// not a database is refused, and a database that will not open is left exactly
+// where it stood. The set-aside recovery Open performs is the daemon's - the
+// alternative there is a service crash-looping on the same file - and a
+// command an operator runs by hand must never take it on their behalf:
+// `pingularity reset-auth` pointed at the key file beside the database used to
+// rename the key to .corrupt, build an empty store under its name, clear the
+// password on that, and report success.
+func OpenExisting(path string) (*Store, error) {
+	now := time.Now()
+	return openAtClock(path, now.Unix(), now, true)
 }
 
 // openAt is Open against a caller-supplied judging clock (the same seam
@@ -319,7 +333,7 @@ func Open(path string) (*Store, error) {
 // which is exactly the shape of the scenario being modelled: rows judged by
 // one clock, the machine actually running on another.
 func openAt(path string, nowU int64) (*Store, error) {
-	return openAtClock(path, nowU, time.Now())
+	return openAtClock(path, nowU, time.Now(), false)
 }
 
 // containerDataDir is the image's own data directory - the Dockerfile VOLUME,
@@ -385,8 +399,10 @@ func looseDataDirWarning(dir string) string {
 }
 
 // openAtClock is the full seam: the judging clock AND the wall/monotonic
-// reading the step detector baselines on, as one pair.
-func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
+// reading the step detector baselines on, as one pair. existing is
+// OpenExisting's contract: the file must already be a database, and a
+// database that will not open is never set aside.
+func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Store, error) {
 	// PINGULARITY_TEST_DB_DIR redirects a ":memory:" open to a unique file
 	// under the named directory - CI's file-backed matrix leg, and nothing
 	// else. The in-memory pool is pinned to ONE connection (see Open below),
@@ -406,6 +422,21 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 			}
 			path = f.Name()
 			_ = f.Close()
+		}
+	}
+	// What KIND of thing sits at the path is settled BEFORE anything below
+	// touches it. The securing chmod further down follows symlinks and the
+	// set-aside recovery renames whatever it finds, and both used to act on
+	// things that were never a file of ours: a directory typed for the file
+	// inside it (-db /var/lib/pingularity) was left 0600 and untraversable, and
+	// a symlink had its target chmod'ed through the link and was itself renamed
+	// away. Only a regular file goes any further. What is IN that file is not
+	// asked here on purpose - a database whose first page a power cut zeroed no
+	// longer looks like one, and refusing it would take away the very recovery
+	// below.
+	if path != ":memory:" {
+		if err := checkDBPath(path, existing); err != nil {
+			return nil, err
 		}
 	}
 	// Create the parent dir for file-backed databases (skips ":memory:" and bare
@@ -550,10 +581,17 @@ func openAtClock(path string, nowU int64, opened time.Time) (*Store, error) {
 		// initialize, not only the schema: that step reads just sqlite_master, so
 		// a torn page in a table the repairs scan sailed past it and surfaced as
 		// "malformed" from the repair instead - the same file, the same crash
-		// loop, but with nothing set aside. A :memory: store or a
-		// non-corruption error still fails fast.
-		if path == ":memory:" || !dbCorrupt(err) {
+		// loop, but with nothing set aside. A :memory: store, an OpenExisting
+		// caller or a non-corruption error still fails fast.
+		if path == ":memory:" || existing || !dbCorrupt(err) {
 			db.Close()
+			if existing && dbCorrupt(err) {
+				// Name the FILE. This door is what the hand-typed recovery
+				// commands use, and the driver's own "file is not a database
+				// (26)" says nothing about which path produced it - the key
+				// file beside the database is one tab-completion away from it.
+				return nil, fmt.Errorf("%s is not a pingularity database, or is damaged past opening: %w", path, err)
+			}
 			return nil, err
 		}
 		// Ask the doomed file, while it is still open, whether the install it
@@ -1244,6 +1282,54 @@ func firstRunInDoomedDB(db *sql.DB) bool {
 		return false
 	}
 	return offered != 0 && settled == 0
+}
+
+// checkDBPath is what Open establishes about the -db path and its WAL/SHM
+// sidecars before anything touches them: each is absent or a regular file, not
+// a directory and not a symlink (the securing chmod would follow the link, and
+// the set-aside would rename the link itself). Either is a mistake at the path
+// - a directory typed for the file inside it, a symlink someone pointed at
+// another volume - and is refused with an error that names it, never
+// re-permissioned, renamed or replaced.
+//
+// It deliberately does NOT judge the file's CONTENTS. A regular file that is
+// not a database reaches SQLite, fails to open, and is set aside by the
+// recovery below - which is what that recovery is for, because the shapes are
+// indistinguishable: a torn database whose header page was lost to a bad
+// sector reads exactly like a file that was never a database at all, and
+// refusing those bytes would leave the daemon crash-looping on precisely the
+// fault the set-aside exists to end. The price is an unrelated file at a
+// mistyped -db being renamed to .corrupt; nothing is deleted, and OpenExisting
+// (what the hand-typed commands use) refuses rather than rename.
+//
+// mustExist is OpenExisting's contract: nothing at the path, or an empty file,
+// is refused as well.
+func checkDBPath(path string, mustExist bool) error {
+	for _, sfx := range []string{"", "-wal", "-shm"} {
+		p := path + sfx
+		fi, err := os.Lstat(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if sfx == "" && mustExist {
+					return fmt.Errorf("no database at %s", path)
+				}
+				continue
+			}
+			return fmt.Errorf("check db path %s: %w", p, err)
+		}
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("%s is a symlink; the -db path is never followed through one - pass the file it points to", p)
+		case fi.IsDir():
+			return fmt.Errorf("%s is a directory, not a database file; pass -db the file inside it", p)
+		case !fi.Mode().IsRegular():
+			return fmt.Errorf("%s is not a regular file", p)
+		}
+		if sfx == "" && fi.Size() == 0 && mustExist {
+			return fmt.Errorf("%s is empty, not a database", path)
+		}
+	}
+	return nil
 }
 
 // quarantineCorruptDB moves a corrupt database and its WAL/SHM sidecars aside to

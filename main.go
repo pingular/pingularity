@@ -1941,14 +1941,22 @@ func resetAuthCmd(args []string) error {
 	if _, err := os.Stat(cfg.DBPath); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("no database found at %s; re-run %s (the service database is owned by the service account) or pass -db <path>", cfg.DBPath, elevationHint())
 	}
-	st, err := store.Open(cfg.DBPath)
+	// And never set one aside. The daemon's Open moves a database it cannot
+	// open to .corrupt and rebuilds an empty one, which is right for a service
+	// that would otherwise crash-loop and wrong for a command typed by hand:
+	// pointed at the key file beside the database (same directory, one
+	// tab-completion apart) it renamed the key away, built an empty database
+	// under its name, cleared auth on that, and printed success. OpenExisting
+	// opens the file as it is or refuses, naming what it found.
+	st, err := store.OpenExisting(cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	// The stat above refuses to create a database, so this command never witnesses
-	// a birth. Without saying so, an empty-but-existing store would come out of
-	// here wearing a birth marker naming the release that cleared its password.
+	// The stat above and OpenExisting refuse to create a database, so this
+	// command never witnesses a birth. Without saying so, an empty-but-existing
+	// store would come out of here wearing a birth marker naming the release
+	// that cleared its password.
 	set, _ := settings.New(context.Background(), st, settings.Values{}, settings.WithDatabaseCreated(false))
 	if err := set.ClearAuth(context.Background()); err != nil {
 		return err

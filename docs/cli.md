@@ -15,6 +15,11 @@ pingularity healthz          probe a running instance's /healthz; exit 0 = healt
 pingularity version          print version
 ```
 
+`reset-auth` opens the database as it is: a path that is missing, empty or not
+a database is refused, and a database that will not open is left where it
+stands - it never creates a database and never sets one aside (that recovery is
+the daemon's; see [the README](../README.md#run-in-the-background-systemd--launchd--windows-service)).
+
 Flags only **seed** the initial values - almost everything is adjustable live in
 the settings drawer afterward and persists across restarts. A value you **save**
 in the UI is persisted even when it equals what a flag currently supplies, and

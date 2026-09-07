@@ -406,7 +406,9 @@ else is affected).
 
 **Forgot the password?** `pingularity reset-auth` needs the database, and in
 a container that means the volume - run it from a one-off container sharing
-the volume (the image's entrypoint pins the `run` subcommand, so override it):
+the volume (the image's entrypoint pins the `run` subcommand, so override it).
+It opens the database as it is: a path that is missing, empty or not a
+database is refused, and it never creates a database or sets one aside.
 
 ```bash
 docker run --rm --entrypoint /pingularity \
