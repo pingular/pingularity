@@ -46,8 +46,9 @@ type Iperf struct {
 	// changes behavior or retry classification. An empty return appends nothing.
 	EnvHint func(errText string) string
 	// congestionSkipOnce coalesces the "-C ignored" warning so it logs once per
-	// Iperf, not once per transfer.
+	// Iperf, not once per transfer; mssSkipOnce does the same for "-M ignored".
 	congestionSkipOnce sync.Once
+	mssSkipOnce        sync.Once
 	ServerFn           func() string // "host" or "host:port" - the user's iperf3 server
 	LabelFn            func() string // friendly name for the active server; "" -> fall back to the host
 	// OnServer, if set, is called with the display name ("iperf3: <label>", falling back
@@ -125,6 +126,27 @@ func congestionForOS(requested, goos string) (effective string, dropped bool) {
 	// Narrowing this to Linux once stripped a working knob on FreeBSD.
 	if requested != "" && goos != "linux" && goos != "freebsd" {
 		return "", true
+	}
+	return requested, false
+}
+
+// mssForOS is congestionForOS for the -M value: it resolves the segment size
+// actually passed to iperf3 and reports whether a requested one was DROPPED
+// because the platform cannot set it. Linux takes TCP_MAXSEG as a ceiling and
+// sends the smaller of it and the path MTU, so any value works there. macOS
+// only lets a socket LOWER its segment size below the kernel's pre-connect
+// default (net.inet.tcp.mssdflt, 512 bytes): every value an operator would
+// actually type - 1200 for a VPN, 1452 for PPPoE - comes back EINVAL, and
+// iperf3 aborts the run before a byte moves, with an error that names neither
+// the setting nor the platform and that no retry or fallback engine catches.
+// Windows has no settable TCP_MAXSEG at all. So, as with -C, a value that rode
+// an imported backup from a Linux box is dropped and the run uses the system
+// default. The platform set is congestionForOS's: FreeBSD keeps the flag,
+// because narrowing -C to Linux once stripped a working knob there and -M has
+// not been measured on that kernel.
+func mssForOS(requested int, goos string) (effective int, dropped bool) {
+	if requested > 0 && goos != "linux" && goos != "freebsd" {
+		return 0, true
 	}
 	return requested, false
 }
@@ -252,7 +274,7 @@ const (
 	iperfMaxStreams  = settings.MaxIperfStreams
 	iperfDefaultOmit = 1
 	iperfMaxOmit     = 5
-	iperfMaxWindow   = 65536 // KB (64 MB) ceiling for -w; 0 = auto
+	iperfMaxWindow   = 65536 // KB (64 MB) ceiling for -w; 0 = auto - the kernel's is lower, see attributeWindow
 	iperfMaxMSS      = 9000  // bytes ceiling for -M (jumbo-frame headroom); 0 = auto
 )
 
@@ -437,6 +459,32 @@ func iperfServerName(label, host string) string {
 	return "iperf3: " + label
 }
 
+// attributeWindow explains iperf3's "socket buffer size not set correctly" when
+// a -w window is in play, returning errText otherwise untouched. iperf3 asks for
+// the window as SO_SNDBUF/SO_RCVBUF, reads the size back and aborts before the
+// transfer when the kernel granted less - and the kernel's ceiling is a sysctl,
+// not ours: kern.ipc.maxsockbuf on macOS and FreeBSD, net.core.rmem_max and
+// wmem_max on Linux (a few hundred KB stock, doubled on the way back, so twice
+// the sysctl is the usable window). The bare text names neither the setting nor
+// the knob to turn, the failure is rightly non-transient, and no fallback engine
+// steps in, so a window carried over from a tuned host killed every run here
+// until someone guessed. Say which setting, what it asked for, and which sysctl
+// decides. Text only, appended after the original message: retry
+// classification and speedFailStage read the prefix.
+func attributeWindow(errText string, windowKB int, goos string) string {
+	if windowKB <= 0 || !strings.Contains(strings.ToLower(errText), "socket buffer size not set correctly") {
+		return errText
+	}
+	limit := "the socket-buffer limit"
+	switch goos {
+	case "darwin", "freebsd":
+		limit = "kern.ipc.maxsockbuf"
+	case "linux":
+		limit = "net.core.rmem_max and net.core.wmem_max"
+	}
+	return fmt.Sprintf("%s (the iperf3 Window size setting, %d KB, is more than this host lets a socket buffer hold; lower it, or raise %s)", errText, windowKB, limit)
+}
+
 // withEnvHint appends the injected environment hint (EnvHint) to a transfer or
 // UDP-pass failure, keeping the original error in the %w chain - callers rely on
 // errors.Is (context cancellation) and on the raw text prefix (speedFailStage).
@@ -548,6 +596,17 @@ func (i *Iperf) warnCongestionSkipped(requested, goos string) {
 	})
 }
 
+// warnMSSSkipped says why a requested -M value is not taking effect. Takes goos
+// rather than reading it, so the message is testable on any host.
+func (i *Iperf) warnMSSSkipped(requested int, goos string) {
+	i.mssSkipOnce.Do(func() {
+		if i.Log != nil {
+			i.Log.Warn("iperf3 max segment size ignored: -M needs Linux or FreeBSD; running with the system default",
+				"requested", requested, "os", goos)
+		}
+	})
+}
+
 // Run measures download then upload against the configured iperf3 server, with the
 // bufferbloat sampler running during each transfer.
 func (i *Iperf) Run(ctx context.Context) (Result, error) {
@@ -578,6 +637,13 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	if eff, dropped := congestionForOS(tp.congestion, runtime.GOOS); dropped {
 		i.warnCongestionSkipped(tp.congestion, runtime.GOOS)
 		tp.congestion = eff
+	}
+	// The same backup carries a segment size, and macOS and Windows refuse
+	// that one too (mssForOS) - with the run aborting before the transfer, no
+	// retry, and no fallback engine. Drop it the same way, and say so once.
+	if eff, dropped := mssForOS(tp.mss, runtime.GOOS); dropped {
+		i.warnMSSSkipped(tp.mss, runtime.GOOS)
+		tp.mss = eff
 	}
 	dir := speedDirection(i.DirectionFn)
 	auth, cleanup, err := i.resolveAuth()
@@ -1370,7 +1436,7 @@ func runIperf(ctx context.Context, host, port string, tp iperfTunables, auth ipe
 		sum = j.End.SumReceived // download: this client is the receiver
 	}
 	if j.Error != "" {
-		return iperfRun{bytes: billableBytes(sum)}, errors.New(strings.TrimSpace(j.Error))
+		return iperfRun{bytes: billableBytes(sum)}, errors.New(attributeWindow(strings.TrimSpace(j.Error), tp.window, runtime.GOOS))
 	}
 	if runErr != nil {
 		// A nonzero exit can still follow a body carrying real totals (data moved,
@@ -1425,7 +1491,7 @@ func runIperfBidir(ctx context.Context, host, port string, tp iperfTunables, aut
 	// so the usage row bills them; only the measurement is discarded.
 	spent := iperfBidir{downBytes: billableBytes(dn), upBytes: billableBytes(up)}
 	if j.Error != "" {
-		return spent, errors.New(strings.TrimSpace(j.Error))
+		return spent, errors.New(attributeWindow(strings.TrimSpace(j.Error), tp.window, runtime.GOOS))
 	}
 	if runErr != nil {
 		return spent, runErr

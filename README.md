@@ -773,8 +773,14 @@ There are two engines, picked in the settings drawer:
   only in the `-iperf` image variant, not the default image.
   Its own knobs: parallel streams, duration, warm-up, TCP window, congestion
   control, MSS, DSCP, the loss/jitter UDP pass, and - per server - IP version,
-  bind source, and optional RSA auth. In a bridged container several of those
-  knobs point at things only the host has - see
+  bind source, and optional RSA auth. Congestion control and MSS are Linux (and
+  FreeBSD) knobs: macOS and Windows cannot set either, so the daemon runs with the
+  system default there and says so once in the log. The TCP window is the kernel's
+  to grant, not iperf3's - about 8 MB on stock macOS (`kern.ipc.maxsockbuf`), a few
+  hundred KB on stock Linux until `net.core.rmem_max`/`wmem_max` are raised - and a
+  window past that fails the run with a message naming the setting, the KB it asked
+  for and the sysctl to raise. In a bridged container several of those knobs point
+  at things only the host has - see
   [iperf3 in a container](#iperf3-in-a-container) below.
 
 **Direction** (both / download / upload, plus iperf3's simultaneous `--bidir`) and
