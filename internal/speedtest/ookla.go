@@ -5029,7 +5029,29 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 				select {
 				case slots <- struct{}{}:
 				case <-ctx.Done():
-					return // out of time: unprobed, which applyRankPing's zero value already means
+					// Out of time before the ping could start. Record it the
+					// way a failed ping is recorded: the report's nil comes on
+					// its own, but the server's Latency still holds the one
+					// echo the list fetch took, and left there the sort below
+					// read it as a measured ping - a server nobody pinged this
+					// run ranked ahead of every server measured slower, and
+					// was the one the run measured, while its own report row
+					// read unanswered. Its fallback was never judged either.
+					//
+					// A racer is the exception, and the one candidate a union
+					// round is mostly made of: the race pinged it seconds ago
+					// and REPLACED the fetch echo with the floor it measured,
+					// so its Latency is this phase's ping, taken. The lapse
+					// costs it only the fallback check. Zeroing it here would
+					// throw away the round's own measurement and hand the run
+					// to a server the race had clocked slower.
+					if floor, ok := raced[s.ID]; ok {
+						pings[i] = applyRankPing(s, nil, floor > 0, floor)
+					} else {
+						pings[i] = applyRankPing(s, ctx.Err(), false, 0)
+					}
+					health[i] = endpointUnknown
+					return
 				}
 				defer func() { <-slots }()
 				// The per-sample callback is the only honest success signal: the
