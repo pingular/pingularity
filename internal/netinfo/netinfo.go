@@ -891,12 +891,23 @@ func (m *Manager) fetchGen(ctx context.Context, gen uint64) Info {
 	// when its egress IP proves unchanged - that is the check a public-IP
 	// comparison cannot make, and this gate covers only an entry no live lookup
 	// vouched for.
+	//
+	// The persisted speed-history entry is keyed on its OWN address for the same
+	// reason, because a process start is the one moment the comparison above has
+	// nothing to compare: prev is the zero snapshot, so every restart read as a
+	// return to the same network and the last run's resolver was published as
+	// current on whatever network the daemon came up on - then kept, since the
+	// next fetch reads it back from the snapshot this one publishes. That row
+	// records the public IPv4 it was taken on, which is the answer memory cannot
+	// give; it is the key the ISP fill from the same row already uses. Where
+	// neither side has an address to compare - a row from before this host had an
+	// IPv4, or a fetch that found none - the carry stands, being all the panel has.
 	ipChanged := ip4 != "" && prevIP != "" && ip4 != prevIP
 	if dns == nil && !ipChanged {
 		if prev.DNSUpstream != nil { // resolver egress lookup failed
 			cp := *prev.DNSUpstream
 			dns = &cp
-		} else if lk := getLast(); lk != nil && lk.DNSUpstream != nil {
+		} else if lk := getLast(); lk != nil && lk.DNSUpstream != nil && (lk.PublicIP == "" || ip4 == "" || lk.PublicIP == ip4) {
 			cp := *lk.DNSUpstream
 			dns = &cp
 		}
