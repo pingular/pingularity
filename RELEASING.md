@@ -206,12 +206,18 @@ locally without publishing) validates the config without needing any of them.
 | Requirement | What it is | Notes |
 | --- | --- | --- |
 | `GITHUB_TOKEN` | Auto-provided by Actions | Uploads the release assets and pushes the GHCR image. Needs `contents: write` and `packages: write` on the workflow. |
-| `TAP_GITHUB_TOKEN` (PAT) | One PAT with write access to **both** `pingular/homebrew-tap` and `pingular/winget-pkgs` | The single cross-repo secret the pipeline reads (`release.yml` passes it; `.goreleaser.yaml` uses it for the brew cask commit and the winget manifest branch). Store as a repo secret under exactly this name. |
+| `TAP_GITHUB_TOKEN` (PAT) | One **fine-grained** PAT with write access to **both** `pingular/homebrew-tap` and `pingular/winget-pkgs`, and nothing else | The single cross-repo secret the pipeline reads (`release.yml` passes it; `.goreleaser.yaml` uses it for the brew cask commit and the winget manifest branch). Store as a repo secret under exactly this name. |
 | GHCR package | The `ghcr.io/pingular/pingularity` package | Created on first push by `GITHUB_TOKEN`; set its visibility to **public** when you go public. |
 
-`TAP_GITHUB_TOKEN` needs `repo`/`contents` scope on those two repos and
-nothing more. Keep it as a repo (or org) Actions secret, never in the
-workflow file.
+`TAP_GITHUB_TOKEN` must be a **fine-grained** PAT (GitHub → Settings →
+Developer settings → Fine-grained tokens): repository access limited to those
+two repos, the single permission **Contents: Read and write**, and the
+shortest expiry you can live with - rotate it when it lapses. Not a classic
+PAT: a classic token's repository scope covers every repo the owner can reach
+and cannot be narrowed to two, so a compromised release step holding one could
+write to all of them - the blast radius `release.yml`'s comment at the secret
+rules out. Keep it as a repo (or org) Actions secret, never in the workflow
+file.
 
 ## Update notifications
 
@@ -260,11 +266,33 @@ separate:
   `latest.json`.
 - **Roll back a bad release:** set `latest.json` back to the previous good
   version. That silences the badge immediately - no install auto-updated, so
-  nothing has to be un-done on the client side. (Optionally mark the GitHub
-  release as a pre-release or delete it so fresh downloads don't grab it.)
-  Docker is the one channel with its own moving pointer: the release moved
-  `latest` and `latest-iperf`, and pulls of those tags keep landing on the bad
-  version until you retreat them to the previous stable index:
+  nothing has to be un-done on the client side - and it covers winget, whose
+  self-hosted source advertises nothing above `LATEST_VERSION`. Two channels
+  carry a moving pointer of their own that `latest.json` cannot retract, and
+  both have to be walked back by hand.
+
+  **The Homebrew tap.** The release committed a cask naming the bad version
+  to `pingular/homebrew-tap`, and `brew upgrade` installs whatever the tap's
+  HEAD names - brew refreshes its taps ahead of an install or upgrade, so
+  allow up to a day for a change there to reach everyone - which means every
+  macOS user keeps getting the bad build until that commit is reverted:
+
+  ```bash
+  git clone git@github.com:pingular/homebrew-tap.git && cd homebrew-tap
+  git log --oneline -3 -- Casks/pingularity.rb   # the bad release's "Brew cask update" commit is HEAD
+  git revert --no-edit HEAD && git push          # the cask names the previous version and checksums again
+  ```
+
+  Revert the tap before touching the GitHub release. Deleting the release
+  makes the cask's `releases/download/` URLs answer 404, which turns "brew
+  serves the bad build" into "brew serves an error" rather than a rollback;
+  marking it a pre-release leaves the assets downloadable, so on its own it
+  changes nothing for brew. With the tap reverted, either steers fresh manual
+  downloads away from the bad version.
+
+  **Docker.** The release moved `latest` and `latest-iperf`, and pulls of
+  those tags keep landing on the bad version until you retreat them to the
+  previous stable index:
 
   ```bash
   # find the previous stable multi-arch index digests
