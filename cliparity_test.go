@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -211,4 +212,113 @@ func TestHealthzRejectsStrayPositional(t *testing.T) {
 	if n := hits.Load(); n != 0 {
 		t.Errorf("a refused healthz still sent %d request(s); the refusal has to come before the probe, or the exit code is still reporting on something", n)
 	}
+}
+
+// -speedtest seeds the setting that gates the whole scheduled group, and main
+// wires the while-degraded trigger behind it: DegradedPingFn returns 0 -
+// detection off, not merely no dispatch - unless scheduled speedtests are on.
+// docs/cli.md's -speedtest row and the flag's own usage string both filed the
+// degraded trigger beside on-reconnect as governed by "its own UI toggle", and
+// on-reconnect really is independent, so the sentence promised an independence
+// only one of the two triggers has. A headless install that turned the toggle
+// on over the API with -speedtest off got no degraded tests and no complaint.
+// The README's paragraph carries the qualifier; this holds the other two
+// surfaces to the same words, and the premise to main.go.
+func TestSpeedtestFlagSaysTheDegradedTriggerNeedsIt(t *testing.T) {
+	src := mustReadRepoFile(t, "main.go")
+	gate := regexp.MustCompile(`m\.DegradedPingFn = func\(\) float64 \{\s*\n\s*if ([^\n]+)`).FindStringSubmatch(src)
+	if gate == nil || !strings.Contains(gate[1], "!set.SpeedtestEnabled()") {
+		t.Fatalf("main.go no longer gates DegradedPingFn on SpeedtestEnabled; the coupling this test documents has changed: %q", gate)
+	}
+	const rule = "needs scheduled tests on"
+
+	entry, ok := flagDefaultsEntry(runFlagDefaultsText(t), "-speedtest")
+	if !ok {
+		t.Fatal("ParseFlags(-h) prints no -speedtest row; the flag was renamed or PrintDefaults changed shape")
+	}
+	var row string
+	for _, l := range strings.Split(mustReadRepoFile(t, filepath.Join("docs", "cli.md")), "\n") {
+		if strings.HasPrefix(l, "| `-speedtest` |") {
+			row = l
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("docs/cli.md has no `-speedtest` row in its flag table")
+	}
+	para := paragraphsMentioning(mustReadRepoFile(t, "README.md"), "**while degraded**")
+	if para == "" {
+		t.Fatal("README.md no longer has a paragraph about the **while degraded** toggle")
+	}
+
+	for _, s := range []struct{ name, text string }{
+		{"the -speedtest usage string (`pingularity run -h`)", entry},
+		{"docs/cli.md's -speedtest row", row},
+		{"the README's while-degraded paragraph", para},
+	} {
+		if !strings.Contains(s.text, rule) {
+			t.Errorf("%s never says the while-degraded trigger %s, but main.go's gate (%s) turns detection off without them:\n%s",
+				s.name, rule, strings.TrimSpace(gate[1]), s.text)
+		}
+	}
+}
+
+// paragraphsMentioning returns every blank-line-delimited block of doc that
+// mentions marker - a table, a paragraph, a list item - joined, so an assertion
+// about one topic reads everything the document says about it and nothing else.
+func paragraphsMentioning(doc, marker string) string {
+	var out []string
+	for _, para := range strings.Split(strings.ReplaceAll(doc, "\r\n", "\n"), "\n\n") {
+		if strings.Contains(para, marker) {
+			out = append(out, para)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
+// runFlagDefaultsText is what `pingularity run -h` prints: the FlagSet's own
+// PrintDefaults, one row per flag with its usage string beneath - the second
+// place an operator reads a flag's description, after the curated help. Same
+// capture as definedRunFlags, kept whole here because the text is the point.
+func runFlagDefaultsText(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "flagdefaults")
+	if err != nil {
+		t.Fatalf("temp stderr: %v", err)
+	}
+	defer f.Close()
+	orig := os.Stderr
+	defer func() { os.Stderr = orig }()
+	os.Stderr = f
+	_, perr := config.ParseFlags([]string{"-h"})
+	os.Stderr = orig
+	if !errors.Is(perr, flag.ErrHelp) {
+		t.Fatalf("ParseFlags(-h) = %v, want flag.ErrHelp", perr)
+	}
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read captured flag defaults: %v", err)
+	}
+	return string(b)
+}
+
+// flagDefaultsEntry returns one flag's row and usage from PrintDefaults text. A
+// bool flag's row is the bare name ("  -speedtest"), which is why usageEntry,
+// written for the curated help's "  -flag type" rows, cannot read it.
+func flagDefaultsEntry(text, flag string) (string, bool) {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if l != "  "+flag && !strings.HasPrefix(l, "  "+flag+" ") {
+			continue
+		}
+		entry := []string{l}
+		for _, c := range lines[i+1:] {
+			if !strings.HasPrefix(c, "    ") {
+				break
+			}
+			entry = append(entry, c)
+		}
+		return strings.Join(entry, "\n"), true
+	}
+	return "", false
 }
