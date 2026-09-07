@@ -60,10 +60,14 @@ and `-d '{…}'` where a body is listed below.
   bucket to one number (the lowest latency measured in it, and the mean DNS time). The stride is positional, so widening a window past 1500 runs re-picks
   from scratch: the newest run is always kept, but the other points are generally
   *different* runs rather than a superset of the narrower window's. The body stays
-  a bare array; the disclosure is
-  in the headers - `X-Total-Count` (runs in the window), `X-Returned-Count` and
-  `X-Sampled` (`true` when thinned), so a client can tell a thinned answer from a
-  complete one. For every run, use `/api/speed/runs` (paginated) or
+  a bare array; the disclosure is in the headers - `X-Total-Count` (recorded
+  rows in the window: the runs, plus any Best-of round members kept by
+  **Discard losers** off, which are rows here like any other), `X-Returned-Count`
+  and `X-Sampled` (`true` when thinned) - so a client can tell a thinned answer
+  from a complete one. A thinned answer also carries `X-Total-Runs`, the runs
+  alone (rows without `round_ts`), for a caveat that compares runs with runs;
+  an unthinned answer has no run count in its headers, so count the rows
+  without `round_ts` in the body. For every run, use `/api/speed/runs` (paginated) or
   `/api/speed/runs.csv` - both cover the whole history rather than a window, so a
   caller that wants one window filters on `ts` itself. Also
   takes an absolute window as `?from=&to=` (unix seconds, half-open `[from, to)`;
