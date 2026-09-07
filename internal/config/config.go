@@ -210,7 +210,10 @@ func ParseFlags(args []string) (Config, error) {
 	fs.StringVar(&c.AllowedHosts, "allow-host", c.AllowedHosts, "extra Host header values to accept, comma-separated (reverse-proxy domains)")
 	fs.StringVar(&c.TrustedProxies, "trusted-proxy", c.TrustedProxies, "proxy IPs/CIDRs whose X-Forwarded-For identifies the client, comma-separated")
 	fs.StringVar(&c.MetricsToken, "metrics-token", c.MetricsToken, "optional read-only token for /metrics (Bearer or Basic password), so Prometheus needn't hold the admin login; only used when Require login is on")
-	fs.BoolVar(&c.SpeedtestEnabled, "speedtest", c.SpeedtestEnabled, "enable scheduled speedtests (startup + every -speedtest-interval); off by default. On-reconnect tests are governed by -speedtest-on-reconnect, the run-while-degraded trigger by its own UI toggle")
+	// Scheduled tests gate the while-degraded trigger too - main wires its
+	// detection behind SpeedtestEnabled - so the usage says so; only the
+	// on-reconnect test runs on monitoring alone.
+	fs.BoolVar(&c.SpeedtestEnabled, "speedtest", c.SpeedtestEnabled, "enable scheduled speedtests (startup + every -speedtest-interval); off by default. On-reconnect tests are governed by -speedtest-on-reconnect; the run-while-degraded trigger has its own UI toggle but needs scheduled tests on as well")
 	fs.DurationVar(&c.SpeedtestInterval, "speedtest-interval", c.SpeedtestInterval, "time between scheduled speedtests (1m-24h)")
 	fs.BoolVar(&c.SpeedtestOnReconnect, "speedtest-on-reconnect", c.SpeedtestOnReconnect, "run a speedtest on reconnect")
 	fs.StringVar(&c.IPv4Mode, "ipv4", c.IPv4Mode, "IPv4 probing: auto | on | off")
