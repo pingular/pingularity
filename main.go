@@ -2908,6 +2908,9 @@ func joinNonEmpty(parts ...string) string {
 // FlagSet and requires an entry here for each name, in both directions.
 func usage() {
 	db := config.DefaultDBPath()
+	// The install example is a root command, and help is read unelevated: the
+	// directory it names has to be the service's, not the reader's own.
+	serviceDir := filepath.Dir(config.ServiceDBPath())
 	fmt.Printf(`pingularity - internet connectivity monitor with a built-in web dashboard
 
 Usage:
@@ -2982,5 +2985,5 @@ root, so run unelevated it reports the state as unknown rather than guessing.
 Examples:
   pingularity                  # run in foreground; UI on http://localhost:9000
   %s     # install as a service and start it; DB -> %s, UI on :9000
-`, db, quickSetupHoldGraceText(), elevationHint(), elevate("pingularity install"), filepath.Dir(db))
+`, db, quickSetupHoldGraceText(), elevationHint(), elevate("pingularity install"), serviceDir)
 }
