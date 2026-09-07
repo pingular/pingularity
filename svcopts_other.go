@@ -2,7 +2,11 @@
 
 package main
 
-import "github.com/kardianos/service"
+import (
+	"strings"
+
+	"github.com/kardianos/service"
+)
 
 // applyServiceOpts sets non-Windows service ordering. Only systemd has a clean
 // network-ready gate; launchd on macOS has no equivalent, so there we lean on the
@@ -33,7 +37,38 @@ func applyServiceOpts(sc *service.Config) {
 		// post-install, and a crash kept the monitor down for 2 minutes instead of 5
 		// seconds.
 		sc.Option["SystemdScript"] = systemdScript
+		// The template writes each install argument through kardianos's cmd,
+		// which double-quotes it and escapes only the quote. systemd then reads
+		// ExecStart by its own rules, quotes or not: %x is a specifier (%t the
+		// runtime directory, %h the home), $VAR and ${VAR} substitute the
+		// environment, and a backslash starts a C escape. So a -metrics-token
+		// with a % in it reached the daemon as a different token and the
+		// scraper's 401s said nothing about why, a %-mangled -db planted the
+		// database at a path nobody named, and an unknown specifier or a
+		// trailing backslash left a unit systemd refuses to load. Escape here,
+		// on the unit path only: launchd's plist and the Windows SCM expand
+		// nothing and must see the bytes as typed.
+		sc.Arguments = systemdArgs(sc.Arguments)
 	}
+}
+
+// systemdArgs escapes install arguments for the unit's ExecStart line per
+// systemd.unit(5) and systemd.service(5): a literal percent is written %%, a
+// literal dollar $$, and every backslash doubled (inside double quotes systemd
+// unescapes C sequences, so a lone one eats the closing quote or turns into a
+// newline). The double quote itself stays kardianos's cmd's job. Backslashes
+// first, so the doubling never touches what the other two produce.
+func systemdArgs(args []string) []string {
+	if args == nil {
+		return nil
+	}
+	out := make([]string, len(args))
+	for i, a := range args {
+		a = strings.ReplaceAll(a, `\`, `\\`)
+		a = strings.ReplaceAll(a, "%", "%%")
+		out[i] = strings.ReplaceAll(a, "$", "$$")
+	}
+	return out
 }
 
 // systemdScript tracks packaging/pingularity.service for the self-install path:

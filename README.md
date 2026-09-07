@@ -522,7 +522,9 @@ equivalent, and re-running `install` is not one: over a service that already
 exists it fails with an "already exists" error and leaves the flags it was
 installed with exactly as they were - on macOS, on Windows, and on a systemd
 unit this CLI installed alike. Wherever `/etc/default` isn't an option, then,
-changing a flag means `uninstall` first, then `install` with the new set.
+changing a flag means `uninstall` first, then `install` with the new set. Whatever
+you pass reaches the daemon exactly as typed: on systemd the unit escapes a `%`, a
+`$` or a backslash in a value, which systemd would otherwise expand or choke on.
 Manage with `pingularity start | stop | restart | status | uninstall`. On macOS
 `status` needs `sudo` like the rest: launchd shows a system daemon only to root,
 so run unelevated it reports the state as `unknown` and points at
