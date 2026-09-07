@@ -44,7 +44,7 @@ type Monitor struct {
 
 	downPausedAt time.Time     // when the current pause episode began while down; folded into pausedGap on resume (monitor goroutine only)
 	pausedGap    time.Duration // total unwatched paused time in the current outage, excluded from its recorded duration (monitor goroutine only)
-	frozenGap    time.Duration // wall seconds of this outage's booked suspend rows that the monotonic clock slept through; transition's widen adds them back so the read model's pause subtraction lands on seconds the pair holds (guarded by mu)
+	frozenGap    time.Duration // this outage's booked pause rows minus the monotonic time they cover: what a suspend the wall-gap check saw while probing, or one that fell inside a switched-off stretch, left the rows holding and the elapsed not. Kept exact and signed; transition's widen rounds it up ONCE and adds it back, so the read model's pause subtraction lands on seconds the pair holds (guarded by mu)
 	outageGen    uint64        // opaque token identifying the current accumulator incarnation; bumped as transition() resets the two gaps above, stamped into each pendingGap so a refusal/eviction surfacing in a LATER outage is not reversed out of THIS one's accumulators. Monitor-goroutine only, save for the under-mu bump/read in transition and the accumulator functions
 
 	degradedStreak int           // consecutive rounds over the degraded-latency threshold (monitor goroutine only)
@@ -432,7 +432,8 @@ func (m *Monitor) Run(ctx context.Context) error {
 			return
 		}
 		span := time.Duration(end.Unix()-pauseSpanStart.Unix()) * time.Second
-		if mono := end.Sub(pauseSpanStart); mono > span {
+		mono := end.Sub(pauseSpanStart)
+		if mono > span {
 			span = mono
 		}
 		if span <= 0 || (!force && span < pauseCheckpoint) {
@@ -451,7 +452,11 @@ func (m *Monitor) Run(ctx context.Context) error {
 		// advances either way: a held record replays its own span, and a refused one
 		// re-anchors at the corrected reading, whose stepped-back minutes the still-
 		// open pause covers with its next slice (spans are merged on read).
-		if p := m.flushGap(ctx, &pendingGap{start: pauseSpanStart, secs: int64(span.Seconds()), pause: true, gen: m.outageGen}); p != nil {
+		// Both readings travel with the slice: the row is the wall span, and whatever
+		// of it the monotonic clock did not see is the suspend this path exists to
+		// record - which the resume fold below deliberately leaves out, so the widen
+		// in transition has to be told about it (see bookPauseSpan).
+		if p := m.bookPauseSpan(ctx, pauseSpanStart, span, mono); p != nil {
 			held = appendHeldGap(m, held, p)
 		}
 		pauseSpanStart = end
@@ -520,6 +525,9 @@ func (m *Monitor) Run(ctx context.Context) error {
 			// is subtracted from Monitor.transition's MONOTONIC elapsed, so it has to be
 			// measured on the same clock. Feeding it wall time would double-subtract a
 			// suspend that fell inside an outage - the monotonic elapsed already omits it.
+			// What the two clocks disagree by is that suspend, and it still has to reach
+			// transition's widen: bookPauseSpan accumulates the difference as the flush
+			// above books each slice, and the widen rounds the episode's total once.
 			m.noteResume(time.Now())
 			m.log.Info("monitor recording resumed")
 		}
@@ -702,7 +710,10 @@ func (m *Monitor) bookUnobservedGap(ctx context.Context, prev, now time.Time, pa
 	// have it.
 	if pauseOpen {
 		// The open pause span already covers this stretch, so there is nothing to
-		// write and nothing to adjust.
+		// write and nothing to deduct. The widen's share is not skipped, only left
+		// to the row: flushPause sizes this stretch's row on the wall clock, and
+		// bookPauseSpan credits whatever of it the monotonic clock did not see when
+		// that row is booked - crediting it here too would widen the pair twice.
 		return true, nil
 	}
 	// Measure the numerator correction HERE, against the outage this gap actually
@@ -737,6 +748,72 @@ func (m *Monitor) bookUnobservedGap(ctx context.Context, prev, now time.Time, pa
 	}
 	m.mu.Unlock()
 	return true, m.flushGap(ctx, p)
+}
+
+// bookPauseSpan books one slice of an explicit pause - a checkpoint, or the
+// remainder at the resume edge - as the row flushPause measured: `span` WALL
+// seconds from start, of which the monotonic clock advanced `mono`.
+//
+// The two readings differ by exactly the time the host was asleep inside the
+// pause, and that difference has to reach transition's widen. flushPause sizes
+// the row on the wall clock so a lid closed while monitoring was switched off is
+// recorded at all, and the resume edge folds the episode into pausedGap on the
+// MONOTONIC clock so a suspend is not subtracted from an elapsed that never
+// contained it. Both are right, and between them they leave the row wider than
+// the fold by the freeze. duration_s is elapsed minus the fold; the read model
+// subtracts the whole row from the stored pair; so the pair has to be elapsed
+// plus the freeze, or a backward wall step at the recovery books
+// duration-minus-freeze on uptime, the outage list and the heatmap while
+// duration_s claims the full length - a fifteen-minute outage shown as two. It
+// is the same corruption frozenGap closes for a suspend the wall-gap check saw
+// while probing, reached through the switched-off path, where that check leaves
+// the row - and so the credit - to the pause. Credited at measurement, for the
+// reason bookUnobservedGap gives: a write that lands after the recovery has no
+// outage left to widen.
+//
+// The difference is accumulated EXACTLY, signed, and rounded nowhere here. A
+// pause episode is written as many slices - flushPause checkpoints one every
+// pauseCheckpoint, and the paused branch re-enters every scheduleRecheck - whose
+// rows telescope ([start.Unix(), start.Unix()+secs) end to end), while the fold
+// that offsets them all is ONE monotonic subtraction at the resume edge. So the
+// rounding belongs to the episode, not to the slice, and it is left to the widen
+// that consumes the total (see ceilSeconds). Rounding each slice up instead
+// charged a whole second for the sub-second phase between its two endpoints -
+// the row is whole Unix seconds, the monotonic reading is the exact distance -
+// about half the time, some six seconds an hour SWITCHED OFF on a host that
+// never slept and whose clock never stepped. An overnight or weekend schedule
+// window inside one outage is enough of those to stamp the recovery minutes past
+// the true one, beyond the future horizon the read model trusts, where the
+// outage stops being resolved at all: the outage list loses it while uptime
+// still books its downtime.
+//
+// Negative residues are kept for the same reason. flushPause floors a slice's
+// row at the monotonic reading, so a slice whose wall span was stepped BACK
+// holds a fraction of a second less than the clock saw; discarding those while
+// keeping the positive ones is what made a long pause drift. Summed over the
+// outage the difference is exactly its rows minus its fold, which is what the
+// widen needs, and the sum is what the widen rounds.
+//
+// The credit is never taken back. A REFUSED slice is reconciled by
+// dropRefusedPauseDeduction moving the fold's anchor past the slice's wall
+// seconds, freeze included, so the rowless stretch counts as observed downtime
+// in duration_s - and the pair has to hold those seconds too; reversing the
+// credit, as revertGapDeduction does for a refused suspend row, would leave the
+// pair short by the freeze. An EVICTED record cannot give its fold back either
+// (see pendingGap.pause), and a credit left standing only makes the pair too
+// wide, which observedOutageSpans trims. So the record carries no frozen half.
+//
+// mono comes from the caller for the reason bookUnobservedGap takes monoAdvance:
+// a test cannot synthesize a time.Time whose wall advanced while its monotonic
+// reading stood still, which is the very state this credit exists for.
+func (m *Monitor) bookPauseSpan(ctx context.Context, start time.Time, span, mono time.Duration) *pendingGap {
+	p := &pendingGap{start: start, secs: int64(span.Seconds()), pause: true, gen: m.outageGen}
+	m.mu.Lock()
+	if !m.online {
+		m.frozenGap += time.Duration(p.secs)*time.Second - mono
+	}
+	m.mu.Unlock()
+	return m.flushGap(ctx, p)
 }
 
 // maxHeldGaps bounds the records carried for retry. A store that refuses to write
@@ -781,7 +858,7 @@ type pendingGap struct {
 	start  time.Time
 	secs   int64
 	deduct time.Duration // already added to pausedGap; reversed if the store refuses
-	frozen time.Duration // the span's mono-absent remainder, already added to frozenGap; reversed with deduct - the widen must not add back a row that will never exist
+	frozen time.Duration // the span's mono-absent remainder, already added to frozenGap; reversed with deduct - the widen must not add back a row that will never exist (suspend gaps only: a pause slice's credit is never reversed, see bookPauseSpan)
 	gen    uint64        // Monitor.outageGen at booking time: the accumulator incarnation deduct/frozen were added to (or, on the pause path, the outage the resume fold belongs to). A refusal or eviction reverses/advances only while this still matches; a mismatch means the booking's outage has closed and its accumulators are gone, so leave the current outage's untouched
 	// pause marks a span from the pause path - flushPause's checkpoints and resume
 	// edge, or the startup gap - rather than a suspend gap. The failed/refused
@@ -793,6 +870,8 @@ type pendingGap struct {
 	// asymmetry is accepted: a pause record dropped from a FULL queue cannot give
 	// its fold back (the episode may be closed and consumed by then), the same
 	// bounded cross-outage slack revertGapDeduction's zero-clamp already carries.
+	// Nor is its widen credit carried here (never frozen above): bookPauseSpan
+	// applies it once, and it stands whatever becomes of the row.
 	pause bool
 }
 
@@ -941,6 +1020,26 @@ func unobservedInOutage(wallGap, monoGap time.Duration) time.Duration {
 		return wallGap
 	}
 	return monoGap
+}
+
+// ceilSeconds rounds a duration UP to whole seconds, for either sign (Go's
+// integer division truncates toward zero, which already rounds a negative up).
+//
+// transition's widen consumes frozenGap in seconds, and UP is the direction that
+// makes the widened pair hold its outage's pause rows exactly. The outage's
+// recorded length is int(elapsed) minus int(pausedGap) - two separate floors -
+// while the rows those figures have to line up with are whole seconds of their
+// own, so the second the floors disagree by lives in frozenGap's fraction.
+// Rounding it away leaves the pair one second short of the rows the read model
+// subtracts from it, which is the shortfall the widen exists to prevent; paying
+// it here, once per outage, is the entire rounding an outage can owe, however
+// many slices its pause was written as.
+func ceilSeconds(d time.Duration) int64 {
+	s := int64(d / time.Second)
+	if d > time.Duration(s)*time.Second {
+		s++
+	}
+	return s
 }
 
 // resetStreaks clears the overall, per-family, and degraded debounce counters.
@@ -1513,20 +1612,33 @@ func (m *Monitor) transition(ctx context.Context, online bool, res prober.Result
 	// monotonic elapsed is the one honest measurement here, and lastEventWall is
 	// the paired 'down' (transitions alternate), already stamped on the pre-step
 	// timeline this clamp preserves - the wall clock rejoins it as it catches up.
-	// In ordinary runs wall >= monotonic, so this fires only when a backward step
-	// (or slew) squeezed the pair below the window it needs.
+	// In ordinary runs wall >= monotonic, so a backward step (or slew) is what
+	// squeezes the pair below the window it needs - though not the only thing;
+	// see the rounding below.
 	//
 	// Elapsed alone is only the whole window when every pause row inside the
-	// outage is also inside the monotonic elapsed - true for explicit pauses,
-	// which advance both clocks. A SUSPEND on a frozen-monotonic platform books
-	// its row for wall seconds the elapsed never contained, so those rows must be
-	// added on top (frozenGap, measured row by row in bookUnobservedGap) or the
-	// read model subtracts them from seconds the pair does not hold and books
-	// duration-minus-suspend while duration_s claims the full length. An
-	// unstepped wall stores down + elapsed + frozenGap on its own, so this still
-	// fires only when a backward step squeezed the pair.
+	// outage is also inside the monotonic elapsed - true for an explicit pause
+	// on a host that stayed awake, which advances both clocks. A SUSPEND on a
+	// frozen-monotonic platform books its row for wall seconds the elapsed never
+	// contained - whether the wall-gap check booked it while probing or
+	// flushPause did because the lid closed while monitoring was switched off -
+	// so those rows must be added on top (frozenGap, accumulated exactly by
+	// bookUnobservedGap and bookPauseSpan) or the read model subtracts them from
+	// seconds the pair does not hold and books duration-minus-suspend while
+	// duration_s claims the full length.
+	//
+	// Rounded UP here and nowhere else, because frozenGap is this outage's rows
+	// minus their monotonic cover to the nanosecond while `duration` above floors
+	// the fold: see ceilSeconds. Rounded that way the width is EXACT - rows plus
+	// duration_s, whatever the fractions - which is why an awake, unstepped host
+	// can still land here: its rows are whole Unix seconds and its fold is not, so
+	// the pair the wall clock stored can be a second short of its own rows, once
+	// per pause episode. Each such second is genuinely owed, and that is the whole
+	// of it; a rounding taken per SLICE instead grows with the length of the pause
+	// rather than the number of episodes, and walks the recovery out of its own
+	// second on a host with nothing to correct for.
 	if online && duration > 0 && !m.lastEventWall.IsZero() {
-		if width := int64(elapsed.Seconds()) + int64(m.frozenGap.Seconds()); evWall.Unix()-m.lastEventWall.Unix() < width {
+		if width := int64(elapsed.Seconds()) + ceilSeconds(m.frozenGap); evWall.Unix()-m.lastEventWall.Unix() < width {
 			evWall = time.Unix(m.lastEventWall.Unix()+width, 0)
 		}
 	}
