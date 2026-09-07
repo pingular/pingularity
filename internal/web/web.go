@@ -4943,8 +4943,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "# HELP pingularity_speed_info Last speedtest's backend engine (in the label); value is constant 1.")
 		fmt.Fprintln(w, "# TYPE pingularity_speed_info gauge")
 		fmt.Fprintf(w, "pingularity_speed_info{engine=\"%s\"} 1\n", promTargetLabel(engine))
-		if sp.Healthy != nil { // the in-app threshold verdict, so alerts reuse it instead of re-encoding thresholds
-			fmt.Fprintln(w, "# HELP pingularity_speed_healthy Last speedtest passed its configured thresholds (1/0); absent when no thresholds are configured or the run measured nothing they cover.")
+		// The in-app threshold verdict, so alerts reuse it instead of re-encoding
+		// thresholds. It is the verdict recorded ON THE RUN, judged against the
+		// thresholds in force when the run happened - the rule the dashboard
+		// shows each run by - so a threshold changed since waits for the next run
+		// rather than re-judging the last one here, where it would put a scrape
+		// at odds with the row it reports. The HELP line has to name that moment:
+		// read as scrape-time state, "absent when no thresholds are configured"
+		// told an operator that clearing thresholds retires the `== 0` alert,
+		// and with scheduled tests off nothing ever replaced the stored verdict.
+		if sp.Healthy != nil {
+			fmt.Fprintln(w, "# HELP pingularity_speed_healthy Whether the last speedtest passed the thresholds in force when it ran (1/0) - the verdict recorded on the run, as the dashboard shows it; absent when that run was made with no thresholds configured or measured nothing they covered. A threshold changed since is applied by the next run, not by the scrape.")
 			fmt.Fprintln(w, "# TYPE pingularity_speed_healthy gauge")
 			fmt.Fprintln(w, "pingularity_speed_healthy", util.B2I(*sp.Healthy))
 		}

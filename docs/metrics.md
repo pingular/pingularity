@@ -110,10 +110,15 @@ self-describing):
   **gap** between the two to spot a lossy path. Absent on iperf3 runs, which do
   sample the server themselves - up to five bare TCP handshakes - but report the
   **median** of those as `_ping_ms` and record no floor beside it
-- `pingularity_speed_healthy` - 1/0, did the last run pass your configured
-  thresholds (lets alerting reuse the in-app verdict instead of re-encoding it);
-  **absent** when no thresholds are configured *or* when the run couldn't measure
-  something a threshold covers. A check that never ran is not a check that
+- `pingularity_speed_healthy` - 1/0, did the last run pass the thresholds in
+  force **when it ran** (lets alerting reuse the in-app verdict instead of
+  re-encoding it); **absent** when that run was made with no thresholds
+  configured *or* when it couldn't measure something a threshold covered. The
+  verdict is recorded on the run, as the dashboard shows it, so a threshold
+  changed since - tightened, loosened or cleared - is applied by the next run,
+  not by the scrape: clearing every threshold to retire the `== 0` recipe below
+  leaves the old 0 exported until a fresh run lands, which with scheduled tests
+  off means until you run one. A check that never ran is not a check that
   passed, so those runs get no verdict rather than a green one - alert on
   `absent()` if a silently unjudged run matters to you
 - `pingularity_speed_idle_latency_ms` / `pingularity_speed_loaded_latency_ms{direction}`
@@ -379,7 +384,7 @@ pingularity_speed_download_mbps < 100
 # DNS resolution failing while the link itself is up (name resolution broke)
 pingularity_dns_up == 0 and pingularity_up == 1
 
-# Last speedtest failed its configured thresholds, or a long current outage
+# Last speedtest failed the thresholds in force when it ran, or a long current outage
 pingularity_speed_healthy == 0
 pingularity_current_outage_seconds > 300
 
