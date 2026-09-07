@@ -360,7 +360,7 @@ func TestMetricsSpeedByteGauges(t *testing.T) {
 		`pingularity_speed_last_run_bytes{direction="up"} 500000`,
 		`pingularity_speed_data_used_window_bytes{window="24h"} 1500000`,
 		`pingularity_speed_data_used_window_bytes{window="30d"} 1500000`,
-		"absent when no thresholds are configured",
+		"absent when that run was made with no thresholds configured",
 	} {
 		if !strings.Contains(body, m) {
 			t.Errorf("/metrics missing %q\n--- body ---\n%s", m, body)
