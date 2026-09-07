@@ -150,7 +150,10 @@ and `-d '{…}'` where a body is listed below.
   value the daemon refuses outright - today, an iperf3 password beginning with the
   reserved `enc:v1:` seal prefix - comes back as `400` with the reason as the body,
   so it can be shown to whoever typed it; a `500` here really is a daemon-side
-  failure
+  failure. A schedule (`sched_lat_*`, `sched_speed_*`) switched on with no
+  window, or with only windows that select no weekday, could never be on, so it
+  is saved as off and the response says so - the daemon keeps probing rather
+  than silently stopping
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The
   session cookie lasts **30 days**, and a logout revokes **every** signed-in
