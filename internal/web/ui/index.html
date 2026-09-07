@@ -2077,7 +2077,8 @@
         <label class="srow"><span class="lbl">Window size
           <span class="info" tabindex="0" data-tip="TCP window / socket-buffer size (-w).
 • 0 = auto.
-• Raise it to unlock speed on high-latency, long-distance links where the default window caps the rate.">i</span></span>
+• Raise it to unlock speed on high-latency, long-distance links where the default window caps the rate.
+• The OS caps what a socket may hold and iperf3 refuses the run past it: 8192 KB (8 MB) on stock macOS (kern.ipc.maxsockbuf), a few hundred KB on stock Linux until net.core.rmem_max and wmem_max are raised. Raise the sysctl to go higher.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfWindow" min="0" max="65536" step="1"><span class="unit">KB</span></span></label>
         <label class="srow"><span class="lbl">Warm-up
           <span class="info" tabindex="0" data-tip="Seconds to discard at the start of each transfer (TCP slow-start), for steadier numbers.
@@ -2093,6 +2094,7 @@
           <span class="info" tabindex="0" data-tip="TCP max segment size (-M), in bytes.
 • 0 = auto.
 • Lower it to test small-MTU links such as VPNs or PPPoE.
+• Linux (and FreeBSD) only: macOS and Windows cannot set it, so a saved value is ignored there and the daemon logs that once.
 • Most users leave it at 0.">i</span></span>
           <span class="ctl"><input type="number" id="setIperfMSS" min="0" max="9000" step="1"><span class="unit">B</span></span></label>
         <label class="srow"><span class="lbl">No delay (Nagle off)

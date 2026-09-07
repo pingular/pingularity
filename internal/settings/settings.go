@@ -415,7 +415,9 @@ type Values struct {
 	IperfUDP     bool
 	IperfUDPRate int
 	// IperfWindow sets the TCP window / socket-buffer KB (-w); 0 = auto, raise it to
-	// unlock throughput on high-BDP (long-distance) links.
+	// unlock throughput on high-BDP (long-distance) links - as far as the kernel will
+	// grant a socket buffer, past which iperf3 refuses the run and says which sysctl
+	// decides.
 	IperfWindow int
 
 	// OoklaConnections is the number of parallel Ookla connections (0 = the
@@ -448,6 +450,8 @@ type Values struct {
 	// e.g. cubic/bbr); NoDelay disables Nagle (-N); DSCP marks the IP DiffServ value
 	// (--dscp); MSS pins the TCP max segment size in bytes (-M). All optional - blank/0
 	// keeps iperf3's default. Congestion/NoDelay/MSS are TCP-only; DSCP marks UDP too.
+	// Congestion and MSS are Linux (and FreeBSD) knobs: macOS and Windows cannot set
+	// either, so the engine drops a saved value there rather than fail every run.
 	IperfCongestion string
 	IperfNoDelay    bool
 	IperfDSCP       string

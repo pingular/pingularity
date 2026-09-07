@@ -732,6 +732,22 @@ test('int-field fallbacks match the shipping defaults (streams=8, omit=1)', () =
   assert.equal(omit[1], '1', 'blank warm-up (omit) must fall back to 1 (config.go IperfOmit), not 0');
 });
 
+test('iperf3 window and MSS fields tell the truth about the host', () => {
+  // The input still offers what iperf3 accepts (settings.MaxIperfWindow, 64 MB) -
+  // a tuned kernel can use it - but the kernel grants far less untuned, and iperf3
+  // refuses the run rather than shrinking, so the tip names the sysctl that decides.
+  assert.match(html, /<input type="number" id="setIperfWindow" min="0" max="65536" step="1">/, 'window input offers the full -w range');
+  const winTip = html.match(/Window size\s*<span class="info"[^>]*data-tip="([^"]*)"/);
+  assert.ok(winTip, 'window tip present');
+  assert.match(winTip[1], /kern\.ipc\.maxsockbuf/, 'window tip names the macOS sysctl that caps it');
+  assert.match(winTip[1], /net\.core\.rmem_max and wmem_max/, 'window tip names the Linux sysctls');
+  // MSS cannot be set on macOS or Windows (the daemon drops a saved value there and
+  // says so once), and the tip must not offer it as if it worked everywhere.
+  const mssTip = html.match(/Max segment size\s*<span class="info"[^>]*data-tip="([^"]*)"/);
+  assert.ok(mssTip, 'MSS tip present');
+  assert.match(mssTip[1], /macOS and Windows cannot set it/, 'MSS tip says where the knob does nothing');
+});
+
 test('getField int: a typed 0 is a value, not the fallback', () => {
   els.retries = { value: '0' };
   assert.equal(SF.getField('retries', 'int', 1), 0);
