@@ -306,7 +306,9 @@ func TestEventTypeFilterCoversEveryEventRead(t *testing.T) {
 		}
 	}
 	// Sanity: the scan found the real queries rather than silently matching none.
-	for _, must := range []string{"UptimeSince", "EventsPage", "EventCount", "monitoringSince", "DowntimeByDay"} {
+	// DowntimeByDay holds no SQL of its own any more - the query moved into
+	// downtimeByDayAt with the clock seam, so that is the name the scan must see.
+	for _, must := range []string{"UptimeSince", "EventsPage", "EventCount", "monitoringSince", "downtimeByDayAt"} {
 		if !seen[must] {
 			t.Errorf("the source scan did not find %s - it is no longer checking anything", must)
 		}

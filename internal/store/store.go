@@ -1900,21 +1900,101 @@ func (s *Store) orphanGapDowntime(ctx context.Context, sinceU, nowU int64) (down
 	return downtime, recovered, nil
 }
 
-// nextLocalDay returns the unix second at which the local date after d begins.
+// nextLocalDay returns the unix second at which the local date after d begins -
+// the first instant whose local date is no longer d's. Shared by DowntimeByDay's
+// proration and its observation loop so the two cannot bucket the same second into
+// different days.
 //
-// It resolves to the NEXT local date's first EXISTING instant rather than
-// rebuilding midnight of the current day and adding 24h: in zones whose DST jump
-// lands at midnight (America/Havana) that midnight does not exist and Go
-// normalizes it BACKWARDS, which would collapse a whole multi-day span onto one
-// day. Shared by DowntimeByDay's proration and its observation loop so the two
-// cannot bucket the same second into different days.
+// Both of those loops walk the window one local day at a time by asking for the
+// next boundary, so the answer has to be strictly later than d, it has to be the
+// FIRST second the clock no longer reads d's date, and it has to be the SAME second
+// whichever second of that run of the date it is asked from - the observation loop
+// enters at the run's first second, proration enters wherever an outage happens to
+// begin. Run, and not day: where the clock falls back across midnight a date comes
+// back later on, and the two loops still have to agree on where each run of it ends.
+//
+// CONSTRUCTING that second is what does not work. Where a DST jump lands exactly on
+// midnight, the next local midnight either does not happen at all (America/Havana,
+// America/Santiago and Atlantic/Azores each spring) or happens twice (Asia/Gaza and
+// Asia/Hebron each autumn), and time.Date answers the first case by normalizing to a
+// neighbouring instant and the second by picking whichever of the two its offset
+// lookup lands in - the later one wherever the zone is east of Greenwich. Adding a
+// day to d first made it worse rather than better: AddDate keeps d's time of day, so
+// asked from inside the very hour the next date skips, its own result normalized
+// BACKWARDS onto d's date, the repair loop underneath it never ran because the day
+// numbers already matched, and the boundary came back equal to its own input. Both
+// callers then fell through to their "must advance" fallback and walked that hour one
+// second at a time. The downtime arithmetic survived - a second is a second whichever
+// tile holds it - but the observation loop mints a day's row on the first tile that is
+// not fully watched and ASSIGNS that tile's span to window_s, so the hour of
+// fully-watched one-second tiles ahead of it was never in the number: on the eve of
+// the jump the heatmap offered "monitored 19h 0m of 23h 0m" for an ordinary 24-hour
+// Saturday.
+//
+// SEARCHING for the next date is no better, and it fails somewhere rarer and quieter.
+// A fall-back can carry the clock backwards ACROSS midnight: Newfoundland and
+// Labrador changed the clocks at 00:01 until 2011, so on 2010-11-06 the local date
+// reached the 7th, dropped back to the 6th a minute later, and only stayed on the 7th
+// an hour after that. The local date does not increase with time there, so nothing may
+// bisect on it - "has the date reached the next one yet" lands in the second stretch
+// and answers an hour late from 85,440 of that date's 89,940 seconds, and answers
+// differently depending on which second it was asked from, which is exactly what
+// sharing this function between the two loops exists to rule out.
+//
+// So read the zone's own clock forward instead of guessing at a date. Between two
+// clock changes the offset is fixed, so the local date turns only at local midnight,
+// and local midnight is d's own time of day subtracted from d - a count of seconds, so
+// no rule can normalize it anywhere. The only other instant the date can turn is a
+// clock change, and the zone names its own. Whichever comes first wins: midnight if
+// nothing changes before it, otherwise the change if the date turned with it, and
+// otherwise the walk goes on from there, because an ordinary autumn fall-back puts the
+// clock back inside the same date. That answers every shape - a midnight that never
+// happens, a midnight that happens twice (the first one wins), a calendar date the
+// zone skips outright, and a date that comes back - and it answers from the run of
+// seconds d belongs to rather than from d itself, so every second of one run of a
+// date gets the same boundary. Both candidates are later than d, so the result
+// always is.
+//
+// The changes are read out of ZoneBounds' START, never its end. The end goes stale
+// for the last day before a zone's stored transitions run out and its rule takes
+// over: on the tzdata here that is 2040-12-31, where 192 of the 598 zones report an
+// end EARLIER than the instant asked about. A walk that steps onto such an end never
+// moves again.
 func nextLocalDay(d time.Time, loc *time.Location) int64 {
-	nd := d.AddDate(0, 0, 1)
-	b := time.Date(nd.Year(), nd.Month(), nd.Day(), 0, 0, 0, 0, loc)
-	for b.Day() != nd.Day() { // local midnight skipped by a DST jump
-		b = b.Add(time.Hour)
+	t := d.In(loc)
+	y, m, day := t.Date()
+	for {
+		// Midnight, counted rather than built: whatever is left of today.
+		h, mi, s := t.Clock()
+		mid := t.Unix() + int64(86400-(h*3600+mi*60+s))
+		// The FIRST clock change in (t, midnight], if the zone makes one. ZoneBounds
+		// names the change that began the stretch an instant belongs to, so asking
+		// about midnight and then about the second before each answer walks back to
+		// the earliest one - the zone's own list read backwards, never a search over
+		// dates.
+		chg, changed := int64(0), false
+		for probe := mid; probe > t.Unix(); probe = chg - 1 {
+			// A zone that never changes reports the zero Time here, which is year one
+			// and so falls under the same test as a change that is already behind us.
+			// The last clause only keeps the walk moving: ZoneBounds' start has never
+			// been observed past the instant it was asked about, in any zone, but a
+			// probe that climbed would never come back.
+			st, _ := time.Unix(probe, 0).In(loc).ZoneBounds()
+			if st.Unix() <= t.Unix() || st.Unix() > probe {
+				break
+			}
+			chg, changed = st.Unix(), true
+		}
+		if !changed {
+			return mid // the offset holds until midnight, so midnight is the boundary
+		}
+		// The offset is fixed from t up to that change, so the date cannot have turned
+		// before it. Either it turns AT it, or the day carries on past it.
+		if ey, em, ed := time.Unix(chg, 0).In(loc).Date(); ey != y || em != m || ed != day {
+			return chg
+		}
+		t = time.Unix(chg, 0).In(loc)
 	}
-	return b.Unix()
 }
 
 // pauseSpans returns the recorded pause spans overlapping [from, to), each already
@@ -4652,6 +4732,15 @@ func (d DowntimeDay) Observed() bool { return d.WindowS <= 0 || d.ObservedS > 0 
 // without it a fully dark day produces no row at all and its ObservedS field would
 // have nowhere to live.
 func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Location) ([]DowntimeDay, error) {
+	return s.downtimeByDayAt(ctx, since, loc, time.Now().Unix())
+}
+
+// downtimeByDayAt is DowntimeByDay against a caller-supplied clock (the same seam
+// openAt gives Open), so a test can stand the heatmap on a chosen day - the eve of
+// a DST jump, say - without faking time for the whole process. Everything this
+// function decides about a day is measured against nowU: the event horizon, the
+// end of the observation walk, and the bound on a still-open outage.
+func (s *Store) downtimeByDayAt(ctx context.Context, since time.Time, loc *time.Location, nowU int64) ([]DowntimeDay, error) {
 	if loc == nil {
 		loc = time.Local
 	}
@@ -4669,7 +4758,6 @@ func (s *Store) DowntimeByDay(ctx context.Context, since time.Time, loc *time.Lo
 	// would silently switch that branch off here while uptime and the digest still
 	// credit the outage - the heatmap drawing a clean square beside a percentage
 	// that is not.
-	nowU := time.Now().Unix()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts, type, COALESCE(duration_s, 0)
 		-- type IN ('down','up') here and in the anchor: consistency with the
