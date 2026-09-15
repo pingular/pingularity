@@ -141,8 +141,9 @@ brew install pingular/tap/pingularity
 sudo pingularity install    # registers the launchd service and starts it
 ```
 
-`brew upgrade` later pulls new versions; `sudo pingularity uninstall` removes the
-service (data untouched).
+`brew upgrade` later pulls new versions, and `sudo pingularity restart` switches the
+running service to one; `sudo pingularity uninstall` removes the service (data
+untouched).
 
 ### Windows
 

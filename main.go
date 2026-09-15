@@ -2809,7 +2809,18 @@ func controlCmd(action string, args []string) error {
 	// The intent of restart-when-stopped is unambiguous: make it run.
 	action = effectiveControlAction(action, s)
 
+	// A second install over a registered service is an upgrade that needs a
+	// restart, not an install; say so before the service manager refuses in its
+	// own words, and explain those words when it gets there first.
+	if action == "install" {
+		if err := refuseReinstall(s); err != nil {
+			return err
+		}
+	}
 	if err := service.Control(s, action); err != nil {
+		if action == "install" {
+			return explainInstallErr(err)
+		}
 		return err
 	}
 	switch action {
@@ -2830,6 +2841,37 @@ func controlCmd(action string, args []string) error {
 		fmt.Println("pingularity service removed. Your database and key are untouched, wherever you configured them.")
 	}
 	return nil
+}
+
+// alreadyInstalledMsg is what `install` says over a service that is already
+// registered. That is almost always an upgrade - brew or a package put the new
+// binary in place - and the running service is still the old binary until it
+// is restarted.
+func alreadyInstalledMsg() string {
+	return fmt.Sprintf("pingularity is already installed as a service. To switch it to a newly installed version, run `%s`; to change its flags, run `%s` and then install again",
+		elevate("pingularity restart"), elevate("pingularity uninstall"))
+}
+
+// refuseReinstall reports an already-registered service before install asks the
+// service manager to register it again. Only a clean status reading counts as
+// installed: "not installed" goes ahead, and so does an error reading it (no
+// permission, a platform quirk), so install can say what it says.
+func refuseReinstall(s service.Service) error {
+	if _, err := s.Status(); err == nil {
+		return errors.New(alreadyInstalledMsg())
+	}
+	return nil
+}
+
+// explainInstallErr explains the service manager's own "already exists"
+// refusal (launchd and SysV: "Init already exists: <path>"; Windows: "service
+// <name> already exists"), for the case refuseReinstall could not see, and
+// keeps its words. Any other error passes through untouched.
+func explainInstallErr(err error) error {
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("%s (%w)", alreadyInstalledMsg(), err)
+	}
+	return err
 }
 
 // absDBArgs returns args with any relative -db value replaced by its absolute
