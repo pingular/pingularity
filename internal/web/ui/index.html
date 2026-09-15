@@ -7774,9 +7774,17 @@ function drawHeatmap(){
   // are week-column padding, not days the response describes, so they hold
   // their grid slot and draw as nothing at all.
   const oldest=new Date(today); oldest.setDate(oldest.getDate()-366);
+  // Each day is built from its date parts and compared by them, as hmDayRange builds its
+  // bounds. Where the clocks go forward at local midnight (Santiago in September, Havana in
+  // March) that day starts at 01:00, and a date stepped on from it kept the hour: the last
+  // one compared later than today's midnight, and today's square was left off for months.
+  const dayNo=d=>Date.UTC(d.getFullYear(),d.getMonth(),d.getDate())/864e5;
+  const todayNo=dayNo(today), oldestNo=dayNo(oldest);
   let n=0;
-  for(let dt=new Date(start);dt<=today;dt.setDate(dt.getDate()+1)){
-    if(dt<oldest){
+  for(let i=0;;i++){
+    const dt=new Date(start.getFullYear(),start.getMonth(),start.getDate()+i);
+    if(dayNo(dt)>todayNo) break;
+    if(dayNo(dt)<oldestNo){
       const pad=document.createElement('div'); pad.className='cell';
       pad.style.visibility='hidden'; el.appendChild(pad); n++; continue;
     }
