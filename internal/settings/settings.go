@@ -120,11 +120,30 @@ const (
 	// the API, not shown in the UI: the feature is meant to just work, and the
 	// runs table's "challenger" tag is how it shows.
 	keySpeedChallengeEvery = "speed_challenge_every"
+	// keySpeedAutoLoc / keySpeedAutoLabel are the RETIRED auto-selection city:
+	// the coordinate and place name that a pre-picker build centred every
+	// automatic Ookla run on, ahead of any measurement - "a city the user
+	// searched overrides everything". The picker rework replaced the whole idea:
+	// a run either uses the server you pinned or races the cities it can name
+	// and measures which one is fastest. Nothing overlays them into Values any
+	// more, and nothing ever will.
+	//
+	// They are still READ, once per load, for one reason: an install that
+	// carries one had its server selection quietly change under it at the
+	// upgrade, and the daemon has to be able to say so (RetiredCityScope). The
+	// rows are never written and never removed - a value nobody applies costs
+	// nothing, an export still carries it, and a downgrade finds the scope it
+	// left behind.
+	keySpeedAutoLoc   = "speed_auto_loc"
+	keySpeedAutoLabel = "speed_auto_label"
 	// keyEngineSplit records that the direction/retries split has been applied to
 	// this table: the iperf3 pair was seeded from the shared speed_* pair once
 	// (when there was one), and an absent iperf3 key now means "left at the
-	// default", not "pre-split". A birth marker says the same of a table (see
-	// splitApplied). Bookkeeping (installStateKeys), never exported.
+	// default", not "pre-split". This row is the only one that says so: no other
+	// row records it, the birth marker least of all (see splitApplied).
+	// Bookkeeping (installStateKeys). This build never exports it and never lands
+	// it from a backup, but releases before 0.100 do both, so the store deletes
+	// one it finds on a file no build that records the split has opened.
 	keyEngineSplit = "engine_split_done"
 	// Per-server network path + RSA auth (bind, ipver, auth, username, password, rsa
 	// key) live inside each IperfTarget, serialized in keyIperfServers - not as their
@@ -553,6 +572,13 @@ type Controller struct {
 	// Atomic: armed under New/Reload, read (and cleared) from the settings write
 	// path, which holds wmu rather than any lock New takes.
 	bornPending atomic.Bool
+	// retiredCityScope names the auto-selection city the store still carries in
+	// the retired keySpeedAutoLoc/keySpeedAutoLabel rows ("" when it carries
+	// none). Read at every load beside the values themselves, but deliberately
+	// NOT part of Values: it is evidence of what an older build was configured
+	// to do, not configuration this one applies. Atomic because the boot path
+	// reads it without taking the writer lock.
+	retiredCityScope atomic.Pointer[string]
 	// sessionEpoch is the persisted session-revocation epoch, folded into every
 	// session-token MAC. Kept in an atomic (not Values) so it's cheap to read on
 	// every authenticated request and never flows through the export/normalize path.
@@ -791,6 +817,7 @@ func New(ctx context.Context, st *store.Store, def Values, opts ...Option) (*Con
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
 	c.seedSessionEpoch(m)
+	c.readRetiredCityScope(m)
 	c.vals = normalize(overlay(def, m))
 	c.recordMigrations(ctx, m, c.vals)
 	// Passwords saved before encryption existed are still in the clear on disk: seal
@@ -981,9 +1008,9 @@ func overlay(v Values, m map[string]string) Values {
 	// boot and handed iperf3 whatever Ookla had last been set to, silently, and
 	// the next save pinned it. The split marker settles it: recordMigrations
 	// writes it (with the seeded pair) the first time a table without it loads,
-	// and from then on an absent iperf3 key means the default. A table born on
-	// a split build says as much through its birth marker before that first
-	// load, which spares it a seed it never needed (splitApplied).
+	// and from then on an absent iperf3 key means the default. Until that marker
+	// is written the absent key still means whatever Ookla holds, whatever the
+	// table says about its own birth (splitApplied).
 	split := splitApplied(m)
 	if val, ok := m[keyIperfDirection]; ok {
 		v.IperfDirection = val
@@ -1121,6 +1148,7 @@ func (c *Controller) reload(ctx context.Context) (wasLoaded bool, err error) {
 	raw, legacy := c.unsealServers(m[keyIperfServers])
 	m[keyIperfServers] = raw
 	c.seedSessionEpoch(m)
+	c.readRetiredCityScope(m)
 	v := normalize(overlay(c.defaults, m))
 	// Apply the loaded config to the live process FIRST, before the legacy
 	// re-seal write. Otherwise a transient write failure would discard a
@@ -1153,34 +1181,140 @@ func (c *Controller) reload(ctx context.Context) (wasLoaded bool, err error) {
 
 // splitApplied reports whether the direction/retries split has been applied to
 // the table m was read from, so that an absent iperf3 key means "left at the
-// default" and not "still sharing Ookla's value". The split marker says so
-// outright. The birth marker (KeyInstallBornVersion) says so too, and it is the
-// one that matters on a table the split marker has not reached yet: a store
-// born on a split build and last run by a build that did not record the split.
-// Such a store carries the Ookla pair and no iperf3 pair for the ordinary
-// reason - the operator set Ookla and left iperf3 alone - and reading that as
-// pre-split would copy Ookla's values under iperf3's keys one last time, for
-// good, on precisely the installs the leak had been biting. The birth marker
-// rules it out: it is younger than the split (the split is older than any
-// tagged release; the marker arrived in 0.70), it is stamped only on a store
-// the daemon watched come into existence, and a backup cannot carry it in
-// (settingsExportDeny), so no pre-split build ever wrote to a store that wears
-// it. Even the markers the early releases stamped on stores they did not
-// create (see KeyInstallBornVersion) hold here: those stores read NOT
-// established, so they held no configuration at all - no shared speed_* pair
-// from before the split - and whatever they carry now was saved by a split
-// build.
+// default" and not "still sharing Ookla's value". The split marker is the only
+// row that can say it: recordMigrations writes it the first time a table
+// without it loads, together with whatever the pair had been inheriting, and
+// from then on absence means the default. A marker that arrived any other way
+// says nothing about the table it sits in. Releases before 0.100 export it with
+// every other row and land it again on restore, so a backup one takes of a
+// database this release has started brings it onto a machine that never ran
+// this release, whose iperf3 still follows Ookla; the store deletes such a
+// marker at Open, before this is asked, unless the page it has to read to find
+// it is damaged (store's forgetRestoredSplitMarker), and that table is carried
+// like any other the split has not reached.
 //
-// A store with neither marker predates the birth marker, or its stamp never
-// landed, and nothing on disk says whether it also predates the split; it is
-// seeded, and one that did not need it pays the same copy once, where it shows
-// in the iperf3 tab and setting it back sticks.
+// The birth marker (KeyInstallBornVersion) looks like it should serve too - the
+// iperf3 keys are older than any tagged release, so a store born under 0.70
+// was born on a build that already had them - and it must not be read that way.
+// That build had the keys and still handed them Ookla's values at every load,
+// so on such a store an absent iperf3 key meant "whatever Ookla is set to"
+// right up to the boot that records the split. Taking it for the default at
+// that boot does not undo the leak, it changes what the machine measures, and
+// changes it silently: an upload-only iperf3 run becomes a down-and-up one,
+// roughly twice the transfer per run, on a link somebody pointed one way
+// precisely because it is metered. Worse, the old build goes on reading the
+// absent key its way, so the two disagree about the same file for good.
+//
+// So a table without the split marker is seeded once whatever it says about its
+// birth, and the seed is written down under iperf3's own names: what the
+// machine was already doing goes on being done, the leak stops there, and an
+// older build stepped back onto the file reads those rows as this one does. A
+// store that never shared the pair copies values it was running anyway, which
+// is no change at all - except on a fresh install whose first load could not
+// write the marker and whose Ookla pair moved before the next one; that one
+// pays a real copy once, where it shows in the iperf3 tab and setting it back
+// sticks.
+//
+// A half with nothing to carry is another matter, and nothing here settles it.
+// An iperf3 half that was following an Ookla value nobody had saved - the
+// shipped default, the same on both engines - stays unwritten, since a default
+// is not pinned in a sparse overlay, and both builds run it at that default
+// until Ookla's direction or retries move, on either of them. From then on an
+// older build stepped back onto the file hands the unwritten half Ookla's value
+// at every load while this one keeps the default, and nothing on disk says
+// which build made the move: an Ookla save here writes exactly the rows an
+// Ookla save there does. README says what to check when stepping down and back.
 func splitApplied(m map[string]string) bool {
-	if _, split := m[keyEngineSplit]; split {
+	_, split := m[keyEngineSplit]
+	return split
+}
+
+// engineSplitMinor is the 0.MINOR release in which the two engines stopped
+// sharing one direction/retries pair. Releases below it ran iperf3 on the Ookla
+// value for any half without an iperf3 value of its own, so a settings backup
+// from one holds such a half in the Ookla row and nowhere else. A half with a
+// value of its own is a row in the file and restores like every other setting.
+const engineSplitMinor = 100
+
+// SharedIperfPair reports whether a build calling itself this version is one of
+// those - what a restore needs in order to know that a backup's Ookla direction
+// and retries were also its iperf3 ones. It reads the first two dot-separated
+// fields, after an optional leading "v", as plain decimal digits, and reports
+// true for a major of 0 and a minor below engineSplitMinor. What follows the
+// minor is not read, so a build stamped off one of those tags by git describe
+// ("v0.70.1-3-gabc1234") counts as the release it was built from. Anything else
+// reports FALSE - "dev", a sign or a letter where a number belongs, a single
+// field: the pair's history can only be read off a version shaped like a
+// release, and a caller that guesses would tell an operator restoring an
+// ordinary modern backup that something was lost when nothing was - the same
+// rule the update check follows when it cannot parse a version.
+func SharedIperfPair(version string) bool {
+	majS, rest, ok := strings.Cut(strings.TrimPrefix(version, "v"), ".")
+	if !ok {
+		return false
+	}
+	minS, _, _ := strings.Cut(rest, ".")
+	// strconv.Atoi refuses an empty field but takes a sign, which no release
+	// number carries.
+	digits := func(s string) bool { return strings.TrimLeft(s, "0123456789") == "" }
+	if !digits(majS) || !digits(minS) {
+		return false
+	}
+	major, err1 := strconv.Atoi(majS)
+	minor, err2 := strconv.Atoi(minS)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return major == 0 && minor < engineSplitMinor
+}
+
+// IperfPairKey reports whether a settings key is one of the four rows
+// IperfPairAbsent reads. A restore keeps just those as its config streams past:
+// the category can be any size, and nothing else in it bears on the pair.
+func IperfPairKey(key string) bool {
+	switch key {
+	case keySpeedDirection, keySpeedRetries, keyIperfDirection, keyIperfRetries:
 		return true
 	}
-	_, born := m[KeyInstallBornVersion]
-	return born
+	return false
+}
+
+// IperfPairAbsent reports which half of the iperf3 direction/retries pair a
+// settings backup from a release that shared it (SharedIperfPair) could not
+// bring, and what that pair was set to on the machine that wrote it. rows are
+// the BACKUP's own rows for those keys (IperfPairKey), never the table they
+// landed in: a restore upserts row by row and leaves every key the file does
+// not carry alone, so the table afterwards can hold an Ookla pair that is this
+// install's own, and a question asked of it answers for a file that carried
+// nothing at all.
+//
+// A restore is the one place this build meets a file written under the shared
+// pair and can tell: the destination applied the split at its own first boot,
+// so nothing carries the backup's pair across (recordMigrations only carries
+// what it finds before the marker is written), and the file names the release
+// that wrote it. (An older build stepped back onto a database brings the shared
+// reading back too, for any iperf3 half left unwritten, and leaves nothing on
+// disk to tell - see splitApplied.) A half is left behind when the file holds
+// the Ookla half and no iperf3 value of its own for it - no direction row, or
+// no retry row that reads as a count - so that build ran iperf3 on the Ookla
+// value, and what it ran is not what iperf3 runs here now. An install already
+// running that value, from its defaults or from rows of its own, lost nothing;
+// so did one whose table the split had not reached, since the reload just
+// carried the pair itself. The rows are read the way that build read them - no
+// split marker, then normalize - so a value it clamped or refused is reported
+// as what it ran, not as what the file says.
+func (c *Controller) IperfPairAbsent(rows map[string]string) (direction string, retries int, noDirection, noRetries bool) {
+	there := normalize(overlay(c.defaults, rows))
+	here := c.get()
+	if _, ok := rows[keyIperfDirection]; !ok && rows[keySpeedDirection] != "" {
+		noDirection = there.IperfDirection != here.IperfDirection
+	}
+	if _, ok := atoi(rows[keyIperfRetries]); !ok {
+		if _, ok := atoi(rows[keySpeedRetries]); ok {
+			noRetries = there.IperfRetries != here.IperfRetries
+		}
+	}
+	return there.IperfDirection, there.IperfRetries, noDirection, noRetries
 }
 
 // recordMigrations writes back what the legacy reads in overlay and loadSchedule
@@ -1200,12 +1334,12 @@ func splitApplied(m map[string]string) bool {
 // its own name, and an import that brings the legacy keys back gets the same
 // treatment. speed_direction and speed_retries stayed in service as Ookla's
 // own, so for the iperf3 pair the trigger is whether the split has been
-// applied (splitApplied): a table with neither the split marker nor a birth
-// marker has not had it, and this write applies it - the seeded pair, when
-// there was one, and the marker - after which an absent iperf3 key means the
-// default. A table with only the birth marker gets the split marker and
-// nothing for iperf3. A fresh install gets the marker at its first boot for
-// the same reason; it is bookkeeping (installStateKeys), not configuration.
+// applied (splitApplied): a table without the split marker has not had it, and
+// this write applies it - the seeded pair, when there was one, and the marker -
+// after which an absent iperf3 key means the default. A fresh install gets the
+// marker at its first boot for the same reason; it is bookkeeping
+// (installStateKeys), not configuration, and there is no Ookla pair on disk yet
+// to seed from.
 //
 // Every load runs this, the reset-auth command's included (main builds that
 // controller through New, with zero defaults): like the legacy password
@@ -1220,14 +1354,16 @@ func splitApplied(m map[string]string) bool {
 func (c *Controller) recordMigrations(ctx context.Context, m map[string]string, v Values) {
 	fk := formKeys(v)
 	kv := map[string]string{}
-	if _, split := m[keyEngineSplit]; !split {
-		kv[keyEngineSplit] = "1"
-	}
 	if !splitApplied(m) {
+		kv[keyEngineSplit] = "1"
 		if _, ok := m[keyIperfDirection]; !ok && m[keySpeedDirection] != "" {
 			kv[keyIperfDirection] = fk[keyIperfDirection]
 		}
-		if _, ok := m[keyIperfRetries]; !ok {
+		// A retry row that does not read as a count is no value of its own:
+		// overlay reads straight past it to Ookla's, as every release before the
+		// split did at every load, so it is carried like a missing row, and the
+		// count that was running takes the unreadable row's place.
+		if _, ok := atoi(m[keyIperfRetries]); !ok {
 			if _, ok := atoi(m[keySpeedRetries]); ok {
 				kv[keyIperfRetries] = fk[keyIperfRetries]
 			}
@@ -1251,7 +1387,38 @@ func (c *Controller) recordMigrations(ctx context.Context, m map[string]string, 
 	// SetSettingsDiff writes nothing for it.
 	if _, err := c.store.SetSettingsDiff(ctx, kv); err != nil {
 		fmt.Fprintf(os.Stderr, "pingularity: WARNING: could not record migrated settings: %v - they are in effect; the next settings load tries again\n", err)
+		return
 	}
+	// Only now, and only about a write that landed: the line says the pair is
+	// stored under iperf3's own names, so a load whose write failed must not
+	// print it. That load has the WARNING above, which is the honest word for
+	// it, and the next load seeds the same pair from the same rows and says it
+	// then.
+	sayCarriedIperfPair(kv)
+}
+
+// sayCarriedIperfPair names the values a seed just brought under iperf3's own
+// keys, once, on the boot that stores them. Nothing else says so: the numbers
+// themselves do not move - that is the point of carrying them - so the iperf3
+// tab reads exactly as it did before, and an operator never told the pair
+// changed hands has no reason to look at it. Said on stderr rather than logged,
+// like the notices around it: this runs inside the settings load, and the
+// logger is pinned silent until the level stored in those very settings has
+// been read (main's applyLogLevel), so a logged line would be dropped whatever
+// the operator's level says.
+func sayCarriedIperfPair(kv map[string]string) {
+	var carried []string
+	if d, ok := kv[keyIperfDirection]; ok {
+		carried = append(carried, fmt.Sprintf("direction %q", d))
+	}
+	if r, ok := kv[keyIperfRetries]; ok {
+		carried = append(carried, "retries "+r)
+	}
+	if len(carried) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "pingularity: iperf3 had been taking %s from the Ookla settings on this database and keeps what it had - stored under iperf3's own settings now, out of reach of the next Ookla change\n",
+		strings.Join(carried, " and "))
 }
 
 // Getters (each safe for concurrent use).
@@ -1373,6 +1540,37 @@ func (c *Controller) LatencyAllowed(t time.Time) bool {
 		return true
 	}
 	return windowsActive(v.SchedLatWindows, t)
+}
+
+// NeverActiveSchedules names the features - "latency", "speedtest" - whose
+// schedule is switched on with nothing that can ever be active: every window it
+// has selects no weekday. Such a schedule parks its feature for good, and an
+// install measuring nothing looks exactly like an install with nothing to
+// report, so the daemon says it at boot rather than leaving it to be found in a
+// flat chart. A schedule with no window AT ALL never reaches here - normalize
+// forces that flag off, which reads as no restriction.
+func (c *Controller) NeverActiveSchedules() []string {
+	v := c.get()
+	var out []string
+	if v.SchedLatEnabled && !windowsEverActive(v.SchedLatWindows) {
+		out = append(out, "latency")
+	}
+	if v.SchedSpeedEnabled && !windowsEverActive(v.SchedSpeedWindows) {
+		out = append(out, "speedtest")
+	}
+	return out
+}
+
+// windowsEverActive reports whether any of the windows can be active at some
+// point in the week. It mirrors windowActive's fail-open on malformed data: a
+// mask that is not seven days reads as every day, not as no day.
+func windowsEverActive(ws []Window) bool {
+	for _, w := range ws {
+		if len(w.Days) != 7 || strings.Contains(w.Days, "1") {
+			return true
+		}
+	}
+	return false
 }
 
 // Snapshot and Defaults hand the whole Values to external callers, so they
@@ -2397,6 +2595,12 @@ var installStateKeys = map[string]bool{
 	// table (recordMigrations). Every install gets it at its first boot, fresh
 	// ones included, so it says nothing about whether anyone configured it.
 	keyEngineSplit: true,
+	// access_hold_after_rebuild - the store's own note that it was rebuilt after
+	// corruption and has had no login since (store.AccessHoldAfterRebuild). The
+	// rebuild writes it and nobody configures it; counted as configuration it
+	// would read a rebuilt first-run install as established and release the
+	// consent hold that install is still owed.
+	"access_hold_after_rebuild": true,
 	// Legacy telemetry identity/state (feature removed; only on older DBs).
 	"telemetry_id": true, "telemetry_install_id": true, "telemetry_salt": true,
 	"telemetry_id_born_at": true, "telemetry_consent_version": true,
@@ -2545,6 +2749,39 @@ func (c *Controller) seedSessionEpoch(m map[string]string) {
 // SessionEpoch returns the current session-revocation epoch, folded into every
 // session-token MAC (see BumpSessionEpoch).
 func (c *Controller) SessionEpoch() int64 { return c.sessionEpoch.Load() }
+
+// readRetiredCityScope picks up the retired auto-selection city a load found in
+// the store. The COORDINATE is what decides there was one: it is the half the
+// old build parsed and centred on, and the label beside it was only ever the
+// name shown for it, so a table carrying a label and no coordinate never had a
+// working scope and has nothing to be told about. The label is preferred for
+// the telling, being what the operator typed; nothing is parsed or bounded,
+// because nothing acts on it - it is quoted back verbatim.
+func (c *Controller) readRetiredCityScope(m map[string]string) {
+	scope := ""
+	if loc := strings.TrimSpace(m[keySpeedAutoLoc]); loc != "" {
+		scope = loc
+		if label := strings.TrimSpace(m[keySpeedAutoLabel]); label != "" {
+			scope = label
+		}
+	}
+	c.retiredCityScope.Store(&scope)
+}
+
+// RetiredCityScope reports the auto-selection city a pre-picker build was
+// configured to centre every automatic speedtest on, and that this build no
+// longer honours - "" when the store carries none, which is every install that
+// never used it and every one created since.
+//
+// It reports what is ON DISK, not what to do about it: whether an operator
+// still needs telling depends on what they have chosen SINCE, which is the
+// boot path's judgement to make.
+func (c *Controller) RetiredCityScope() string {
+	if s := c.retiredCityScope.Load(); s != nil {
+		return *s
+	}
+	return ""
+}
 
 // BumpSessionEpoch advances the session-revocation epoch and persists it, so a
 // logout invalidates every outstanding token AND the revocation survives a
@@ -2707,8 +2944,8 @@ func normalize(v Values) Values {
 	// reconnect/degraded speedtests never fire) with no window to explain why. Treat
 	// "enabled but empty" as "no restriction" - force the flag off so the gate reads
 	// as unscheduled (always allowed), which is what an empty allow-list means here.
-	// sanitizeWindows has already dropped every window that selects no weekday -
-	// the same never-active state wearing a row - so this covers that shape too.
+	// A schedule whose windows are all no-day is NOT this state: it has rows on
+	// screen to explain itself, so it keeps its flag and stays parked.
 	if v.SchedLatEnabled && len(v.SchedLatWindows) == 0 {
 		v.SchedLatEnabled = false
 	}
@@ -2950,26 +3187,28 @@ func mergeIperfPasswords(incoming, stored []IperfTarget) []IperfTarget {
 }
 
 // sanitizeWindows normalizes each window's day mask and clamps its minutes,
-// dropping any past the per-feature cap and any whose mask selects no weekday.
+// dropping any past the per-feature cap.
+//
+// A well-formed mask with every day off is kept exactly as written. Such a
+// window can never be active, so the schedule it belongs to parks its feature -
+// which is what the operator wrote down, and what an older build does with the
+// same rows. Dropping the row instead hands the schedule to normalize's
+// empty-list guard, and "never run" comes back out of it as "no restriction":
+// an install that was deliberately quiet starts probing and running speedtests
+// round the clock on the first restart after an upgrade, spending data nobody
+// asked for, with the stored row still saying the opposite and the API
+// answering off. What makes that shape dangerous is silence, so the silence is
+// what gets fixed: the dashboard renders the dead row and refuses to save it
+// ("pick a day or turn it off"), and the daemon names it at every boot (see
+// NeverActiveSchedules). A malformed mask is a different case: normDays reads
+// that as every day, not as no day.
 func sanitizeWindows(ws []Window) []Window {
 	if len(ws) > maxWindows {
 		ws = ws[:maxWindows]
 	}
-	out := make([]Window, 0, len(ws))
-	for _, w := range ws {
-		days := normDays(w.Days)
-		// A well-formed mask with every day off is a window that can never be
-		// active: beside a live window it adds nothing, and on its own it is the
-		// "no windows" state wearing a row - which normalize's empty-list guard
-		// counts as a window, leaving the toggle on and the whole feature gated
-		// off with nothing to say why. Drop it here, as the dashboard drops such
-		// a row before it posts, so the guard sees the empty list it was written
-		// for. A malformed mask is a different case: normDays reads that as every
-		// day, not as no day.
-		if !strings.Contains(days, "1") {
-			continue
-		}
-		out = append(out, Window{Days: days, Start: clampMin(w.Start), End: clampMin(w.End)})
+	out := make([]Window, len(ws))
+	for i, w := range ws {
+		out[i] = Window{Days: normDays(w.Days), Start: clampMin(w.Start), End: clampMin(w.End)}
 	}
 	return out
 }

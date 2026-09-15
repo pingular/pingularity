@@ -31,6 +31,11 @@ archives:
       # flags, security model). Without this an archive carries a README whose
       # "see docs/..." links point at nothing that shipped with it.
       - docs/*.md
+      # The archive is the only channel that carries prose at all - the packages
+      # and the images ship the licences and nothing else - and the reader
+      # unpacking a tarball over an install that is already running is the one
+      # CHANGELOG.md is written for.
+      - CHANGELOG*
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     format_overrides:

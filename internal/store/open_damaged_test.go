@@ -72,7 +72,9 @@ func tearTableRoot(t *testing.T, path, table string) {
 }
 
 // The README promises that a database which will not open is set aside, not
-// repaired, so the service cannot crash-loop on it. Open kept that promise only
+// repaired, for an install that asked for that road (-on-corrupt rebuild, which
+// is what every reopen below arms; the default refusal has its own file), so
+// the service cannot crash-loop on it. Open kept that promise only
 // when the damage sat where the very first statement looks (the schema page):
 // a torn page in a table the at-Open repairs scan - events here - passed the
 // schema step and then failed the repair, and Open returned the error with the
@@ -124,7 +126,7 @@ func TestOpenSetsAsideCorruptionPastTheSchemaStep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	matches, _ := filepath.Glob(path + ".*.corrupt")
 	if err != nil {
 		t.Fatalf("Open returned %v and left the file in place (%d set-aside files): the service restarts on the same file forever", err, len(matches))
@@ -157,7 +159,7 @@ func TestRebuiltStoreCarriesAnInstallAnchor(t *testing.T) {
 	}
 	tearPastHeader(t, path)
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open must set a torn database aside and rebuild, got: %v", err)
 	}
@@ -204,7 +206,7 @@ func TestOpenSetsAsideADatabaseWhoseHeaderPageIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open refused a database whose header page was lost instead of setting it aside: %v", err)
 	}
@@ -242,7 +244,7 @@ func TestRebuildKeepsTheFirstRunHoldWhenTheOldFileWasStillOnIt(t *testing.T) {
 	}
 	tearTableRoot(t, path, "pauses")
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open must set a torn database aside and rebuild, got: %v", err)
 	}
@@ -276,7 +278,7 @@ func TestRebuildAnchorsWhenTheOldFileWasPastItsFirstRun(t *testing.T) {
 	}
 	tearTableRoot(t, path, "pauses")
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open must set a torn database aside and rebuild, got: %v", err)
 	}
@@ -313,7 +315,7 @@ func TestRebuildAnchorsWhenTheOldFileSaidNothingEitherWay(t *testing.T) {
 	}
 	tearTableRoot(t, path, "pauses")
 
-	st2, err := Open(path)
+	st2, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open must set a torn database aside and rebuild, got: %v", err)
 	}

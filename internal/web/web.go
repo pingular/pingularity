@@ -157,6 +157,21 @@ type Server struct {
 	// network reach with -access network. Set by main before Serve.
 	InContainer bool
 
+	// AccessHold reports, live, whether the hold a store rebuilt after the
+	// database was found damaged keeps on network access stands in this process
+	// (see store.AccessHoldAfterRebuild) - main reads it at boot and judges it
+	// again at every settings load, because a load can be the first that reads
+	// the store. While it stands only loopback reaches the dashboard, whatever the
+	// access setting says, and readiness says why. Set by main before Serve; nil
+	// means nothing is held.
+	AccessHold func() AccessHold
+
+	// holdReleased records that network access was switched on from this
+	// machine - the Access tab or Quick Setup - and the hold released with it
+	// (releaseAccessHold), so this process stops refusing what the operator at
+	// the machine just opened rather than waiting for the next settings load.
+	holdReleased atomic.Bool
+
 	// DBPath is the on-disk database path, used only for its size on /metrics.
 	// Set by main before Serve; empty (or ":memory:") skips the gauge.
 	DBPath string
@@ -2655,6 +2670,17 @@ type settingsDTO struct {
 	// shape - a parallel DTO would only be a place to drift.
 	SpeedServers []settings.SavedServer `json:"speed_servers"`
 
+	// The retired auto-selection city. These are the only fields here that are
+	// not settings: they are decoded so a POST still carrying one can be REFUSED
+	// (see retiredScopeRefusal) instead of answered 200 by a decoder that
+	// ignores what it does not know. Plain strings, not the PATCH pointers
+	// everything else uses - there is no value to keep, and absent and blank
+	// mean the same thing here - and dtoFrom never fills them, so omitempty
+	// keeps them off every response and nothing puts them back on the read
+	// surface.
+	SpeedAutoLoc   string `json:"speed_auto_loc,omitempty"`
+	SpeedAutoLabel string `json:"speed_auto_label,omitempty"`
+
 	// Alerting.
 	ThreshDownMbps    *float64 `json:"thresh_down_mbps"`
 	ThreshUpMbps      *float64 `json:"thresh_up_mbps"`
@@ -2993,6 +3019,13 @@ func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// A first-run store rebuilt after corruption offers Quick Setup again, from
+	// behind the hold on network access. Answering it with network access is the
+	// same choice made at the same machine as the Access tab's, and ends the hold
+	// the same way (releaseAccessHold).
+	if !ans.LocalOnly {
+		s.releaseAccessHold(r.Context())
+	}
 
 	// A new hash re-keys the session token, and enabling login would otherwise
 	// lock out the very browser that just set it - re-issue the cookie so the
@@ -3004,6 +3037,48 @@ func (s *Server) handleQuickSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("quick setup applied", "speedtest", ans.SpeedtestEnabled, "local_only", ans.LocalOnly, "auth", s.settings.AuthActive())
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// retiredSettingsKeys are settings fields that were real in an older release and
+// name nothing now. They are listed once, so the refusal below, the reference
+// (docs/api.md) and TestRetiredSettingsKeysAreDocumented all speak of the same
+// set.
+var retiredSettingsKeys = []string{"speed_auto_loc", "speed_auto_label"}
+
+// retiredScopeRefusal returns the message for a POST that tries to set the
+// retired auto-selection city, and "" for one that does not.
+//
+// The keys used to scope every automatic Ookla run to one city, and the lenient
+// decoder answered 200 to them long after the picker rework removed them: the
+// value went nowhere, came back in no response, and steered nothing. A
+// provisioning run that pins its speedtest scope that way therefore reported
+// success at every boot forever while the daemon measured whatever the city
+// race found - the one answer a config API must never give. So it is a 400, and
+// the message names what decides selection now, because a script that has to be
+// changed deserves to be told what to change it to.
+//
+// A BLANK value is not refused. It asks for the state the daemon is already in
+// - no city scope at all - so 200 tells the caller nothing false. The page these
+// keys came from sent them with every save, blank unless a city had been chosen,
+// so a body modelled on it still works for an install that never chose one.
+//
+// A value that only repeats the city already stored IS refused, although the
+// store would not change: that is the very body a provisioning run that pinned
+// the city under the older release sends every time it runs, and the run this
+// refusal exists for. The one other sender is that older page itself, left open
+// across the upgrade on an install that had a city - it posts the stored city
+// back with every save and shows whatever comes back in its drawer - so the
+// message ends with the one thing that gets that save through.
+func retiredScopeRefusal(loc, label string) string {
+	if strings.TrimSpace(loc) == "" && strings.TrimSpace(label) == "" {
+		return ""
+	}
+	return strings.Join(retiredSettingsKeys, " and ") + " are no longer settings: automatic server " +
+		"selection races the cities it can name - the connection's own, plus the cities of any servers " +
+		"starred in speed_servers - and measures which of them is fastest, and nothing but a pinned " +
+		"speed_server_id overrides that. Pin the server itself with speed_server_id, or star servers " +
+		"near that city with speed_servers. A dashboard page loaded before the upgrade still sends them " +
+		"with every save: reload it and save again."
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -3033,6 +3108,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		var in settingsDTO
 		if err := decodeJSONBody(w, r, &in); err != nil {
 			return // response already written (415/400)
+		}
+		// Refuse a retired setting BEFORE anything is applied: a body the daemon
+		// will not honour in full must not be honoured in part.
+		if msg := retiredScopeRefusal(in.SpeedAutoLoc, in.SpeedAutoLabel); msg != "" {
+			http.Error(w, msg, http.StatusBadRequest)
+			return
 		}
 		prevExit := s.settings.ExitTarget() // detect an exit-path change to re-trace below
 		// Update() is a PATCH: nil (absent) fields keep their current value, so a
@@ -3778,6 +3859,38 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	s.settings.ForgetBirthWitness()
 	oldestTS := map[string]int64{}
 	importedConfig := false
+	// The version that WROTE the file, from the envelope. Restoring decides
+	// nothing on it - a stamp is whatever the file says - but one question can
+	// only be answered by it (the shared iperf3 pair, at the end of the
+	// reconcile below), and only together with the rows that pair sat in, as the
+	// file carried them: just those keys (settings.IperfPairKey), kept as the
+	// config streams past, whatever size the category is. Each is kept as the
+	// text it lands as (importedSettingText), and first for the batch it came in
+	// alone (batchPairRows): only a batch the store reports committed vouches
+	// for the rows it held (importArray). A restore commits batch by batch and
+	// stops at the first it cannot, so rows that landed ahead of a refusal - in
+	// an earlier category or earlier in the same one - still answer, and a
+	// partial restore's reply carries the warnings below as a clean one does,
+	// while the refused batch's rows answer nothing, landed or not. (A row of
+	// any other table carrying key and value is refused for those columns,
+	// which is this same refusal.)
+	var producerVersion string
+	pairRows, batchPairRows := map[string]string{}, map[string]string{}
+	notePairRow := func(row map[string]any) {
+		k, _ := row["key"].(string)
+		if !settings.IperfPairKey(k) {
+			return
+		}
+		if v, ok := importedSettingText(row["value"]); ok {
+			batchPairRows[k] = v
+		}
+	}
+	commitPairRows := func() {
+		for k, v := range batchPairRows {
+			pairRows[k] = v
+		}
+		clear(batchPairRows)
+	}
 	// The login state BEFORE any config lands. A backup carries the login settings
 	// but never the password hash (settingsExportDeny), so applying it verbatim can
 	// leave this box in a state its own credentials do not fit - and the endpoint
@@ -3817,11 +3930,21 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			// must stay bounded) and every few thousand tokens rearms the read
 			// deadline, so a big skipped category on a slow link is not reaped
 			// mid-walk while a stalled body still is.
+			//
+			// producer_version is walked the same way, and it is the one value here
+			// anything keeps: its first token, when that token is the whole value - a
+			// string - and shaped like a version. A stamp of any other shape restores
+			// exactly as it did before anything read this key, and nothing a crafted
+			// one says can ride into the warning or the log line below.
+			stamp := key == "producer_version"
 			skippedToks := 0
-			if err := skipJSONValue(dec, func() {
+			if err := skipJSONValue(dec, func(tok json.Token) {
 				body.renew()
 				if skippedToks++; skippedToks%4096 == 0 {
 					resetDeadline()
+				}
+				if pv, ok := tok.(string); ok && stamp && skippedToks == 1 && versionStamp(pv) {
+					producerVersion = pv
 				}
 			}); err != nil {
 				// An element outgrowing the allowance is a size problem, and saying
@@ -3861,7 +3984,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			s.reconciling.Store(true)
 			defer s.reconciling.Store(false)
 		}
-		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, progress)
+		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, progress, notePairRow, commitPairRows)
 		result[dc.cat] += n // latency spans two tables (samples + dns); sum them
 		if sawTS {
 			if cur, ok := oldestTS[dc.cat]; !ok || minTS < cur {
@@ -4134,6 +4257,51 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			s.log.Warn("imported config had login enabled but no password; login left off",
 				"local_only", s.settings.AccessLocalOnly())
 		}
+		// Until 0.100 both speedtest engines shared ONE direction and retry
+		// count: an iperf3 field with no value of its own followed the Ookla one,
+		// at every load. A settings backup from such a release therefore holds
+		// any iperf3 value that was still following Ookla's in the Ookla row and
+		// nowhere else (a value of its own is a row, and restores like any
+		// other), and this destination applied the split at its own first boot -
+		// so the restore lands such a value as Ookla's, iperf3 keeps whatever
+		// this install had, and an upload-only iperf3 run on the old machine
+		// becomes a down-and-up one here with nothing anywhere to show it
+		// happened.
+		//
+		// Carrying the values across instead is not open to a restore. The
+		// commoner case by far is a modern backup onto a configured install,
+		// where copying Ookla's pair into iperf3's is precisely the leak the
+		// split exists to stop - and nothing in the rows separates the two
+		// cases: a config-only export stamps envelope version 1 whoever wrote
+		// it, and the same configuration writes the same rows on either side of
+		// the split. Only the version stamp tells them apart, which is enough to
+		// SAY something and not enough to change what a machine measures. So the
+		// restore says it, and only when the file names a release that shared
+		// the pair: an unreadable version ("dev", a self-build) is one to draw no
+		// conclusion from, since a wrong warning here would send an ordinary
+		// restore looking for a setting it never lost.
+		//
+		// The same caution decides what it is asked of. The rows are the FILE's
+		// (pairRows), never the table afterwards: a restore leaves every key the
+		// file does not carry alone, so the Ookla pair the table holds can be
+		// this install's own, and a backup that carried no pair at all would be
+		// told it restored one. What stays is named whether it is the default or
+		// a pair this install set itself - either way it is not what the machine
+		// the backup came from was running - and a half that already matches what
+		// iperf3 runs here is not named at all (IperfPairAbsent). Nothing waits on
+		// the reload having gone through: the values named are the ones this
+		// install runs, and a reload that failed leaves them where they were,
+		// along with the iperf3 rows the file never carried.
+		if settings.SharedIperfPair(producerVersion) {
+			dir, retries, noDir, noRetries := s.settings.IperfPairAbsent(pairRows)
+			if noDir || noRetries {
+				warnings = append(warnings, sharedIperfPairWarning(producerVersion, noDir, noRetries,
+					dir, retries, s.settings.IperfDirection(), s.settings.IperfRetries()))
+				s.log.Warn("restored a config from before the speedtest engines had their own direction and retries; the iperf3 pair was left as it was here",
+					"producer_version", producerVersion,
+					"iperf_direction", s.settings.IperfDirection(), "iperf_retries", s.settings.IperfRetries())
+			}
+		}
 	}
 	if result["downtime"] > 0 || result["speed"] > 0 {
 		s.invalidateAggregates() // the uptime/data pills must not serve pre-import numbers for another aggTTL
@@ -4207,7 +4375,17 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 // sawTS distinguishes "no timestamped rows at all" (speed_servers is keyed by
 // run_ts and has no ts column; an empty array has no rows) from a genuine row
 // stamped 0, which is an ancient, entirely prunable timestamp.
-func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, onProgress func()) (n int, minTS int64, sawTS bool, err error) {
+//
+// onRow, when not nil, sees each row as it is decoded, before it is batched,
+// and onCommit, when not nil, runs each time the store reports a batch
+// committed. Every batch committed before a refusal stays stored whatever
+// follows, so what a caller keeps from a row answers once onCommit has run
+// after it, and not before. A refused batch has as a rule stored none of its
+// rows. The exception is a full one (batchRows): the store commits it as its
+// last row lands and then opens another transaction, and if that one fails -
+// a client hanging up at that moment - the store refuses a batch whose rows
+// are all stored, and onCommit does not run for them.
+func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, onProgress func(), onRow func(map[string]any), onCommit func()) (n int, minTS int64, sawTS bool, err error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("bad %s data: %w", key, err)
@@ -4233,6 +4411,9 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		if onProgress != nil {
 			onProgress() // a batch landed: rearm the read deadline for the next one
 		}
+		if ierr == nil && onCommit != nil {
+			onCommit()
+		}
 		return ierr
 	}
 	for dec.More() {
@@ -4253,6 +4434,9 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		var row map[string]any
 		if derr := json.Unmarshal(raw, &row); derr != nil {
 			return n, minTS, sawTS, fmt.Errorf("bad %s data: %w", key, derr)
+		}
+		if onRow != nil {
+			onRow(row)
 		}
 		// Only a timestamp the store would actually keep counts: it applies this
 		// same sanity rule (finite, >= 0, in int64 range) and drops the row
@@ -4275,6 +4459,87 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		return n, minTS, sawTS, fmt.Errorf("bad %s data: %w", key, terr)
 	}
 	return n, minTS, sawTS, flush()
+}
+
+// maxProducerVersion bounds the envelope's version stamp before it is kept: it
+// is the one piece of a restored file that reaches an operator-facing warning
+// and the log, and a version string that long is not one this product ever
+// wrote.
+const maxProducerVersion = 64
+
+// versionStamp reports whether a restored file's producer_version is short and
+// shaped like a version - digits, letters, and the punctuation a release tag
+// uses - and nothing else. The stamp is FILE data, not ours, and it is the one
+// piece of a backup that gets quoted back to the operator and written to the
+// log, so anything that is not this shape is dropped rather than repeated.
+func versionStamp(s string) bool {
+	if s == "" || len(s) > maxProducerVersion {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case r == '.', r == '-', r == '+':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// importedSettingText is the text a restored settings value lands as, so the
+// shared-pair notice reads each row the way the release that wrote the file ran
+// on it. Our exporters write every value as a string, but a hand-edited backup
+// can carry a JSON number or boolean and the store takes those as well: a whole
+// number lands as its digits, a boolean as 1 or 0, a fraction as text no retry
+// count reads. What the store will not land - null, an array, an object, a
+// whole number past int64 - is reported as nothing landing.
+func importedSettingText(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case bool:
+		if x {
+			return "1", true
+		}
+		return "0", true
+	case float64:
+		if x != math.Trunc(x) {
+			return strconv.FormatFloat(x, 'g', -1, 64), true
+		}
+		if x >= float64(math.MinInt64) && x < float64(math.MaxInt64) {
+			return strconv.FormatInt(int64(x), 10), true
+		}
+	}
+	return "", false
+}
+
+// sharedIperfPairWarning tells a restorer what a backup from before the engines
+// were split could not bring: whichever half of the iperf3 pair the file held
+// only as Ookla's, what iperf3 was set to on the machine that wrote it, and the
+// value in force here instead. Named per half, because a file can carry one and
+// not the other, and pointed at the tab that fixes it - the numbers are right
+// there and setting them takes a moment, but only if somebody knows to look.
+func sharedIperfPairWarning(producerVersion string, noDir, noRetries bool, dir string, retries int, hereDir string, hereRetries int) string {
+	count := func(n int) string {
+		if n == 1 {
+			return "1 retry"
+		}
+		return strconv.Itoa(n) + " retries"
+	}
+	there, here, those, them := "direction "+strconv.Quote(dir)+" and "+count(retries),
+		"direction "+strconv.Quote(hereDir)+" and "+count(hereRetries), "those", "them"
+	switch {
+	case !noRetries:
+		there, here, those, them = "direction "+strconv.Quote(dir), "direction "+strconv.Quote(hereDir), "that", "it"
+	case !noDir:
+		there, here, those, them = count(retries), count(hereRetries), "that", "it"
+	}
+	return "This backup was written by Pingularity " + producerVersion + ", where both speedtest engines shared " +
+		"one direction and retry count, so iperf3 there was set to " + there + ". The file keeps " + those +
+		" only in Ookla's settings, which is where the restore put " + them + "; iperf3 keeps this install's " + here +
+		". If the machine this backup came from was testing with iperf3, set that in the iperf3 tab - its runs " +
+		"would otherwise change shape here."
 }
 
 // importBatchBytes flushes an import batch once its decoded rows exceed this many
@@ -4355,13 +4620,14 @@ const maxImportDepth = 64
 // skipJSONValue advances dec past exactly one JSON value (scalar, object, or
 // array) without materializing it - how the import walks past categories it
 // wasn't asked to restore, at O(1) memory even when that category is huge.
-// onTok, if non-nil, runs after every consumed token, so the caller can mark
-// progress (read allowance, deadline) through an arbitrarily long walk.
-func skipJSONValue(dec *json.Decoder, onTok func()) error {
+// onTok, if non-nil, runs after every consumed token and is handed it, so the
+// caller can mark progress (read allowance, deadline) through an arbitrarily
+// long walk and keep the one token it came for.
+func skipJSONValue(dec *json.Decoder, onTok func(json.Token)) error {
 	return skipJSONValueDepth(dec, onTok, 0)
 }
 
-func skipJSONValueDepth(dec *json.Decoder, onTok func(), depth int) error {
+func skipJSONValueDepth(dec *json.Decoder, onTok func(json.Token), depth int) error {
 	if depth > maxImportDepth {
 		return fmt.Errorf("bad import data: JSON nested too deeply")
 	}
@@ -4370,7 +4636,7 @@ func skipJSONValueDepth(dec *json.Decoder, onTok func(), depth int) error {
 		return err
 	}
 	if onTok != nil {
-		onTok()
+		onTok(tok)
 	}
 	if d, ok := tok.(json.Delim); ok && (d == '{' || d == '[') {
 		for dec.More() {
@@ -4378,11 +4644,12 @@ func skipJSONValueDepth(dec *json.Decoder, onTok func(), depth int) error {
 				return err
 			}
 		}
-		if _, err := dec.Token(); err != nil { // the matching closing delimiter
+		end, err := dec.Token() // the matching closing delimiter
+		if err != nil {
 			return err
 		}
 		if onTok != nil {
-			onTok()
+			onTok(end)
 		}
 	}
 	return nil
@@ -4620,6 +4887,83 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// AccessHold is what a start knows about the hold a store rebuilt after the
+// database was found damaged keeps on network access (store.AccessHoldAfterRebuild).
+type AccessHold int32
+
+const (
+	// AccessNotHeld: nothing holds network access back.
+	AccessNotHeld AccessHold = iota
+	// AccessHeldAfterRebuild: the store was rebuilt after the database was found
+	// damaged, has had no login set on it since, and network access was asked
+	// for anyway - by -access/PINGULARITY_ACCESS, or by a stored choice this
+	// build did not make.
+	AccessHeldAfterRebuild
+	// AccessHeldUnread: whether the store carries that hold could not be read,
+	// so network access fails closed until a settings load reads it.
+	AccessHeldUnread
+)
+
+// accessHeld is the hold as this process's requests see it: unset reads as
+// nothing held, and network access switched on from this machine ends it.
+func (s *Server) accessHeld() AccessHold {
+	if s.AccessHold == nil || s.holdReleased.Load() {
+		return AccessNotHeld
+	}
+	return s.AccessHold()
+}
+
+// Enforced reports whether the hold keeps network access to this machine for a
+// request judged against settings that did, or did not, load. A hold read as
+// standing does, whatever the settings. One that could not be read does only
+// once they have loaded: until then every request is refused already, because
+// the settings could not be loaded - the refusal this daemon gave before there
+// was a hold to read, and the one that names the fault, since the hold is read
+// from those same settings. Told instead that local-only access is on and to
+// start with -access network, an operator who had passed it went looking for a
+// setting that was never the problem. The guard and the startup line both judge
+// with this, so the line states what the guard does.
+func (h AccessHold) Enforced(settingsLoaded bool) bool {
+	return h == AccessHeldAfterRebuild || (h == AccessHeldUnread && settingsLoaded)
+}
+
+// releaseAccessHold ends the hold a store rebuilt after corruption keeps on
+// network access, because network access has just been switched on from this
+// machine - the Access tab, or a Quick Setup answer - with the store's own
+// setting already written. That is the operator at the machine saying they
+// know what they are opening, the same boundary reset-auth stands on, so it is
+// the one network choice the hold gives way to.
+//
+// It has to END the hold rather than merely win over it, and in this order.
+// A network choice found stored under a standing hold is not honoured (main's
+// judgeAccessHold), because an older release the store was rolled back to
+// stores one on any ordinary Save - and any visitor could send that Save while
+// the older release had the network open. So this build's own choice is told
+// apart the only way the store can carry: the hold is gone. A write that lands
+// with the hold still standing - the release below failing - is still refused,
+// here and at every later load, which fails closed.
+func (s *Server) releaseAccessHold(ctx context.Context) {
+	if s.store == nil {
+		return
+	}
+	released, err := s.store.ReleaseAccessHold(ctx)
+	if err != nil {
+		s.log.Warn("network access was switched on, but the hold a rebuilt store keeps on it could not be released; the network is still refused",
+			"err", err)
+		return
+	}
+	s.holdReleased.Store(true)
+	switch {
+	case released && s.settings.AuthActive():
+		// Switched on in the same Save that set a login: the store has one, and
+		// telling the operator who just typed it to set a password is wrong.
+		s.log.Warn("the hold a rebuilt store kept on network access is released: network access was switched on from this machine, and a login stands behind it")
+	case released:
+		s.log.Warn("the hold a rebuilt store kept on network access is released: network access was switched on from this machine, and the store has no login",
+			"fix", "set a password in the Access tab")
+	}
+}
+
 // handleReadyz is readiness: 200 only when the store answers and the first status
 // aggregate has been computed (so a scrape/dashboard won't hit a cold, zero-valued
 // cache). 503 otherwise, so a load balancer holds traffic until the daemon is warm.
@@ -4642,6 +4986,36 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	if s.store == nil || s.store.DB().PingContext(ctx) != nil {
 		http.Error(w, "not ready: store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// The store answers, and it is empty because this process built it: the
+	// database it replaced was damaged, and the history and every saved setting
+	// went with the file set aside. Monitoring carries on - that is what the
+	// rebuild is for, and why /healthz keeps saying ok rather than restarting
+	// the container - but nothing else would ever tell anyone. An alert on "is
+	// it up" answers yes over a blank dashboard indefinitely, so the readiness
+	// verdict is where this has to show. This part clears at the next start,
+	// which opens the rebuilt database and finds it healthy.
+	if s.store.RebuiltAfterCorruption() {
+		http.Error(w, "not ready: running on an empty store rebuilt after the database was found damaged; the old file is beside it as <db>.<UTC>.corrupt", http.StatusServiceUnavailable)
+		return
+	}
+	// What does not clear with it is the hold on network access, for an install
+	// that was asked for the network: the rebuilt store has no login, so every
+	// start holds network access to loopback until one is set (see
+	// store.AccessHoldAfterRebuild), and the network clients this daemon exists
+	// to serve are refused meanwhile. Answering ready would send a load
+	// balancer's traffic here and tell an alert all is well. Read live, because
+	// network access the operator switches on from this machine releases the
+	// hold, and then nothing is being held. A hold that could not be read is
+	// refusing the network just the same, but nothing says the store was ever
+	// rebuilt, so this does not say so either.
+	switch s.accessHeld() {
+	case AccessHeldAfterRebuild:
+		http.Error(w, "not ready: network access is held to this machine - the store was rebuilt after the database was found damaged and has no login yet; set a password from this machine and restart or reload, or run pingularity reset-auth", http.StatusServiceUnavailable)
+		return
+	case AccessHeldUnread:
+		http.Error(w, "not ready: network access is held to this machine - whether the store carries the hold a rebuilt store keeps could not be read; check the log, then reload or restart", http.StatusServiceUnavailable)
 		return
 	}
 	s.aggregates() // warm the cache on demand so a readyz-only probe can flip ready

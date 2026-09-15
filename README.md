@@ -182,6 +182,19 @@ Store and re-run.
 > errors; unset the variable, or start with
 > `GODEBUG=x509sslcertoverrideplatform=0` to restore the old behavior.
 
+> **A webhook or heartbeat URL with a bare IPv6 address?** The same toolchain
+> change made the URL parser refuse a host whose colons are not a port, so
+> `http://fd00::1/hook` now fails with `invalid port "::1" after host`. Bracket
+> the address - `http://[fd00::1]/hook`, which older builds take too - and it is
+> delivered. `GODEBUG=urlstrictcolons=0` restores the old parsing for any other
+> URL the stricter parser now refuses, but it does not deliver this one: the old
+> parser read that address as the host `fd00:` and the port `1`, and looked up
+> `fd00:` as a name, which is why it never arrived on the old build either. The
+> same address with a port is the one that stops working:
+> `http://fd00::1:8080/hook` was delivered by older builds, whose parser took the
+> last colon for the port, and is refused now. For that one both remedies work:
+> `http://[fd00::1]:8080/hook`, or `GODEBUG=urlstrictcolons=0`.
+
 > **Downloaded a raw binary in a browser?** macOS Gatekeeper or Windows
 > SmartScreen may block it as "unidentified". Clear the quarantine flag once and
 > it runs:
@@ -279,10 +292,19 @@ yourself. Two more flags matter:
 > `PINGULARITY_ACCESS` is authoritative at every start: it updates a disagreeing
 > saved setting (in either direction) and logs the change, so
 > `-e PINGULARITY_ACCESS=network` also recovers an install whose saved
-> local-only would otherwise lock its published port out. The flip side: while
-> the flag or env stays pinned in your unit/compose file, changing **Network
-> access** in the UI is overridden again at the next restart - drop the flag to
-> let the UI choice stick.
+> local-only would otherwise lock its published port out. One store does not
+> honour it: a database the daemon rebuilt because it was damaged and it was
+> asked to (`-on-corrupt rebuild`) has no password - that went with the file it
+> set aside - and the flag was only ever safe with one behind it. That store
+> answers loopback-only at every start, not just the first, until a password is
+> set on it from the machine itself and the daemon is restarted or reloaded,
+> network access is switched on there by hand, or `pingularity reset-auth`
+> releases the hold (the way back for a bridged container; see the corruption
+> notes under
+> [the service section](#run-in-the-background-systemd--launchd--windows-service)).
+> The flip side: while the flag or env stays pinned in your unit/compose file,
+> changing **Network access** in the UI is overridden again at the next restart -
+> drop the flag to let the UI choice stick.
 
 > **Upgrading a container from 0.61 or earlier?** Up to 0.61 a container
 > answered the network by default; every install now starts private -
@@ -294,8 +316,12 @@ yourself. Two more flags matter:
 > PINGULARITY_ACCESS=network` at start). The one-step fix is the env var: add
 > `-e PINGULARITY_ACCESS=network` and recreate the container - an explicitly
 > passed access mode is authoritative at every start, so it opens the port
-> immediately, at that start and every later one. It does not write the choice
-> into the database, though: keep the env var in your `docker run` / compose
+> immediately, at that start and every later one - bar a store rebuilt from a
+> damaged database on request, which has no password and holds itself to
+> loopback until one is set on it and the daemon restarted or reloaded, network
+> access is switched on at the machine, or `reset-auth` releases it
+> ([`-on-corrupt`](docs/cli.md)). It does not write
+> the choice into the database, though: keep the env var in your `docker run` / compose
 > file, or - to make it stick without one - open the **Access** tab while the
 > port is open, leave **Network access** on, enter your **current password**
 > and hit **Save**, which does store it (a saved value persists even when it
@@ -408,7 +434,12 @@ else is affected).
 a container that means the volume - run it from a one-off container sharing
 the volume (the image's entrypoint pins the `run` subcommand, so override it).
 It opens the database as it is: a path that is missing, empty or not a
-database is refused, and it never creates a database or sets one aside.
+database is refused, and it never creates a database or sets one aside. It is
+also the way back onto the network for a container whose database was rebuilt
+with `-on-corrupt rebuild`: that store has no password and holds network access
+to loopback until one is set and the daemon restarted or reloaded, which a
+bridged container cannot do through its own published port. `reset-auth` releases the hold and says so, and the next
+start answers the network with no login - so claim it straight away.
 
 ```bash
 docker run --rm --entrypoint /pingularity \
@@ -433,7 +464,9 @@ the stored setting. Then set things right in the Access tab.
 - **apt / dnf** - download the newer `.deb`/`.rpm` and reinstall it the same way
   (`sudo apt install ./pingularity_*.deb` / `sudo dnf install ./pingularity_*.rpm`);
   your data and env file are preserved, and the running service is restarted
-  onto the new binary automatically.
+  onto the new binary automatically. If it does not come back, the install says
+  so and points you at `systemctl status pingularity`; apt and dnf themselves
+  report a clean success either way.
 - **Homebrew** - `brew upgrade pingularity`, then `sudo pingularity restart`.
 - **winget** - re-run the one-shot
   (`irm https://install.pingularity.dev/winget.ps1 | iex`), or by hand from an
@@ -536,8 +569,9 @@ and the way back from the `503` a daemon serves when it couldn't load its
 settings at all. Windows has no reload signal;
 restart the service there.
 
-Alongside the database sit `logs.txt` (the log viewer's ring, so it survives a
-restart) and **`pingularity.key`** (0600) - the key that encrypts the secret
+Beside the `-db` path - beside the link, when that path is a symlink to the
+database - sit `logs.txt` (the log viewer's ring, so it survives a restart) and
+**`pingularity.key`** (0600) - the key that encrypts the secret
 that has to be kept recoverable: each saved iperf3 server's password. iperf3 needs
 it in the clear at test time (it encrypts it with the server's RSA key itself), so
 unlike your dashboard login it can't be hashed. Two things follow:
@@ -574,29 +608,75 @@ consequences worth knowing before you need them:
   round-trips**, however large - import puts no ceiling on the total file, only on
   a single record (8 MiB) or a single JSON element (256 MiB), which no real backup
   reaches.)
-- **A database that won't open is set aside, not repaired.** A torn file - typically
-  a hard power-off mid-write - would otherwise crash-loop the service forever, so
-  instead the daemon renames it and its `-wal`/`-shm` sidecars to
-  `pingularity.db.<UTC timestamp>.corrupt`, starts again on an empty store, and logs
-  which file it moved - wherever in the file the damage sits, not only in the
-  page the first statement reads, and whether or not enough of it survives to
-  still look like a database. Monitoring carries on: the daemon knows this is no
-  first run (it just moved your database aside), so it does not ask Quick Setup
-  again or hold measuring for the 48h consent grace. The exception is an install
-  torn while it was still *on* its first run - one that had never answered Quick
-  Setup - and only when the old file can still say so: that comes back held, and
-  offers the dialog again, because it never consented to anything. Nothing is
-  deleted, so the old data is still there to inspect or hand to a recovery tool -
-  but the dashboard comes back blank, every saved setting (login, network access,
-  thresholds, notifications) is back at its default, so the box is local-only
-  with no password until you set it up again, and the quarantined copy keeps
-  taking up its space until you remove it. This is the failure a periodic
-  **Export** exists for. What the daemon will *not* do is touch a `-db` path that
+- **A database that won't open is left where it is.** A torn file - typically a
+  hard power-off mid-write - stops the daemon starting, and the message names the
+  file, the command that tries to get the data back
+  (`sqlite3 pingularity.db .recover | sqlite3 pingularity.db.recovered`), and the
+  flag below. The file is not moved, replaced or repaired, because a refusal can
+  be undone and a replacement cannot: recover it, check the copy kept your
+  settings (`sqlite3 pingularity.db.recovered "SELECT key FROM settings"` lists
+  them), put it back, start again. How much `.recover` gets back depends on where
+  the damage is - most of the file for a torn table page; for a torn first page,
+  anything from all of it to nothing, sometimes only a `lost_and_found` table with
+  no settings table in it - and a copy with no settings in it is a
+  brand-new install with no login: do not put that one back, take the flag below
+  instead, which holds the network closed.
+  Under a service manager set to restart forever this does mean restarting
+  forever until you act - which is the point. It is loud, and it is the failure a
+  periodic **Export** exists for.
+  - **`-on-corrupt rebuild`** takes the other road, for an unattended box where
+    monitoring matters more than the history: the daemon renames the file and its
+    `-wal`/`-shm` sidecars to `pingularity.db.<UTC timestamp>.corrupt`, starts
+    again on an empty store, and logs which file it moved - wherever in the file
+    the damage sits, not only in the page the first statement reads, and whether
+    or not enough of it survives to still look like a database. Monitoring
+    carries on: the daemon knows this is no first run (it just moved your database
+    aside), so it does not ask Quick Setup again or hold measuring for the 48h
+    consent grace. The exception is an install torn while it was still *on* its
+    first run - one that had never answered Quick Setup - and only when the old
+    file can still say so: that comes back held, and offers the dialog again,
+    because it never consented to anything. Nothing is deleted, so the old data is
+    still there to inspect or hand to a recovery tool - but the dashboard comes
+    back blank, every saved setting (login, network access, thresholds,
+    notifications) is back at its default, and the quarantined copy keeps taking
+    up its space until you remove it. Because the password went with the old file,
+    the rebuilt store stays **loopback-only even if you passed `-access network`** -
+    not for one start but for every start until a login stands behind the network
+    again: set a new password from the machine itself, then restart or reload to
+    get network access back. Switching **Network access** on there yourself releases the hold as
+    well, since that is you deciding at the machine; a network setting stored by
+    anything else does not - an older release the store is rolled back to stores one
+    on any ordinary Save, and this build does not honour it and says why. A bridged container has no shell and its published
+    port is not loopback, so there `pingularity reset-auth` (the one-off container under
+    [Forgot the password?](#docker)) releases the hold instead - after which the
+    next start answers the network with no login at all, like a fresh install, so
+    publish the port to `127.0.0.1` and set the password straight away (see
+    [claiming a container](docs/security-model.md#claiming-a-container-before-someone-else-does)).
+    The start that rebuilt the store answers
+    [`/readyz` with 503](docs/metrics.md#health-endpoints) for as long as it runs,
+    and every later start does too while the hold keeps the network out, so a
+    monitoring system hears about it instead of reading a healthy daemon over an
+    empty dashboard.
+
+  What the daemon will *not* do is touch a `-db` path that
   is not a file at all: a directory (the easy slip - `-db /var/lib/pingularity`
-  for the file inside it) or a symlink is refused with an error naming what it
-  found, rather than re-permissioned or renamed - `-db` is never followed through
-  a link, so point it at the file itself. `reset-auth` never sets a file aside
-  either - it opens the database as it is, or refuses.
+  for the file inside it), a device or a link that leads nowhere is refused with
+  an error naming what it found, rather than re-permissioned or renamed. (One
+  link to nothing is not refused: the one a rebuild cut short between its two
+  renames leaves, with the store it finished beside the far end - the next
+  start puts that store in place.) A
+  symlink to a real file is fine - the database moved to a bigger disk with a
+  link left behind is an ordinary arrangement - and the database is then the
+  file the link names: that file is what is opened and tightened, what the
+  refusal above names - so the recovered copy goes back in its place and the
+  link goes on naming it - and what `-on-corrupt rebuild` sets aside. The link
+  itself is never renamed or replaced, and
+  `pingularity.key` and `logs.txt` stay beside the link, where they have always
+  been - so keep `-db` pointing at the link. Pointed at the file it names
+  instead, the daemon finds no key beside it and makes a new one, and saved
+  iperf3 passwords stop decrypting until the old `pingularity.key` is copied
+  across. `reset-auth` never sets a file aside either - it opens the database as
+  it is, or refuses.
 - **Restoring a backup where login was enabled?** The export carries the
   "login on" preference but never the password, so on a machine that doesn't
   already have one the restore leaves login **off**, **forces access to
@@ -792,7 +872,31 @@ There are two engines, picked in the settings drawer:
 **Direction** (both / download / upload, plus iperf3's simultaneous `--bidir`) and
 **retries** (default `1`, at most `3`) are kept **per engine**: the Ookla and iperf3
 tabs each carry their own pair, so tuning one never disturbs the other, and
-switching engines switches which pair is in force. On Ookla, retries are also what
+switching engines switches which pair is in force. Releases before 0.100 shared
+a single pair: an iperf3 field with no value of its own followed Ookla's. So
+the first start after upgrading writes the values iperf3 had been taking from
+Ookla under iperf3's own names and says so on stderr (a start that cannot write
+to the database runs with those values anyway, warns that it could not record
+them, and tries again at the next settings load) - nothing about your runs
+changes, and an older build reads those same values back if you step down. A
+field that was following an Ookla value nobody had saved - the shipped default -
+has nothing to carry and stays unwritten, and there the two releases part company
+once Ookla's direction or retries move, on either of them: an older build hands
+that field Ookla's value at every start, this one keeps iperf3's default. So if
+you step down to a release before 0.100, check the iperf3 direction and retries
+after the step and again after coming back up. A database created by 0.70 or
+later that 0.100.0-rc.1 has already started is past the carry: that release took
+the database's record of its own birth to mean the pair was already split, so
+an iperf3 field still following Ookla's came up at the shipped default there
+and stays there until you set it. Restoring a settings backup taken before
+0.100 is not an upgrade either: an iperf3 field that was still following Ookla's
+is in the file only as Ookla's, so that is where the restore puts it and the
+iperf3 field keeps whatever this install already had. When the backup names
+the release that wrote it, the restore says which of those values differ from
+what iperf3 runs here, and what this install keeps instead. A field the backup
+holds a value of its own for - a save from the settings drawer on those releases
+wrote one whenever the value iperf3 was running differed from the shipped
+default - restores like any other setting. On Ookla, retries are also what
 let a very slow uplink finish at all: when parallel upload streams are too slow for
 any of them to complete inside the capture window, the retry falls back to a single
 stream. Set Ookla's retries to `0` and that fallback cannot run, so on a link that

@@ -129,6 +129,33 @@ type program struct {
 	// that, which is why it is carried across to run and handed to settings as
 	// half the evidence behind settings.KeyInstallBornVersion.
 	dbCreated bool
+
+	// accessHold is what this process last learned about the hold a store
+	// rebuilt after corruption keeps on network access, as a web.AccessHold:
+	// read at boot (accessSeedAtBoot), judged again at every settings load
+	// (judgeAccessHold), and read by the web server's guard and readiness on
+	// every request - which is why it is atomic.
+	accessHold atomic.Int32
+
+	// accessHoldWarned records that a load has given the warning for a standing
+	// hold since one last found it anything else. It is kept apart from
+	// accessHold because the boot's seed records a standing hold before any load
+	// has judged it, and the warning belongs to the load that does - with what
+	// that load finds stored beside the hold.
+	accessHoldWarned atomic.Bool
+}
+
+// openOptionsFor turns the operator's -on-corrupt choice into what the store
+// takes. Only an explicit "rebuild" arms the set-aside recovery: an unset field
+// - a Config built by hand, an argv persisted by an install that predates the
+// flag - means the damaged file is left where it is and the start fails saying
+// how to recover it. The default has to fall that way round, because a start
+// that refuses can be taken back and one that replaces the database cannot.
+func openOptionsFor(cfg config.Config) []store.OpenOption {
+	if cfg.OnCorrupt != config.OnCorruptRebuild {
+		return nil
+	}
+	return []store.OpenOption{store.RebuildOnCorruption()}
 }
 
 // dbCreatedNow reports whether the store.Open that follows will be what creates
@@ -148,7 +175,7 @@ func (p *program) Start(s service.Service) error {
 	// Must stay above the open: the open is what creates the file.
 	p.dbCreated = dbCreatedNow(p.cfg.DBPath)
 
-	st, err := store.Open(p.cfg.DBPath)
+	st, err := store.Open(p.cfg.DBPath, openOptionsFor(p.cfg)...)
 	if err != nil {
 		return err
 	}
@@ -341,7 +368,13 @@ func (p *program) run(ctx context.Context) {
 	// warning, and the ambiguous-provenance WARNING below - nothing about the
 	// environment, the store's age, or its shape ever decides access.
 	containerized := util.InContainer()
-	def := defaultSettings(p.cfg)
+	// A store rebuilt after corruption has no login in it, so it must not be
+	// reachable from the network - not at the start that rebuilt it, and not at
+	// any start after, until one is set. The defaults are seeded from what the
+	// hold allows; judgeAccessHold settles the rest on every settings load.
+	def := defaultSettings(p.accessSeedAtBoot(ctx, func(msg string, args ...any) {
+		earlyLog = append(earlyLog, func() { p.log.Warn(msg, args...) })
+	}))
 	// Seal the stored iperf3 passwords at rest (key file beside the DB, 0600). If the key
 	// can't be opened we carry on WITHOUT encryption rather than refuse to run: monitoring
 	// is the job, and a legible warning beats a dead daemon.
@@ -472,8 +505,13 @@ func (p *program) run(ctx context.Context) {
 
 	// The one always-on startup line, straight to stdout past the level gate.
 	// After the access reconcile above so the mode it states is the one actually
-	// in force this boot.
-	fmt.Fprintln(os.Stdout, startupLine(version, p.cfg.ListenAddr, set.AccessLocalOnly()))
+	// in force this boot - which a hold on network access makes local-only
+	// whatever the setting says, exactly where the web guard enforces it
+	// (web.AccessHold.Enforced). The warnings below about who can reach the
+	// dashboard judge that same scope: a held store is reachable from this machine
+	// only, whatever its stored setting says.
+	localOnly := set.AccessLocalOnly() || p.currentAccessHold().Enforced(set.Loaded())
+	fmt.Fprintln(os.Stdout, startupLine(version, p.cfg.ListenAddr, localOnly))
 
 	// A fresh install measures NOTHING while the Quick Setup offer is open (see
 	// newMonitoringLiveFn), and the startup line above is what a healthy install
@@ -487,6 +525,32 @@ func (p *program) run(ctx context.Context) {
 	// is still refusing to serve - the WARNING above is what explains that.
 	if quickSetupHoldState(ctx, set) == qsHeld {
 		fmt.Fprintln(os.Stdout, firstRunHoldLine(p.cfg.ListenAddr))
+	}
+
+	// An install upgraded from a build that had the auto-selection city is the
+	// other state that looks perfectly healthy and is not what its operator
+	// configured: the setting is gone, so an install that scoped selection to
+	// one city and pinned nothing quietly starts measuring a server chosen some
+	// other way, and the only sign of it is a step in the speed history with no
+	// configuration change to explain it. Say so on the same stdout past the
+	// level gate the startup line uses, for the same reason - the install this
+	// is for may well be running with logging "off". It is said at every boot
+	// while it is still true, like the container access ambiguity: what it
+	// reports is a standing state, not an event, and it ends with either of the
+	// two things the line names - or with speedtests moved onto iperf3, whose
+	// server the city never chose (see retiredCityScope).
+	if scope := retiredCityScope(set); scope != "" {
+		fmt.Fprintln(os.Stdout, retiredCityScopeLine(scope, p.cfg.ListenAddr))
+	}
+
+	// A schedule switched on with no weekday selected can never be active, so
+	// the feature it gates never runs - the same "looks healthy, measures
+	// nothing" shape as the hold above, on the same stdout past the level gate
+	// and for the same reason. The dashboard refuses to save this state, so it
+	// arrives from the settings API, a restored backup or a hand-edited
+	// database, where nothing else would ever mention it.
+	for _, feature := range set.NeverActiveSchedules() {
+		fmt.Fprintln(os.Stdout, schedParkedLine(feature))
 	}
 
 	// Apply the saved log level now that settings are loaded (the logger starts
@@ -551,7 +615,7 @@ func (p *program) run(ctx context.Context) {
 		"monitoring", set.Monitoring(), "speedtest", set.SpeedtestEnabled(),
 		"speed_engine", set.SpeedEngine(), "speed_interval", set.SpeedInterval(),
 		"thresholds", set.Thresholds().Any(), "auth", set.AuthEnabled(),
-		"access_local_only", set.AccessLocalOnly())
+		"access_local_only", localOnly)
 
 	// Warn when the control plane is actually reachable from the network without
 	// auth: a non-loopback listen AND the loopback filter off. Every install
@@ -559,7 +623,7 @@ func (p *program) run(ctx context.Context) {
 	// input ever turns it off, so this fires only where it was opened on purpose
 	// (-access network / PINGULARITY_ACCESS, the Access tab) - exactly the
 	// installs this warning is for.
-	if nonLoopbackListen(p.cfg.ListenAddr) && !set.AccessLocalOnly() && !set.AuthActive() {
+	if nonLoopbackListen(p.cfg.ListenAddr) && !localOnly && !set.AuthActive() {
 		// Also straight to stderr, bypassing the log level: the default install
 		// runs with logging "off", and this warning targets exactly that install.
 		fmt.Fprintf(os.Stderr, "pingularity: WARNING: dashboard reachable on the network with authentication OFF (listen %s)\n"+
@@ -572,7 +636,7 @@ func (p *program) run(ctx context.Context) {
 	// "Local only" is enforced on the TCP peer, and visitors arriving through a
 	// same-host reverse proxy (what -allow-host declares) all look local, so the
 	// two settings contradict each other. Same stderr treatment as above.
-	if set.AccessLocalOnly() && p.cfg.AllowedHosts != "" {
+	if localOnly && p.cfg.AllowedHosts != "" {
 		fmt.Fprintln(os.Stderr, "pingularity: WARNING: 'local only' access is on, but -allow-host declares a reverse proxy;"+
 			"\n  visitors through the proxy arrive as local connections and are NOT blocked - enable authentication instead")
 		p.log.Warn("'local only' access cannot block visitors arriving through the -allow-host reverse proxy",
@@ -1043,6 +1107,9 @@ func (p *program) run(ctx context.Context) {
 	srv.SessionKey = sessionKey           // key-file-bound secret folded into session-token MACs (see tokenKey)
 	srv.MetricsToken = p.cfg.MetricsToken // optional read-only scrape credential for /metrics
 	srv.Update = upd                      // update status on /api/status + powers the toggle
+	// The guard and readiness read the hold a rebuilt store keeps on network
+	// access live: every settings load judges it again (judgeAccessHold).
+	srv.AccessHold = p.currentAccessHold
 	// The settings server-browsing list centres where auto last landed, and
 	// before any auto run exists it falls back to these same candidates - so
 	// the picker starts from cities the race would consider and then follows
@@ -2005,7 +2072,20 @@ func resetAuthCmd(args []string) error {
 	if err := set.ClearAuth(context.Background()); err != nil {
 		return err
 	}
+	// A store the daemon rebuilt after finding the database damaged holds the
+	// network back until a login exists (store.AccessHoldAfterRebuild), and this
+	// command ends that hold too: it is how an operator says they know the store
+	// has no login, and it is the only way back for an install that cannot reach
+	// its own loopback address to set one - a bridged container with no shell,
+	// whose published port the hold refuses like any other peer.
+	released, err := st.ReleaseAccessHold(context.Background())
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Authentication disabled and password cleared (%s).\n", cfg.DBPath)
+	if released {
+		fmt.Println("This database was rebuilt after it was found damaged, and it was holding network access to this machine until a login was set. That hold is released: the next start with -access network answers the network with no login at all, so set a password straight away.")
+	}
 	fmt.Printf("If the service is currently running, restart it (`%s`)\n", elevate("pingularity restart"))
 	fmt.Println(" - it caches settings in memory and would keep enforcing the old password.")
 	return nil
@@ -2049,6 +2129,158 @@ func healthzCmd(args []string) error {
 		return fmt.Errorf("healthz: %s answered %s", *addr, resp.Status)
 	}
 	return nil
+}
+
+// holdAccessLocalAfterRebuild is the access posture for a start on a store that
+// was rebuilt after the database was found damaged and has had no login set
+// since (store.AccessHoldAfterRebuild): loopback only, whatever the command line
+// says. That store has no login in it - the password left with the file set
+// aside, and an empty store cannot ask for one - and 'network' was only ever
+// safe with a login behind it. An explicit -access/PINGULARITY_ACCESS beats a
+// STORED choice at every boot, deliberately, because it is a container's way
+// back onto its own published port; but the store that made the stored choice
+// is gone, and re-seeding the flag over an empty one turns a box that was behind
+// a password into an open dashboard on the LAN, with nothing said about it.
+//
+// So the flag loses - at the start that rebuilt the store and at every one
+// after, because the next start finds that store healthy and the flag is still
+// standing on nothing. Holding it for one start only just moved the open
+// dashboard one restart later. The hold ends with the thing it stands in for: a
+// login set on the store, from this machine, which the next load sees and
+// releases; `pingularity reset-auth`, the one route an install that cannot
+// reach its own loopback address has, which says in so many words that the
+// operator knows there is no login; or network access switched on from this
+// machine's Access tab or Quick Setup, which says the same thing by doing it
+// (web's releaseAccessHold). Returns the config to run with, and whether it
+// moved.
+func holdAccessLocalAfterRebuild(cfg config.Config, holdStands bool) (config.Config, bool) {
+	if !holdStands || cfg.Access != "network" {
+		return cfg, false
+	}
+	cfg.Access, cfg.AccessExplicit = "local", false
+	return cfg, true
+}
+
+// currentAccessHold is the hold as this process last judged it - what the web
+// server's guard and readiness read on every request, and what the startup
+// line states.
+func (p *program) currentAccessHold() web.AccessHold { return web.AccessHold(p.accessHold.Load()) }
+
+// accessSeedAtBoot reads the hold before the settings controller exists and
+// returns the config its defaults are seeded from. The seed is where the flag
+// first reaches access: a store with no stored access row runs on what the flag
+// seeded, so a held store seeded from -access network would be on the network
+// before anything judged it. A hold that reads as standing seeds loopback, and
+// is in force for the web server from here on.
+//
+// From here, and not only from the first load that judges it, because a boot
+// whose settings then fail to load serves on this seed until a load recovers
+// them - and that load puts the stored values in force, and counts the settings
+// loaded, a moment before its hook judges the hold on them. Those values can
+// carry network access an older release stored beside the hold. Recorded only
+// by the judgement, the hold was not in force through that moment, and a
+// network peer that landed in it was served with no login. The judgement still
+// settles the hold, and gives its warning.
+//
+// A hold that cannot be read seeds what the flag asks, deliberately. The store
+// very likely carries no hold - it is almost always a healthy install whose
+// settings failed to read for a moment - and seeding loopback would make the
+// load that finally reads them store a network choice the flag never needed
+// stored, on a guess. Nothing is opened on the guess either: the web guard
+// refuses the network while the hold reads as unread (web.AccessHeldUnread) -
+// with the settings' own refusal while they cannot be read either - and the
+// load that reads it decides (judgeAccessHold).
+func (p *program) accessSeedAtBoot(ctx context.Context, warn func(msg string, args ...any)) config.Config {
+	stands, err := p.store.AccessHoldAfterRebuild(ctx)
+	if err != nil {
+		p.accessHold.Store(int32(web.AccessHeldUnread))
+		warn("could not read or release the access hold a rebuilt store keeps; network access is held to this machine until it can be read",
+			"err", err)
+		return p.cfg
+	}
+	if stands {
+		p.accessHold.Store(int32(web.AccessHeldAfterRebuild))
+	}
+	seed, _ := holdAccessLocalAfterRebuild(p.cfg, stands)
+	return seed
+}
+
+// judgeAccessHold settles what the hold a rebuilt store keeps does to access on
+// a LOADED controller, records it for the web server, and returns the config
+// the rest of the access sequence runs with. Every load runs it - boot, the
+// retry loop, a reload signal, a restore - because any of them can be the first
+// that reads the store, and a login set since the last one releases the hold.
+//
+// A standing hold withholds network access from both things that could ask for
+// it with no login behind them: the flag, and a network choice found stored.
+// The second needs saying. The one network choice this build stores over a held
+// store is made at this machine - its Access tab or Quick Setup - and making it
+// releases the hold in the same request. So a network choice found stored while
+// the hold still stands was made by something that did not know about the hold:
+// an older release the store was rolled back to, where one ordinary Save stores
+// the scope the drawer shows and any visitor could send that Save while the
+// older release had the network open. Honouring it put the store back on the
+// network with no login from the first start after the re-upgrade, for good,
+// with nothing said. It is not honoured, and the warning says why - but it is
+// not overwritten here either: main persists an access decision only from
+// explicit operator input (reconcileAccess), and holding needs no write. The
+// web server enforces the hold whatever the setting says (web.Server.AccessHold)
+// and shows the dashboard's Access tab the scope it enforces, so the operator's
+// own next Save at the machine is what stores local-only.
+//
+// A hold that cannot be read holds for this load without claiming a rebuild
+// that may never have happened, and without writing anything on the guess; a
+// later load that reads it decides. The warning comes with the load that first
+// finds the hold, so a reload signal on a store already held does not repeat it -
+// and the boot's seed, which records a standing hold before any load has judged
+// it, does not count as finding it (accessHoldWarned).
+func (p *program) judgeAccessHold(ctx context.Context, set *settings.Controller,
+	warn func(msg string, args ...any), info func(msg string, args ...any)) config.Config {
+	was := p.currentAccessHold()
+	stands, err := p.store.AccessHoldAfterRebuild(ctx)
+	if err != nil {
+		cfg, _ := holdAccessLocalAfterRebuild(p.cfg, true)
+		p.accessHold.Store(int32(web.AccessHeldUnread))
+		p.accessHoldWarned.Store(false)
+		if was != web.AccessHeldUnread {
+			warn("could not read or release the access hold a rebuilt store keeps; network access is held to this machine until it can be read",
+				"err", err)
+		}
+		return cfg
+	}
+	cfg, withheld := holdAccessLocalAfterRebuild(p.cfg, stands)
+	networkInForce := stands && !set.AccessLocalOnly()
+	if networkInForce {
+		withheld = true
+	}
+	if !withheld {
+		p.accessHold.Store(int32(web.AccessNotHeld))
+		p.accessHoldWarned.Store(false)
+		if was == web.AccessHeldUnread {
+			info("the access hold a rebuilt store keeps could be read: nothing holds network access back on this store")
+		}
+		return cfg
+	}
+	p.accessHold.Store(int32(web.AccessHeldAfterRebuild))
+	if !p.accessHoldWarned.Swap(true) {
+		args := []any{
+			"why", "the password went with the database that was set aside, and network access was only ever safe behind one; neither -access network nor a stored network choice opens this store, at this start or at any later one",
+			"fix", "set a password in the Access tab from this machine, then restart or reload - or switch network access on there yourself, which releases the hold; a bridged container that cannot reach its own dashboard runs pingularity reset-auth against the database instead, which releases the hold - the next start then answers the network with no login at all, so set one straight away",
+		}
+		// A stored network choice is named only where one is stored. The network
+		// in force can be the flag's own seed instead - a boot that could not read
+		// the hold seeds what the flag asks (accessSeedAtBoot) - and an operator
+		// told of a stored choice goes looking for a rollback that never happened.
+		if networkInForce {
+			if all, err := p.store.AllSettings(ctx); err == nil {
+				if _, stored := all["access_local_only"]; stored { // settings' keyAccessLocalOnly
+					args = append(args, "stored_network_access", "not honoured: it was not chosen on this build while the hold stood - an older release the store was rolled back to stores one on any Save")
+				}
+			}
+		}
+		warn("access held to this machine: the store was rebuilt after the database was found damaged and has no login", args...)
+	}
+	return cfg
 }
 
 // reconcileAccess makes an EXPLICITLY-passed -access flag / PINGULARITY_ACCESS
@@ -2108,17 +2340,20 @@ func (p *program) registerSettingsLoadedHook(ctx context.Context, set *settings.
 // the log level is known; every other caller logs directly.
 func (p *program) applyExplicitAccess(ctx context.Context, set *settings.Controller, warnAmbiguity bool,
 	warn func(msg string, args ...any), info func(msg string, args ...any)) {
+	// The hold a rebuilt store keeps is judged first: it decides whether the
+	// flag gets a say at all on this load (judgeAccessHold).
+	cfg := p.judgeAccessHold(ctx, set, warn, info)
 	if warnAmbiguity {
 		if werr := warnAmbiguousContainerAccess(ctx, p.cfg, p.store, set, util.InContainer(), warn); werr != nil {
 			warn("container access provenance could not be judged; nothing changed, re-judged next boot", "err", werr)
 		}
 	}
-	if changed, aerr := reconcileAccess(ctx, p.cfg, set); aerr != nil {
+	if changed, aerr := reconcileAccess(ctx, cfg, set); aerr != nil {
 		warn("explicit -access/PINGULARITY_ACCESS could not override the stored access setting", "err", aerr)
 	} else if changed {
-		localOnly := p.cfg.Access != "network"
+		localOnly := cfg.Access != "network"
 		info("stored access setting overridden by explicit operator input",
-			"access", p.cfg.Access, "access_local_only", localOnly,
+			"access", cfg.Access, "access_local_only", localOnly,
 			"why", "-access/PINGULARITY_ACCESS was passed explicitly, and explicit operator intent beats the stored value")
 	}
 }
@@ -2199,6 +2434,14 @@ func warnAmbiguousContainerAccess(ctx context.Context, cfg config.Config, st *st
 		return err
 	}
 	if _, stored := all["access_local_only"]; stored { // settings' keyAccessLocalOnly
+		return nil
+	}
+	// A store the daemon rebuilt after finding the database damaged has this
+	// shape and none of the ambiguity: the daemon made it, and it holds access
+	// to loopback for a reason its own warning gives (holdAccessLocalAfterRebuild).
+	// The way out offered below - restart with -access network - is the one
+	// thing that store does not honour, so it is not offered there.
+	if _, rebuilt := all["access_hold_after_rebuild"]; rebuilt { // store's accessHoldKey
 		return nil
 	}
 	if _, born := all[settings.KeyInstallBornVersion]; born {
@@ -2750,6 +2993,59 @@ func firstRunHoldLine(listenAddr string) string {
 		dashboardURL(listenAddr), quickSetupHoldGraceText())
 }
 
+// retiredCityScope reports the auto-selection city this install still carries
+// and no longer honours, or "" when there is nothing to say. A named function
+// so the judgement is tested against the real settings controller rather than a
+// copy of it, the same reason autoOrigins is one.
+//
+// Three installs carry the scope and are NOT told about it, because for them
+// nothing changed. One has a pinned server: a pin resolved by ID overrode the
+// city then and overrides the race now, so the same server is measured either
+// way. Another has starred servers: their cities enter the race every run,
+// which is the nearest thing this build has to "look for servers there", and an
+// operator who has been through the new picker has already made the choice this
+// line would ask them to make. The third runs its speedtests on iperf3, which
+// measures the server the operator named: the Ookla city never chose that
+// server, then or now, and a line telling that install its speed history may
+// have moved would be untrue. The test is the one sched.TesterFn makes, so an
+// iperf3 install whose binary is missing from PATH - which falls back to Ookla,
+// where the city is exactly what stopped counting - is still told.
+func retiredCityScope(set *settings.Controller) string {
+	if set.SpeedServerID() != "" || len(set.SpeedServers()) > 0 {
+		return ""
+	}
+	if set.SpeedEngine() == "iperf3" && speedtest.IperfAvailable() {
+		return ""
+	}
+	return set.RetiredCityScope()
+}
+
+// retiredCityScopeLine renders that notice. Same shape as firstRunHoldLine -
+// one line, operational facts only - and it has to do three things: quote the
+// scope back so the operator recognises what it is talking about, say what
+// picks the server now, and name both ways to take the choice back.
+func retiredCityScopeLine(scope, listenAddr string) string {
+	return fmt.Sprintf("pingularity: the saved speedtest city %q is no longer used - automatic tests now "+
+		"race the cities this connection names, plus the cities of servers you star, and measure from the "+
+		"one that answers fastest, so the server behind your speed history may have changed. Star a server "+
+		"there, or pin one outright, in the Ookla tab at %s; nothing else overrides the race.",
+		scope, dashboardURL(listenAddr))
+}
+
+// schedParkedLine renders the boot notice for a schedule that is on with no
+// weekday selected: it can never be active, so the feature it gates is parked
+// until someone changes it. Same shape as firstRunHoldLine - one line,
+// operational facts only - and it asks for the fix in the dashboard's own
+// words, so the sentence an operator meets here is the one the Settings drawer
+// gives them when it refuses to save the same schedule.
+func schedParkedLine(feature string) string {
+	parked := "latency probing is parked"
+	if feature == "speedtest" {
+		parked = "no automatic speedtest will run"
+	}
+	return fmt.Sprintf("pingularity: the %s schedule is on with no active days, so %s - pick a day or turn it off in the dashboard's Schedule tab.", feature, parked)
+}
+
 // dashboardURL renders a friendly local URL for a listen address (a bare port,
 // empty host, or wildcard all resolve to localhost), for the post-install pointer.
 func dashboardURL(addr string) string {
@@ -2948,6 +3244,20 @@ Run flags (all optional - defaults work with no flags):
   -db string       SQLite path (default: %s;
                    a system path when run as a service, else a per-user data dir;
                    the directory is auto-created)
+  -on-corrupt s    What to do when that database is damaged and will not open:
+                   'refuse' (default) leaves the file where it is and does not
+                   start, so sqlite3's .recover can still try to get the data
+                   back (check the copy lists your settings before it replaces
+                   anything - a torn first page can leave nothing); 'rebuild'
+                   renames it to <db>.<UTC>.corrupt and starts over on an empty
+                   store, so a restarting service comes back monitoring - at
+                   the cost of the history and every saved setting, login
+                   included. That start answers /readyz 503, and the store
+                   stays loopback-only whatever -access says - still answering
+                   503 while that holds the network back - until a password is
+                   set on it and the daemon restarted or reloaded, network
+                   access is switched on from the machine itself, or reset-auth
+                   releases it.
   -interval dur    Time between probe rounds (default 5s; 1s-1h)
   -timeout dur     Per-target dial timeout (default 3s; 1s-30s)
   -down-after int  Consecutive failures before DOWN (default 2; 1-10)

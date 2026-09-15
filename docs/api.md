@@ -154,10 +154,19 @@ and `-d '{…}'` where a body is listed below.
   value the daemon refuses outright - today, an iperf3 password beginning with the
   reserved `enc:v1:` seal prefix - comes back as `400` with the reason as the body,
   so it can be shown to whoever typed it; a `500` here really is a daemon-side
-  failure. A schedule (`sched_lat_*`, `sched_speed_*`) switched on with no
-  window, or with only windows that select no weekday, could never be on, so it
-  is saved as off and the response says so - the daemon keeps probing rather
-  than silently stopping
+  failure. Two names are refused outright as well: `speed_auto_loc` and
+  `speed_auto_label` scoped automatic server selection to one city in older
+  releases and are not settings any more, so a non-empty value for either is a
+  `400` naming what decides selection now (a pinned `speed_server_id`, else the
+  raced cities, which the servers you star in `speed_servers` enter) rather than
+  a `200` that would change nothing. Sending them empty is still fine - that
+  asks for the state the daemon is in. Rows an older release stored are left
+  alone: they are still in an export, and a daemon that still reads them finds
+  them. A schedule (`sched_lat_*`, `sched_speed_*`) switched on with no window
+  at all could never be on, so it is saved as off and the response says so; a
+  window that selects no weekday is saved as sent, and a schedule left with only
+  such windows parks its feature - latency probing stops, no automatic speedtest
+  fires - which the daemon says on stdout at every boot
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The
   session cookie lasts **30 days**, and a logout revokes **every** signed-in

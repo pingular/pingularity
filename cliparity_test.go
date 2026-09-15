@@ -357,3 +357,105 @@ func TestHelpInstallExampleNamesTheServiceDirectory(t *testing.T) {
 			m[1], serviceDir, filepath.Dir(config.DefaultDBPath()))
 	}
 }
+
+// -on-corrupt decides what a start does with a database it cannot open: keep it
+// where it is, or set it aside and begin again empty. Which one an operator
+// gets by saying nothing is the whole content of that flag for them, and it is
+// written out in three places - the parser's own default, the usage string it
+// prints, and the row in docs/cli.md people read before they ever run it. The
+// flag table is documentation and nothing else compiles it, so a default edited
+// there and nowhere else promises someone their year of history survives a
+// power cut when the daemon has been told to replace it. This holds all three
+// to config.Default(), in the shape TestSpeedtestFlagSaysTheDegradedTriggerNeedsIt
+// holds the -speedtest row.
+func TestOnCorruptSurfacesAgreeOnTheDefault(t *testing.T) {
+	def := config.Default().OnCorrupt
+	if def != config.OnCorruptRefuse && def != config.OnCorruptRebuild {
+		t.Fatalf("config.Default().OnCorrupt is %q, which is neither mode the flag accepts", def)
+	}
+	// What a start with no -on-corrupt really does, so the documented default is
+	// held to behaviour rather than to another sentence.
+	cfg, err := config.ParseFlags(nil)
+	if err != nil {
+		t.Fatalf("ParseFlags(no flags): %v", err)
+	}
+	if cfg.OnCorrupt != def {
+		t.Fatalf("a start with no -on-corrupt runs as %q, not the documented default %q", cfg.OnCorrupt, def)
+	}
+
+	var row string
+	for _, l := range strings.Split(mustReadRepoFile(t, filepath.Join("docs", "cli.md")), "\n") {
+		if strings.HasPrefix(l, "| `-on-corrupt` |") {
+			row = l
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("docs/cli.md has no `-on-corrupt` row in its flag table; the flag table is where an operator decides whether their database is safe across a restart")
+	}
+	if cells := strings.Split(row, "|"); len(cells) < 4 {
+		t.Fatalf("docs/cli.md's -on-corrupt row is not a three-column flag row: %s", row)
+	} else if got := strings.TrimSpace(cells[2]); got != "`"+def+"`" {
+		t.Errorf("docs/cli.md's -on-corrupt row gives the default as %s; a start with no flag does %q. One of the two is lying to an operator about whether a damaged database is kept:\n%s", got, def, row)
+	}
+	for _, mode := range []string{config.OnCorruptRefuse, config.OnCorruptRebuild} {
+		if !strings.Contains(row, "`"+mode+"`") {
+			t.Errorf("docs/cli.md's -on-corrupt row never mentions `%s`, so the road it does not describe is one nobody can choose:\n%s", mode, row)
+		}
+	}
+
+	// The README's corruption notes open with a headline, and for someone
+	// skimming it is the whole answer to which way a damaged database falls when
+	// they pass nothing.
+	var headline string
+	for _, l := range strings.Split(mustReadRepoFile(t, "README.md"), "\n") {
+		if strings.HasPrefix(l, "- **A database that won't open is ") {
+			headline = l
+			break
+		}
+	}
+	wantHeadline := map[string]string{config.OnCorruptRefuse: "left where it is", config.OnCorruptRebuild: "set aside"}[def]
+	if headline == "" {
+		t.Error("README.md's corruption notes no longer open with \"- **A database that won't open is ...\"; that headline is where a skimming operator learns whether their database survives a start")
+	} else if !strings.Contains(headline, wantHeadline) {
+		t.Errorf("README.md's corruption headline does not say the database is %s, which is what a start with no -on-corrupt (%q) does to it:\n%s", wantHeadline, def, headline)
+	}
+
+	// The two surfaces the daemon itself prints: the flag's usage string
+	// (`pingularity run -h`) and the curated help (`pingularity help`).
+	marker := "'" + def + "' (default)"
+	entry, ok := flagDefaultsEntry(runFlagDefaultsText(t), "-on-corrupt")
+	if !ok {
+		t.Fatal("ParseFlags(-h) prints no -on-corrupt row; the flag was renamed or PrintDefaults changed shape")
+	}
+	help, ok := usageEntry(captureUsage(t), "-on-corrupt")
+	if !ok {
+		t.Fatal("the curated help has no -on-corrupt entry")
+	}
+	for _, s := range []struct{ name, text string }{
+		{"the -on-corrupt usage string (`pingularity run -h`)", entry},
+		{"the curated help's -on-corrupt entry (`pingularity help`)", help},
+	} {
+		if !strings.Contains(s.text, marker) {
+			t.Errorf("%s never says %s, so nobody reading it knows which way their database falls when they pass nothing:\n%s", s.name, marker, s.text)
+		}
+	}
+
+	// What the refusal leaves: the file where it is, nothing moved or replaced.
+	// Not "untouched" - the migration is one transaction, so damage it meets
+	// leaves an older release's file as it was, but damage only the repairs after
+	// it read is met once the migration has committed: that file keeps the new
+	// columns and indexes, grows, and its bytes change, and an operator promised
+	// otherwise compares checksums and concludes the daemon wrote over the one copy
+	// of their data.
+	for _, s := range []struct{ name, text string }{
+		{"the -on-corrupt usage string (`pingularity run -h`)", entry},
+		{"the curated help's -on-corrupt entry (`pingularity help`)", help},
+		{"docs/cli.md's -on-corrupt row", row},
+	} {
+		flat := strings.Join(strings.Fields(s.text), " ")
+		if !strings.Contains(flat, "where it is") || strings.Contains(flat, "untouched") {
+			t.Errorf("%s does not say the refused file stays where it is, or promises it untouched when the migration may have written to it:\n%s", s.name, s.text)
+		}
+	}
+}

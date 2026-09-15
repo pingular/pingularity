@@ -492,6 +492,39 @@ func TestAccessFlag(t *testing.T) {
 	}
 }
 
+// -on-corrupt decides the fate of a damaged database, so the value that arrives
+// when nobody says anything has to be the one that keeps every option open, and
+// a value nobody recognises has to stop the start rather than be compared into
+// one of the two roads by accident.
+func TestOnCorruptFlag(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr bool
+	}{
+		{"silence leaves the file alone", nil, OnCorruptRefuse, false},
+		{"refuse", []string{"-on-corrupt", "refuse"}, OnCorruptRefuse, false},
+		{"rebuild", []string{"-on-corrupt", "rebuild"}, OnCorruptRebuild, false},
+		{"a typo is not a decision", []string{"-on-corrupt", "rebiuld"}, "", true},
+		{"and neither is an empty one", []string{"-on-corrupt", ""}, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ParseFlags(c.args)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, c.wantErr)
+			}
+			if c.wantErr {
+				return
+			}
+			if got.OnCorrupt != c.want {
+				t.Errorf("OnCorrupt=%q, want %q", got.OnCorrupt, c.want)
+			}
+		})
+	}
+}
+
 // ServiceDBPath is DefaultDBPath's answer for root: the path the installed
 // service resolves, whoever asks. `pingularity help` prints it in its install
 // example, and help is read unelevated, so the per-user answer would name a

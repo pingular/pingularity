@@ -90,6 +90,28 @@ func TestImportRefusesASingleOversizedElementWithASizeError(t *testing.T) {
 	}
 }
 
+// The envelope's version stamp is walked like every other value the import does
+// not restore, so an oversized one is the same size problem as an oversized
+// skipped element: 413 naming the limit, not 400 "invalid JSON".
+func TestImportRefusesAnOversizedVersionStampWithASizeError(t *testing.T) {
+	s := newTestServer(t)
+	chunk := strings.Repeat("7", 4<<20)
+	parts := []io.Reader{strings.NewReader(`{"pingularity_export":2,"producer_version":"`)}
+	for i := 0; i < 68; i++ { // 68 x 4 MiB = 272 MiB in the one string, past the 256 MiB allowance
+		parts = append(parts, strings.NewReader(chunk))
+	}
+	parts = append(parts,
+		strings.NewReader(`","categories":["downtime"],"downtime":[{"ts":1000,"type":"down","duration_s":60}]}`))
+	rr := postImportBody(t, s, "downtime=1", io.MultiReader(parts...))
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a 272 MiB version stamp got HTTP %d, want 413: %s",
+			rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+	if body := rr.Body.String(); !strings.Contains(body, "MiB") {
+		t.Errorf("the 413 does not name the size limit: %s", strings.TrimSpace(body))
+	}
+}
+
 // The arithmetic the no-whole-body-cap decision rests on, pinned to the config
 // defaults it is computed from: a default install (dual-stack targets, 5s
 // probe interval, 30-day latency retention) exports a samples array that alone
