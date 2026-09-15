@@ -1005,12 +1005,12 @@ test('heatmap: today’s square is drawn in zones whose clocks go forward at mid
   for (const [zone, shift, key] of [['America/Santiago', [2025, 8, 7], '2025-09-07'], ['America/Havana', [2026, 2, 8], '2026-03-08']]) {
     withTimeZone(zone, () => {
       assert.equal(new Date(...shift, 0, 0).getHours(), 1, `${zone} no longer shifts at local midnight - pick a zone that does`);
-        // Sunday 2 Aug 2026: the grid runs from Sunday 27 Jul 2025 and crosses the shift.
-        const cells = driveHeatmap([], new Date(2026, 7, 2, 12, 0).getTime());
-        assert.equal(cells.length, 372, `${zone}: Sun 27 Jul 2025 .. Sun 2 Aug 2026 is 372 squares`);
-        const days = cells.map(c => (c.dataset.tip || '').split(':')[0]).filter(Boolean);
-        assert.equal(days[days.length - 1], '2026-08-02', `${zone}: the last square is not today`);
-        assert.equal(days.filter(d => d === key).length, 1, `${zone}: the day the clocks go forward is not drawn exactly once`);
+      // Sunday 2 Aug 2026: the grid runs from Sunday 27 Jul 2025 and crosses the shift.
+      const cells = driveHeatmap([], new Date(2026, 7, 2, 12, 0).getTime());
+      assert.equal(cells.length, 372, `${zone}: Sun 27 Jul 2025 .. Sun 2 Aug 2026 is 372 squares`);
+      const days = cells.map(c => (c.dataset.tip || '').split(':')[0]).filter(Boolean);
+      assert.equal(days[days.length - 1], '2026-08-02', `${zone}: the last square is not today`);
+      assert.equal(days.filter(d => d === key).length, 1, `${zone}: the day the clocks go forward is not drawn exactly once`);
       assert.equal(new Set(days).size, days.length, `${zone}: a day is drawn twice`);
     });
   }
