@@ -1451,8 +1451,8 @@ and persist across restarts.
   sits in the same round as Montréal's. A starred server the race did not
   reach is looked up and pinged for the round. It costs N times the data and
   up to N times the time of a single test (each server's turn is bounded, and
-  the run's budget grows with N), so the estimate on the Speedtest tab turns
-  amber above 4; above 1 the automatic challenger stands down. (Upgrading from
+  the run's budget grows with N), so the estimate on the Speedtest tab shows
+  a warning sign above 4; above 1 the automatic challenger stands down. (Upgrading from
   a version with the old on/off: on becomes 3, off becomes 1; the old setting
   is left as it was, so a downgrade reads it as before the upgrade.) It keeps
   only the best result as the test's result - handy when one server has a bad
