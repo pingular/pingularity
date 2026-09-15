@@ -5,10 +5,10 @@ upgrading, what changes without anyone asking for it, and what has been taken
 away. New panels and fixes are in the release's own notes and in the commit
 log - this file is for the things that reach a machine on their own.
 
-Releases before v0.100.0 have no section here. The file starts where it was
+Releases before v0.100.1 have no section here. The file starts where it was
 first needed; nothing has been reconstructed after the fact.
 
-## v0.100.0
+## v0.100.1
 
 Upgrading from v0.70.1. On a healthy database this is an in-place upgrade:
 start the new binary on the same file. Every metric, endpoint and flag v0.70.1
