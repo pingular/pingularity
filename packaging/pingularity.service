@@ -9,6 +9,13 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
+# No Type=, so this is Type=simple: the start job is finished at fork/exec and
+# says nothing about whether the daemon is serving, which is why the postinstall
+# watches the unit after starting it instead of trusting an exit code. Type=notify
+# would say - but only once the daemon speaks sd_notify (same gap as the
+# notify-reload note below), and then a READY=1 that never arrives, a slow first
+# run over a large database say, becomes a start systemd kills at
+# TimeoutStartSec. Not a trade to make blind.
 # Runs as a dedicated unprivileged account (created by the package postinstall),
 # NOT root. The raw-socket traceroute needs CAP_NET_RAW, so grant JUST that one
 # capability ambiently - which, unlike a plain --cap-add, an unprivileged process

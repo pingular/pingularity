@@ -14,8 +14,10 @@ import (
 )
 
 // A corrupt or non-database file at the DB path must not crash-loop the daemon
-// (systemd's Restart=always would re-hit the same bad file forever). Open moves
-// it aside to a .corrupt file and rebuilds an empty, usable store.
+// (systemd's Restart=always would re-hit the same bad file forever) once the
+// operator has asked for that recovery. With RebuildOnCorruption armed - the
+// daemon's -on-corrupt rebuild - Open moves it aside to a .corrupt file and
+// rebuilds an empty, usable store.
 func TestOpenRecoversFromCorruptDB(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupt.db")
@@ -23,7 +25,7 @@ func TestOpenRecoversFromCorruptDB(t *testing.T) {
 	if err := os.WriteFile(path, []byte("this is not a sqlite database - a power cut truncated it"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(path)
+	st, err := Open(path, RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("Open must recover from a corrupt DB, got: %v", err)
 	}

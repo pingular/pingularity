@@ -30,13 +30,16 @@ func tearDatabase(t *testing.T, path string) {
 	}
 }
 
-// TestCorruptRebuildDoesNotReholdAnEstablishedInstall: the store sets a torn
+// TestCorruptRebuildDoesNotReholdAnEstablishedInstall: asked for the rebuild
+// (`-on-corrupt rebuild`, which is what the reopens here arm - without it the
+// start refuses and there is no rebuilt store to rehold), the store sets a torn
 // database aside and rebuilds an empty one "so the daemon comes back up
-// monitoring". Booted the way the packaged unit and the container boot it -
-// `run -db <path>`, no consent flag - the first-run decision then saw an empty
-// store, seeded a fresh offer clock, and held monitoring for the whole 48h
-// consent grace, on an install that had consented long ago. The daemon holds
-// the evidence that this is no first run: it just moved a database aside.
+// monitoring". Booted the way the packaged unit and the container boot it
+// otherwise - `run -db <path>`, no consent flag - the first-run decision then
+// saw an empty store, seeded a fresh offer clock, and held monitoring for the
+// whole 48h consent grace, on an install that had consented long ago. The
+// daemon holds the evidence that this is no first run: it just moved a
+// database aside.
 func TestCorruptRebuildDoesNotReholdAnEstablishedInstall(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "pingularity.db")
@@ -69,7 +72,7 @@ func TestCorruptRebuildDoesNotReholdAnEstablishedInstall(t *testing.T) {
 	tearDatabase(t, dbPath)
 	cfg := config.Config{DBPath: dbPath}
 	created := dbCreatedNow(dbPath) // what Start records: the file was there
-	st2, err := store.Open(dbPath)
+	st2, err := store.Open(dbPath, store.RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("reopen after the fault: %v", err)
 	}
@@ -158,7 +161,7 @@ func TestCorruptRebuildKeepsAFreshInstallOnItsHold(t *testing.T) {
 
 	// The disk fault, then the restart in the same shape.
 	tearTableRoot(t, dbPath, "pauses")
-	st2, err := store.Open(dbPath)
+	st2, err := store.Open(dbPath, store.RebuildOnCorruption())
 	if err != nil {
 		t.Fatalf("reopen after the fault: %v", err)
 	}

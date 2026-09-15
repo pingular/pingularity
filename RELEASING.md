@@ -172,7 +172,26 @@ The tag publishes artifacts; the GitHub release's notes are where behavior
 changes for *running installs* get called out, above the generated changelog.
 Checklist for what earns a note: a changed default, a changed upgrade path, a
 one-time migration, anything an operator would otherwise discover as a
-surprise. The private-by-default access change is the standing example - its
+surprise.
+
+The same note also goes in `CHANGELOG.md`, and that copy is the one that lasts.
+A GitHub release's notes are read by whoever upgrades that week and by nobody
+afterwards, while the person working backwards from a graph that stepped - or
+upgrading an install four releases behind - has only what is in the repo. Three
+shapes of change earn a line there whatever else is in the release: a release
+that **removes a field from an API response**, **retires a setting**, or
+**changes a default**. v0.100.0 did all three and recorded none of them: the
+auto-location setting went, taking two settings keys and a `/api/status` field
+with it, and a provisioning script that pinned the scope kept being answered
+`200` and kept writing nothing. `changelog_test.go` holds this paragraph and
+that file to each other; holds the toolchain's platform floor and URL rule to
+the cask and the parser that enforce them; holds the clauses it names in the
+`-db`, iperf3, schedule, retired-city and package-upgrade entries to the store,
+the settings controller, the settings API, the boot notices and the package
+script that decide them; and holds the file itself to the archive block that
+ships it. Everything else in the file is held by review alone.
+
+The private-by-default access change is the standing example - its
 notes must say, in this order, because the first bullet is what a skimming
 operator has to leave with:
 

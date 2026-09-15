@@ -79,10 +79,43 @@ if [ "$enable_now" = 1 ]; then
 	fi
 fi
 
+# Whether the daemon is still there a few seconds after we asked systemd to run
+# it. The return code of `start`/`try-restart` cannot answer that: the unit
+# declares no Type=, so it is Type=simple and systemd calls the start job done
+# the moment the binary has been exec'd - a build that execs and then exits (a
+# -db it refuses, a port already taken, a flag in /etc/default it will not
+# parse) is a start that "succeeded" with status 0. Restart=always/RestartSec=5
+# then parks a daemon that will not stay up in auto-restart for five seconds out
+# of every six, where is-active reports it as not active, so a short run of
+# samples sees it where one look, or one exit code, does not. A daemon that dies
+# later than this window is past what a package script can watch for, which is
+# why every message here points at `systemctl status` rather than claiming to
+# have the whole answer.
+#
+# --quiet silences is-active's answer, not systemctl's errors. Where systemctl
+# is installed but systemd is not running - a chroot, a container that was never
+# booted, WSL without systemd - every call fails and says so on stderr, and
+# every other systemctl call in this script already sends that nowhere; these
+# looks at the unit do the same, so a package operation there prints only what
+# the package itself means to say.
+service_stayed_up() {
+	i=0
+	while [ "$i" -lt 5 ]; do
+		systemctl is-active --quiet pingularity.service >/dev/null 2>&1 || return 1
+		i=$((i + 1))
+		if [ "$i" -lt 5 ]; then
+			sleep 1
+		fi
+	done
+	return 0
+}
+
 if [ "$fresh" = 1 ]; then
-	# Report the truth: a failed start (e.g. port already in use) must not print
-	# "is running". The binary's own `install` command reports the same way.
-	if systemctl start pingularity.service >/dev/null 2>&1; then
+	# Report the truth: a start that leaves no daemon running (port already in
+	# use, a database it refuses) must not print "is running". The binary's own
+	# `install` command reports a failed start the same way, off the exit code
+	# alone - the same blind spot, on a surface this script does not own.
+	if systemctl start pingularity.service >/dev/null 2>&1 && service_stayed_up; then
 		echo "Pingularity is running - dashboard: http://localhost:9000"
 	else
 		echo "Pingularity installed but did not start; check: systemctl status pingularity"
@@ -91,8 +124,22 @@ if [ "$fresh" = 1 ]; then
 else
 	# Upgrade: preremove deliberately skips stop-on-upgrade, so the OLD binary is
 	# still running; try-restart hands over to the new one. It restarts only a
-	# currently-running service, so a stopped or admin-disabled unit stays put.
+	# currently-running service, so a stopped unit stays put - ask before
+	# restarting, so that deliberate case is not then reported as a handover that
+	# failed. A unit an admin disabled but left running IS running: disabling
+	# decides what starts at boot, so that one is handed over and watched too.
+	was_running=0
+	if systemctl is-active --quiet pingularity.service >/dev/null 2>&1; then
+		was_running=1
+	fi
 	systemctl try-restart pingularity.service >/dev/null 2>&1 || true
+	# An upgrade prints nothing when it works, so the one line it does print has
+	# to be worth reading: apt and dnf report a clean success either way, and a
+	# monitor that is simply gone is otherwise found by nobody until somebody
+	# happens to look at the dashboard.
+	if [ "$was_running" = 1 ] && ! service_stayed_up; then
+		echo "Pingularity upgraded but is not running; check: systemctl status pingularity"
+	fi
 fi
 
 exit 0

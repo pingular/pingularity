@@ -96,3 +96,45 @@ func TestResetAuthRefusesAnEmptyFile(t *testing.T) {
 		t.Fatalf("reset-auth built a database in the empty file (size %v, err %v)", fi.Size(), err)
 	}
 }
+
+// The lockout `reset-auth` exists to end can happen on an install whose -db
+// path is a symlink - a database moved to another volume with a link left where
+// the unit file points - and that is the install least able to afford a second
+// obstacle: the service on it is already not letting anyone in.
+func TestResetAuthOpensADatabaseBehindASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere.db")
+	st, err := store.Open(target)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.SetSetting(context.Background(), "auth_user", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	link := filepath.Join(dir, "pingularity.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := resetAuthCmd([]string{"-db", link}); err != nil {
+		t.Fatalf("reset-auth refused a symlinked -db: %v", err)
+	}
+	if lfi, lerr := os.Lstat(link); lerr != nil || lfi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("reset-auth replaced the symlink at the -db path (%v)", lerr)
+	}
+	// The password was cleared on the database the link names, not on a store
+	// invented somewhere else.
+	st, err = store.OpenExisting(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	all, err := st.AllSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all["auth_enabled"] == "1" || all["auth_hash"] != "" {
+		t.Fatalf("auth was not cleared on the database the link names: %v", all)
+	}
+}

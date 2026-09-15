@@ -111,4 +111,31 @@ func TestContainerDataDirCarveOut(t *testing.T) {
 			t.Errorf("target mode = %o, want 755 (the carve-out followed a symlink)", got)
 		}
 	})
+
+	t.Run("database at the default path is a link to another mount: tightened", func(t *testing.T) {
+		// The image pins -db inside its volume, and a database moved to another
+		// mount can leave a link there. The key and the log snapshot stay beside
+		// that link - they follow the -db path as typed - so the volume is still
+		// the directory they sit in, still ours by construction, and still the
+		// one this carve-out is for.
+		dir := mkLoose(t)
+		elsewhere := filepath.Join(t.TempDir(), "mnt")
+		if err := os.Mkdir(elsewhere, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		moved := filepath.Join(elsewhere, "p.db")
+		st, err := Open(moved)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		st.Close()
+		if err := os.Symlink(moved, filepath.Join(dir, "p.db")); err != nil {
+			t.Fatal(err)
+		}
+		containerDataDir, inContainerFn = dir, func() bool { return true }
+		open(t, dir)
+		if got := mode(t, dir); got != 0o700 {
+			t.Errorf("mode = %o, want 700 (a -db link in the image's own volume took the volume out of the carve-out)", got)
+		}
+	})
 }

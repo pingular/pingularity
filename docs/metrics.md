@@ -267,7 +267,20 @@ local-only filter, and auth so a bare-IP health check from an LB reaches them):
   aggregate is warm; `503` otherwise, so an LB holds traffic until the daemon is warm.
   It also reports `503` when the daemon could not read its settings at startup - in
   that state it refuses every other route, `/metrics` and the dashboard included,
-  rather than serve with access control it can't apply. `/healthz` keeps answering
+  rather than serve with access control it can't apply - and for as long as it is
+  running on an empty store it rebuilt after finding the database damaged
+  (`-on-corrupt rebuild`; see [that flag](cli.md)). That daemon is alive
+  and monitoring, but it is not the install anyone configured - the history and
+  every saved setting are in the `.corrupt` file beside it - and readiness is the
+  only automatic word anyone gets. The next start finds the rebuilt database
+  healthy, but the store has no login, so a daemon asked for network access
+  holds it to loopback and keeps answering `503` for as long as that hold is
+  what keeps the network out - until a password is set on the store and the
+  daemon restarted or reloaded, network access is switched on from the machine
+  itself, or `pingularity reset-auth` releases it (see [`-on-corrupt`](cli.md)). A daemon that could not read
+  whether its store carries that hold answers `503` too, holding the network the
+  same way without claiming a rebuild, until a settings load reads it.
+  `/healthz` keeps answering
   `200` throughout, so the container images' baked-in health check still reads
   `(healthy)` there: a whole-instance `503` beside a healthy `/healthz` means "check
   the log, then reload or restart", not "still warming up".

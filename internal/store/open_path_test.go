@@ -45,8 +45,14 @@ func TestOpenRefusesADirectoryAtTheDBPath(t *testing.T) {
 
 // A symlink at the -db path used to have its TARGET chmod'ed through the link
 // and was then itself renamed away as a corrupt database, with a real database
-// created in its place.
-func TestOpenRefusesASymlinkAtTheDBPath(t *testing.T) {
+// created in its place - two files touched for one path, and the file that had
+// actually been named left where it stood under its own name. The link is now
+// resolved before anything acts, so the -db path behaves exactly as if the file
+// it resolves to had been typed instead: the price of a mistyped path under
+// -on-corrupt rebuild (an unrelated file set aside, never deleted) is the same
+// one a mistyped path without a link carries, and the link itself is still
+// never re-permissioned, renamed or replaced.
+func TestOpenNeverActsOnTheSymlinkAtTheDBPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix permission bits and symlinks")
 	}
@@ -60,29 +66,25 @@ func TestOpenRefusesASymlinkAtTheDBPath(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(link)
-	if err == nil {
-		st.Close()
-		t.Fatal("Open succeeded through a symlink at the -db path")
+	st, err := Open(link, RebuildOnCorruption())
+	if err != nil {
+		t.Fatalf("Open refused a link to a regular file: %v", err)
 	}
-	fi, serr := os.Stat(target)
-	if serr != nil {
-		t.Fatal(serr)
-	}
-	if fi.Mode().Perm() != 0o644 {
-		t.Fatalf("the symlink's target was re-permissioned through the link to %o (was 644)", fi.Mode().Perm())
-	}
-	if got, _ := os.ReadFile(target); !bytes.Equal(got, want) {
-		t.Fatal("the symlink's target was rewritten")
-	}
+	st.Close()
 	if lfi, lerr := os.Lstat(link); lerr != nil || lfi.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("the symlink at the -db path is gone or replaced (%v)", lerr)
 	}
 	if matches, _ := filepath.Glob(link + ".*.corrupt"); len(matches) != 0 {
 		t.Fatalf("the symlink was set aside as a corrupt database: %v", matches)
 	}
-	if !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("the error does not name the mistake: %v", err)
+	// Set aside under its own name, beside itself, contents intact - the file
+	// the path named is the one the recovery acted on.
+	matches, _ := filepath.Glob(target + ".*.corrupt")
+	if len(matches) != 1 {
+		t.Fatalf("the file the link names was not set aside beside itself: %v", matches)
+	}
+	if got, _ := os.ReadFile(matches[0]); !bytes.Equal(got, want) {
+		t.Fatal("the file the link names was rewritten rather than moved aside")
 	}
 }
 

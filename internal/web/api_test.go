@@ -362,8 +362,10 @@ func TestSettingsPinAndScopeTravelIndependently(t *testing.T) {
 		t.Errorf("an explicit \"\" must store and echo as Auto, got echo %v stored %q", echo["speed_server_id"], s.settings.SpeedServerID())
 	}
 	// The retired city scope is not a setting any more: a legacy key in the body
-	// is ignored, never echoed, and never resurrected as a centre.
-	if w := do(t, h, "POST", "/api/settings", `{"speed_auto_loc":"45.5,-73.5","speed_auto_label":"Montreal"}`); w.Code != http.StatusOK {
+	// is refused rather than ignored, never echoed, and never resurrected as a
+	// centre. (What the refusal has to SAY is
+	// TestSettingsRefusesAWriteToTheRetiredCityScope's.)
+	if w := do(t, h, "POST", "/api/settings", `{"speed_auto_loc":"45.5,-73.5","speed_auto_label":"Montreal"}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("legacy scope POST %d: %s", w.Code, w.Body)
 	}
 	if got := get(); got["speed_auto_loc"] != nil || got["speed_auto_label"] != nil {

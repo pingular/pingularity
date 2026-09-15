@@ -293,7 +293,18 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// X-Forwarded-For. A same-host reverse proxy still passes - detected and
 		// warned about below. Restores need no special case here: the reconcile
 		// window is refused outright above, before any setting is consulted.
-		if s.settings.AccessLocalOnly() {
+		// The hold a store rebuilt after corruption keeps on network access is
+		// local-only too, whatever the setting says, for as long as it stands in
+		// this process - from the boot that reads it standing, through the moment
+		// between a settings load and the judgement of the hold that runs on it
+		// (see Server.AccessHold). A hold that could not be read gives way to the
+		// refusal below for exactly as long as the settings have not loaded either
+		// (AccessHold.Enforced), so whether they loaded is read once, here, for the
+		// whole request: read twice, a load finishing in between would let one
+		// request past both.
+		loaded := s.settings.Loaded()
+		held := s.accessHeld()
+		if s.settings.AccessLocalOnly() || held.Enforced(loaded) {
 			// Local-only means loopback-only for EVERYONE, containers included. A
 			// container that must be reachable over the network opts in explicitly
 			// with -access network (PINGULARITY_ACCESS=network), which turns this
@@ -314,6 +325,29 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				// usually the operator hitting their own fresh install's published
 				// port, and the body is all the interface they have. It states only
 				// the setting that refused them - nothing about auth or the install.
+				//
+				// Except where what refused them is the hold, because then the
+				// ordinary body is wrong: -access network is what they already
+				// passed, and it is the one thing this store does not honour. The
+				// way back that does work has to be here, since a bridged operator
+				// may have nothing else to read. /readyz says the same to anyone.
+				if held == AccessHeldAfterRebuild {
+					http.Error(w, "this dashboard is private: its database was rebuilt after it was found damaged, "+
+						"so network access is held to this machine whatever -access says, until a password is set on it "+
+						"from the machine itself (then restart or reload) or pingularity reset-auth is run against the database.",
+						http.StatusForbidden)
+					return
+				}
+				// And where it is a hold that could not be read, over a setting that
+				// would have let them in: nothing says this store was ever rebuilt,
+				// the -access network the ordinary body names is not what is wrong,
+				// and the read that failed is in the log.
+				if held == AccessHeldUnread && !s.settings.AccessLocalOnly() {
+					http.Error(w, "this dashboard is private: whether its database holds network access to this machine "+
+						"could not be read, so it is held until that can be read. Check the log, then reload or restart.",
+						http.StatusForbidden)
+					return
+				}
 				http.Error(w, "this dashboard is private (local-only access is on). "+
 					"Enable network access from the machine itself in the Access tab, "+
 					"or start with -access network / -e PINGULARITY_ACCESS=network - and set a password.",
@@ -346,7 +380,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// stays answerable and readiness can report NOT ready - which is how a
 		// supervisor learns to keep traffic away. Everything else - UI, API and
 		// metrics alike - gets 503 until a reload succeeds.
-		if !s.settings.Loaded() {
+		if !loaded {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "settings could not be loaded, so access control cannot be applied; "+
 				"refusing to serve. check the log, then restart or SIGHUP once the database is readable.",
@@ -903,10 +937,16 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 		// Empty username and password mean "keep current", so only a real
 		// difference counts as a change.
 		reqUser := strings.TrimSpace(in.Username)
+		// The scope a request is compared with is the one in force, which is the
+		// one the Access tab was shown (accessStatus): over a store whose hold on
+		// network access stands, that is local-only whatever the setting says, so
+		// switching network access on is a change - and releases the hold below -
+		// while a Save that echoes local-only is not.
+		localOnlyNow := s.settings.AccessLocalOnly() || s.accessHeld() != AccessNotHeld
 		delta := in.Password != "" ||
 			(reqUser != "" && reqUser != s.settings.AuthUser()) ||
 			(in.AuthEnabled != nil && *in.AuthEnabled != s.settings.AuthEnabled()) ||
-			(in.LocalOnly != nil && *in.LocalOnly != s.settings.AccessLocalOnly())
+			(in.LocalOnly != nil && *in.LocalOnly != localOnlyNow)
 		if !delta {
 			// One thing still has to happen on a no-change save: PERSIST an
 			// explicitly submitted access scope. The value an operator sees can
@@ -1093,7 +1133,7 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 		// from repeating "access is now limited" until the operator stops reading it.
 		turnedLocalOnly := false
 		if in.LocalOnly != nil {
-			turnedLocalOnly = *in.LocalOnly && !s.settings.AccessLocalOnly()
+			turnedLocalOnly = *in.LocalOnly && !localOnlyNow
 			if err := s.settings.SetAccessLocalOnly(ctx, *in.LocalOnly); err != nil {
 				s.internalError(w, err)
 				return
@@ -1107,6 +1147,13 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			// box that is already local-only they are noise, and noise is what buries
 			// the one line that mattered.
 			s.log.Info("network access changed", "local_only", *in.LocalOnly)
+			// Network access switched on here, from the machine - the guard lets
+			// nobody else reach this over a held store - ends the hold a rebuilt
+			// store keeps (releaseAccessHold). Only a real change counts: the
+			// drawer echoes local_only on every Save, and an echo is not a choice.
+			if !*in.LocalOnly {
+				s.releaseAccessHold(ctx)
+			}
 			// -allow-host declares a reverse proxy, and proxied visitors reach
 			// this machine as loopback connections - local-only can't see them.
 			if turnedLocalOnly && len(s.AllowedHosts) > 0 {
@@ -1216,10 +1263,14 @@ func (s *Server) accessStatus(r *http.Request) map[string]any {
 	active := s.settings.AuthActive()
 	authed := !active || s.authed(r)
 	out := map[string]any{
-		"local_only":        s.settings.AccessLocalOnly(),
-		"local_only_active": s.settings.AccessLocalOnly(), // now enforced whenever on (no container bypass)
-		"auth_enabled":      s.settings.AuthEnabled(),     // intent - drives the toggle
-		"auth_active":       active,                       // enforced - drives the overlay
+		// While a rebuilt store's hold on network access stands, the scope in force
+		// is local-only whatever the setting says, and that is what the Access tab
+		// shows and compares a Save with (handleAccess) - not a network setting the
+		// hold is refusing.
+		"local_only":        s.settings.AccessLocalOnly() || s.accessHeld() != AccessNotHeld,
+		"local_only_active": s.settings.AccessLocalOnly() || s.accessHeld() != AccessNotHeld, // now enforced whenever on (no container bypass)
+		"auth_enabled":      s.settings.AuthEnabled(),                                        // intent - drives the toggle
+		"auth_active":       active,                                                          // enforced - drives the overlay
 		"has_password":      s.settings.HasPassword(),
 		"authed":            authed,
 		// Which machine the locked-out recovery command has to be run on. The

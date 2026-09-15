@@ -184,11 +184,26 @@ Two things worth knowing about the filter:
   daemon updates the stored value to match (in either direction) and logs the
   change - which also makes `-e PINGULARITY_ACCESS=network` the recovery path
   for an install whose saved local-only would otherwise 403 its own published
-  port. There is **no upgrade exception**: a container carried over from 0.61
-  or earlier - where the filter defaulted off - starts local-only too, and its
-  published port answers 403 until the operator opts in. An earlier, unreleased
-  build did make one, persisting network access for any store that *looked*
-  like an upgrade (established, no birth marker, no stored access choice).
+  port. One store is not covered by that rule: one the daemon rebuilt after
+  finding the database damaged (`-on-corrupt rebuild`). That store has no login
+  in it - the hash went with the file set aside - and the flag was only ever
+  safe with one behind it, so access is held to loopback whatever was passed,
+  with a warning saying why and a `503` from `/readyz` - at the start that
+  rebuilt it and at every start after, because the next one finds that database
+  healthy and the flag still has nothing behind it. The hold ends when a login
+  is set on the store (from the machine itself; the next start sees it and lets
+  the flag decide again), when network access is switched on from the machine
+  itself - which says by doing it what reset-auth says in words - or when
+  `pingularity reset-auth` releases it, which is the way back for a bridged
+  container that cannot reach its own dashboard (see
+  [claiming a container](#claiming-a-container-before-someone-else-does)). The
+  flag on its own never reopens it, and neither does a network setting stored
+  by anything else: an older release the store is rolled back to stores one on
+  any ordinary Save, and this build does not honour it and says so. There is **no upgrade
+  exception**: a container carried over from 0.61 or earlier - where the filter
+  defaulted off - starts local-only too, and its published port answers 403
+  until the operator opts in. An earlier, unreleased build did make one,
+  persisting network access for any store that *looked* like an upgrade (established, no birth marker, no stored access choice).
   That inference was unsound: the fail-closed default landed several commits
   before the birth marker existed, so a container born private under one of
   those pre-marker builds carries no marker and is byte-identical on disk to a
@@ -383,7 +398,9 @@ does not.
 
 Forgot the password: `pingularity reset-auth` clears it and disables auth. That
 is a local command, so it is gated by access to the machine, which is the same
-boundary as the data itself.
+boundary as the data itself. It also releases the hold a store rebuilt after
+damage keeps on network access (see the filter notes above): the command is an
+operator saying, from the machine, that they know the store has no login.
 
 ## Data and secrets at rest
 
@@ -402,10 +419,10 @@ boundary as the data itself.
   own by construction, so the never-repermission rule protects nothing there.
   Keep it that way if you relocate the database with `-db`.
 - **Secrets** you enter, such as iperf3 passwords, are sealed with a key stored
-  as `pingularity.key` beside the database. That protects a settings export or
-  a database copy, not someone who already has both files and the ability to
-  read them.
-- **The saved log snapshot** (`logs.txt`, beside the database) holds the raw
+  as `pingularity.key` beside the `-db` path - beside the link, when that path
+  is a symlink to the database. That protects a settings export or a database
+  copy, not someone who already has both files and the ability to read them.
+- **The saved log snapshot** (`logs.txt`, beside the `-db` path) holds the raw
   log lines — unmasked IPs and hostnames — so it gets the same owner-only
   treatment as the database and key: `0600`, and on Windows a protected ACL of
   its own rather than the ACEs it would inherit from its directory, applied
@@ -522,3 +539,11 @@ password before the LAN can reach it again. Do not use local-only to close the
 window on a bridged container - it refuses your own published port too, and
 then nobody can set a password. Once the new password is set the old session
 token dies with the old hash, so the party that claimed it is out.
+
+A store the daemon rebuilt after damage (`-on-corrupt rebuild`) is this
+section's install with one difference: `-access network` does not open it,
+because it has no login and the flag was never meant to publish a dashboard
+without one. On `--network=host`, set the password from the host as above and
+restart. A bridged container runs `reset-auth` against the volume first, which
+releases the hold; from its next start it is the unclaimed install this section
+describes, so publish to `127.0.0.1` while you claim it.

@@ -80,6 +80,16 @@ type Config struct {
 	// operator says what they want instead. From -access or PINGULARITY_ACCESS.
 	Access string
 
+	// OnCorrupt is what a start does when the database will not open because it
+	// is damaged: "refuse" (the default) leaves the file exactly where it is
+	// and fails the start, so the data can still be recovered; "rebuild" sets
+	// it aside as <db>.<UTC>.corrupt and starts over on an empty store, so a
+	// service on Restart=always comes back monitoring rather than crash-looping
+	// on the same bad file - at the price of the history and every saved
+	// setting. From -on-corrupt. Not persisted; the choice is re-made every
+	// start, because it only matters on a start that hits the fault.
+	OnCorrupt string
+
 	// AccessExplicit records that Access came from explicit operator input - a
 	// -access flag actually passed on the command line, or a non-blank
 	// PINGULARITY_ACCESS - as opposed to the silent "local" default. At boot an
@@ -176,7 +186,8 @@ func Default() Config {
 		DownAfter:      2,
 		UpAfter:        1,
 		Targets:        DefaultTargets(),
-		ListenAddr:     ":9000", // all interfaces, IPv4 + IPv6
+		OnCorrupt:      OnCorruptRefuse, // a damaged database is left alone, never replaced, unless the operator says otherwise
+		ListenAddr:     ":9000",         // all interfaces, IPv4 + IPv6
 
 		SpeedtestEnabled:     false, // scheduled/interval tests are opt-in
 		SpeedtestInterval:    time.Hour,
@@ -188,6 +199,13 @@ func Default() Config {
 		DowntimeRetention:    365 * 24 * time.Hour, // outages: 1 year
 	}
 }
+
+// The -on-corrupt modes. Refusing is the default: a set-aside is not reversible
+// and a refusal is, so the daemon only takes that road when asked to.
+const (
+	OnCorruptRefuse  = "refuse"
+	OnCorruptRebuild = "rebuild"
+)
 
 // Flag bounds, mirroring the settings layer's clamps (settings.Min*/Max*): the
 // UI and settings.normalize enforce the same ranges, so rejecting an
@@ -218,6 +236,7 @@ func ParseFlags(args []string) (Config, error) {
 	fs.StringVar(&c.ListenAddr, "listen", c.ListenAddr, "HTTP listen address for UI + metrics")
 	fs.StringVar(&c.AllowedHosts, "allow-host", c.AllowedHosts, "extra Host header values to accept, comma-separated (reverse-proxy domains)")
 	fs.StringVar(&c.TrustedProxies, "trusted-proxy", c.TrustedProxies, "proxy IPs/CIDRs whose X-Forwarded-For identifies the client, comma-separated")
+	fs.StringVar(&c.OnCorrupt, "on-corrupt", c.OnCorrupt, "what to do when the database is damaged and will not open: 'refuse' (default) leaves the file where it is - nothing moved or replaced - and does not start, so it can still be recovered from; 'rebuild' sets it aside as <db>.<UTC>.corrupt and starts over on an empty store, losing the history and every saved setting (login included)")
 	fs.StringVar(&c.MetricsToken, "metrics-token", c.MetricsToken, "optional read-only token for /metrics (Bearer or Basic password), so Prometheus needn't hold the admin login; only used when Require login is on")
 	// Scheduled tests gate the while-degraded trigger too - main wires its
 	// detection behind SpeedtestEnabled - so the usage says so; only the
@@ -245,6 +264,14 @@ func ParseFlags(args []string) (Config, error) {
 	fs.StringVar(&c.Access, "access", access, "who may open the dashboard: 'local' (loopback only; the safe default) or 'network' (reachable from the LAN - set a login). Containers that publish a port need 'network' (or PINGULARITY_ACCESS=network)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
+	}
+	// A typo'd -on-corrupt must fail loudly at parse time, like every other
+	// enum flag: silently falling through would decide the fate of a damaged
+	// database by whichever way the unrecognized value happened to compare.
+	switch c.OnCorrupt {
+	case OnCorruptRefuse, OnCorruptRebuild:
+	default:
+		return Config{}, fmt.Errorf("invalid -on-corrupt %q: want %q or %q", c.OnCorrupt, OnCorruptRefuse, OnCorruptRebuild)
 	}
 	// Validate -access / PINGULARITY_ACCESS (an env typo must fail loudly, not
 	// silently fall through to network-open or a broken value).

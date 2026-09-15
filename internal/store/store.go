@@ -24,6 +24,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -266,6 +267,12 @@ type Store struct {
 	pauseRepairArm  atomic.Uint64
 	pauseRepairDone atomic.Uint64
 	pauseRepairMu   sync.Mutex // serializes the judgement transaction itself
+
+	// rebuilt records that this Open found the database damaged, set it aside
+	// and started over on an empty one. Fixed for the life of the handle - a
+	// later Open of the file it just built finds a healthy database and says
+	// no. See RebuiltAfterCorruption for who asks.
+	rebuilt bool
 }
 
 // pragmaConn is the per-connection pragma query appended to every file-backed
@@ -299,9 +306,29 @@ func buildDSN(path string) string {
 	return "file:" + esc + pragmaConn
 }
 
+// OpenOption adjusts how Open treats a database it cannot read.
+type OpenOption func(*openOpts)
+
+// openOpts is what the OpenOptions set. Zero value = the default open: a
+// damaged file is refused and left where it is.
+type openOpts struct {
+	rebuildOnCorruption bool
+}
+
+// RebuildOnCorruption arms the set-aside recovery: a database Open cannot read
+// is renamed to <db>.<UTC>.corrupt (with its WAL/SHM sidecars) and an empty one
+// is built in its place, so a service on Restart=always comes back monitoring
+// instead of crash-looping on the same bad file. It is the daemon's -on-corrupt
+// rebuild, and it is off by default for the reason recorded where the recovery
+// runs: the history and every saved setting - login included - leave with the
+// old file, and that is not a decision to take on an operator's behalf.
+func RebuildOnCorruption() OpenOption {
+	return func(o *openOpts) { o.rebuildOnCorruption = true }
+}
+
 // Open opens (creating if needed) the SQLite database at path and ensures the
 // schema exists.
-func Open(path string) (*Store, error) {
+func Open(path string, opts ...OpenOption) (*Store, error) {
 	// ONE reading: the clock the pause rows are judged with (nowU) and the
 	// step detector's baseline are the same time.Time. Two separate readings -
 	// even nanoseconds apart, and previously a whole slow Open apart - leave a
@@ -309,7 +336,7 @@ func Open(path string) (*Store, error) {
 	// stale clock, the corrected one installed as the baseline, and no step
 	// ever visible afterwards to trigger the re-judgement.
 	now := time.Now()
-	return openAtClock(path, now.Unix(), now, false)
+	return openAtClock(path, now.Unix(), now, false, opts...)
 }
 
 // OpenExisting opens the database at path as it is. It never creates one and
@@ -402,7 +429,11 @@ func looseDataDirWarning(dir string) string {
 // reading the step detector baselines on, as one pair. existing is
 // OpenExisting's contract: the file must already be a database, and a
 // database that will not open is never set aside.
-func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Store, error) {
+func openAtClock(path string, nowU int64, opened time.Time, existing bool, opts ...OpenOption) (*Store, error) {
+	var oo openOpts
+	for _, opt := range opts {
+		opt(&oo)
+	}
 	// PINGULARITY_TEST_DB_DIR redirects a ":memory:" open to a unique file
 	// under the named directory - CI's file-backed matrix leg, and nothing
 	// else. The in-memory pool is pinned to ONE connection (see Open below),
@@ -434,15 +465,44 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 	// asked here on purpose - a database whose first page a power cut zeroed no
 	// longer looks like one, and refusing it would take away the very recovery
 	// below.
+	//
+	// A link is resolved rather than refused, and everything from here down -
+	// the check, the chmod, the DSN, the set-aside - is about the file it
+	// resolved to. See resolveDBPath: the harm was never that the -db path was
+	// a link, it was that the repair acted on the link and the chmod acted on
+	// its target, so they were about two different files.
+	//
+	// The one thing still judged by the path as typed is the data directory
+	// below. pingularity.key and logs.txt are placed beside the -db flag, not
+	// beside what it resolves to (secret.New and ringPath are handed the flag),
+	// so behind a link that directory is where they sit: it is the one whose
+	// looseness is worth a warning, the one an older build judged, and - when
+	// the link sits in the image's own volume - the one the container carve-out
+	// below exists for. The database file itself is secured where it really is.
+	asTyped := path
 	if path != ":memory:" {
+		resolved, err := resolveDBPath(path)
+		if err != nil {
+			return nil, err
+		}
+		path = resolved
 		if err := checkDBPath(path, existing); err != nil {
 			return nil, err
+		}
+		// A rebuild that a start left between setting the damaged file aside and
+		// putting its replacement in place is finished here, before anything
+		// below can create a brand-new store at the empty path instead (see
+		// finishInterruptedRebuild).
+		if !existing {
+			if err := finishInterruptedRebuild(path); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Create the parent dir for file-backed databases (skips ":memory:" and bare
 	// filenames, whose dir is "."). 0o700 because the DB holds secrets at rest
 	// (bcrypt auth hash, webhook URLs) - not readable by other local users.
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	if dir := filepath.Dir(asTyped); dir != "" && dir != "." {
 		// Whether the directory already existed decides if we may tighten it.
 		// os.MkdirAll gives no "did I create it" signal, so probe first (Lstat,
 		// not Stat, so a symlinked dir is seen as pre-existing rather than
@@ -530,7 +590,28 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 	// twice: once on the existing file, then again on a freshly rebuilt one if
 	// the first attempt reveals the file is corrupt (see the recovery below).
 	initialize := func(db *sql.DB) error {
-		if err := applySchema(db); err != nil {
+		// First, while the schema still shows whether a build that records the
+		// engine split has had this file (see the function). This one stays
+		// outside the transaction below: its delete is allowed to meet damage and
+		// leave its row, and damage met inside a transaction fails everything the
+		// transaction tries after it.
+		if err := forgetRestoredSplitMarker(db); err != nil {
+			return err
+		}
+		// The migration is ONE transaction: the base schema, the added columns
+		// and the new indexes. Building an index is the first read of a table an
+		// older release never read at startup, so that is where damage that sat
+		// dormant under the older release surfaces on the upgrade. Committed
+		// statement by statement, the steps before it stayed behind in a file the
+		// start then refused - server_health among them, which is how the marker
+		// check above tells a file this release has opened from one it has not -
+		// so a marker restored into that file later, under the older release, was
+		// believed at the next upgrade. Rolled back, a file refused on damage the
+		// migration meets keeps nothing of it; the one change a start can already
+		// have made is that delete of a marker restored from another database, a
+		// row no older release reads. Damage only the repairs below read is met
+		// after the commit, and a file refused on that keeps the migration.
+		if err := migrateInOneTransaction(db); err != nil {
 			return err
 		}
 		// Repair what an OLDER build's unvalidated InsertPause left behind. The
@@ -570,6 +651,7 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 		}
 		return nil
 	}
+	rebuilt := false // this Open set a damaged database aside and started over on an empty one
 	if err := initialize(db); err != nil {
 		// A malformed or truncated main DB (typically a hard power-off mid-
 		// checkpoint) makes a statement fail with "database disk image is
@@ -583,7 +665,34 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 		// "malformed" from the repair instead - the same file, the same crash
 		// loop, but with nothing set aside. A :memory: store, an OpenExisting
 		// caller or a non-corruption error still fails fast.
-		if path == ":memory:" || existing || !dbCorrupt(err) {
+		//
+		// So does damage itself, unless the operator armed the recovery. The crash
+		// loop is real, but as a DEFAULT this trades a fault the operator can still
+		// act on for one they cannot: the file is replaced, the dashboard comes back
+		// empty, and nothing about a running daemon says so. Damage sitting in a
+		// table an earlier release never read at startup is dormant until some
+		// release reads it - an added index does, and an upgrade is precisely when
+		// nobody is watching the logs. A refusal keeps every option open - the file
+		// stays where it is, sqlite3's .recover can try to read it back, and a build
+		// whose startup never reads the damaged table still opens it - while a
+		// rebuild closes them. (How much .recover gets back depends on where the
+		// damage sits: most of the file for a torn table page, and anything from
+		// all of it to nothing for a torn first page - a header wiped alone reads
+		// back whole, a zeroed first page comes back as lost_and_found rows with no
+		// settings table, random bytes over it as an empty file - which is why the
+		// message below says to check the copy before it replaces anything. The
+		// migration is one transaction, so damage it meets - the new indexes are
+		// what reach a table an older release never read - is refused with none of
+		// it committed; damage only the repairs after it read is met once it has
+		// committed, and that file keeps this release's tables, columns and indexes
+		// (see initialize). Nothing is moved, replaced or deleted, which is the part
+		// that cannot be taken back.) None of this restores an older release's
+		// behaviour: those replaced a database they could not open too, and the only
+		// reason this damage is new is that their startup never read the table it
+		// sits in. So a box that a power cut would have silently restarted empty now
+		// stops until somebody looks at it, which is the trade this default is
+		// making on purpose.
+		if path == ":memory:" || existing || !oo.rebuildOnCorruption || !dbCorrupt(err) {
 			db.Close()
 			if existing && dbCorrupt(err) {
 				// Name the FILE. This door is what the hand-typed recovery
@@ -592,6 +701,29 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 				// file beside the database is one tab-completion away from it.
 				return nil, fmt.Errorf("%s is not a pingularity database, or is damaged past opening: %w", path, err)
 			}
+			if path != ":memory:" && dbCorrupt(err) {
+				// The whole refusal in one message: nothing was touched, here
+				// is how to try to get the data back, and here is the switch
+				// that takes the other road. An operator reads this in
+				// `systemctl status`/`docker logs` with the daemon down, so it
+				// has to carry the commands rather than point at a manual.
+				//
+				// And it must not promise what .recover cannot do. For a torn
+				// table page it reads nearly everything back; random bytes over
+				// the first page leave an empty file and exit 0, and a zeroed
+				// first page or damage just past the header a copy with no
+				// settings table. Put in place, either is a brand-new install - no login,
+				// and on the network if -access network says so - which is the
+				// open dashboard a refusal exists to prevent, reached by doing
+				// what the message said. Which shape this is cannot be told from
+				// the error (the same "not a database" comes back for a header
+				// .recover reads straight past), so the check is the operator's,
+				// and the message hands them the command for it and says where
+				// to go when it comes back empty.
+				q := shellQuotePath(runtime.GOOS, path)
+				rq := shellQuotePath(runtime.GOOS, path+".recovered")
+				return nil, fmt.Errorf("database %s is damaged (%w); it has not been moved or replaced - try to recover it with `sqlite3 %s .recover | sqlite3 %s`, then check what came back before it replaces anything: `sqlite3 %s \"SELECT key FROM settings\"` lists the install's saved settings, auth_hash among them if it had a password. How much comes back depends on where the damage is, and a torn first page can leave nothing at all. If the list is there, put the copy in the damaged file's place and start again; if the copy is empty or has no settings, do not put it in place - start with -on-corrupt rebuild instead, which sets the damaged file aside, begins again on an empty store that has lost the history and every saved setting (login, network access, thresholds, notifications), and holds network access to this machine until a password is set on it and the daemon restarted or reloaded", path, err, q, rq, rq)
+			}
 			return nil, err
 		}
 		// Ask the doomed file, while it is still open, whether the install it
@@ -599,9 +731,28 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 		firstRun := firstRunInDoomedDB(db)
 		db.Close()
 		stats.Inc("db.corrupt")
+		// The replacement is built whole, beside the damaged file, BEFORE that
+		// file moves, and only then do the two change places. Building it where
+		// the damaged file had been, after moving that file aside, left every
+		// failure in between - a full disk while the schema was written, an I/O
+		// error, a crash or a power cut - holding an empty store with no hold row
+		// in it at the database's path. The next start found that store healthy
+		// and brand new, and -access network put it on the network with no login:
+		// the outcome the hold row below exists to prevent, reached by failing to
+		// write it. Built first, a failure leaves the damaged file exactly where
+		// it was, to be refused or rebuilt again; and the one step left between
+		// the set-aside and the replacement is a rename, which the next Open
+		// finishes if a start dies across it (finishInterruptedRebuild).
+		built, berr := buildRebuiltStore(path, nowU, firstRun, initialize)
+		if berr != nil {
+			return nil, fmt.Errorf("database %s is damaged (%v), and the empty store to replace it could not be built, so the damaged file has not been moved: rebuild after corruption: %w", path, err, berr)
+		}
 		moved, qerr := quarantineCorruptDB(path)
 		if qerr != nil {
 			return nil, qerr
+		}
+		if rerr := renameIntoPlaceFn(built, path); rerr != nil {
+			return nil, fmt.Errorf("put the rebuilt store in place of %s: %w", path, rerr)
 		}
 		lost := "monitoring continues on it, but the history and every saved setting (login, network access, thresholds, notifications) are gone with the old file"
 		if firstRun {
@@ -612,39 +763,7 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 			return nil, fmt.Errorf("open db (post-recovery): %w", err)
 		}
 		db.SetMaxOpenConns(4) // file-backed: recovery only runs for path != ":memory:"
-		if err := initialize(db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("rebuild after corruption: %w", err)
-		}
-		// The rebuilt store belongs to an install that already existed - the
-		// database just moved aside was its - and it has to say so. An empty
-		// store reads as a brand-new install to the first-run decision, which
-		// then seeded a fresh offer clock and held monitoring for the whole
-		// consent grace: two days of measuring nothing on a box that consented
-		// long ago, the boot notice claiming a first run, and the health
-		// endpoint green throughout. The install anchor is the evidence that
-		// decision reads (settings.EstablishedInStore): as far as this store can
-		// vouch for it, monitoring began at the rebuild.
-		//
-		// Unless the old file said otherwise while it could still be read. An
-		// install still INSIDE its first-run offer has consented to nothing
-		// yet, and anchoring one would start it probing with the defaults and
-		// retire the Quick Setup dialog it was never shown. So the anchor is
-		// withheld only on that positive evidence, and a file too damaged to
-		// answer keeps monitoring: a database ruined past reading is far more
-		// often one that had been written to for months than one three hours
-		// old, holding wrongly costs two days of the measurement this daemon
-		// exists to do, and releasing wrongly costs what the offer's own 48h
-		// expiry would have done anyway - minus the dialog, which is the part
-		// worth avoiding when it can be.
-		if !firstRun {
-			if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
-				ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-				firstSeenKey, strconv.FormatInt(nowU, 10)); err != nil {
-				db.Close()
-				return nil, fmt.Errorf("anchor rebuilt store: %w", err)
-			}
-		}
+		rebuilt = true
 	}
 	// Tighten on-disk permissions to owner-only: the driver creates files 0644
 	// (umask-subject) but this DB stores secrets. Covers the main file plus the
@@ -664,6 +783,7 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 		recCache:    map[int64]recScan{},
 		seriesCache: map[seriesKey]*seriesEntry{},
 		opened:      opened, // the top-of-Open reading; carries a monotonic reading for clockStepped
+		rebuilt:     rebuilt,
 	}
 	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
 	// When the clock could not anchor the future-end pause repair above, arm the
@@ -674,13 +794,190 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool) (*Sto
 	return st, nil
 }
 
+// rebuiltSuffix names the replacement a rebuild builds beside a damaged
+// database before either file moves (see buildRebuiltStore).
+const rebuiltSuffix = ".rebuilt"
+
+// renameIntoPlaceFn is os.Rename, for the step that puts a rebuilt store at the
+// database's path - a var so tests can make that one rename fail, which nothing
+// in a real directory does just after the damaged file left the same one.
+var renameIntoPlaceFn = os.Rename
+
+// buildRebuiltStore builds, beside the damaged database at path, the whole store
+// a rebuild puts in its place - the schema and at-Open repairs, the install
+// anchor, the access hold - closes it, which folds its WAL into the one file,
+// and returns that file's path (<path>.rebuilt). Nothing about the damaged
+// database is touched. A build that fails part-way is removed and its error
+// returned, so what it leaves behind is what was there before it started.
+func buildRebuiltStore(path string, nowU int64, firstRun bool, initialize func(*sql.DB) error) (string, error) {
+	built := path + rebuiltSuffix
+	remove := func() error {
+		for _, sfx := range []string{"", "-wal", "-shm"} {
+			if err := os.Remove(built + sfx); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return nil
+	}
+	// A build an earlier start abandoned, or a finished one it never put in
+	// place over a damaged file that is still here: this start builds its own.
+	if err := remove(); err != nil {
+		return "", fmt.Errorf("clear an earlier rebuild: %w", err)
+	}
+	db, err := sql.Open("sqlite", buildDSN(built))
+	if err != nil {
+		return "", err
+	}
+	db.SetMaxOpenConns(1)
+	fail := func(err error) (string, error) {
+		db.Close()
+		_ = remove()
+		return "", err
+	}
+	if err := initialize(db); err != nil {
+		return fail(err)
+	}
+	// The rebuilt store belongs to an install that already existed - the
+	// database just moved aside was its - and it has to say so. An empty
+	// store reads as a brand-new install to the first-run decision, which
+	// then seeded a fresh offer clock and held monitoring for the whole
+	// consent grace: two days of measuring nothing on a box that consented
+	// long ago, the boot notice claiming a first run, and the health
+	// endpoint green throughout. The install anchor is the evidence that
+	// decision reads (settings.EstablishedInStore): as far as this store can
+	// vouch for it, monitoring began at the rebuild.
+	//
+	// Unless the old file said otherwise while it could still be read. An
+	// install still INSIDE its first-run offer has consented to nothing
+	// yet, and anchoring one would start it probing with the defaults and
+	// retire the Quick Setup dialog it was never shown. So the anchor is
+	// withheld only on that positive evidence, and a file too damaged to
+	// answer keeps monitoring: a database ruined past reading is far more
+	// often one that had been written to for months than one three hours
+	// old, holding wrongly costs two days of the measurement this daemon
+	// exists to do, and releasing wrongly costs what the offer's own 48h
+	// expiry would have done anyway - minus the dialog, which is the part
+	// worth avoiding when it can be.
+	if !firstRun {
+		if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			firstSeenKey, strconv.FormatInt(nowU, 10)); err != nil {
+			return fail(fmt.Errorf("anchor rebuilt store: %w", err))
+		}
+	}
+	// And the store records, in itself, that nobody has a login on it. The
+	// password left with the file set aside, and a daemon told -access
+	// network would otherwise answer the network over an empty store with
+	// nothing to check a visitor against - not only at this start but at
+	// every later one, because the next start finds this database healthy
+	// and has no other way to know. See AccessHoldAfterRebuild.
+	if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		accessHoldKey, strconv.FormatInt(nowU, 10)); err != nil {
+		return fail(fmt.Errorf("hold access on rebuilt store: %w", err))
+	}
+	if err := db.Close(); err != nil {
+		_ = remove()
+		return "", fmt.Errorf("close the rebuilt store: %w", err)
+	}
+	// One file, whole: the rename that puts it in place moves the main file only,
+	// and a WAL left beside the old name - the hold row in it, if the checkpoint
+	// the close runs did not finish - would not follow it.
+	if fi, err := os.Stat(built + "-wal"); err == nil && fi.Size() > 0 {
+		_ = remove()
+		return "", fmt.Errorf("the rebuilt store's WAL still holds %d bytes after it was closed", fi.Size())
+	}
+	return built, nil
+}
+
+// finishInterruptedRebuild completes a rebuild that a start left between
+// setting a damaged database aside and putting its finished replacement in
+// place: nothing at path, and <path>.rebuilt beside it. Left alone, this Open
+// would create a brand-new store at the empty path - no install anchor, and no
+// hold on network access, so -access network would put it on the network with
+// no login - while the store the rebuild finished, carrying both, sat unused
+// beside it. Sidecars the damaged file still has at path (a WAL the set-aside
+// did not reach) are set aside first, as the rebuild would have: renamed into
+// place beside them, the rebuilt store would be read through the old WAL. The
+// build finishes before the damaged file moves, so a build a start died in the
+// middle of sits beside a damaged database still at path, is never put in place
+// here, and is cleared by the next rebuild.
+func finishInterruptedRebuild(path string) error {
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	built := path + rebuiltSuffix
+	if fi, err := os.Lstat(built); err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	if _, err := quarantineCorruptDB(path); err != nil {
+		return err
+	}
+	if err := renameIntoPlaceFn(built, path); err != nil {
+		return fmt.Errorf("put the rebuilt store in place of %s: %w", path, err)
+	}
+	log.Printf("pingularity: database %s had been set aside as damaged by a start that stopped before putting the store it rebuilt in its place; that store is in place now", path)
+	return nil
+}
+
+// migrator is what the migration steps write through: the one connection Open
+// runs them on (see migrateInOneTransaction), or a database handle.
+type migrator interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// migrateInOneTransaction runs applySchema as one transaction, on a connection of
+// its own that is handed back before anything else runs - a rebuild caps the pool
+// at one. The transaction takes the write lock before its first read (BEGIN
+// IMMEDIATE), so a writer busy on the same file makes it wait out the busy
+// timeout, as the statements it replaced did. Begun as an ordinary transaction,
+// its first read took a shared lock that SQLite will not upgrade while another
+// connection writes, and it does not call the busy handler for that: the first
+// start on an older release's file failed "database is locked" at once whenever
+// something else was writing to it, and so did reset-auth.
+func migrateInOneTransaction(db *sql.DB) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := applySchema(connMigrator{ctx, conn}); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// connMigrator is a migrator over one pinned connection.
+type connMigrator struct {
+	ctx  context.Context
+	conn *sql.Conn
+}
+
+func (m connMigrator) Exec(query string, args ...any) (sql.Result, error) {
+	return m.conn.ExecContext(m.ctx, query, args...)
+}
+
+func (m connMigrator) QueryRow(query string, args ...any) *sql.Row {
+	return m.conn.QueryRowContext(m.ctx, query, args...)
+}
+
 // applySchema creates the base tables, runs the additive column migrations, and
 // drops a retired index. Idempotent: re-running an ALTER on an already-migrated
 // table fails with "duplicate column name", the expected no-op. Any other error
 // (locked, disk full, corrupt) is real and returned, because continuing would
 // leave a column missing and every statement naming it failing forever. Open
 // runs this twice when it has to rebuild a corrupt file.
-func applySchema(db *sql.DB) error {
+func applySchema(db migrator) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
@@ -1246,6 +1543,66 @@ func stampRepairGeneration(db *sql.DB, gen int64) error {
 	return nil
 }
 
+// forgetRestoredSplitMarker deletes the settings layer's split marker
+// (engine_split_done, see settings.recordMigrations) from a file no build that
+// records the split has opened, and it runs before applySchema because the
+// schema is what tells. server_health reached the base schema ahead of the
+// split, in the same release, and every build that writes the marker creates
+// that table here at Open, before its settings load writes a row. So a settings
+// table holding the marker with no server_health beside it was handed the
+// marker by something other than that load - and every release before 0.100 is
+// such a thing: none of them leaves the key out of an export or refuses it on
+// restore, so a backup one takes of a database this release has started carries
+// the marker onto a machine that never ran this release. That machine goes on
+// running iperf3 on Ookla's direction and retries wherever iperf3 has no row of
+// its own, as those releases always did. Kept, the marker told the split's
+// first load here that the carry had already been made, and iperf3 dropped to
+// its defaults at the upgrade with nothing said: upload-only with three retries
+// became both directions with one, roughly twice the transfer per run. Deleted,
+// it leaves that load to carry the pair as on any upgrade, say so, and write
+// the marker back itself. The row goes before the table is created, so an Open
+// cut short between the two leaves the next Open the same answer.
+//
+// The query reads only the schema, which applySchema reads first, and the
+// delete is a write like the ones applySchema makes next, so what fails either
+// of them - a file that is not a database, one locked or read-only - fails
+// applySchema too, which used to meet it first. It is worded as applySchema
+// words its own and counted as it is: not here, but once, by Open's recovery
+// when the file is corrupt.
+//
+// Damage only the delete reads is the exception. The delete finds its row
+// through the settings table's key index, and nothing else at Open reads that
+// page: applySchema never touches the table, and the settings load reads it
+// whole. So a file whose only damage is that index opened on the releases
+// before this step, which ran on the settings it held. Failing Open here would
+// set such a file aside, or refuse to start on it, at its first start after
+// the upgrade - the history and every saved setting out of reach over one
+// damaged page nothing needed. A delete that meets corruption is left undone
+// instead: the marker stays, as it did before this step, and a machine that
+// also restored one drops iperf3 to its defaults at the upgrade, as it did
+// then.
+//
+// This leans on server_health staying in the base schema: a build that retires
+// that table owes this check another one that arrived with it.
+func forgetRestoredSplitMarker(db *sql.DB) error {
+	var haveSettings, haveHealth int
+	if err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'settings'),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'server_health')`).Scan(&haveSettings, &haveHealth); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if haveSettings == 0 || haveHealth != 0 {
+		return nil // a new file, or one a build that records the split has opened
+	}
+	if _, err := db.Exec(`DELETE FROM settings WHERE key = 'engine_split_done'`); err != nil {
+		if dbCorrupt(err) {
+			return nil // damage only the delete reads: see above
+		}
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
 // dbCorrupt reports whether err is SQLite signalling on-disk corruption or a
 // non-database file - the unrecoverable class Open quarantines and rebuilds from,
 // as opposed to a transient busy/locked or a real I/O fault.
@@ -1284,13 +1641,95 @@ func firstRunInDoomedDB(db *sql.DB) bool {
 	return offered != 0 && settled == 0
 }
 
+// resolveDBPath answers the question a -db path actually poses: which file does
+// it lead to. A link there is an ordinary arrangement - the database moved to
+// the bigger disk and a link stayed where the unit file points - and refusing
+// it stops installs that had been running for years. What must not happen is
+// what used to: the securing chmod followed the link while the set-aside
+// renamed the link itself, so a repair re-permissioned one file and renamed
+// another, left the damaged database sitting under its own name, and put a
+// brand-new empty store where the link had been. Resolving once, here, is what
+// keeps every step below talking about the same file - and it also means a link
+// swapped after this point cannot redirect any of them, because nothing opens
+// the link's name again.
+//
+// A link that leads nowhere, or round in a circle, is refused instead. It names
+// no file to resolve to, and the alternative is worse than an error: the open
+// below would create a database at the far end of it, which on the usual cause
+// - the volume the link points into is not mounted yet - means monitoring
+// starting over into an empty file that the mount then hides.
+//
+// One link to nothing is not that: the one a rebuild leaves when its start dies
+// between setting the damaged database aside and putting the store it finished
+// in that file's place (see finishInterruptedRebuild). The link - or the last
+// of a chain of them - names a file the rebuild has just moved, and the
+// finished store sits beside where it was.
+// Refused, that store stayed unused and the daemon stayed down on a message
+// about a link, for want of the one rename the next Open exists to make. So
+// the far end, through as many as maxLinkHops links, is handed on when a
+// finished store is beside it, and only then - nothing sits beside a file on a
+// volume that is not mounted.
+func resolveDBPath(path string) (string, error) {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		// Nothing there yet (a first run creates the file) or not a link:
+		// the path is already the file's own name. A path that cannot be
+		// Lstat'ed at all is left to checkDBPath, which reports why.
+		return path, nil
+	}
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if far, ok := farEndOfLinks(path); ok {
+			if bfi, berr := os.Lstat(far + rebuiltSuffix); berr == nil && bfi.Mode().IsRegular() {
+				return far, nil
+			}
+		}
+		return "", fmt.Errorf("%s is a symlink that names no file: %w", path, err)
+	}
+	return target, nil
+}
+
+// maxLinkHops bounds farEndOfLinks the way the kernel bounds a path lookup
+// (Linux gives up after 40 links, macOS after 32): a chain longer than that is a
+// loop, or near enough to be treated as one.
+const maxLinkHops = 40
+
+// farEndOfLinks follows the chain of links that starts at path - each relative
+// hop read from the directory its link really sits in, as the kernel reads it -
+// to the first name that is not itself a link, and reports whether it got there.
+// That name need not exist: a chain that ends nowhere is what it is asked about.
+func farEndOfLinks(path string) (string, bool) {
+	cur := path
+	for hop := 0; hop < maxLinkHops; hop++ {
+		next, err := os.Readlink(cur)
+		if err != nil {
+			return "", false
+		}
+		if !filepath.IsAbs(next) {
+			// A directory on the way to the link can itself be a link, and a ".." in
+			// the target climbs out of the directory the kernel reached, not out of
+			// the one the name spells.
+			dir := filepath.Dir(cur)
+			if real, err := filepath.EvalSymlinks(dir); err == nil {
+				dir = real
+			}
+			next = filepath.Join(dir, next)
+		}
+		if fi, err := os.Lstat(next); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return next, true
+		}
+		cur = next
+	}
+	return "", false
+}
+
 // checkDBPath is what Open establishes about the -db path and its WAL/SHM
-// sidecars before anything touches them: each is absent or a regular file, not
-// a directory and not a symlink (the securing chmod would follow the link, and
-// the set-aside would rename the link itself). Either is a mistake at the path
-// - a directory typed for the file inside it, a symlink someone pointed at
-// another volume - and is refused with an error that names it, never
-// re-permissioned, renamed or replaced.
+// sidecars before anything touches them: each is absent or a regular file and
+// not a directory. The path itself has been resolved through any link by then
+// (see resolveDBPath), so what is judged here is the real file the -db flag
+// leads to - a directory typed for the file inside it, a device node, a fifo -
+// and it is refused with an error that names it, never re-permissioned,
+// renamed or replaced.
 //
 // It deliberately does NOT judge the file's CONTENTS. A regular file that is
 // not a database reaches SQLite, fails to open, and is set aside by the
@@ -1319,7 +1758,15 @@ func checkDBPath(path string, mustExist bool) error {
 		}
 		switch {
 		case fi.Mode()&os.ModeSymlink != 0:
-			return fmt.Errorf("%s is a symlink; the -db path is never followed through one - pass the file it points to", p)
+			// A sidecar, almost always: the -db path itself arrives here
+			// already resolved, and only a link planted between the resolve
+			// and this Lstat could still be one. Neither can be followed -
+			// SQLite opens the write-ahead log and the shared-memory file
+			// beside the database directly and gets no further than "unable
+			// to open database file" through a link - so the remedy named is
+			// the one that exists for all three, and never "pass -db the file
+			// it points to", which is not a thing to do with a WAL.
+			return fmt.Errorf("%s is a symlink; the database and its -wal/-shm sidecars are opened directly, never through a link - put the file it names in its place", p)
 		case fi.IsDir():
 			return fmt.Errorf("%s is a directory, not a database file; pass -db the file inside it", p)
 		case !fi.Mode().IsRegular():
@@ -1330,6 +1777,62 @@ func checkDBPath(path string, mustExist bool) error {
 		}
 	}
 	return nil
+}
+
+// shellQuotePath wraps a path for the recovery commands the refusal above
+// prints, quoted for the shell an operator on goos pastes them into - the
+// refusal runs on the machine that holds the database, so the caller passes
+// runtime.GOOS. Those commands are read with the daemon down and pasted
+// straight into a shell, and on macOS the default database directory is
+// "Application Support": pasted bare, the space splits the command and sqlite3
+// reports a SQL syntax error about the second half rather than opening
+// anything, so the one instruction an operator has fails and recovers nothing.
+// (The Windows default, under %ProgramData%, has no space in it; a -db pointed
+// somewhere else can.)
+//
+// A POSIX shell gets single quotes, because they are also the only quoting that
+// survives a $ or a backtick in a directory name - inside double quotes the
+// shell would expand those, and a recovery command that quietly names a
+// different file is worse than one that fails.
+//
+// Windows gets its own. cmd.exe does not treat a single quote as quoting at
+// all, so the POSIX form handed sqlite3 a file name that began with one - and on
+// every Windows path, since a backslash is outside the POSIX safe set. Double
+// quotes are what cmd.exe and PowerShell both strip, a Windows file name cannot
+// contain one, and a backslash is an ordinary character to both shells, so the
+// default path stays bare and a spaced one comes through either shell whole.
+// What double quotes do not stop is PowerShell expanding a $ or a backtick
+// inside them, or cmd.exe a %NAME%. A path carrying one of those gets
+// PowerShell's single quotes instead (a quote inside doubled): literal in the
+// shell this project's Windows instructions use, and in cmd.exe a name no file
+// has, so the command fails there rather than opening a different one.
+//
+// A path that needs none is left bare so the common message reads as prose
+// rather than as a script.
+func shellQuotePath(goos, p string) string {
+	safeChars := "_-./:@+=,"
+	if goos == "windows" {
+		if strings.ContainsAny(p, "$`%") {
+			return "'" + strings.ReplaceAll(p, "'", "''") + "'"
+		}
+		safeChars = `\/:._-`
+	}
+	safe := p != ""
+	for _, r := range p {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			strings.ContainsRune(safeChars, r) {
+			continue
+		}
+		safe = false
+		break
+	}
+	if safe {
+		return p
+	}
+	if goos == "windows" {
+		return `"` + p + `"`
+	}
+	return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
 }
 
 // quarantineCorruptDB moves a corrupt database and its WAL/SHM sidecars aside to
@@ -1392,6 +1895,69 @@ func securingSkippable(err error) bool {
 	return strings.Contains(msg, "read-only") ||
 		strings.Contains(msg, "not supported") ||
 		strings.Contains(msg, "not permitted")
+}
+
+// RebuiltAfterCorruption reports that this store is the empty one Open built
+// after setting a damaged database aside - so everything the install had is in
+// the .corrupt file beside it, not in here. The daemon is monitoring again,
+// which is what the recovery is for, but it is not the install anyone
+// configured: the callers are the ones that must not carry on as though
+// nothing happened (readiness, for the life of this handle; the access posture
+// the lost password was standing behind outlives it - see
+// AccessHoldAfterRebuild).
+func (s *Store) RebuiltAfterCorruption() bool { return s.rebuilt }
+
+// accessHoldKey is the settings row a store rebuilt after corruption carries
+// until a login stands behind it again; its value is when the rebuild happened.
+const accessHoldKey = "access_hold_after_rebuild"
+
+// AccessHoldAfterRebuild reports whether network access must stay held to this
+// machine because this is a store Open rebuilt after finding the database
+// damaged, and no login has been set on it since. The hold lives in the rebuilt
+// store rather than on the handle because the handle is gone at the next start
+// and the store is not: that start opens a healthy, empty database, and without
+// the row an explicit -access network would put it on the network with no
+// password behind it - the outcome the hold exists to prevent, one restart
+// later.
+//
+// The first call that finds a login releases the hold, so a login switched off
+// later, on purpose, is the operator's decision and not the rebuild's
+// consequence. A store whose settings cannot be read answers held: this decides
+// who can reach the dashboard, and it fails closed.
+func (s *Store) AccessHoldAfterRebuild(ctx context.Context) (bool, error) {
+	all, err := s.AllSettings(ctx)
+	if err != nil {
+		return true, err
+	}
+	if all[accessHoldKey] == "" {
+		return false, nil
+	}
+	if all["auth_hash"] == "" || (all["auth_enabled"] != "1" && all["auth_enabled"] != "true") {
+		return true, nil
+	}
+	// Said, because it need not be anyone's doing at this machine: an older build
+	// the store was rolled back to does not know the hold, and a login set there -
+	// by whoever reached its open dashboard first - ends it just the same. This
+	// line is the only record of that.
+	released, err := s.ReleaseAccessHold(ctx)
+	if released {
+		log.Printf("pingularity: the hold a rebuilt store kept on network access is released: a login is set on it")
+	}
+	return false, err
+}
+
+// ReleaseAccessHold ends the hold AccessHoldAfterRebuild reports, and says
+// whether there was one to end. `pingularity reset-auth` calls it: that command
+// is how an operator says they know the store has no login, and it is the way
+// back for an install that cannot reach its own loopback address to set one - a
+// bridged container with no shell, whose published port the hold refuses.
+func (s *Store) ReleaseAccessHold(ctx context.Context) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, accessHoldKey)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // Close releases the underlying database handle.
@@ -5920,6 +6486,12 @@ var settingsExportDeny = map[string]bool{
 	//
 	// Restoring a backup moves the DATA. The destination decides who can see it.
 	"access_local_only": true,
+	// The hold a store rebuilt after corruption keeps on network access until a
+	// login is set on it (AccessHoldAfterRebuild). Like the access scope above,
+	// it describes one host's store, not the history: exported, a restore would
+	// hold some healthy install off its own network; imported, a crafted file
+	// could close a published port with nothing saying why.
+	accessHoldKey: true,
 	// When THIS box started watching. It lives in the settings table but it is
 	// evidence, not configuration: monitoringSince takes the MIN of it and the
 	// earliest row on disk, making it the denominator behind every uptime figure.
