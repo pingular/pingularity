@@ -3577,7 +3577,7 @@ test('a warning is marked by its ⚠, never by a hue of its own', () => {
   assert.ok(tintPct(heavy) > tintPct(calm), 'the heavy estimate is tinted no more deeply than the calm one');
   assert.equal(tintPct(heavy), tintPct(cssRule('.info.conn-off')), 'the heavy estimate no longer takes the off-marker’s deeper tint');
   assert.match(cssProp(calm, 'border') || '', /^1px solid color-mix\(in srgb,var\(--accent\) \d+%,transparent\)$/,
-    'the calm estimate is no longer ringed in the faint accent mix the heavy ring stands out from');
+    'the calm estimate is no longer ringed in an accent mix, apart from the heavy ring in its ⚠’s colour');
   assert.equal(cssProp(heavy, 'border-color'), 'var(--accent-mark)', 'the heavy estimate is not ringed solid in its ⚠’s colour');
   assert.equal(cssColour('.info-note.warn .wi'), cssColour('.warn-bubble .wi'),
     'the heavy estimate’s ⚠ is not the colour of every other warning’s ⚠');
@@ -3791,6 +3791,146 @@ test('a warning’s ⚠, ring and bold words clear their floors, under any accen
     }
   }
   assert.deepEqual(low, [], `a warning mark, ring or bold word below its floor:\n  ${low.join('\n  ')}`);
+});
+
+// ORDINARY WORDS HAVE TO READ ON EVERY GROUND THEY ARE DRAWN ON. --fg is the page's text
+// on the panels and dialogs (a --panel2 to --panel gradient), in the settings drawer, and
+// inside the calm notes, whose accent tint lifts a dark ground toward the text. Solarized's
+// classic base1 #93a1a1 read 4.1:1 on its own raised panel and 3.7:1 inside a calm note
+// there. The note's tint is read from the stylesheet, so a retuned recipe is measured.
+test('ordinary text clears 4.5:1 on every ground and inside the calm notes, in every theme', () => {
+  const m = (cssProp(cssRule('.info-note'), 'background') || '').match(/^color-mix\(in srgb,var\(--accent\) (\d+)%,transparent\)$/);
+  assert.ok(m, '.info-note is no longer tinted as a mix of the accent');
+  assert.equal(tokOf(cssColour('.info-note')), 'fg', 'a calm note no longer writes in --fg');
+  const low = [];
+  for (const [name, t] of Object.entries(themeTokens())) {
+    for (const [g, ground] of Object.entries(warnGrounds(t))) {
+      for (const [where, back] of [[`on ${g}`, ground], [`in a calm note on ${g}`, overRgb(rgbOf(t.accent), +m[1] / 100, ground)]]) {
+        const r = contrast(t.fg, hexOf(back));
+        if (r < 4.5) low.push(`${name} --fg ${t.fg} ${where}: ${r.toFixed(2)}:1`);
+      }
+    }
+  }
+  assert.deepEqual(low, [], `ordinary text below 4.5:1:\n  ${low.join('\n  ')}`);
+});
+
+// A WARN LINE IS READ ON THE LOG'S OWN GROUND. The log window is --bg2, darker than the
+// panels on the light themes, and Light's and Parchment's amber, chosen against the panels,
+// read 4.1 and 3.8:1 there.
+test('WARN lines in the log clear 4.5:1 on the log’s own ground, in every theme', () => {
+  assert.equal(tokOf(cssColour('.log-window .lg-warn')), 'warn', 'WARN lines are no longer written in --warn');
+  const ground = tokOf(cssProp(cssRule('.log-window'), 'background'));
+  assert.equal(ground, 'bg2', 'the log window is no longer drawn on --bg2 - this test measures the wrong ground');
+  const low = Object.entries(themeTokens()).map(([name, t]) => [name, t.warn, contrast(t.warn, t[ground])])
+    .filter(([, , r]) => r < 4.5).map(([name, warn, r]) => `${name} --warn ${warn} on --${ground}: ${r.toFixed(2)}:1`);
+  assert.deepEqual(low, [], `WARN lines below 4.5:1:\n  ${low.join('\n  ')}`);
+});
+
+// A PALE ACCENTS COLOUR LIFTS A WARNING'S TINT THE MOST. The bubbles and the heavy estimate
+// are a tint of the accent under --warning-fg, and under a near-white accent (#e6f2ff) that
+// tint lifts a dark panel toward the words: Solarized's read 4.2:1 on its raised panel, in
+// the connection panel's bubble and the Quick Setup dialog.
+test('a warning’s words still clear 4.5:1 under a pale Accents colour, in every theme', () => {
+  const pale = '#e6f2ff', low = [];
+  const parts = ['.warn-bubble', '.info-note.warn'].map(sel => {
+    const m = (cssProp(cssRule(sel), 'background') || '').match(/^color-mix\(in srgb,var\(--accent\) (\d+)%,transparent\)$/);
+    assert.ok(m, `${sel} is no longer tinted as a mix of the accent`);
+    const words = tokOf(cssColour(sel));
+    assert.equal(words, 'warning-fg', `${sel} no longer writes in --warning-fg`);
+    return [sel, +m[1] / 100, words];
+  });
+  for (const [name, t] of Object.entries(themeTokens()))
+    for (const [sel, a, words] of parts)
+      for (const [g, ground] of Object.entries(warnGrounds(t))) {
+        const r = contrast(t[words], hexOf(overRgb(rgbOf(pale), a, ground)));
+        if (r < 4.5) low.push(`${name} ${sel} on ${g}: --${words} ${t[words]} = ${r.toFixed(2)}:1`);
+      }
+  assert.deepEqual(low, [], `warning words below 4.5:1 under Accents ${pale}:\n  ${low.join('\n  ')}`);
+});
+
+// THE LIGHT THAT SAYS A SERVER IS BEING CHECKED HAS TO STAY SEEN. It pulsed its own opacity
+// down to 30%, where it all but vanished on the server list in every theme (1.5-2.3:1). It
+// stays solid now and a ring grows and fades around it, so it still moves; for someone who
+// has asked for less motion it just stays lit.
+test('the iperf3 checking light never fades, reads 3:1 on the list, and holds still for reduced motion', () => {
+  const rule = cssRule('.iperf-dot.loading');
+  const colour = tokOf(cssProp(rule, 'background'));
+  assert.equal(colour, 'warn', 'the checking light is no longer drawn in --warn');
+  assert.match(rule, /(?:^|;)opacity:1;/, 'the checking light is no longer fully opaque');
+  const name = (cssProp(rule, 'animation') || '').trim().split(/\s+/)[0];
+  assert.ok(name && name !== 'none', 'the checking light no longer moves at all');
+  const frames = (html.match(new RegExp('@keyframes ' + name + '\\{((?:[^{}]*\\{[^{}]*\\})+)\\}')) || [])[1];
+  assert.ok(frames, `@keyframes ${name} is missing`);
+  assert.doesNotMatch(frames, /opacity/, 'the checking light fades itself again');
+  assert.match(html, /@media \(prefers-reduced-motion:reduce\)\{\s*\.iperf-dot\.loading\{animation:none;\}\s*\}/,
+    'the checking light keeps moving for someone who asked for less motion');
+  const ground = tokOf(cssRules.filter(r => r.sels.includes('.fp-list')).map(r => cssProp(r.body, 'background')).filter(Boolean).pop());
+  assert.equal(ground, 'bg2', 'the server list is no longer drawn on --bg2 - this test measures the wrong ground');
+  const low = Object.entries(themeTokens()).map(([n, t]) => [n, t[colour], contrast(t[colour], t[ground])])
+    .filter(([, , r]) => r < 3).map(([n, c, r]) => `${n} --${colour} ${c} on --${ground}: ${r.toFixed(2)}:1`);
+  assert.deepEqual(low, [], `the checking light below 3:1:\n  ${low.join('\n  ')}`);
+});
+
+// AN ERROR DOES NOT SIT INSIDE A GLOW THAT SAYS OTHERWISE. A server search that finds nothing
+// turns the city field's edge red, and while the field keeps focus the accent glow every
+// focused search field wears went on surrounding that red edge.
+test('a city field showing an error keeps its focus glow in the error colour', () => {
+  assert.match(cssProp(cssRule('.server-search input:focus'), 'box-shadow') || '', /var\(--accent\)/,
+    'the ordinary focus glow has moved - this test guards the wrong rule');
+  const glow = cssProp(cssRule('#serverCity.field-error:focus'), 'box-shadow') || '';
+  assert.match(glow, /var\(--down\)/, 'a city field in error is not glowing in --down');
+  assert.doesNotMatch(glow, /var\(--accent\)/, 'a city field in error still glows in the accent');
+});
+
+// AN OUTLINE HAS TO BE SEEN AGAINST WHAT IS AROUND IT. The warning bubbles, the calm notes, the
+// "!" box and the stale bar are each a tint with an edge, and those edges read 1.6-3.0:1 in
+// most themes, under the 3:1 a boundary needs. Each edge is read from the stylesheet and
+// painted over its own tint and ground: bubbles on the drawer and on panels, calm notes in
+// the drawer (on a Solarized panel its accent itself reads under 3:1, so no mix of it can),
+// the "!" box on its panel, the stale bar over the page. The warning edges take --accent-mark,
+// worked out here as the page works it out. Where a theme rule gives the "!" box a grey
+// .info edge instead, that edge is the one measured.
+test('warning, note, "!" box and stale bar outlines clear 3:1 against their ground, in every theme', () => {
+  const mixIn = (value, what) => {
+    const m = (value || '').match(/color-mix\(in srgb,var\(--([a-z0-9-]+)\) (\d+)%,(?:transparent|var\(--([a-z0-9-]+)\))\)/);
+    assert.ok(m, `${what} is no longer a color-mix of one token`);
+    return { tok: m[1], a: +m[2] / 100, into: m[3] };
+  };
+  const factory = new Function('document', 'getComputedStyle',
+    ['function _rgb', 'function relLum', 'function tintShare', 'function tuneTintMarks'].map(extract).join('\n') + '\nreturn tuneTintMarks;');
+  const tuned = t => {
+    const inline = new Map();
+    const doc = { documentElement: { style: { setProperty: (k, v) => inline.set(k, v), removeProperty: k => inline.delete(k) } },
+      createElement: () => ({ getContext: () => ({ fillStyle: '#000' }) }) };
+    factory(doc, () => ({ getPropertyValue: k => inline.get(k) ?? t[k.slice(2)] ?? '' }))();
+    return { ...t, 'accent-mark': inline.get('--accent-mark') ?? t['accent-mark'] };
+  };
+  // cssRules splits selectors on every comma, the ones inside :is() too, so the rule is
+  // matched on its selectors joined back up.
+  const greyRule = cssRules.find(r => /^:is\((?:html\[data-theme="[a-z]+"\],?)+\) \.info$/.test(r.sels.join(',')));
+  const greyThemes = greyRule ? [...greyRule.sels.join(',').matchAll(/data-theme="([a-z]+)"/g)].map(m => m[1]) : [];
+  const parts = [
+    ['warning bubble', '.warn-bubble', 'border', g => ['drawer', 'panel', 'panel2']],
+    ['calm note', '.info-note', 'border', g => ['drawer']],
+    ['"!" box', '.info.conn-off', 'border-color', g => ['panel2', 'panel']],
+    ['stale bar', '.stale-bar', 'border-top', g => ['page']],
+  ];
+  const low = [];
+  for (const [name, raw] of Object.entries(themeTokens())) {
+    const t = tuned(raw), grounds = { ...warnGrounds(t), page: rgbOf(t.bg) };
+    for (const [what, sel, prop, where] of parts) {
+      const body = cssRule(sel), tint = mixIn(cssProp(body, 'background'), `${sel} background`);
+      let edge = mixIn(cssProp(body, prop), `${sel} ${prop}`);
+      if (sel === '.info.conn-off' && greyThemes.includes(name)) edge = { tok: tokOf(cssProp(greyRule.body, 'border-color')), a: 1 };
+      for (const g of where()) {
+        const box = overRgb(rgbOf(t[tint.tok]), tint.a, tint.into ? rgbOf(t[tint.into]) : grounds[g]);
+        const r = contrast(hexOf(overRgb(rgbOf(t[edge.tok]), edge.a, box)), hexOf(grounds[g]));
+        if (r < 3) low.push(`${name} ${what} edge on ${g}: ${r.toFixed(2)}:1`);
+      }
+    }
+  }
+  assert.ok(greyThemes.length, 'the light themes’ grey .info edge was not found - the scan has gone blind');
+  assert.deepEqual(low, [], `outlines below 3:1:\n  ${low.join('\n  ')}`);
 });
 
 // The legacy-RSA-padding toggle is gated on what the LOCAL iperf3 can actually

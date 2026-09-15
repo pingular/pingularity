@@ -105,11 +105,12 @@
   html[data-theme="slate"] .targets,
   html[data-theme="slate"] .heatmap,
   html[data-theme="slate"] canvas{filter:grayscale(1);}
-  /* Light - a flat, clean light theme (flat design language; depth stripped below). */
+  /* Light - a flat, clean light theme (flat design language; depth stripped below). Its
+     --warn is dark enough for WARN lines on --bg2, the log's ground, not only on the panels. */
   html[data-theme="light"]{
     --bg:#f2f1ed; --bg2:#e9e8e2; --panel:#fffefa; --panel2:#f8f7f2;
     --line:#ddd9d0; --line2:#c8c2b6; --fg:#1e1f21; --muted:#64665f;
-    --up:#0e8040; --down:#db1f25; --warn:#996308; --accent:#3060b4; --accent2:#0c8a72; --on-accent:#ffffff;
+    --up:#0e8040; --down:#db1f25; --warn:#8d5c0b; --accent:#3060b4; --accent2:#0c8a72; --on-accent:#ffffff;
     --grid:rgba(0,0,0,.06); --hm0:#f0eee9; --header-bg:#fbfaf5;
     color-scheme:light;
   }
@@ -119,24 +120,25 @@
   /* Solarized (dark) - the classic petrol base with blue/teal accents; keeps the soft depth. */
   html[data-theme="solarized"]{
     --bg:#002b36; --bg2:#013440; --panel:#073642; --panel2:#0a4250;
-    --line:#0f4d5c; --line2:#16606f; --fg:#93a1a1; --muted:#9cabac;
+    --line:#0f4d5c; --line2:#16606f; --fg:#a9b4b4; --muted:#9cabac;
     --up:#9cb400; --down:#ec8f8d; --warn:#d4a000; --accent:#268bd2; --accent2:#2aa198; --on-accent:#06101f;
     --grid:rgba(147,161,161,.07); --hm0:#094656; --header-bg:rgba(7,54,66,.88);
   }
   /* Coordinate the wordmark + radar logo with Solarized's blue/teal palette. */
   html[data-theme="solarized"]{--logo-ping:var(--theme-accent); --logo-ul:var(--accent2);}
-  /* A warning's words: base1 taken 30% of the way to white. Base1 reads 3.6-4.3:1 inside
-     the accent tint a warning sits on and 3.8:1 on the stale bar, under the 4.5:1 text
-     needs; this reads 5.0-5.9:1 there, and keeps the data estimate's words over 4.5:1
-     under a pale Accents colour too, whose tint lifts this dark ground the most (a
-     quarter of the way read 4.4). Only warnings are drawn in it: the rest of the theme
-     keeps its classic base1. */
-  html[data-theme="solarized"]{--warning-fg:#b3bdbd;}
-  /* Parchment - a warm paper light theme: cream stock, sepia-brown ink, a rust accent. */
+  /* Its text is base1 taken 20% of the way to white: the classic base1 #93a1a1 read 4.1:1
+     on the raised panel and 3.7:1 inside a calm note there, under the 4.5:1 text needs.
+     A warning's words go further, because a warning's tint lifts this dark ground more:
+     base1's 30% step #b3bdbd, taken another fifth of the way to white. That keeps them
+     over 4.5:1 in every warning on every ground, under a pale Accents colour too, whose
+     tint lifts the ground the most (#b3bdbd read 4.2:1 on the raised panel under #e6f2ff). */
+  html[data-theme="solarized"]{--warning-fg:#c2caca;}
+  /* Parchment - a warm paper light theme: cream stock, sepia-brown ink, a rust accent. Its
+     --warn is dark enough for WARN lines on --bg2, the log's ground, not only on the panels. */
   html[data-theme="parchment"]{
     --bg:#efe4c8; --bg2:#e7dab9; --panel:#f9f1da; --panel2:#fdf7e8;
     --line:#d6c39c; --line2:#c4ad80; --fg:#3c3124; --muted:#6b5a40;
-    --up:#577631; --down:#a83a29; --warn:#936215; --accent:#9a4e22; --accent2:#6f7d43; --on-accent:#faf3e0;
+    --up:#577631; --down:#a83a29; --warn:#825818; --accent:#9a4e22; --accent2:#6f7d43; --on-accent:#faf3e0;
     --grid:rgba(60,49,36,.08); --hm0:#ebe1c9; --header-bg:rgba(249,241,218,.88);
     color-scheme:light;
   }
@@ -750,8 +752,12 @@
   .iperf-dot:disabled{cursor:default;} /* a light with no address to dial is not a button, and must not offer itself as one */
   .iperf-dot.on{background:var(--up);opacity:1;box-shadow:0 0 5px var(--up);}
   .iperf-dot.off{background:var(--down);opacity:1;}
-  .iperf-dot.loading{background:var(--warn);opacity:1;animation:iperfpulse 1s ease-in-out infinite;}
-  @keyframes iperfpulse{0%,100%{opacity:.3}50%{opacity:1}}
+  /* Checking: solid, with a ring that grows and fades around it. It used to fade its own
+     opacity to 30%, where it all but vanished on the list (1.5-2.3:1); the ring keeps the
+     motion without the light ever dimming, and fits inside the row's 12px padding. */
+  .iperf-dot.loading{background:var(--warn);opacity:1;animation:iperfring 1s ease-out infinite;}
+  @keyframes iperfring{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--warn) 80%,transparent)}100%{box-shadow:0 0 0 7px color-mix(in srgb,var(--warn) 0%,transparent)}}
+  @media (prefers-reduced-motion:reduce){ .iperf-dot.loading{animation:none;} }
   .bad-input{border-color:var(--down)!important;}
   .bad-input:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--down) 16%,transparent)!important;}
   .iperf-editor{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;border:1px solid var(--line2);border-radius:10px;
@@ -817,7 +823,9 @@
   .server-select.loading select{opacity:.55;}
   .server-select .sel-spin{position:absolute;right:30px;top:50%;margin-top:-6px;display:none;pointer-events:none;}
   .server-select.loading .sel-spin{display:inline-block;}
-  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:10px;color:var(--warning-fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent-mark);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning; --accent-mark is the accent, kept to 3.5:1 on the strongest tint by tuneTintMarks() */ .warn-bubble b{color:var(--accent-bold);font-weight:650;} /* mixed toward the foreground: raw accent ON an accent tint is the same hue twice, which read 3.05:1 in solarized - dimmer than the body text it emphasises. --accent-bold is that 55% mix with a warning's words (--warning-fg), taken further toward them wherever it still misses 4.5:1 */ .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note.warn{background:color-mix(in srgb,var(--accent) 14%,transparent);border-color:var(--accent-mark);color:var(--warning-fg);} .info-note.warn .wi{color:var(--accent-mark);} .info-note.warn b{color:var(--warning-fg);} /* a heavy estimate takes the accent every warning takes, never a hue of its own, and has to stand out from the calm estimate this same box shows the rest of the time, which wears the accent too: so the off-marker's deeper 14% tint, and a solid ring in the ⚠'s own colour. Tinted with --warn it was the one amber, yellow or olive box among blue, cyan and purple controls, a ⚠ dimmer on slate than the ≈ it replaces, and left behind when an Accents colour is chosen. With the bubbles' 12% tint and 38% ring it differed from the calm note by little more than its ⚠, and that ring read 2.3-2.5:1 on dark, amoled, retro and ember, where the amber ring had read 3.3-3.9:1 (6.2 on cyber); a 55% ring still reads under the amber there (3.0-3.7, 4.6 on cyber), the solid ring 5.4-10.8 */ .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:color-mix(in srgb,var(--muted) 75%,var(--fg));font-size:11.5px;} /* at 11.5px plain --muted measured 4.30-4.49:1 on the tint in retro, cyber, slate and ember */
+  .server-search{display:flex;gap:8px;} .days{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px;} .day{width:30px;height:30px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);color:var(--muted);font:inherit;font-size:12px;cursor:pointer;transition:background .12s,color .12s,border-color .12s;} .day:hover{border-color:var(--accent);} .day.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600;} .window{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);} .window input[type=time]{background:var(--bg2);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:6px 8px;font:inherit;} /* A warning's edge is its ⚠'s colour at 75%, a calm note's the accent at 85%: each clears
+     3:1 against the ground around it, in every theme (at 38% and 30% they read 1.6-3.0:1). */
+  .warn-bubble{grid-column:1/-1;display:flex;gap:9px;align-items:flex-start;background:color-mix(in srgb,var(--accent) 12%,transparent);border:1px solid color-mix(in srgb,var(--accent-mark) 75%,transparent);border-radius:10px;color:var(--warning-fg);font-size:12.5px;line-height:1.5;max-height:0;opacity:0;overflow:hidden;padding:0 12px;margin:0;transition:max-height .3s ease,opacity .25s ease,padding .3s ease,margin .3s ease;} .warn-bubble.show{max-height:160px;opacity:1;padding:10px 12px;margin:8px 0 4px;} .warn-bubble .wi{color:var(--accent-mark);font-size:14px;flex:none;line-height:1.35;} /* the ⚠ glyph, not a foreign hue, is what marks this a warning; --accent-mark is the accent, kept to 3.5:1 on the strongest tint by tuneTintMarks() */ .warn-bubble b{color:var(--accent-bold);font-weight:650;} /* mixed toward the foreground: raw accent ON an accent tint is the same hue twice, which read 3.05:1 in solarized - dimmer than the body text it emphasises. --accent-bold is that 55% mix with a warning's words (--warning-fg), taken further toward them wherever it still misses 4.5:1 */ .info-note{grid-column:1/-1;display:block;box-sizing:border-box;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 85%,transparent);border-radius:10px;color:var(--fg);font-size:12.5px;line-height:1.5;padding:10px 12px;margin:8px 0 4px;} .info-note.hidden{display:none;} .info-note.warn{background:color-mix(in srgb,var(--accent) 14%,transparent);border-color:var(--accent-mark);color:var(--warning-fg);} .info-note.warn .wi{color:var(--accent-mark);} .info-note.warn b{color:var(--warning-fg);} /* a heavy estimate takes the accent every warning takes, never a hue of its own, and has to stand out from the calm estimate this same box shows the rest of the time, which wears the accent too: so the off-marker's deeper 14% tint, and a solid ring in the ⚠'s own colour. Tinted with --warn it was the one amber, yellow or olive box among blue, cyan and purple controls, a ⚠ dimmer on slate than the ≈ it replaces, and left behind when an Accents colour is chosen. With the bubbles' 12% tint and 38% ring it differed from the calm note by little more than its ⚠, and that ring read 2.3-2.5:1 on dark, amoled, retro and ember, where the amber ring had read 3.3-3.9:1 (6.2 on cyber); a 55% ring still reads under the amber there (3.0-3.7, 4.6 on cyber), the solid ring 5.4-10.8 */ .info-note .wi{color:var(--accent);font-size:14px;margin-right:8px;} .info-note b{color:var(--fg);font-weight:600;} .info-note .sub{color:color-mix(in srgb,var(--muted) 75%,var(--fg));font-size:11.5px;} /* at 11.5px plain --muted measured 4.30-4.49:1 on the tint in retro, cyber, slate and ember */
   .server-search input{flex:1;background:var(--bg2);color:var(--fg);border:1px solid var(--line2);
     border-radius:8px;padding:7px 9px;font:inherit;}
   .server-search input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
@@ -826,6 +834,9 @@
   ::placeholder{color:var(--muted);opacity:.75;}
   #serverCity.field-error{border-color:var(--down);}
   #serverCity.field-error::placeholder{color:var(--down);opacity:1;}
+  /* Focused and in error, the glow is the error's too: the accent glow every focused
+     search field wears would otherwise surround the red edge. */
+  #serverCity.field-error:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--down) 22%,transparent);}
   .server-search .btn{margin:0;}
   #testWebhook,#testHeartbeat{width:90px;height:36px;padding:0;} /* same footprint as the tab's dropdown pills (Periodic summary) */
   /* The (i) glyph is text, so pin EVERY inherited metric (family, weight, size,
@@ -918,11 +929,14 @@
      (i) on purpose: round means "help here", this means "something is off".
      Accent, not --warn amber, to match .warn-bubble - and its "!" in --accent-mark, as the
      bubbles' ⚠ is: this 14% fill is the strongest tint a mark sits on, and Solarized's
-     plain accent read 2.7:1 on it. */
+     plain accent read 2.7:1 on it. Its edge is that mark at 75%, as the bubbles' is, which
+     clears 3:1 on its panel in every theme; the accent at 55% did not. In Light and
+     Parchment the grey .info edge set below wins over this one, and reads better there
+     than the accent would. */
   .info.conn-off{position:absolute;top:var(--corner-y);right:calc(var(--corner-x) + 30px);z-index:2;
     width:24px;height:24px;border-radius:7px;padding:0;
     background:color-mix(in srgb,var(--accent) 14%,transparent);
-    border-color:color-mix(in srgb,var(--accent) 55%,transparent);color:var(--accent-mark);
+    border-color:color-mix(in srgb,var(--accent-mark) 75%,transparent);color:var(--accent-mark);
     font:600 13px/1 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;cursor:help;}
   .info.conn-off:hover,.info.conn-off:focus-visible{border-color:var(--accent);
     background:color-mix(in srgb,var(--accent) 22%,transparent);}
@@ -1637,10 +1651,11 @@
   .netinfo .info>.tip{left:auto;right:0;}
   /* Banner shown when the status poll keeps failing - for a connectivity
      monitor, silently-frozen data is indistinguishable from "all good". Its words
-     are a warning's, --warning-fg. */
+     are a warning's, --warning-fg, and its top edge --down at 70%, which clears 3:1
+     against the page in every theme (at 55% it read 2.5-3.0:1 in five). */
   .stale-bar{position:fixed;left:0;right:0;bottom:0;z-index:95;text-align:center;padding:8px 14px;
     font-size:12.5px;color:var(--warning-fg);background:color-mix(in srgb,var(--down) 16%,var(--panel));
-    border-top:1px solid color-mix(in srgb,var(--down) 55%,transparent);}
+    border-top:1px solid color-mix(in srgb,var(--down) 70%,transparent);}
   /* Brief undo toast after a tile is hidden by edge-drag (easy to do by accident). */
   /* Said, not shown: a polite live region for a readout that otherwise exists only
      as a picture (the chart cursor). Off screen rather than display:none or
