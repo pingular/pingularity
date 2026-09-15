@@ -3509,6 +3509,290 @@ test('every built-in theme meets WCAG AA for its normal-size text tokens', () =>
     `theme text below WCAG AA 4.5:1:\n  ${failures.join('\n  ')}`);
 });
 
+// The stylesheet as rules, comments stripped first so a brace or a ⚠ inside one
+// cannot pass for CSS. Media blocks flatten: their inner rules are found on
+// their own, which is all the warning tests below need.
+const cssRules = [...[...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map(m => m[1]).join('\n')
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+  .map(m => ({ sels: m[1].split(',').map(s => s.trim()), body: m[2] }));
+const cssRule = sel => {
+  const r = cssRules.find(r => r.sels.includes(sel));
+  assert.ok(r, `${sel} no longer has a rule of its own`);
+  return r.body;
+};
+const cssProp = (body, name) => (body.match(new RegExp('(?:^|;)\\s*' + name + ':([^;]+)')) || [])[1];
+// The last rule naming exactly this selector wins its colour, as in the cascade.
+const cssColour = sel => cssRules.filter(r => r.sels.includes(sel)).map(r => cssProp(r.body, 'color')).filter(Boolean).pop();
+
+// A WARNING IS MARKED BY ITS ⚠, NOT BY A HUE OF ITS OWN. The note beside
+// .warn-bubble .wi says so, and every warning bubble tints, rings and marks
+// itself with the theme's accent. Two things showing the same ⚠ did not: the
+// data estimate above four servers, tinted with --warn, and the log-stall line,
+// written in it. --warn is amber or yellow in every coloured theme and the accent
+// is amber, orange or rust in only three, so elsewhere each was the one amber,
+// yellow or olive thing among blue, cyan and purple controls - on Slate a grey ⚠
+// dimmer than the ≈ it replaces - and an Accents choice reached neither. Which
+// elements carry a ⚠ is read from the page rather than listed here, so a warning
+// added later answers to the same rule. Each is named by its id as well as its
+// classes: a rule spelled #speedDataEst.warn paints the same box as .info-note.warn,
+// and a scan that only knew classes let exactly the old amber back in that way.
+test('a warning is marked by its ⚠, never by a hue of its own', () => {
+  const surfaces = new Set();
+  const attrs = (a, name) => (a.match(new RegExp('\\b' + name + '="([^"]+)"')) || [])[1];
+  for (const m of html.matchAll(/<[a-z]+\b([^>]*)>(?:<span class="wi">)?\u26A0/g)) {
+    for (const c of (attrs(m[1], 'class') || '').split(/\s+/)) if (c) surfaces.add('.' + c);
+    if (attrs(m[1], 'id')) surfaces.add('#' + attrs(m[1], 'id'));
+  }
+  // Bubbles whose ⚠ the script writes in (#netinfoWarn, #netNoAuthWarn, #qsNoAuthWarn)
+  // share the class the scan found; their ids count too.
+  for (const m of html.matchAll(/<[a-z]+\b([^>]*)>/g))
+    if (/(?:^|\s)warn-bubble(?:\s|$)/.test(attrs(m[1], 'class') || '') && attrs(m[1], 'id')) surfaces.add('#' + attrs(m[1], 'id'));
+  // The data estimate is the one that gets its ⚠ from the script, together with
+  // the .warn class its heavy look hangs on.
+  const est = extract('function updateSpeedEstimate');
+  assert.match(html, /<div class="info-note[^"]*" id="speedDataEst">/, 'the data estimate is no longer an .info-note');
+  assert.match(est, /el\.classList\.toggle\('warn', heavy\);/, 'the heavy estimate is no longer the .warn state');
+  assert.match(est, /heavy \? '\\u26A0\\uFE0E' : '\\u2248'/, 'a heavy estimate is no longer told apart by its ⚠');
+  surfaces.add('.info-note.warn');
+  surfaces.add('#speedDataEst');
+  for (const s of ['.warn-bubble', '.log-stall', '.stale-bar', '.info-note.warn', '#speedDataEst', '#logStall', '#staleBar', '#netinfoWarn'])
+    assert.ok(surfaces.has(s), `${s} was not found carrying a ⚠ - the scan has gone blind`);
+
+  const names = sel => [...surfaces].some(s => new RegExp(s.replace(/[.#-]/g, '\\$&') + '(?![\\w-])').test(sel));
+  const foreign = cssRules.flatMap(r => r.sels.filter(names).filter(() => /var\(--warn\b/.test(r.body))
+    .map(sel => `${sel}{${r.body.trim()}}`));
+  assert.deepEqual(foreign, [],
+    `a ⚠ surface takes a hue of its own from --warn:\n  ${foreign.join('\n  ')}`);
+
+  // The heavy estimate is a warning like the bubbles, so it takes the accent they take,
+  // in every theme and under any Accents choice - and it shares its box with the calm
+  // estimate, which wears the accent too, so it has to be plainly the stronger of the
+  // two: a deeper tint, and a solid ring in its ⚠'s own colour. With the bubbles' 12%
+  // tint and 38% ring it differed from the calm note by little more than the glyph, and
+  // that ring read 2.3-2.5:1 on dark, amoled, retro and ember, where the amber one before
+  // it had read 3.3-3.9:1.
+  const calm = cssRule('.info-note'), heavy = cssRule('.info-note.warn');
+  const tintPct = body => +((cssProp(body, 'background') || '').match(/^color-mix\(in srgb,var\(--accent\) (\d+)%,transparent\)$/) || [])[1];
+  assert.ok(tintPct(heavy) > tintPct(calm), 'the heavy estimate is tinted no more deeply than the calm one');
+  assert.equal(tintPct(heavy), tintPct(cssRule('.info.conn-off')), 'the heavy estimate no longer takes the off-marker’s deeper tint');
+  assert.match(cssProp(calm, 'border') || '', /^1px solid color-mix\(in srgb,var\(--accent\) \d+%,transparent\)$/,
+    'the calm estimate is no longer ringed in the faint accent mix the heavy ring stands out from');
+  assert.equal(cssProp(heavy, 'border-color'), 'var(--accent-mark)', 'the heavy estimate is not ringed solid in its ⚠’s colour');
+  assert.equal(cssColour('.info-note.warn .wi'), cssColour('.warn-bubble .wi'),
+    'the heavy estimate’s ⚠ is not the colour of every other warning’s ⚠');
+  // The stall line is a statement of fact, and the note written beside it for
+  // .log-trunc promised it the same muted treatment; its ⚠ is what marks it.
+  assert.match(cssRule('.log-stall'), /(?:^|;)color:var\(--muted\);/, 'the log-stall line is no longer muted');
+});
+
+// ONLY A WARNING IS DRAWN IN THE WARNING TOKENS. --warning-fg, --accent-mark and
+// --accent-bold are tuned to read on a warning's tint, so they part from --fg and
+// --accent in Solarized and under a picked Accents colour, and anything else drawn in
+// one changes colour with them. The ≈ of the calm data estimate and the ℹ of the notes
+// beside it did: drawn in the tuned mark, they turned a greyer blue in Solarized and a
+// darker green under a green accent on Light and Parchment, though none is a warning.
+test('only a warning is drawn in the warning tokens; a note that is not one keeps the plain accent', () => {
+  assert.equal(cssColour('.info-note .wi'), 'var(--accent)',
+    'the calm estimate’s ≈ and the ℹ notes are no longer drawn in the plain accent');
+  const warning = /^(?:\.warn-bubble|\.info-note\.warn|\.info\.conn-off|\.stale-bar)(?![\w-])/;
+  const readers = cssRules.filter(r => /var\(--(?:warning-fg|accent-mark|accent-bold)\)/.test(r.body))
+    .flatMap(r => r.sels.filter(s => s !== ':root'));
+  for (const s of ['.warn-bubble', '.warn-bubble .wi', '.warn-bubble b', '.info-note.warn', '.info-note.warn .wi', '.info-note.warn b', '.info.conn-off', '.stale-bar'])
+    assert.ok(readers.includes(s), `${s} is not drawn in a warning token - the scan has gone blind`);
+  const strays = readers.filter(s => !warning.test(s));
+  assert.deepEqual(strays, [], `rules that are not warnings are drawn in a warning token:\n  ${strays.join('\n  ')}`);
+  // The script only writes them: the tuner, and applyPaletteVars passing a picked Text
+  // colour on to a warning's words. Comments are left out of the count.
+  const mentions = s => (s.replace(/\/\/[^\n]*/g, '').match(/--(?:warning-fg|accent-mark|accent-bold)\b/g) || []).length;
+  assert.ok(mentions(extract('function tuneTintMarks')) >= 4, 'the tuner no longer names the tokens it writes - the count has gone blind');
+  assert.equal(mentions(script), mentions(extract('function tuneTintMarks')) + mentions(extract('function applyPaletteVars')),
+    'the script reads or writes a warning token outside tuneTintMarks and applyPaletteVars');
+});
+
+// A THEME THAT PAINTS ITS OWN SURFACES CHOOSES ITS OWN --warn. Warnings take the
+// accent, but --warn is still read where a level has no mark to carry it - WARN
+// lines in the log, the light that pulses while an iperf3 server is checked - and
+// a theme that leaves it out does not get no warning colour: it gets Dark's amber,
+// tuned for a blue theme. Amoled, Dracula's purple and pink on true black, did.
+test('every theme with a palette of its own chooses its own --warn', () => {
+  const themes = {};
+  for (const m of html.matchAll(/html\[data-theme="([a-z]+)"\]\{([^}]*)\}/g))
+    themes[m[1]] = (themes[m[1]] || '') + m[2];
+  const painted = Object.keys(themes).filter(t => /--panel:/.test(themes[t]));
+  assert.ok(painted.length >= 8, `only ${painted.length} themes paint their own panels - the selector shape changed`);
+  assert.deepEqual(painted.filter(t => !/--warn:/.test(themes[t])), [],
+    'these themes inherit --warn from :root, the colour chosen for Dark');
+  // Declaring one is not choosing one: Dark's amber spelled out again is still Dark's.
+  const rootWarn = html.match(/:root\{[\s\S]*?--warn:(#[0-9a-fA-F]{3,6})/)[1].toLowerCase();
+  const ownWarn = t => ((themes[t].match(/--warn:\s*(#[0-9a-fA-F]{3,6})/) || [])[1] || '').toLowerCase();
+  assert.deepEqual(painted.filter(t => ownWarn(t) === rootWarn), [],
+    `these themes spell out Dark's ${rootWarn} as their own --warn`);
+});
+
+// Every theme's colour tokens, :root (Dark) under each, and the grounds a warning is
+// drawn on: the settings drawer belongs to the header, so --header-bg over the page;
+// panels and dialogs run a --panel2 to --panel gradient, so both ends count.
+const themeTokens = () => {
+  const readTok = block => Object.fromEntries(
+    [...block.matchAll(/--([a-z0-9-]+):\s*(#[0-9a-fA-F]{3,6}|rgba\([^)]*\)|var\(--[a-z0-9-]+\))/g)].map(m => [m[1], m[2]]));
+  const base = readTok(html.match(/:root\{([\s\S]*?)\n {2}\}/)[1]);
+  const themes = { dark: { ...base } };
+  for (const m of html.matchAll(/html\[data-theme="([a-z]+)"\]\{([^}]*)\}/g))
+    themes[m[1]] = { ...(themes[m[1]] || base), ...readTok(m[2]) };
+  assert.ok(Object.keys(themes).length >= 9, 'fewer than nine themes parsed');
+  // A token that names another takes that token's value in its own theme, as var() does.
+  for (const t of Object.values(themes))
+    for (const [k, v] of Object.entries(t)) { const to = (v.match(/^var\(--([a-z0-9-]+)\)$/) || [])[1]; if (to) t[k] = t[to]; }
+  return themes;
+};
+const rgbOf = v => v.startsWith('#') ? [...srgb(v).map(c => Math.round(c * 255)), 1] : v.match(/[\d.]+/g).map(Number);
+const overRgb = (top, a, under) => [0, 1, 2].map(i => top[i] * a + under[i] * (1 - a));
+const hexOf = c => '#' + c.slice(0, 3).map(x => Math.round(x).toString(16).padStart(2, '0')).join('');
+const warnGrounds = t => {
+  const hb = rgbOf(t['header-bg']);
+  return { drawer: overRgb(hb, hb[3] ?? 1, rgbOf(t.bg)), panel: rgbOf(t.panel), panel2: rgbOf(t.panel2) };
+};
+const tokOf = v => ((v || '').match(/^var\(--([a-z0-9-]+)\)$/) || [])[1];
+
+// A WARNING'S WORDS HAVE TO READ WHERE THEY ARE DRAWN. They are --warning-fg on a tint of
+// the accent (the bubbles and the heavy data estimate) or of --down (the stale bar), and
+// on a dark theme that tint lifts the ground toward the text: Solarized's base1 #93a1a1,
+// already 4.1:1 on its own raised panel, came out 3.6-4.3:1 inside its warnings, the
+// data estimate among them. --warning-fg is a step lighter there and --fg everywhere else,
+// so the words read without recolouring the rest of the theme. The tints and grounds are
+// read from the stylesheet, so a retuned recipe is measured rather than trusted.
+test('a warning’s words clear 4.5:1 where they are drawn, in every theme', () => {
+  const mixOf = sel => {
+    const m = (cssProp(cssRule(sel), 'background') || '').match(/^color-mix\(in srgb,var\(--([a-z0-9-]+)\) (\d+)%,(?:transparent|var\(--([a-z0-9-]+)\))\)$/);
+    assert.ok(m, `${sel} is no longer tinted as a color-mix of one token`);
+    return { tok: m[1], a: +m[2] / 100, into: m[3] };
+  };
+  const low = [];
+  for (const [name, t] of Object.entries(themeTokens())) {
+    const P = k => rgbOf(t[k]);
+    const check = (what, sel, ground) => {
+      const text = tokOf(cssColour(sel));
+      assert.ok(text && t[text], `${sel} no longer draws its words in a token`);
+      const r = contrast(hexOf(P(text)), hexOf(ground));
+      if (r < 4.5) low.push(`${name} ${what}: --${text} ${t[text]} = ${r.toFixed(2)}:1`);
+    };
+    for (const [tinted, words] of [['.warn-bubble', ['.warn-bubble']], ['.info-note.warn', ['.info-note.warn', '.info-note.warn b']]]) {
+      const { tok, a } = mixOf(tinted);
+      for (const sel of words) for (const [g, ground] of Object.entries(warnGrounds(t))) check(`${sel} on ${g}`, sel, overRgb(P(tok), a, ground));
+    }
+    const bar = mixOf('.stale-bar');
+    assert.ok(bar.into, '.stale-bar is no longer mixed into a token of its own');
+    check('.stale-bar', '.stale-bar', overRgb(P(bar.tok), bar.a, P(bar.into)));
+  }
+  assert.deepEqual(low, [], `warning text below 4.5:1:\n  ${low.join('\n  ')}`);
+});
+
+// THE ⚠, THE HEAVY RING AND THE BOLD WORDS HAVE TO READ, WHATEVER THE ACCENT. They are
+// the accent drawn on the accent's own tint, so how far apart the two land is up to the
+// theme and to any Accents colour or palette the user picks: Solarized's blue was 2.6:1
+// as a mark, a navy accent on Dark put the heavy estimate's ⚠ at 1.2:1 and a pale blue
+// one on Light at 1.1:1 - and that ⚠ is what tells a heavy estimate from a light one.
+// tuneTintMarks is run here the way the page runs it (computed tokens in, inline custom
+// properties out) for every theme, with its own accent and with picked ones, and what it
+// leaves in force is measured on the strongest tint each is drawn on, read from the
+// stylesheet - the mark on the bare ground as well, being the heavy estimate's ring. The
+// mark's floor is 3.5: a 14px ⚠ is antialiased part-way into its tint, and drawn at
+// 3.1-3.4:1 it measured 2.7-3.0 on screen.
+test('a warning’s ⚠, ring and bold words clear their floors, under any accent', () => {
+  for (const sel of ['.warn-bubble .wi', '.info-note.warn .wi', '.info.conn-off'])
+    assert.equal(cssColour(sel), 'var(--accent-mark)', `${sel} is not drawn in --accent-mark`);
+  assert.equal(cssProp(cssRule('.info-note.warn'), 'border-color'), 'var(--accent-mark)', 'the heavy estimate’s ring is not drawn in --accent-mark');
+  assert.equal(cssColour('.warn-bubble b'), 'var(--accent-bold)', 'bubble bold is not drawn in --accent-bold');
+  const rootBlock = html.match(/:root\{([\s\S]*?)\n {2}\}/)[1];
+  assert.match(rootBlock, /--warning-fg:var\(--fg\);/, 'a warning’s words no longer default to the text colour');
+  assert.match(rootBlock, /--accent-mark:var\(--accent\);/, 'the mark no longer defaults to the accent itself');
+  assert.match(rootBlock, /--accent-bold:color-mix\(in srgb,var\(--accent\) 55%,var\(--warning-fg\)\);/,
+    'bold no longer defaults to the 55% accent recipe');
+  // Re-tuned wherever its inputs change, once the new input is in place.
+  for (const [fn, anchor] of [['function setTheme', "if(ov) st.setProperty('--accent', ov);"],
+    ['function applyViz', "else { st.removeProperty('--accent'); st.removeProperty('--on-accent'); }"],
+    ['function applyPalette()', 'applyPaletteVars();']]) {
+    const body = extract(fn), i = body.indexOf(anchor);
+    assert.ok(i >= 0, `${fn}: the line it re-tunes after has moved`);
+    assert.ok(body.indexOf('tuneTintMarks()', i) > i, `${fn} does not re-tune the warning marks after changing their inputs`);
+  }
+  // But not from applyPaletteVars. Boot runs that before setTheme, while <html> still
+  // carries the resting Retro theme, and a computed-style read there resolved the page in
+  // Retro first: in every other theme the rounded corners of panels and chart frames then
+  // painted a shade (1-2 of 255) off a page that never did. What it does do is pass a
+  // picked Text colour on to a warning's words - the user's choice for every word.
+  const pal = extract('function applyPaletteVars');
+  assert.doesNotMatch(pal, /tuneTintMarks\(|getComputedStyle\(/, 'applyPaletteVars reads computed style before boot has set the theme');
+  assert.match(pal, /if\(palettePrefs\.fg\) st\.setProperty\('--warning-fg', palettePrefs\.fg\); else st\.removeProperty\('--warning-fg'\);/,
+    'a picked Text colour no longer reaches a warning’s words');
+
+  const pctOf = sel => +((cssProp(cssRule(sel), 'background') || '').match(/^color-mix\(in srgb,var\(--accent\) (\d+)%,transparent\)$/) || [])[1];
+  const markTint = Math.max(...['.warn-bubble', '.info-note.warn', '.info.conn-off'].map(pctOf)) / 100;
+  const boldTint = pctOf('.warn-bubble') / 100;
+  assert.ok(markTint >= 0.1 && boldTint >= 0.1, 'the tints were not read from the stylesheet');
+  const factory = new Function('document', 'getComputedStyle',
+    ['function _rgb', 'function relLum', 'function tintShare', 'function tuneTintMarks'].map(extract).join('\n') +
+    '\nreturn tuneTintMarks;');
+
+  // Each theme is taken through a run of inputs on ONE page, the way a user takes it:
+  // its own accent, picked ones, a Text colour picked to match the panels and a mid-grey
+  // one (where nothing reads, the least bad step is what should be drawn, and that is
+  // sometimes the accent and sometimes the words' colour), a Panel colour apart from
+  // Panel 2 (a warning on a panel is judged on both ends of its gradient), and back to
+  // the theme - so an override the previous input left behind is caught. One made-up
+  // palette, a half-clear header over a white page with black panels, is there because
+  // only a translucent header puts the drawer on a ground of its own.
+  const runs = [null, '#22c55e', '#1e2a44', '#e6f2ff', '#ff0000', '#ffff00', '#000000', '#ffffff']
+    .map(a => ({ '--accent': a })).concat([{ '--fg': 'panel2' }, { '--fg': 'panel2', '--accent': '#1e2a44' },
+      { '--fg': '#808080', '--accent': '#1e2a44' }, { '--panel': '#808080' }, { '--panel': '#808080', '--accent': '#1e2a44' },
+      { '--panel': '#3060b4', '--accent': '#e6f2ff' }, {}]);
+  const themes = { ...themeTokens(),
+    'made-up translucent header': { bg: '#ffffff', 'header-bg': 'rgba(0,0,0,.5)', panel: '#000000', panel2: '#000000', fg: '#ffffff', 'warning-fg': '#ffffff', accent: '#808080' } };
+  const low = [];
+  for (const [name, t] of Object.entries(themes)) {
+    const inline = new Map();
+    const doc = {
+      documentElement: { style: { setProperty: (k, v) => inline.set(k, v), removeProperty: k => inline.delete(k) } },
+      // A canvas whose fillStyle echoes what it is given, as toHex's harness has.
+      createElement: () => ({ getContext: () => ({ fillStyle: '#000' }) }),
+    };
+    const tune = factory(doc, () => ({ getPropertyValue: k => inline.get(k) ?? t[k.slice(2)] ?? '' }));
+    for (const run of runs) {
+      for (const k of ['--accent', '--fg', '--panel']) { const v = run[k]; if (v) inline.set(k, v.startsWith('#') ? v : t[v]); else inline.delete(k); }
+      // As applyPaletteVars does it: a picked Text colour is a warning's words too.
+      if (inline.has('--fg')) inline.set('--warning-fg', inline.get('--fg')); else inline.delete('--warning-fg');
+      tune();
+
+      const who = name + Object.entries(run).filter(([, v]) => v).map(([k, v]) => ` ${k}=${v}`).join('');
+      const tok = k => inline.get('--' + k) ?? t[k];
+      const acc = rgbOf(tok('accent')), to = rgbOf(tok('warning-fg')), grounds = Object.values(warnGrounds({ ...t, panel: tok('panel') }));
+      for (const [part, prop, backs, floor, from] of [
+        ['⚠ and ring', 'mark', [...grounds.map(g => overRgb(acc, markTint, g)), ...grounds], 3.5, 0],
+        ['bold', 'bold', grounds.map(g => overRgb(acc, boldTint, g)), 4.5, 45]]) {
+        const step = s => [0, 1, 2].map(i => Math.round(acc[i] * (1 - s / 100) + to[i] * s / 100));
+        const worst = c => Math.min(...backs.map(b => contrast(hexOf(c), hexOf(b))));
+        const set = inline.get(`--accent-${prop}`);
+        const drawn = set ? rgbOf(set) : step(from);
+        const rDrawn = worst(drawn), rRecipe = worst(step(from)), rTo = worst(to);
+        // Short of the floor only when not even the words' own colour clears it, and then no worse than either end.
+        if (rDrawn < floor - 1e-3 && (rTo >= floor || rDrawn < Math.max(rRecipe, rTo) - 1e-3))
+          low.push(`${who}: ${part} ${hexOf(drawn)} reads ${rDrawn.toFixed(2)}:1 (recipe ${rRecipe.toFixed(2)}, --warning-fg ${rTo.toFixed(2)})`);
+        // Where the recipe already reads, the stylesheet's live var(--accent) mix stays in charge.
+        if (rRecipe >= floor + 0.01 && set) low.push(`${who}: --accent-${prop} overridden though the recipe reads ${rRecipe.toFixed(2)}:1`);
+        // And an override moves no further toward the words' colour than it has to, in the page's 5% steps.
+        if (set) {
+          let s = from; while (s <= 100 && hexOf(step(s)) !== set.toLowerCase()) s += 5;
+          if (s > 100) low.push(`${who}: --accent-${prop} ${set} is not a 5% step from the accent toward --warning-fg`);
+          else if (rDrawn >= floor - 1e-3 && s - 5 >= from && worst(step(s - 5)) >= floor + 1e-3)
+            low.push(`${who}: --accent-${prop} mixed ${s}% toward --warning-fg where ${s - 5}% already reads`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(low, [], `a warning mark, ring or bold word below its floor:\n  ${low.join('\n  ')}`);
+});
+
 // The legacy-RSA-padding toggle is gated on what the LOCAL iperf3 can actually
 // send, and both edges are real upstream behavior, verified against esnet/iperf:
 // the flag arrives in 3.17, and 3.20 marks it server-only so a 3.20+ client
@@ -5157,8 +5441,8 @@ test('Best of is a count, not a switch: a number box that drives the data estima
     'as does the scope note - every reader of a box agrees with what Save writes for it');
   assert.match(est, /const heavy = n>4;/, 'and marks a heavy round above four servers');
   assert.match(est, /wi\.textContent = heavy \? '\\u26A0\\uFE0E' : '\\u2248'/,
-    'with the GLYPH, not the tint: several themes put --warn within 1.03:1 of --accent, so a recoloured fill says nothing');
-  assert.match(html, /\.info-note\.warn\{/, 'the amber style exists');
+    'with the GLYPH, not a hue: both states wear the accent, so the mark (and the heavy ring drawn in its colour) is what tells them apart');
+  assert.match(html, /\.info-note\.warn\{/, 'the heavy style exists');
   const tags = script.match(/const WIN_TAGS=\{[\s\S]*?\n\};/)[0];
   assert.match(tags, /favourite:\['favourite'/, 'a starred server winning a round has its own tag');
   assert.doesNotMatch(tags, /best[ -]of[ -]3/i, 'no tag hard-codes three any more');
