@@ -40,7 +40,7 @@ case "$1" in
   is-active)
     if [ -n "$POSTINST_ISACTIVE_ERR" ]; then echo "$POSTINST_ISACTIVE_ERR" >&2; fi
     n=0
-    if [ -f "$POSTINST_STATE_N" ]; then n=$(cat "$POSTINST_STATE_N"); fi
+    if [ -f "$POSTINST_STATE_N" ]; then read -r n < "$POSTINST_STATE_N"; fi
     echo $((n + 1)) > "$POSTINST_STATE_N"
     set -- $POSTINST_STATES
     while [ "$n" -gt 0 ] && [ "$#" -gt 1 ]; do shift; n=$((n - 1)); done
@@ -127,10 +127,21 @@ func runPostinstall(t *testing.T, env postinstallEnv, args ...string) (int, stri
 	if env.unbooted {
 		unbooted = "1"
 	}
+	// The script takes the deb road wherever it finds a deb-systemd-helper, and an
+	// rpm machine has none - but every Debian and Ubuntu machine running these tests
+	// does. So for rpm, a directory carrying the host's own is left off PATH. The
+	// stubs use nothing but shell builtins, so nothing they need goes with it.
+	path := stubDir
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if !env.withDebHelper && hasDebHelper(d) {
+			continue
+		}
+		path += string(os.PathListSeparator) + d
+	}
 	cmd := exec.Command("sh", append([]string{script}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
-		"PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PATH="+path,
 		"POSTINST_LOG="+logPath,
 		"POSTINST_STATE_N="+filepath.Join(dir, "state.n"),
 		"POSTINST_STATES="+strings.Join(env.states, " "),
@@ -157,6 +168,37 @@ func runPostinstall(t *testing.T, env postinstallEnv, args ...string) (int, stri
 		}
 	}
 	return code, string(out), calls
+}
+
+func hasDebHelper(dir string) bool {
+	for _, name := range []string{"deb-systemd-helper", "deb-systemd-helper.exe"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// shReachesStubSleep reports whether sh, given a PATH that starts with a stub
+// sleep, runs that stub. Git for Windows' sh puts its own tools ahead of the PATH
+// it is handed, so there the real sleep runs and the stub never logs a call.
+func shReachesStubSleep(t *testing.T) bool {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	if err := os.WriteFile(filepath.Join(dir, "sleep"), []byte(sleepStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "sleep 0")
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"POSTINST_LOG="+logPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sh -c 'sleep 0': %v\n%s", err, out)
+	}
+	b, _ := os.ReadFile(logPath)
+	return strings.Contains(string(b), "sleep 0")
 }
 
 func countCalls(calls []string, substr string) int {
@@ -189,7 +231,9 @@ func TestPostinstallUpgradeReportsADaemonThatDidNotComeBack(t *testing.T) {
 	if !strings.Contains(out, "systemctl status pingularity") {
 		t.Fatalf("the upgrade said nothing about a daemon that did not come back, so apt/dnf report a clean success on a machine that has stopped monitoring:\noutput: %q\ncalls:\n%s", out, strings.Join(calls, "\n"))
 	}
-	if sleeps := countCalls(calls, "sleep"); sleeps < 1 {
+	if !shReachesStubSleep(t) {
+		t.Log("this sh runs its own sleep ahead of the stub, so the wait between samples cannot be counted here")
+	} else if sleeps := countCalls(calls, "sleep"); sleeps < 1 {
 		t.Errorf("the unit was sampled %d times with no wait between samples - a watch that finishes instantly watches nothing:\n%s", countCalls(calls, "is-active"), strings.Join(calls, "\n"))
 	}
 }
