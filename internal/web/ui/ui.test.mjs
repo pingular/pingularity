@@ -980,27 +980,39 @@ test('heatmap: a day with no row claims no more than the response recorded', () 
     'the accessible name still makes the bare claim');
 });
 
+// withTimeZone runs fn with the process's local time in `zone`, then puts the zone back.
+// It puts it back by name rather than by deleting TZ: on Windows, Node keeps using the
+// last zone it was given after TZ is deleted, and every later test that reads the local
+// clock ran four hours off in Havana time.
+function withTimeZone(zone, fn) {
+  const tz = process.env.TZ, before = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try {
+    process.env.TZ = zone;
+    return fn();
+  } finally {
+    process.env.TZ = before;
+    if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    assert.equal(Intl.DateTimeFormat().resolvedOptions().timeZone, before, `the local time zone was not put back after ${zone}`);
+  }
+}
+
 // TODAY'S SQUARE IS DRAWN WHERE THE CLOCKS GO FORWARD AT MIDNIGHT. Santiago puts its clocks
 // forward at local midnight in September and Havana in March, so that day starts at 01:00.
 // The grid stepped a date on from midnight one day at a time: the step onto that day landed
 // on 01:00, every date after it kept the hour, and the last one compared later than today's
 // midnight - so today's square was left off, for months after each change.
 test('heatmap: today’s square is drawn in zones whose clocks go forward at midnight', () => {
-  const tz = process.env.TZ;
-  try {
-    for (const [zone, shift, key] of [['America/Santiago', [2025, 8, 7], '2025-09-07'], ['America/Havana', [2026, 2, 8], '2026-03-08']]) {
-      process.env.TZ = zone;
+  for (const [zone, shift, key] of [['America/Santiago', [2025, 8, 7], '2025-09-07'], ['America/Havana', [2026, 2, 8], '2026-03-08']]) {
+    withTimeZone(zone, () => {
       assert.equal(new Date(...shift, 0, 0).getHours(), 1, `${zone} no longer shifts at local midnight - pick a zone that does`);
-      // Sunday 2 Aug 2026: the grid runs from Sunday 27 Jul 2025 and crosses the shift.
-      const cells = driveHeatmap([], new Date(2026, 7, 2, 12, 0).getTime());
-      assert.equal(cells.length, 372, `${zone}: Sun 27 Jul 2025 .. Sun 2 Aug 2026 is 372 squares`);
-      const days = cells.map(c => (c.dataset.tip || '').split(':')[0]).filter(Boolean);
-      assert.equal(days[days.length - 1], '2026-08-02', `${zone}: the last square is not today`);
-      assert.equal(days.filter(d => d === key).length, 1, `${zone}: the day the clocks go forward is not drawn exactly once`);
+        // Sunday 2 Aug 2026: the grid runs from Sunday 27 Jul 2025 and crosses the shift.
+        const cells = driveHeatmap([], new Date(2026, 7, 2, 12, 0).getTime());
+        assert.equal(cells.length, 372, `${zone}: Sun 27 Jul 2025 .. Sun 2 Aug 2026 is 372 squares`);
+        const days = cells.map(c => (c.dataset.tip || '').split(':')[0]).filter(Boolean);
+        assert.equal(days[days.length - 1], '2026-08-02', `${zone}: the last square is not today`);
+        assert.equal(days.filter(d => d === key).length, 1, `${zone}: the day the clocks go forward is not drawn exactly once`);
       assert.equal(new Set(days).size, days.length, `${zone}: a day is drawn twice`);
-    }
-  } finally {
-    if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    });
   }
 });
 
@@ -1865,9 +1877,7 @@ test('fmtRangeEcho: a whole day is still a whole day where midnight does not exi
   // first instant of that day is 01:00. Deciding "whole day" by asking for hours
   // 0 and minutes 0 called it a timed span and printed a bound nobody typed:
   // "6 Sep 2025, 00:00 to 7 Sep 2025, 01:00".
-  const tz = process.env.TZ;
-  try {
-    process.env.TZ = 'America/Santiago';
+  withTimeZone('America/Santiago', () => {
     assert.equal(new Date(2025, 8, 7, 0, 0).getHours(), 1,
       'this zone no longer shifts at local midnight - pick one that does');
     const sep = new Date(2025, 8, 20, 12, 0).getTime();
@@ -1876,9 +1886,7 @@ test('fmtRangeEcho: a whole day is still a whole day where midnight does not exi
     assert.equal(e('sep 7'), '7 Sep 2025');            // the shifting day itself
     assert.equal(e('sep 5 to sep 6'), '5 Sep 2025 to 6 Sep 2025');
     assert.equal(e('apr 5'), '5 Apr 2025');            // an ordinary midnight
-  } finally {
-    if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
-  }
+  });
 });
 
 test('rangeLoad: rolling stays a bare int, spans are JSON, junk resets', () => {
