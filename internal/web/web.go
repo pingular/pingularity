@@ -2715,7 +2715,8 @@ type settingsDTO struct {
 	// BusyDeferSupported (GET only) reports whether this host can read the
 	// interface counters busy-defer needs (Linux); the toggle is greyed otherwise.
 	BusyDeferSupported bool `json:"busy_defer_supported"`
-	// Iperf3Available (GET+POST) reports whether the iperf3 binary is on PATH;
+	// Iperf3Available (GET+POST) reports whether an iperf3 binary was found, on PATH
+	// or where the package managers put one (speedtest.IperfAvailable);
 	// the iperf3 engine option is greyed otherwise. Sent on save too so
 	// applySettings doesn't wrongly grey it after a POST.
 	Iperf3Available bool   `json:"iperf3_available"`

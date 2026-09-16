@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/pingular/pingularity/internal/speedtest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -163,7 +164,12 @@ func TestRetiredCityScopeSpeaksOnlyForInstallsThatHaveNotChosen(t *testing.T) {
 	if got := retiredCityScope(seed(t, onIperf)); got != "" {
 		t.Errorf("an install whose speedtests run on iperf3 got %q; the city never chose its server", got)
 	}
+	// No iperf3 anywhere: a bare PATH is not enough, the daemon also looks where
+	// the package managers put one, and this machine may have one there.
 	t.Setenv("PATH", t.TempDir())
+	restoreDirs := speedtest.IperfExtraDirs
+	speedtest.IperfExtraDirs = nil
+	t.Cleanup(func() { speedtest.IperfExtraDirs = restoreDirs })
 	if got := retiredCityScope(seed(t, onIperf)); got != "Vancouver, BC" {
 		t.Errorf("an iperf3 install with no iperf3 on PATH runs Ookla and got %q, want the stored city", got)
 	}
