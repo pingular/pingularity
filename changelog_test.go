@@ -24,7 +24,7 @@ import (
 )
 
 // What a release does to the installs already running is written down in three
-// places. Until v0.100.1 two of them did not exist, and the third described one
+// places. Until v0.100.4 two of them did not exist, and the third described one
 // of the toolchain edges it had.
 //
 //   - CHANGELOG.md. The GitHub release's notes are read by whoever upgrades that
@@ -106,7 +106,7 @@ func TestChangelogIsWhereTheRunbookSendsIt(t *testing.T) {
 	}
 	// The names themselves, because a consumer greps for the one that stopped
 	// answering rather than reading the section. These three are the whole of
-	// what v0.100.1 took off the API surface: a struct-tag diff over the tree
+	// what v0.100.4 took off the API surface: a struct-tag diff over the tree
 	// finds no other removal, and no metric, endpoint or run flag went at all.
 	for _, gone := range []string{"speed_auto_loc", "speed_auto_label", "speedtest_auto_label"} {
 		if !strings.Contains(changelog, gone) {
