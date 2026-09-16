@@ -856,8 +856,9 @@ There are two engines, picked in the settings drawer:
 - **iperf3** - opt-in, run against your own `iperf3 -s` box (LAN, homelab, or
   VPS). It measures what Ookla can't: internal/LAN links and honest upload. Used
   only when the `iperf3` binary is installed (otherwise it falls back to Ookla) -
-  present on a native install once you've installed iperf3, and in the container
-  only in the `-iperf` image variant, not the default image.
+  present on a native install once you've installed iperf3 (a Homebrew, MacPorts
+  or Linuxbrew one is found even though the service starts with a bare `PATH`),
+  and in the container only in the `-iperf` image variant, not the default image.
   Its own knobs: parallel streams, duration, warm-up, TCP window, congestion
   control, MSS, DSCP, the loss/jitter UDP pass, and - per server - IP version,
   bind source, and optional RSA auth. Congestion control and MSS are Linux (and

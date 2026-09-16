@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -80,11 +81,41 @@ type Iperf struct {
 	PKCS1Fn    func() bool   // force --use-pkcs1-padding (legacy/unpatched iperf3 servers)
 }
 
-// IperfAvailable reports whether the iperf3 binary is on PATH. When it isn't, the UI
-// greys out the engine and the runtime never picks it. NOTE: presence on PATH is NOT
-// the same as capability - see IperfVersion; an old or feature-limited build is on
-// PATH yet cannot complete Pingularity's command line.
-func IperfAvailable() bool { _, err := exec.LookPath("iperf3"); return err == nil }
+// IperfExtraDirs is where the package managers put iperf3 when it is not on PATH.
+// A service is started with a bare PATH - launchd gives a system daemon
+// /usr/bin:/bin:/usr/sbin:/sbin, systemd much the same - so a Homebrew iperf3 in
+// /opt/homebrew/bin answered from every terminal while the dashboard said it was
+// not installed. Running one of these as root is no wider a trust than the
+// service already extends: on a Homebrew install the daemon itself runs from
+// /opt/homebrew/bin. Exported so a test that means "no iperf3 anywhere" can
+// empty it; a bare PATH alone no longer means that.
+var IperfExtraDirs = []string{
+	"/opt/homebrew/bin",              // Homebrew on Apple silicon
+	"/usr/local/bin",                 // Homebrew on Intel, and a hand-built one
+	"/opt/local/bin",                 // MacPorts
+	"/home/linuxbrew/.linuxbrew/bin", // Linuxbrew
+}
+
+// iperfPath is the iperf3 binary every call here runs: the one on PATH when there
+// is one, else the first found in IperfExtraDirs, else "" for absent.
+func iperfPath() string {
+	if p, err := exec.LookPath("iperf3"); err == nil {
+		return p
+	}
+	for _, dir := range IperfExtraDirs {
+		p := filepath.Join(dir, "iperf3")
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
+
+// IperfAvailable reports whether an iperf3 binary can be found (see iperfPath). When
+// it can't, the UI greys out the engine and the runtime never picks it. NOTE: presence
+// is NOT the same as capability - see IperfVersion; an old or feature-limited build
+// is present yet cannot complete Pingularity's command line.
+func IperfAvailable() bool { return iperfPath() != "" }
 
 var (
 	iperfVerOnce sync.Once
@@ -99,22 +130,30 @@ var (
 // builds - so the UI/diagnostics can surface the real version and warn instead of
 // presenting an unusable binary as capable.
 func IperfVersion() string {
-	iperfVerOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, "iperf3", "--version").CombinedOutput()
-		if err != nil {
-			return
-		}
-		line := string(out) // first line is "iperf 3.20 (cJSON 1.7.15)"
-		if i := strings.IndexByte(line, '\n'); i >= 0 {
-			line = line[:i]
-		}
-		if f := strings.Fields(line); len(f) >= 2 && strings.EqualFold(f[0], "iperf") {
-			iperfVerStr = f[1]
-		}
-	})
+	iperfVerOnce.Do(func() { iperfVerStr = iperfVersionProbe() })
 	return iperfVerStr
+}
+
+// iperfVersionProbe asks the iperf3 iperfPath finds for its version, uncached.
+func iperfVersionProbe() string {
+	bin := iperfPath()
+	if bin == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	line := string(out) // first line is "iperf 3.20 (cJSON 1.7.15)"
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	if f := strings.Fields(line); len(f) >= 2 && strings.EqualFold(f[0], "iperf") {
+		return f[1]
+	}
+	return ""
 }
 
 // congestionForOS resolves the -C value actually passed to iperf3 and reports
@@ -1222,7 +1261,11 @@ func (a iperfAuth) run(ctx context.Context, args []string) ([]byte, error) {
 	if a.on() && a.password != "" {
 		env = append(os.Environ(), "IPERF3_PASSWORD="+a.password)
 	}
-	out, err := iperfExec(ctx, "iperf3", args, env)
+	bin := iperfPath()
+	if bin == "" {
+		bin = "iperf3" // absent: let exec say so in its own words
+	}
+	out, err := iperfExec(ctx, bin, args, env)
 	// A per-run deadline that fired means the watchdog killed a stalled iperf3; the
 	// context, not the OS exit code/text, is the portable signal for that.
 	return iperfExecErr(out, err, errors.Is(ctx.Err(), context.DeadlineExceeded))
