@@ -180,7 +180,7 @@ afterwards, while the person working backwards from a graph that stepped - or
 upgrading an install four releases behind - has only what is in the repo. Three
 shapes of change earn a line there whatever else is in the release: a release
 that **removes a field from an API response**, **retires a setting**, or
-**changes a default**. v0.100.1 did all three and recorded none of them: the
+**changes a default**. v0.100.4 did all three and recorded none of them: the
 auto-location setting went, taking two settings keys and a `/api/status` field
 with it, and a provisioning script that pinned the scope kept being answered
 `200` and kept writing nothing. `changelog_test.go` holds this paragraph and
