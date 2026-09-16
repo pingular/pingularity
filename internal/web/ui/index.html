@@ -4647,7 +4647,7 @@ async function qsSave(){
       password: network?pass:'',
     };
     const r=await fetch('api/quick-setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok) throw new Error(await r.text()||'saving setup failed');
+    if(!r.ok) throw new Error(await r.text()||'Saving setup failed');
     const t=document.documentElement.dataset.theme; if(t) lsSet('theme',t); // the preview becomes the saved pick
     await loadSettings(); loadAccess();
     qsClose();
@@ -8680,7 +8680,7 @@ async function searchServers(){
       $('settingsMsg').textContent=serverErrShown;
       return;
     }
-    if(opts.id){ serverFieldError(e.status===404 ? 'server '+q+' not found' : 'could not check server '+q); serverSearchFailed=true; return; }
+    if(opts.id){ serverFieldError(e.status===404 ? 'Server '+q+' not found' : 'Could not check server '+q); serverSearchFailed=true; return; }
     // A place the geocoder does not know is the user's to fix, and only a 404
     // says that: the daemon answers 502 when it could not ask at all, 503 while
     // it is restoring a backup, and there is no status at all when the page
@@ -8690,7 +8690,7 @@ async function searchServers(){
     // city search moves the browse list and commits nothing to settings, so a
     // failure to run one is worth saying and nothing more. This is the split the
     // ID branch above already makes, for the same reason.
-    if(e.status===404){ serverFieldError('city not found'); serverSearchFailed=true; return; }
+    if(e.status===404){ serverFieldError('City not found'); serverSearchFailed=true; return; }
     serverErrShown='Could not look up '+q+' - the server list could not be fetched. Try again.';
     $('settingsMsg').textContent=serverErrShown; }
   finally{ if(serverSearchInFlight===p) serverSearchInFlight=null;
@@ -8938,7 +8938,7 @@ function fpAutoRow(){
   b.className='fp-btn'+(chosen?' on':'');
   b.setAttribute('aria-pressed', String(chosen));   // the same state the server rows report
   b.innerHTML='<span class="fp-radio"></span>'+
-    '<span class="fp-name"><span class="fp-txt">Auto<span class="fp-sub"> · fastest near you, measured each run</span></span></span>'+
+    '<span class="fp-name"><span class="fp-txt">Auto<span class="fp-sub"> · Fastest near you, measured each run</span></span></span>'+
     '<span></span><span class="fp-ping"></span><span class="fp-km"></span>';
   w.appendChild(b); w.appendChild(document.createElement('span'));
   return w;
@@ -9772,7 +9772,7 @@ function ip4Literal(s){
 // plus the bind source when one is set, since it changes what the test measures.
 function iperfRowName(s){
   let n = s.label ? `${esc(s.label)}<span class="fp-sub"> · ${esc(s.addr||'no address')}</span>`
-    : (s.addr ? esc(s.addr) : '<span class="fp-sub">new server - add an address</span>');
+    : (s.addr ? esc(s.addr) : '<span class="fp-sub">New server - add an address</span>');
   if(s.bind) n += `<span class="fp-sub"> · bind ${esc(s.bind)}</span>`;
   return n;
 }

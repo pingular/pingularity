@@ -437,7 +437,7 @@ test('iperfAddrValid counts the invisible characters the tester counts', () => {
 test('iperfRowName: "label · addr", bare addr, or a new-server placeholder, plus the bind source when set', () => {
   assert.equal(IP.iperfRowName({ label: 'Home NAS', addr: '10.0.0.5' }), 'Home NAS<span class="fp-sub"> · 10.0.0.5</span>');
   assert.equal(IP.iperfRowName({ label: '', addr: '10.0.0.5' }), '10.0.0.5');
-  assert.match(IP.iperfRowName({ label: '', addr: '' }), /new server/);
+  assert.match(IP.iperfRowName({ label: '', addr: '' }), /New server/);
   assert.equal(IP.iperfRowName({ label: '', addr: '10.0.0.5', bind: 'eth1' }), '10.0.0.5<span class="fp-sub"> · bind eth1</span>');
 });
 
@@ -6252,7 +6252,7 @@ test('server list: a status the daemon itself answers with is not "Ookla unreach
     await search; await tick();
     assert.equal(api.state().pendingServer, '', `${code}: nothing may be pinned`);
     assert.equal(api.state().searchFailed, true, `${code}: the box stays in error`);
-    assert.deepEqual(log.errs, ['could not check server 1993'], `${code}: and the message does not blame Ookla or claim "not found"`);
+    assert.deepEqual(log.errs, ['Could not check server 1993'], `${code}: and the message does not blame Ookla or claim "not found"`);
   }
 });
 
@@ -6265,7 +6265,7 @@ test('server list: a 404 on an ID still means no such server', async () => {
   await search; await tick();
   assert.equal(api.state().pendingServer, '', 'a server Ookla does not know must not be pinned');
   assert.equal(api.state().searchFailed, true, 'and Save stays blocked until the box is fixed');
-  assert.deepEqual(log.errs, ['server 1993 not found']);
+  assert.deepEqual(log.errs, ['Server 1993 not found']);
   assert.equal(els.serverCity.value, '1993', 'the typed ID stays so it can be fixed');
 });
 
@@ -6332,7 +6332,7 @@ test('server list: a city the geocoder does not know is "not found"', async () =
   await tick();
   fetches[0].status(404);   // the daemon's answer when the geocoder knows no such place
   await search; await tick();
-  assert.deepEqual(log.errs, ['city not found']);
+  assert.deepEqual(log.errs, ['City not found']);
   assert.equal(api.state().searchFailed, true);
   assert.equal(api.state().pendingServer, '', 'a city search never pins anything');
 });
