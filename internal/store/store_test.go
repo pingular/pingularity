@@ -898,14 +898,14 @@ func TestOpenMigratesLegacySchema(t *testing.T) {
 	ctx := context.Background()
 
 	// A write naming migrated columns must succeed (they now exist).
-	if err := st.InsertSpeed(ctx, SpeedSample{TS: 200, DownMbps: 99, Engine: "iperf3", ISP: "EBOX"}); err != nil {
+	if err := st.InsertSpeed(ctx, SpeedSample{TS: 200, DownMbps: 99, Engine: "iperf3", ISP: "CalNect"}); err != nil {
 		t.Fatalf("insert speed after migrate: %v", err)
 	}
 	sp, err := st.LatestSpeed(ctx)
 	if err != nil || sp == nil {
 		t.Fatalf("latest speed: %v (nil=%v)", err, sp == nil)
 	}
-	if sp.Engine != "iperf3" || sp.ISP != "EBOX" {
+	if sp.Engine != "iperf3" || sp.ISP != "CalNect" {
 		t.Fatalf("migrated columns not round-tripping: engine=%q isp=%q", sp.Engine, sp.ISP)
 	}
 	// The legacy row must still read (its new columns default NULL/empty).

@@ -102,7 +102,7 @@ func TestAutoOriginsAlwaysOfferTheGeoCity(t *testing.T) {
 	}
 }
 
-// A starred server's city races too. The measured failure: exit discovery down
+// A starred server's city races too. The case this guards: exit discovery down
 // for an evening (the host resolver timing out on the ASN zone), so the field
 // was the ISP geolocation and Ookla's placement - both Toronto - while every
 // starred server, and every faster one, sat in Montreal. With the star as an
@@ -111,7 +111,7 @@ func TestAutoOriginsAlwaysOfferTheGeoCity(t *testing.T) {
 func TestAutoOriginsRaceTheStarredServersCities(t *testing.T) {
 	info := netinfo.Info{City: "Toronto", Country: "CA", Lat: 43.70, Lon: -79.40}
 	saved := []settings.SavedServer{
-		{ID: "1993", Sponsor: "EBOX", Name: "Montréal, QC", Lat: 45.5, Lon: -73.5},
+		{ID: "1993", Sponsor: "CalNect", Name: "Montréal, QC", Lat: 45.5, Lon: -73.5},
 		{ID: "7", Sponsor: "ByID", Name: "Nowhere"}, // starred from a by-ID reply: no coordinate, nothing to race
 	}
 	got := autoOrigins(info, saved, nil)

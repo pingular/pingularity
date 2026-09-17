@@ -62,7 +62,7 @@ func TestDiscoverExitOnlyDestinationResponds(t *testing.T) {
 		return []tHop{{TTL: 5, IP: "1.1.1.1", RTT: 8 * time.Millisecond}}, nil
 	})
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ex, err := m.discoverExit(context.Background(), "1403", [4]byte{1, 1, 1, 1})
+	ex, err := m.discoverExit(context.Background(), "64500", [4]byte{1, 1, 1, 1})
 	if err == nil || !strings.Contains(err.Error(), "no path hops") {
 		t.Fatalf("discoverExit = (%+v, %v), want the no-path error", ex, err)
 	}
@@ -77,8 +77,8 @@ func TestCachedExitCachesWithinWindow(t *testing.T) {
 		return nil, errors.New("no raw socket")
 	})
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	m.cachedExit(context.Background(), "1403")
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
+	m.cachedExit(context.Background(), "64500")
 	if calls != 1 {
 		t.Fatalf("traceFn ran %d times, want 1 (second call must hit the cache)", calls)
 	}
@@ -96,9 +96,9 @@ func TestCachedExitRetracesOnTargetChange(t *testing.T) {
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	target := "9.9.9.9"
 	m.ExitTargetFn = func() string { return target }
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	target = "8.8.4.4"
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if calls != 2 {
 		t.Fatalf("traceFn ran %d times, want 2 (target change must re-trace)", calls)
 	}
@@ -124,7 +124,7 @@ func TestCachedExitSingleFlight(t *testing.T) {
 	m.http = canned(404, "")
 	results := make(chan *ExitInfo, 2)
 	for range 2 {
-		go func() { results <- m.cachedExit(context.Background(), "1403") }()
+		go func() { results <- m.cachedExit(context.Background(), "64500") }()
 	}
 	<-entered // the first trace is in flight; the other caller must not start one
 	close(release)
@@ -172,7 +172,7 @@ func TestParseCymruASN(t *testing.T) {
 	}{
 		{"13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11", "13335", 24, "AU"},
 		{"3320 6939 | 80.81.192.0/21 | DE | ripencc | 1999", "3320", 21, "DE"}, // multi-origin: first ASN
-		{"1403 | 66.254.60.0/22 | CA | arin | 2003-05-13", "1403", 22, "CA"},
+		{"64500 | 66.254.60.0/22 | CA | arin | 2003-05-13", "64500", 22, "CA"},
 		{"26480 | 66.254.32.0/19 | CA | arin | 2003-05-13", "26480", 19, "CA"},
 		{"15169 | 8.8.8.0/24", "15169", 24, ""}, // no country field
 		{"7018", "7018", -1, ""},                // ASN only, no prefix/country
@@ -188,17 +188,17 @@ func TestParseCymruASN(t *testing.T) {
 }
 
 // pickCymruASN must deterministically return the most-specific prefix's origin
-// AS. The real-world shape (eBOX): an address covered by both AS1403's /22 and
+// AS. The real-world shape: an address covered by both AS64500's /22 and
 // AS26480's /19 aggregate, returned by Cymru in random order - the /22
-// (AS1403) is the operative origin and must win regardless of record order.
+// (AS64500) is the operative origin and must win regardless of record order.
 func TestPickCymruASN(t *testing.T) {
-	specific := "1403 | 66.254.60.0/22 | CA | arin | 2003-05-13"
+	specific := "64500 | 66.254.60.0/22 | CA | arin | 2003-05-13"
 	aggregate := "26480 | 66.254.32.0/19 | CA | arin | 2003-05-13"
-	if got, cc := pickCymruASN([]string{specific, aggregate}); got != "1403" || cc != "CA" {
-		t.Errorf("pickCymruASN(specific-first) = (%q, %q), want (1403, CA)", got, cc)
+	if got, cc := pickCymruASN([]string{specific, aggregate}); got != "64500" || cc != "CA" {
+		t.Errorf("pickCymruASN(specific-first) = (%q, %q), want (64500, CA)", got, cc)
 	}
-	if got, _ := pickCymruASN([]string{aggregate, specific}); got != "1403" {
-		t.Errorf("pickCymruASN(aggregate-first) = %q, want 1403", got)
+	if got, _ := pickCymruASN([]string{aggregate, specific}); got != "64500" {
+		t.Errorf("pickCymruASN(aggregate-first) = %q, want 64500", got)
 	}
 	if got, cc := pickCymruASN([]string{"13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11"}); got != "13335" || cc != "AU" {
 		t.Errorf("pickCymruASN(single) = (%q, %q), want (13335, AU)", got, cc)
@@ -215,7 +215,7 @@ func TestParseCymruASNName(t *testing.T) {
 	cases := []struct{ txt, want string }{
 		{"13335 | US | arin | 2010-07-14 | CLOUDFLARENET, US", "CLOUDFLARENET"},
 		{"13335 | US | arin | 2010-07-14 | CLOUDFLARENET - Cloudflare, Inc., US", "CLOUDFLARENET - Cloudflare, Inc."}, // real verbose form: handle + org, internal comma kept
-		{"1403 | CA | arin | 2000-05-04 | EBOX, CA", "EBOX"},
+		{"64500 | CA | arin | 2000-05-04 | CalNect, CA", "CalNect"},
 		{"15169 | US | arin | 2000-03-30 | GOOGLE, US", "GOOGLE"},
 		{"64500 | ZZ | other | 2020-01-01 | SOME, NAME, US", "SOME, NAME"}, // comma in name, trailing CC stripped
 		{"99999 | US | arin | 2021-01-01 | NOCOUNTRY", "NOCOUNTRY"},        // no trailing CC
@@ -272,7 +272,7 @@ func TestGeolocateHopCounters(t *testing.T) {
 func TestCityFromRDNS(t *testing.T) {
 	cases := []struct{ name, want string }{
 		{"ae1-cr2.fra10.isp.net", "Frankfurt"},
-		{"bng4.tor.ebox.net", "Toronto"},
+		{"bng4.tor.calnect.net", "Toronto"},
 		{"xe-0-0-1.lon1.example.co.uk", "London"},
 		{"eqix-yyz.cloudflare.com", "Toronto"},
 		{"host.unknownville.net", ""},
@@ -477,11 +477,11 @@ func TestCachedExitRetriesFasterWithNoExitToShow(t *testing.T) {
 		return nil, errors.New("no raw socket")
 	})
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	m.traceMu.Lock()
 	m.traceAt = time.Now().Add(-2 * time.Minute)
 	m.traceMu.Unlock()
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if calls != 2 {
 		t.Fatalf("traceFn ran %d times, want 2: a failure with no exit on display must retry after the short window, not wait out the full exitCacheFor", calls)
 	}
@@ -505,7 +505,7 @@ func TestCachedExitFailureWithPriorExitKeepsFullWindow(t *testing.T) {
 	m.tracedFor, m.attemptedFor = "", ""
 	m.traceAt = time.Now().Add(-2 * time.Minute)
 	m.traceMu.Unlock()
-	if got := m.cachedExit(context.Background(), "1403"); got == nil {
+	if got := m.cachedExit(context.Background(), "64500"); got == nil {
 		t.Fatal("cachedExit returned nil with a cached exit inside the window")
 	}
 	if calls != 0 {
@@ -571,20 +571,20 @@ func TestCachedExitFastRetryStandsDownAfterStreak(t *testing.T) {
 		m.traceMu.Unlock()
 	}
 	for i := 1; i < exitFailFastTries; i++ {
-		m.cachedExit(context.Background(), "1403")
+		m.cachedExit(context.Background(), "64500")
 		backdate(2 * time.Minute)
 	}
-	m.cachedExit(context.Background(), "1403") // completes the streak
+	m.cachedExit(context.Background(), "64500") // completes the streak
 	if calls != exitFailFastTries {
 		t.Fatalf("traceFn ran %d times, want %d (one per fast retry)", calls, exitFailFastTries)
 	}
 	backdate(2 * time.Minute)
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if calls != exitFailFastTries {
 		t.Fatalf("traceFn ran %d times after the streak completed, want %d: past exitFailFastTries a two-minute-old failure must wait out the full exitCacheFor", calls, exitFailFastTries)
 	}
 	backdate(exitCacheFor + time.Minute)
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if calls != exitFailFastTries+1 {
 		t.Fatalf("traceFn ran %d times past the full window, want %d: standing down must not mean never retrying", calls, exitFailFastTries+1)
 	}
@@ -592,7 +592,7 @@ func TestCachedExitFastRetryStandsDownAfterStreak(t *testing.T) {
 	m.traceAt = time.Time{}
 	m.traceFails, m.warnedNoExit = 0, false // what every cache-bust site does
 	m.traceMu.Unlock()
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if calls != exitFailFastTries+2 {
 		t.Fatalf("traceFn ran %d times after a cache-bust, want %d: a bust must start a fresh fast-retry episode", calls, exitFailFastTries+2)
 	}
@@ -635,14 +635,14 @@ func TestExitFailureWarnsOncePerEpisode(t *testing.T) {
 	})
 	h := &recordingHandler{}
 	m := NewManager(slog.New(h))
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if got := h.warns(); got != 1 {
 		t.Fatalf("first empty-row failure logged %d warns, want exactly 1", got)
 	}
 	m.traceMu.Lock()
 	m.traceAt = time.Now().Add(-2 * time.Minute)
 	m.traceMu.Unlock()
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if got := h.warns(); got != 1 {
 		t.Fatalf("repeat failure in the same episode logged %d warns total, want still 1 (Debug for repeats)", got)
 	}
@@ -650,7 +650,7 @@ func TestExitFailureWarnsOncePerEpisode(t *testing.T) {
 	m.traceAt = time.Time{}
 	m.traceFails, m.warnedNoExit = 0, false // what every cache-bust site does
 	m.traceMu.Unlock()
-	m.cachedExit(context.Background(), "1403")
+	m.cachedExit(context.Background(), "64500")
 	if got := h.warns(); got != 2 {
 		t.Fatalf("first failure of a NEW episode logged %d warns total, want 2 (the bust re-arms the Warn)", got)
 	}
@@ -675,7 +675,7 @@ func TestExitTargetIsMaskedInLogs(t *testing.T) {
 			func(_, m string) { masked = append(masked, m) }))
 		m := NewManager(log)
 		m.ExitTargetFn = func() string { return tc.target }
-		m.cachedExit(context.Background(), "1403")
+		m.cachedExit(context.Background(), "64500")
 		line := ""
 		for _, l := range masked {
 			if strings.Contains(l, tc.warn) {

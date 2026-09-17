@@ -47,13 +47,13 @@ func TestISPBoundary(t *testing.T) {
 		ourASN             string
 		wantExit, wantNext int
 	}{
-		{"private -> ISP -> handoff", hop("192.168.1.1", "203.0.113.1", "8.8.8.8"), []string{"", "1403", "15169"}, "1403", 1, 2},
-		{"empty ourASN seeds from first public hop", hop("192.168.1.1", "203.0.113.1", "8.8.8.8"), []string{"", "1403", "15169"}, "", 1, 2},
-		{"private-stranded exit is dropped", hop("192.168.1.1", "8.8.8.8"), []string{"", "15169"}, "1403", -1, 1},
-		{"IXP LAN (no origin AS) is the handoff", hop("192.168.1.1", "203.0.113.1", "80.81.192.1", "8.8.8.8"), []string{"", "1403", "", "15169"}, "1403", 1, 2},
-		{"ISP-internal private hop keeps the public exit", hop("192.168.1.1", "203.0.113.1", "10.20.0.1", "8.8.8.8"), []string{"", "1403", "", "15169"}, "1403", 1, 3},
-		{"direct public first hop in ISP", hop("203.0.113.1", "8.8.8.8"), []string{"1403", "15169"}, "1403", 0, 1},
-		{"all inside -> no handoff", hop("192.168.1.1", "203.0.113.1"), []string{"", "1403"}, "1403", 1, -1},
+		{"private -> ISP -> handoff", hop("192.168.1.1", "203.0.113.1", "8.8.8.8"), []string{"", "64500", "15169"}, "64500", 1, 2},
+		{"empty ourASN seeds from first public hop", hop("192.168.1.1", "203.0.113.1", "8.8.8.8"), []string{"", "64500", "15169"}, "", 1, 2},
+		{"private-stranded exit is dropped", hop("192.168.1.1", "8.8.8.8"), []string{"", "15169"}, "64500", -1, 1},
+		{"IXP LAN (no origin AS) is the handoff", hop("192.168.1.1", "203.0.113.1", "80.81.192.1", "8.8.8.8"), []string{"", "64500", "", "15169"}, "64500", 1, 2},
+		{"ISP-internal private hop keeps the public exit", hop("192.168.1.1", "203.0.113.1", "10.20.0.1", "8.8.8.8"), []string{"", "64500", "", "15169"}, "64500", 1, 3},
+		{"direct public first hop in ISP", hop("203.0.113.1", "8.8.8.8"), []string{"64500", "15169"}, "64500", 0, 1},
+		{"all inside -> no handoff", hop("192.168.1.1", "203.0.113.1"), []string{"", "64500"}, "64500", 1, -1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -113,7 +113,7 @@ func FuzzCityFromRDNS(f *testing.F) {
 func FuzzPickCymruASN(f *testing.F) {
 	for _, s := range []string{
 		"13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11",
-		"1403 | 66.254.60.0/22 | CA | arin;26480 | 66.254.32.0/19 | CA",
+		"64500 | 66.254.60.0/22 | CA | arin;26480 | 66.254.32.0/19 | CA",
 		"", "| | |", "999 888 | x/8", "  /  ",
 	} {
 		f.Add(s)

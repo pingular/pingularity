@@ -32,7 +32,7 @@ func stubCymru(t *testing.T, system, fb1, fb2 error) *[]string {
 			if fail != nil {
 				return nil, fail
 			}
-			return []string{"1403 | 96.127.192.0/18 | CA | arin | 2011-04-08"}, nil
+			return []string{"64500 | 203.0.113.0/24 | CA | arin | 2011-04-08"}, nil
 		}
 	}
 	oldS, oldF, oldNow := cymruSystemTXT, cymruFallbackTXT, cymruNow
@@ -56,8 +56,8 @@ var errNX = &net.DNSError{Err: "no such host", IsNotFound: true}
 // The host resolver is asked first and, when it answers, alone.
 func TestCymruLookupPrefersTheHostResolver(t *testing.T) {
 	asked := stubCymru(t, nil, nil, nil)
-	asn, err := cymruASNLookup(context.Background(), "96.127.240.62")
-	if err != nil || asn != "1403" {
+	asn, err := cymruASNLookup(context.Background(), "203.0.113.62")
+	if err != nil || asn != "64500" {
 		t.Fatalf("asn = %q err = %v", asn, err)
 	}
 	if len(*asked) != 1 || (*asked)[0] != "system" {
@@ -72,8 +72,8 @@ func TestCymruLookupPrefersTheHostResolver(t *testing.T) {
 func TestCymruLookupFallsBackWhenTheHostResolverFails(t *testing.T) {
 	asked := stubCymru(t, errTimeout, nil, nil)
 	before := stats.Lifetime().Counters["netinfo.cymru_fallback"]
-	asn, err := cymruASNLookup(context.Background(), "96.127.240.62")
-	if err != nil || asn != "1403" {
+	asn, err := cymruASNLookup(context.Background(), "203.0.113.62")
+	if err != nil || asn != "64500" {
 		t.Fatalf("asn = %q err = %v, want the fallback's answer", asn, err)
 	}
 	if want := []string{"system", "fb1"}; !sameOrder(*asked, want) {
@@ -84,8 +84,8 @@ func TestCymruLookupFallsBackWhenTheHostResolverFails(t *testing.T) {
 	}
 	// Once burned, the fallbacks go first: a dozen-hop trace must not pay the
 	// dead resolver's timeout at every hop.
-	asn, _ = cymruASNLookup(context.Background(), "96.127.240.63")
-	if want := []string{"system", "fb1", "fb1"}; asn != "1403" || !sameOrder(*asked, want) {
+	asn, _ = cymruASNLookup(context.Background(), "203.0.113.63")
+	if want := []string{"system", "fb1", "fb1"}; asn != "64500" || !sameOrder(*asked, want) {
 		t.Errorf("second lookup: asked %v, want %v - the fallback first while the host resolver is suspect", *asked, want)
 	}
 }
@@ -111,7 +111,7 @@ func TestCymruLookupDoesNotBlameTheResolverForACancelledCaller(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	before := stats.Lifetime().Counters["netinfo.cymru_fallback"]
-	if _, err := cymruASNLookup(ctx, "96.127.240.62"); err == nil {
+	if _, err := cymruASNLookup(ctx, "203.0.113.62"); err == nil {
 		t.Fatal("a cancelled lookup must fail")
 	}
 	if want := []string{"system"}; !sameOrder(*asked, want) {
@@ -123,9 +123,9 @@ func TestCymruLookupDoesNotBlameTheResolverForACancelledCaller(t *testing.T) {
 	// The next, live lookup still trusts the host resolver first (and it answers).
 	cymruSystemTXT = func(_ context.Context, q string) ([]string, error) {
 		*asked = append(*asked, "system")
-		return []string{"1403 | 96.127.192.0/18 | CA | arin | 2011-04-08"}, nil
+		return []string{"64500 | 203.0.113.0/24 | CA | arin | 2011-04-08"}, nil
 	}
-	cymruASNLookup(context.Background(), "96.127.240.62")
+	cymruASNLookup(context.Background(), "203.0.113.62")
 	if want := []string{"system", "system"}; !sameOrder(*asked, want) {
 		t.Errorf("asked %v, want %v - the host resolver was marked suspect by a cancellation", *asked, want)
 	}
@@ -154,7 +154,7 @@ func TestCymruLookupTreatsNXDomainAsAnAnswer(t *testing.T) {
 // intercepted) must not lock a recovered host resolver out for the window.
 func TestCymruLookupRecoversTheHostResolver(t *testing.T) {
 	asked := stubCymru(t, errTimeout, errTimeout, errTimeout)
-	if _, err := cymruASNLookup(context.Background(), "96.127.240.62"); err == nil {
+	if _, err := cymruASNLookup(context.Background(), "203.0.113.62"); err == nil {
 		t.Fatal("every resolver failed; want an error")
 	}
 	if want := []string{"system", "fb1", "fb2"}; !sameOrder(*asked, want) {
@@ -164,17 +164,17 @@ func TestCymruLookupRecoversTheHostResolver(t *testing.T) {
 	// trusted first again on the next lookup.
 	cymruSystemTXT = func(_ context.Context, q string) ([]string, error) {
 		*asked = append(*asked, "system")
-		return []string{"1403 | 96.127.192.0/18 | CA | arin | 2011-04-08"}, nil
+		return []string{"64500 | 203.0.113.0/24 | CA | arin | 2011-04-08"}, nil
 	}
-	asn, err := cymruASNLookup(context.Background(), "96.127.240.62")
-	if err != nil || asn != "1403" {
+	asn, err := cymruASNLookup(context.Background(), "203.0.113.62")
+	if err != nil || asn != "64500" {
 		t.Fatalf("asn = %q err = %v", asn, err)
 	}
 	if got := (*asked)[3:]; len(got) != 3 || got[2] != "system" {
 		t.Errorf("asked %v after the outage, want fb1, fb2, then the suspect host resolver", got)
 	}
 	n := len(*asked)
-	cymruASNLookup(context.Background(), "96.127.240.62")
+	cymruASNLookup(context.Background(), "203.0.113.62")
 	if got := (*asked)[n:]; len(got) != 1 || got[0] != "system" {
 		t.Errorf("asked %v once the host resolver answered, want it trusted first again", got)
 	}
@@ -186,14 +186,14 @@ func TestCymruSuspectWindowExpires(t *testing.T) {
 	asked := stubCymru(t, errTimeout, nil, nil)
 	now := time.Unix(1_700_000_000, 0)
 	cymruNow = func() time.Time { return now }
-	cymruASNLookup(context.Background(), "96.127.240.62") // burns the host resolver
+	cymruASNLookup(context.Background(), "203.0.113.62") // burns the host resolver
 	now = now.Add(cymruSuspectFor + time.Second)
 	cymruSystemTXT = func(_ context.Context, q string) ([]string, error) {
 		*asked = append(*asked, "system")
-		return []string{"1403 | 96.127.192.0/18 | CA | arin | 2011-04-08"}, nil
+		return []string{"64500 | 203.0.113.0/24 | CA | arin | 2011-04-08"}, nil
 	}
 	n := len(*asked)
-	cymruASNLookup(context.Background(), "96.127.240.62")
+	cymruASNLookup(context.Background(), "203.0.113.62")
 	if got := (*asked)[n:]; len(got) != 1 || got[0] != "system" {
 		t.Errorf("asked %v after the window, want the host resolver first again", got)
 	}

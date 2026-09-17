@@ -49,7 +49,7 @@ func TestCachedExitDropsOutOfGenerationTrace(t *testing.T) {
 	m.ExitTargetFn = func() string { return "1.1.1.1" }
 
 	got := make(chan *ExitInfo, 1)
-	go func() { got <- m.cachedExit(context.Background(), "1403") }()
+	go func() { got <- m.cachedExit(context.Background(), "64500") }()
 	<-entered
 	// The IP-change bust lands mid-trace (as Refresh does): clear the cache and
 	// bump the generation the in-flight trace was started under.
@@ -100,7 +100,7 @@ func TestCachedExitWaiterRetracesForNewTarget(t *testing.T) {
 		return target
 	}
 
-	go m.cachedExit(context.Background(), "1403") // caller 1 -> trace A (9.9.9.9)
+	go m.cachedExit(context.Background(), "64500") // caller 1 -> trace A (9.9.9.9)
 	<-entered
 	tmu.Lock()
 	target = "8.8.4.4" // the exit target changes while A is in flight
@@ -110,7 +110,7 @@ func TestCachedExitWaiterRetracesForNewTarget(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		close(entered2)
-		m.cachedExit(context.Background(), "1403") // caller 2 -> wants B (8.8.4.4)
+		m.cachedExit(context.Background(), "64500") // caller 2 -> wants B (8.8.4.4)
 		close(done)
 	}()
 	<-entered2

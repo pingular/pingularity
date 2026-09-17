@@ -51,7 +51,7 @@ func TestCandidatesEndpointShowsTheRaceFieldFastestFirst(t *testing.T) {
 		return speedtest.RaceListing{
 			Origins: []speedtest.Origin{{Kind: "isp", Label: "Toronto, CA", Anchored: true}, saved, {Kind: "geo", Label: "your connection"}},
 			Servers: []speedtest.RaceCandidate{
-				{ServerInfo: speedtest.ServerInfo{ID: "1993", Sponsor: "EBOX", Name: "Montréal, QC", DistanceKM: 1, Lat: 45.5, Lon: -73.5, PingMS: ms(10.4)}, Origin: "saved", OriginLabel: "Montréal, QC"},
+				{ServerInfo: speedtest.ServerInfo{ID: "1993", Sponsor: "CalNect", Name: "Montréal, QC", DistanceKM: 1, Lat: 45.5, Lon: -73.5, PingMS: ms(10.4)}, Origin: "saved", OriginLabel: "Montréal, QC"},
 				{ServerInfo: speedtest.ServerInfo{ID: "17568", Sponsor: "Bell Canada", Name: "North York, ON", DistanceKM: 4, Lat: 43.76, Lon: -79.41, PingMS: ms(27.7)}, Origin: "isp", OriginLabel: "Toronto, CA"},
 				{ServerInfo: speedtest.ServerInfo{ID: "9", Sponsor: "Silent", Name: "Nowhere", DistanceKM: 8}, Origin: "geo"},
 			},

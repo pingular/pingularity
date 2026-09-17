@@ -32,8 +32,8 @@ func TestServerCoord(t *testing.T) {
 // serverLabel joins the sponsor and city Ookla advertises, the human name shown
 // in the runs table.
 func TestServerLabel(t *testing.T) {
-	if got := serverLabel(&ookla.Server{Sponsor: "EBOX", Name: "Montreal"}); got != "EBOX, Montreal" {
-		t.Errorf("serverLabel = %q, want %q", got, "EBOX, Montreal")
+	if got := serverLabel(&ookla.Server{Sponsor: "CalNect", Name: "Montreal"}); got != "CalNect, Montreal" {
+		t.Errorf("serverLabel = %q, want %q", got, "CalNect, Montreal")
 	}
 }
 
@@ -74,7 +74,7 @@ func TestAutoCandidates(t *testing.T) {
 		mk(1, "Cooptel", 1), mk(2, "Netcrawler", 1), mk(3, "Tata", 1),
 		mk(4, "Bell", 1), mk(5, "Rogers", 1), mk(6, "TELUS", 1),
 		mk(7, "TELUS", 1), mk(8, "Bell", 1), mk(9, "Beanfield", 1),
-		mk(10, "Rogers", 1), mk(11, "EBOX", 1), mk(12, "Cronomagic", 1),
+		mk(10, "Rogers", 1), mk(11, "CalNect", 1), mk(12, "Cronomagic", 1),
 		mk(13, "Fibrenoire", 1), mk(14, "Connexio", 1), mk(15, "Vif", 1),
 	}
 	got := autoCandidates(tie, "")
@@ -85,7 +85,7 @@ func TestAutoCandidates(t *testing.T) {
 	for _, s := range got {
 		found[s.Sponsor] = true
 	}
-	if !found["EBOX"] {
+	if !found["CalNect"] {
 		t.Errorf("the 11th unique sponsor (the user's ISP) missed the race: %v", sponsors(got))
 	}
 	if len(found) != autoPingMax {
@@ -155,48 +155,48 @@ func TestAutoCandidatesISPGuarantee(t *testing.T) {
 	// 14 unique sponsors in one tie band; the ISP's server sits 14th, past the
 	// 12-lane cap - without the guarantee it would be cut.
 	var tie ookla.Servers
-	for i, sp := range []string{"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "EBOX"} {
+	for i, sp := range []string{"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "CalNect"} {
 		tie = append(tie, mk(i+1, sp, 1))
 	}
-	got := autoCandidates(tie, "AS1403 EBOX - EBOX")
+	got := autoCandidates(tie, "AS64500 CalNect - CalNect")
 	if len(got) != autoPingMax {
 		t.Fatalf("cap must hold: %d candidates, want %d", len(got), autoPingMax)
 	}
-	if !hasSponsor(got, "EBOX") {
+	if !hasSponsor(got, "CalNect") {
 		t.Errorf("ISP server missing from the race despite the guarantee")
 	}
 	// Without the ISP name, the same list cuts it (the pre-guarantee behavior).
 	// A hard error, not a skip: t.Skip would abort the whole test and silently
 	// drop every assertion below it, disarming the guarantees they police.
-	if hasSponsor(autoCandidates(tie, ""), "EBOX") {
-		t.Error("fixture no longer exercises the cap: EBOX survives without the ISP name; adjust the tie band")
+	if hasSponsor(autoCandidates(tie, ""), "CalNect") {
+		t.Error("fixture no longer exercises the cap: CalNect survives without the ISP name; adjust the tie band")
 	}
 
 	// ISP server outside the distance margin (geolocation drift): still raced.
 	drift := ookla.Servers{
 		mk(1, "S1", 1), mk(2, "S2", 1), mk(3, "S3", 1), mk(4, "S4", 1),
-		mk(5, "S5", 1), mk(6, "EBOX", 60),
+		mk(5, "S5", 1), mk(6, "CalNect", 60),
 	}
-	if got := autoCandidates(drift, "AS1403 EBOX - EBOX"); !hasSponsor(got, "EBOX") {
+	if got := autoCandidates(drift, "AS64500 CalNect - CalNect"); !hasSponsor(got, "CalNect") {
 		t.Errorf("ISP server beyond the margin must still be raced")
 	}
 
 	// No matching sponsor anywhere: the guarantee must not fire - the set is
-	// exactly the 5 nearest, with the 60km EBOX left out.
+	// exactly the 5 nearest, with the 60km CalNect left out.
 	got = autoCandidates(drift, "AS0000 Some Other ISP")
 	if len(got) != autoPingMin {
 		t.Errorf("non-matching ISP changed the candidate count: %d, want %d", len(got), autoPingMin)
 	}
-	if hasSponsor(got, "EBOX") {
+	if hasSponsor(got, "CalNect") {
 		t.Error("guarantee fired for a non-matching ISP")
 	}
 
 	// Already-included ISP server: no duplicate added, cap intact.
-	included := ookla.Servers{mk(1, "EBOX", 1), mk(2, "S2", 1), mk(3, "S3", 1)}
-	got = autoCandidates(included, "AS1403 EBOX - EBOX")
+	included := ookla.Servers{mk(1, "CalNect", 1), mk(2, "S2", 1), mk(3, "S3", 1)}
+	got = autoCandidates(included, "AS64500 CalNect - CalNect")
 	count := 0
 	for _, s := range got {
-		if s.Sponsor == "EBOX" {
+		if s.Sponsor == "CalNect" {
 			count++
 		}
 	}
@@ -212,14 +212,14 @@ func TestSponsorMatchesISP(t *testing.T) {
 		sponsor, isp string
 		want         bool
 	}{
-		{"EBOX", "AS1403 EBOX - EBOX", true},
+		{"CalNect", "AS64500 CalNect - CalNect", true},
 		{"Bell Canada", "Bell Canada", true},
 		{"TELUS Mobility", "AS852 TELUS Communications", true},
-		{"Rogers Wireless", "AS1403 EBOX - EBOX", false},
+		{"Rogers Wireless", "AS64500 CalNect - CalNect", false},
 		{"Internet Services", "AS1234 Fancy Internet Services", false}, // generic-only words never match
 		{"Videotron", "AS5769 Videotron Ltee", true},
 		{"Cogeco", "", false},
-		{"", "AS1403 EBOX - EBOX", false},
+		{"", "AS64500 CalNect - CalNect", false},
 	}
 	for _, c := range cases {
 		if got := sponsorMatchesISP(c.sponsor, c.isp); got != c.want {
@@ -238,20 +238,20 @@ func TestAutoCandidatesISPMultipleLanes(t *testing.T) {
 	countISP := func(list ookla.Servers) int {
 		n := 0
 		for _, s := range list {
-			if s.Sponsor == "EBOX" {
+			if s.Sponsor == "CalNect" {
 				n++
 			}
 		}
 		return n
 	}
 
-	// 3 EBOX entries scattered through a 16-server tie band: all 3 race.
+	// 3 CalNect entries scattered through a 16-server tie band: all 3 race.
 	var band ookla.Servers
-	sponsors := []string{"S1", "EBOX", "S2", "S3", "S4", "EBOX", "S5", "S6", "S7", "S8", "EBOX", "S9", "S10", "S11", "S12", "S13"}
+	sponsors := []string{"S1", "CalNect", "S2", "S3", "S4", "CalNect", "S5", "S6", "S7", "S8", "CalNect", "S9", "S10", "S11", "S12", "S13"}
 	for i, sp := range sponsors {
 		band = append(band, mk(i+1, sp, 1))
 	}
-	got := autoCandidates(band, "AS1403 EBOX - EBOX")
+	got := autoCandidates(band, "AS64500 CalNect - CalNect")
 	if len(got) != autoPingMax {
 		t.Fatalf("cap must hold: %d, want %d", len(got), autoPingMax)
 	}
@@ -259,21 +259,21 @@ func TestAutoCandidatesISPMultipleLanes(t *testing.T) {
 		t.Errorf("all 3 ISP servers should race, got %d lanes", n)
 	}
 
-	// 6 EBOX entries: capped at autoISPMax so diversity survives.
+	// 6 CalNect entries: capped at autoISPMax so diversity survives.
 	var many ookla.Servers
 	for i := 0; i < 6; i++ {
-		many = append(many, mk(i+1, "EBOX", 1))
+		many = append(many, mk(i+1, "CalNect", 1))
 	}
 	for i := 0; i < 10; i++ {
 		many = append(many, mk(100+i, "S"+strconv.Itoa(i), 1))
 	}
-	got = autoCandidates(many, "AS1403 EBOX - EBOX")
+	got = autoCandidates(many, "AS64500 CalNect - CalNect")
 	if n := countISP(got); n != autoISPMax {
 		t.Errorf("ISP lanes must cap at %d, got %d", autoISPMax, n)
 	}
 	uniqueOthers := map[string]bool{}
 	for _, s := range got {
-		if s.Sponsor != "EBOX" {
+		if s.Sponsor != "CalNect" {
 			uniqueOthers[s.Sponsor] = true
 		}
 	}
@@ -281,9 +281,9 @@ func TestAutoCandidatesISPMultipleLanes(t *testing.T) {
 		t.Errorf("other providers should fill the remaining %d lanes uniquely, got %d", autoPingMax-autoISPMax, len(uniqueOthers))
 	}
 
-	// Under the cap nothing is trimmed: every EBOX entry races regardless.
-	small := ookla.Servers{mk(1, "EBOX", 1), mk(2, "EBOX", 1), mk(3, "S1", 1)}
-	if n := countISP(autoCandidates(small, "AS1403 EBOX - EBOX")); n != 2 {
+	// Under the cap nothing is trimmed: every CalNect entry races regardless.
+	small := ookla.Servers{mk(1, "CalNect", 1), mk(2, "CalNect", 1), mk(3, "S1", 1)}
+	if n := countISP(autoCandidates(small, "AS64500 CalNect - CalNect")); n != 2 {
 		t.Errorf("small pool: both ISP entries should race, got %d", n)
 	}
 }

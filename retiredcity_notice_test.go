@@ -139,7 +139,7 @@ func TestRetiredCityScopeSpeaksOnlyForInstallsThatHaveNotChosen(t *testing.T) {
 	// A starred server's city races every run, which is this build's way of
 	// saying "look for servers there" - the operator has already made the choice
 	// the line would ask for.
-	starred := `[{"id":"1993","sponsor":"EBOX","name":"Montreal, QC","lat":45.5,"lon":-73.5}]`
+	starred := `[{"id":"1993","sponsor":"CalNect","name":"Montreal, QC","lat":45.5,"lon":-73.5}]`
 	if got := retiredCityScope(seed(t, with(map[string]string{"speed_servers": starred}))); got != "" {
 		t.Errorf("an install with starred servers got %q; its cities are in the race already", got)
 	}
