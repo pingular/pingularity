@@ -7,15 +7,12 @@
 # to whoever pulls them, silently and indefinitely. Verified: no CI job inspects
 # a base manifest, so this file is the only thing covering it.
 #
-# SUPPRESSION TRAP (this bit you every prior time): closing a Dependabot PR
-# without merging tells Dependabot "never offer THIS version/digest again" - all
-# 15 PRs it ever opened here were closed unmerged (including #9, the docker
-# one), which is why the pins sat stale with no re-offer. The suppression is
-# per-digest, so the NEXT upstream digest still gets a fresh PR - but if you
-# close that one too, the cycle repeats. To decline a bump without suppressing
-# the next one, just leave the PR open; to resurrect a closed one, comment
-# `@dependabot reopen` on it. Never close-unmerged as a "later" - there is no
-# later.
+# Closing a Dependabot PR without merging tells Dependabot never to offer that
+# version or digest again, so a pin can sit stale with no re-offer. The
+# suppression is per-digest: the next upstream digest still gets a fresh PR, but
+# closing that one too repeats the cycle. To decline a bump without suppressing
+# the next one, leave the PR open; to resurrect a closed one, comment
+# `@dependabot reopen` on it.
 #
 # The other two ecosystems were dropped deliberately, and the asymmetry is the
 # reason:
