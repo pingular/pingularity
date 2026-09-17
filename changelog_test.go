@@ -162,10 +162,10 @@ func TestBareIPv6WebhookRefusalIsDocumentedWithItsEscapeHatch(t *testing.T) {
 	if u.Hostname() != "fd00::1" {
 		t.Fatalf("bracketed IPv6 parses to host %q, not the address that was written; the advice does not survive the parser", u.Hostname())
 	}
-	readme := mustReadRepoFile(t, "README.md")
+	readme := mustReadRepoFile(t, "docs/install.md")
 	changelog := mustReadRepoFile(t, changelogPath)
 	if !strings.Contains(readme, "urlstrictcolons") {
-		t.Errorf("README.md documents the certificate-store half of the Go 1.27 change and not this half: a webhook or heartbeat URL written with a bare IPv6 address now fails to parse, and GODEBUG=urlstrictcolons=0 - the escape hatch that restores the old parsing - is named nowhere in the repository. An operator whose alerts stopped has the error and nothing else.")
+		t.Errorf("docs/install.md documents the certificate-store half of the Go 1.27 change and not this half: a webhook or heartbeat URL written with a bare IPv6 address now fails to parse, and GODEBUG=urlstrictcolons=0 - the escape hatch that restores the old parsing - is named nowhere in the repository. An operator whose alerts stopped has the error and nothing else.")
 	}
 	if !strings.Contains(strings.ToLower(changelog), "urlstrictcolons") {
 		t.Errorf("%s never mentions the URL parsing change, so an operator whose webhook stopped delivering on upgrade cannot find out from the record of what this release changed", changelogPath)
@@ -174,7 +174,7 @@ func TestBareIPv6WebhookRefusalIsDocumentedWithItsEscapeHatch(t *testing.T) {
 	// the webhook, or the escape hatch reads as an alternative to bracketing.
 	for _, doc := range []struct {
 		name, body string
-	}{{"README.md", unwrapped(readme)}, {changelogPath, unwrapped(changelog)}} {
+	}{{"docs/install.md", unwrapped(readme)}, {changelogPath, unwrapped(changelog)}} {
 		if !strings.Contains(doc.body, "[fd00::1]") {
 			t.Errorf("%s names the failure but not the bracketed address that fixes it, which is the only one of the two remedies that gets the webhook delivered", doc.name)
 		}
@@ -201,7 +201,7 @@ func TestBareIPv6WebhookRefusalIsDocumentedWithItsEscapeHatch(t *testing.T) {
 	}
 	for _, doc := range []struct {
 		name, body string
-	}{{"README.md", unwrapped(readme)}, {changelogPath, unwrapped(changelog)}} {
+	}{{"docs/install.md", unwrapped(readme)}, {changelogPath, unwrapped(changelog)}} {
 		for _, want := range []string{withPortDelivered, "`http://[fd00::1]:8080/hook`"} {
 			if !strings.Contains(doc.body, want) {
 				t.Errorf("%s never says %q. A bare IPv6 webhook with a port is the one v0.70.1 delivered and this build refuses, and bracketing it or restoring the old parsing brings it back.", doc.name, want)
@@ -789,7 +789,7 @@ const (
 
 func TestChangelogSaysWhatDamageBehindADbLinkDoes(t *testing.T) {
 	changelog := unwrapped(mustReadRepoFile(t, changelogPath))
-	readme := unwrapped(mustReadRepoFile(t, "README.md"))
+	readme := unwrapped(mustReadRepoFile(t, "docs/install.md"))
 	holds := func(behaves bool, doc, name, clause, what string) {
 		t.Helper()
 		if says := strings.Contains(doc, clause); behaves != says {
@@ -815,7 +815,7 @@ func TestChangelogSaysWhatDamageBehindADbLinkDoes(t *testing.T) {
 	_, err = store.Open(link)
 	namesFar := err != nil && strings.Contains(err.Error(), filepath.Join("moved", "elsewhere.db")) && !strings.Contains(err.Error(), filepath.Base(link))
 	holds(namesFar, changelog, changelogPath, changelogLinkRefusalNames, "the refusal of a damaged database behind a -db link names the file the link leads to")
-	holds(namesFar, readme, "README.md", readmeLinkRefusalNames, "the refusal of a damaged database behind a -db link names the file the link leads to")
+	holds(namesFar, readme, "docs/install.md", readmeLinkRefusalNames, "the refusal of a damaged database behind a -db link names the file the link leads to")
 
 	// A rebuild cut short between its two renames: the file the link names has
 	// moved, and the store the rebuild finished sits beside where it was.
@@ -839,5 +839,5 @@ func TestChangelogSaysWhatDamageBehindADbLinkDoes(t *testing.T) {
 	_, builtErr := os.Lstat(far + ".rebuilt")
 	finished := err == nil && lerr == nil && lfi.Mode()&os.ModeSymlink != 0 && farErr == nil && os.IsNotExist(builtErr)
 	holds(finished, changelog, changelogPath, changelogLinkCutShort, "a link to nothing left by a cut-short rebuild is finished by the next start")
-	holds(finished, readme, "README.md", changelogLinkCutShort, "a link to nothing left by a cut-short rebuild is finished by the next start")
+	holds(finished, readme, "docs/install.md", changelogLinkCutShort, "a link to nothing left by a cut-short rebuild is finished by the next start")
 }

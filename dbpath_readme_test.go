@@ -46,7 +46,7 @@ func TestREADMEDBPathClaimMatchesWhatOpenAccepts(t *testing.T) {
 		st.Close()
 	}
 
-	b, err := os.ReadFile("README.md")
+	b, err := os.ReadFile("docs/install.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestDocsSayWhereTheKeyAndTheLogLiveBehindADBLink(t *testing.T) {
 	if !keyAndLogFollowTheDBPathAsTyped(t) {
 		t.Fatalf("pingularity.key and logs.txt now follow a -db link to the file it names; README.md, docs/security-model.md and %s all say they stay beside the -db path as typed - rewrite them with the change", changelogPath)
 	}
-	readme := unwrapped(mustReadRepoFile(t, "README.md"))
+	readme := unwrapped(mustReadRepoFile(t, "docs/install.md"))
 	if !strings.Contains(readme, dbLinkKeyStays) {
 		t.Errorf("README.md's -db bullet never says %q. It is the sentence that stops an operator pointing -db at the file behind the link, where the daemon makes a new key and the saved iperf3 passwords stop decrypting.", dbLinkKeyStays)
 	}
@@ -196,7 +196,7 @@ func TestDocsSayWhereTheKeyAndTheLogLiveBehindADBLink(t *testing.T) {
 	// does with the two paths, in both documents that say it.
 	newKey, copyBack := pointingAtTheFileLosesTheKey(t)
 	changelog := unwrapped(mustReadRepoFile(t, changelogPath))
-	for _, doc := range []struct{ name, body string }{{"README.md", readme}, {changelogPath, changelog}} {
+	for _, doc := range []struct{ name, body string }{{"docs/install.md", readme}, {changelogPath, changelog}} {
 		for _, c := range []struct {
 			holds  bool
 			clause string

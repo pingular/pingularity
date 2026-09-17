@@ -2,7 +2,7 @@
 
 The optional Prometheus endpoint: every metric Pingularity exports, the
 health endpoints beside it, and how to scrape and alert on them. Summarised
-in the [README](../README.md#metrics).
+in the [README](../README.md#documentation).
 
 > **Grafana users:** there is an official importable dashboard (latency
 > heatmap, speed/bufferbloat history, outage annotations, a multi-instance
@@ -16,7 +16,7 @@ required; the built-in dashboard is fully standalone. `/metrics` is a passive
 answer to a scrape. It is not the whole story of what leaves the box, though:
 measurements *are* pushed on the paths you configure yourself - alerts and the
 periodic digest carry figures to your alert webhook, and the heartbeat pings its
-URL (see the outbound-calls table in the [README](../README.md#dashboard)).
+URL (see the outbound-calls table in the [README](dashboard.md)).
 
 `GET /metrics` exposes (every gauge has a `# HELP` line in the output, so it's
 self-describing):
@@ -288,7 +288,7 @@ local-only filter, and auth so a bare-IP health check from an LB reaches them):
 `pingularity healthz [-addr host:port]` probes `/healthz` from the command
 line and reports by exit code (0 = answered `200`; anything else prints a
 one-line reason). It exists for environments with no curl - it is what the
-container images' baked-in `HEALTHCHECK` runs (see [Docker](../README.md#docker)).
+container images' baked-in `HEALTHCHECK` runs (see [Docker](install.md#docker)).
 
 ## Scraping it
 
@@ -299,7 +299,7 @@ the Access tab, or start with `-access network` / `-e
 PINGULARITY_ACCESS=network`. (A Prometheus on the same host scraping
 `127.0.0.1:9000` needs nothing. A container upgraded from 0.61 or earlier needs
 the same opt-in as any other install - it is not grandfathered into network
-access, see [Docker](../README.md#docker).)
+access, see [Docker](install.md#docker).)
 
 A minimal job (scrape by IP so the DNS-rebinding guard doesn't get in the way -
 see the gotchas below):
