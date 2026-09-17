@@ -596,11 +596,6 @@ func (m *Manager) age() time.Duration {
 	return d
 }
 
-// fetch gathers the fast connection fields under a fresh generation. It backs
-// direct callers (tests); the refresh path calls fetchGen with the generation it
-// already claimed so the miss-state gate lines up with its later publishes.
-func (m *Manager) fetch(ctx context.Context) Info { return m.fetchGen(ctx, m.nextGen()) }
-
 // fetchGen gathers the fast connection fields (public IP/ISP/geo, IPv6, DNS
 // resolver, Cloudflare PoP) concurrently - independent round-trips, so the
 // refresh is bounded by the slowest single lookup, not their sum. The slow exit

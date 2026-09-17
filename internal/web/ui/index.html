@@ -816,9 +816,6 @@
      grey grip (WebKit only; Firefox keeps its native, color-scheme-following grip). */
   textarea::-webkit-resizer{background:linear-gradient(135deg,transparent 55%,var(--line2) 55%);}
   .srow-wide textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent);}
-  .iperf-row{display:flex;gap:8px;align-items:center;}
-  .iperf-row select,.iperf-row input[type=text]{flex:1;width:auto;min-width:0;}
-  .iperf-row .btn{flex:none;}
   .server-select{position:relative;width:100%;}
   .server-select.loading select{opacity:.55;}
   .server-select .sel-spin{position:absolute;right:30px;top:50%;margin-top:-6px;display:none;pointer-events:none;}
@@ -1770,11 +1767,11 @@
      toggle pill - that 1px would otherwise compound down the column. */
   .afield{display:grid;grid-template-columns:minmax(0,1fr) 150px;align-items:center;gap:12px;font-size:13px;}
   .access-col>.srow,.access-col>.afield{min-height:36px;}
-  /* Shared "this control is inactive right now" dim, used for the Access fields
-     (.row-disabled) and the schedule windows. The (i) icons stay hoverable -
+  /* "This control is inactive right now" dim, used for the Access fields and
+     the schedule windows. The (i) icons stay hoverable -
      their tooltips explain the greyed controls, which is when they're needed. */
-  .afield.disabled,.row-disabled{opacity:.45;pointer-events:none;}
-  .afield.disabled .info,.row-disabled .info{pointer-events:auto;}
+  .afield.disabled{opacity:.45;pointer-events:none;}
+  .afield.disabled .info{pointer-events:auto;}
   /* Group opacity would render the open tooltip at 45% too - while a (i) is
      hovered/focused, lift the container dim and re-dim the parts individually
      (the label text via color alpha, which unlike opacity doesn't composite
@@ -2069,7 +2066,7 @@
             <span class="info" tabindex="0" data-tip="Pick a server from the list, or type an Ookla server ID to pin one (IDs show in the runs table).
 • Find only moves the list you are looking at; it never changes where a test runs.
 • Your ISP's own server always gets to compete when Ookla lists one.
-• The list is for browsing: it centres on your last auto test's server (always included), or before any auto run, on a city Auto location would consider.">i</span></span>
+• The list is for browsing: it centres on your last auto test's server (always included), or before any auto run, on a city Auto would consider.">i</span></span>
           <div class="fp-cols">
             <div>
               <div class="fp-list fp-kept" id="fpFav"></div>
@@ -2091,10 +2088,6 @@
             <select id="setServer"><option value="">Auto - fastest near you</option></select>
             <span class="sel-spin btn-spin" aria-hidden="true"></span>
           </div>
-          <!-- Hidden: the caption's text is still built (updateScopeNote also
-               keeps the Find box placeholder current), but the paragraph under
-               the list was judged noise; the buttons' titles carry the gist. -->
-          <span class="muted hidden" id="serverLoc" style="font-size:12px"></span>
         </div>
       </div>
       </div><!-- /ookla pane -->
@@ -4184,10 +4177,6 @@ function openDrawer(){
     fadeAtOpen = parseInt(lsGet('fade'))||100;
     vizAtOpen = JSON.stringify(vizPrefs); syncVizControls(); // baseline chart-customization + refresh its pickers
     paletteAtOpen = JSON.stringify(palettePrefs); syncPaletteControls(); // same for the UI-colour overrides
-    // Re-sync the derived Auto-location toggle (+ search visibility) to the saved
-    // server state: toggling it without searching isn't a settings change, so the
-    // dirty check / discard won't revert it - do it here so a reopen is clean.
-    updateAutoLocUI();
     // A long-lived tab goes stale: another session (or machine - the fleet view is
     // multi-viewer) may have changed settings since this page loaded, and Save posts
     // every field, so without a refetch it would silently revert their change. Pull
@@ -5478,7 +5467,7 @@ async function refreshStatus() {
     // claim (the fallback wording stays true either way) and refetch on the
     // next tab visit. The initial ''->server transition invalidates nothing -
     // a list fetched before it already had this run in the store.
-    if (hadRun){ autoCentreLastRun=false; serversLoaded=false; fpAutoStale(); }
+    if (hadRun){ serversLoaded=false; fpAutoStale(); }
     if (wasLoaded) updateScopeNote();
   }
   if (!!s.bridged_container !== bridgedContainer){ bridgedContainer=!!s.bridged_container; refreshNetinfo(); }
@@ -5756,7 +5745,6 @@ function axFmtLadder(spanSec){
   return [AXF.mon, AXF.day, AXF.dmin];
 }
 // The format a span picks before any fallback - the top of its ladder.
-function fmtAxisTime(ts, spanSec){ return axFmtLadder(spanSec)[0](new Date(ts*1000)); }
 // drawXAxis writes time labels along the bottom edge, using the same fitted
 // domain the series was plotted on. The end labels are pinned to the plot edges
 // rather than centred on their tick, so neither can clip off the canvas.
@@ -8274,7 +8262,7 @@ function fpShowAutoCache(){
   const c=fpAutoCache; if(!c) return false;
   fpListLabel='Candidates'; browseLoc=''; browseLabel='';
   fpAutoCities=fpAutoCitiesOf(c.winner, c.origins);
-  autoDefaultLoc=shortPlace(c.winner&&c.winner.label||''); autoCentreLastRun=false;
+  autoDefaultLoc=shortPlace(c.winner&&c.winner.label||'');
   const w=c.winner||{}; fpCentre=(typeof w.lat==='number' && typeof w.lon==='number' && (w.lat||w.lon)) ? {lat:w.lat, lon:w.lon} : null;
   serversLoaded=true; serversScope=''; serversLatchGen=0;   // remembered, not fetched: no request owns this one
   populateServers(c.servers);
@@ -8292,7 +8280,7 @@ function fpAutoCitiesOf(winner, origins){
   const win=shortPlace(winner&&winner.label||'');
   return cities.length ? cities : (win ? [win] : []);
 }
-let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoDefaultLoc='', autoCentreLastRun=false, lastRunServer='', defaultSettings=null;
+let serversLoaded=false, serversScope='', serverTabSeen=false, pendingServer='', autoDefaultLoc='', lastRunServer='', defaultSettings=null;
 // Which request the reuse latch above is standing on (0 = none: a list shown
 // from memory, which no answer still in flight may take back down). A request
 // that was superseded may only un-latch what it latched itself: the scope
@@ -8310,30 +8298,9 @@ let drawerReopening=false, reopenHadList=false;
 // ("Toronto, Golden Horseshoe, Ontario, Canada"), and the second part is
 // whatever regional label it felt like adding.
 const shortPlace = s => s ? s.split(',')[0].trim() : '';
-// autoOptionText / autoScopeText are pure so the two most-read strings in this
-// panel are unit-tested rather than eyeballed. Only a SEARCHED city may be named
-// as auto's centre: with none, auto re-decides by racing the cities this
-// connection points at, fresh on every test and deliberately never cached, so
-// there is no city to name in advance. autoDefaultLoc is the BROWSING list's
-// centre. When the daemon centred it on the last auto run's server (d.centre
-// 'last_run' -> autoCentreLastRun) it may be NAMED as where auto last landed -
-// in the past tense, remembering for display what selection re-decides - but a
-// fallback centre (a candidate city, before any auto run exists) is never
-// allowed to stand in for auto's answer, which is what it used to do while
-// captioned "near your ISP's exit" even when it came from a Cloudflare PoP.
+// autoOptionText is pure so the most-read string in this panel is unit-tested
+// rather than eyeballed.
 const autoOptionText = () => { return 'Auto - fastest near you'; };
-const autoScopeText = (what, listCentre, lastServer, centredOnLastRun) => {
-  let t = `Auto races the cities your connection points at and ${what} - the location is chosen fresh when the next test runs.`;
-  if(centredOnLastRun && listCentre)
-    t += ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b> where your last auto test ran - not where the next one will.`;
-  else t += listCentre
-    ? ` The list here is only for browsing, centred on <b>${esc(listCentre)}</b>; auto may test from a different city.`
-    : ' The list here is only for browsing, centred on your connection’s own location; auto may test from a different city.';
-  // Past tense on purpose: it reports what the last run measured, which stays
-  // true however that server was chosen, rather than claiming a present centre.
-  if(lastServer) t += ` Your last test measured <b>${esc(lastServer)}</b>.`;
-  return t;
-};
 const autoText = () => autoOptionText();
 
 // findBoxText is the Find box's placeholder: the prompt, plus the place the
@@ -8349,28 +8316,11 @@ const joinPlaces = a => a.length<=1 ? a.join('') : a.slice(0,-1).join(', ')+' an
 // The cities the last Auto raced, winner first, for the Find box; emptied by
 // any other listing.
 let fpAutoCities=[];
+// updateScopeNote keeps the Find box placeholder current with the browsing
+// list's centre (the caption that used to sit under the list is gone; the
+// buttons' titles carry what it said).
 function updateScopeNote(){
-  const el=$('serverLoc'), sel=$('setServer');
   const box=$('serverCity'); if(box) box.placeholder = findBoxText(browseLabel||autoDefaultLoc, fpListLabel==='Candidates' ? fpAutoCities : null);
-  // A Best-of round keeps the chosen server and adds companions: the starred
-  // servers, then the fastest-pinging from around the pinned server - so say
-  // so, because "Using X." alone reads as though X is the only thing measured.
-  const bestOfN = Math.max(1, intOf($('setSpeedBestOf').value)||1), bestOf = bestOfN>1;
-  if(sel.value){
-    const o=sel.selectedOptions[0];
-    let t='Using '+esc(o?o.textContent:'server '+sel.value)+'.';
-    if(bestOf) t += ' Best of '+bestOfN+' also measures your starred servers and the fastest-pinging ones near it, and keeps the best result.';
-    el.innerHTML=t; return;
-  }
-  // A Best-of round measures its candidates and keeps the best-SCORING one - "best",
-  // not "fastest": a near-tie on speed goes to the lower-ping server. A single
-  // run takes the fastest-pinging candidate - but keeps the server the last
-  // test measured while it stays within noise of the fastest, so the history
-  // compares like with like rather than flipping on a millisecond of jitter.
-  // A Best-of round is drawn from every city it races, not the winning one.
-  const what = bestOf ? 'measures your starred servers and the fastest-pinging of the rest across every city it races, '+bestOfN+' in all, keeping the best result'
-    : 'uses the fastest-pinging server (keeping the last test\u2019s server while it stays within a couple of milliseconds of the fastest) in whichever answers fastest';
-  el.innerHTML = autoScopeText(what, autoDefaultLoc, lastRunServer, autoCentreLastRun);
 }
 // serverOptionText renders one dropdown row. The daemon's by-ID resolve can
 // return an empty country (Ookla's by-ID endpoint omits it on sparse records -
@@ -8520,7 +8470,7 @@ async function fetchServers(opts){
       // listed server on a list already on screen.
       serversLoaded=true; serversScope=browseLoc; serversLatchGen=my; }
     else if(opts.candidates){
-      browseLoc=''; browseLabel=''; autoDefaultLoc=shortPlace(d.winner&&d.winner.label||''); autoCentreLastRun=false; // the race's own field: the winner's city is where a run now would centre
+      browseLoc=''; browseLabel=''; autoDefaultLoc=shortPlace(d.winner&&d.winner.label||''); // the race's own field: the winner's city is where a run now would centre
       // This IS the list for the centre now in effect, so a tab revisit or a
       // settings reload reuses it rather than refetching a browse list over it.
       serversLoaded=true; serversScope=browseLoc; serversLatchGen=my;
@@ -8528,7 +8478,7 @@ async function fetchServers(opts){
       // row (see RaceListing), so the column means one thing down the list.
     }
     else if(opts.lat){ /* a refetch of the place last searched (a reopen): browseLoc/browseLabel stay as they are */ }
-    else { autoDefaultLoc=shortPlace(d.location||''); autoCentreLastRun = d.centre==='last_run'; } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
+    else { autoDefaultLoc=shortPlace(d.location||''); } // centre of the BROWSING list only: the last auto run's server when the daemon has one, else the first candidate city auto would race (see handleSpeedtestServers). Never sent back to the daemon.
     // The centre the daemon measured this list's distances from: a searched
     // or default list names its point; the Auto list, the winning city's.
     // Set BEFORE the rows land, so the held row's distance is from this list.
@@ -8745,17 +8695,6 @@ function clearServerFieldError(){ $('serverCity').classList.remove('field-error'
   if(serverErrShown && $('settingsMsg').textContent===serverErrShown) $('settingsMsg').textContent='';
   serverErrShown=''; }
 $('serverCity').addEventListener('input', clearServerFieldError);
-// Auto location: on (default) auto-picks the nearest responsive server near your
-// connection (ranked on latency, not throughput)
-// and hides the city search; off reveals the search so you can look up a city and
-// choose a server. Persisted via the underlying server/scope fields (both empty =
-// auto), so no separate setting is needed.
-function updateAutoLocUI(){
-  // The box is the results pane header now, and Find is how you discover servers
-  // to star - worth doing whether or not each run picks its own location. It used
-  // to exist only to set an auto-location city, which is why it used to hide.
-  $('serverRow').querySelector('.server-search').style.display = '';
-}
 
 // ---- Ookla server picker ----------------------------------------------------
 // Two panes over one column layout: the servers you kept on top, whatever the
@@ -9437,7 +9376,6 @@ function applySettings(s){
   // from that. The saved pane draws whether or not the browse fetch ever runs; it
   // is deferred until the tab is first opened.
   fpAdoptSaved(s.speed_servers);
-  updateAutoLocUI();
 }
 // updateEngineUI shows the controls that belong to the selected engine: the
 // Ookla server picker + auto-location + data estimate for Ookla, the iperf3
@@ -10805,7 +10743,6 @@ $('resetSettings').addEventListener('click', () => {
   // pings at Ookla for the very servers the same click was discarding.
   serversLoaded=false; loadServers();   // back to the default list: a reset starts over
   $('serverCity').value=''; clearServerFieldError(); // else leftover text re-searches on Save and overrides the reset to Auto
-  updateAutoLocUI();
   // Engine + iperf3 server list ride outside FIELDS, so reset them by hand (direction/retries
   // are per-engine FIELDS entries now, already handled by setFields above).
   iperfServers = (Array.isArray(d.iperf_servers) ? d.iperf_servers.map(mapIperfServer) : []).map(sv=>{ sv._id=nextIperfId(); return sv; });
