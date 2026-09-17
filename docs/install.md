@@ -39,7 +39,7 @@ filesystem, and `CAP_NET_RAW` is its only capability, so a `-listen` port below
 on a high port, or put a reverse proxy in front.
 
 Prefer no package manager? Grab the `.tar.gz` for your arch from the
-[Releases page](https://install.pingularity.dev), extract it,
+[install page](https://install.pingularity.dev), extract it,
 and use the binary's own installer:
 
 ```bash
