@@ -212,12 +212,12 @@ func TestHandleSettingsPartialPost(t *testing.T) {
 func TestSettingsSpeedServersRoundTrip(t *testing.T) {
 	s := newTestServer(t)
 	h := s.Handler()
-	body := `{"speed_servers":[{"id":"1993","sponsor":"EBOX","name":"Montreal, QC","country":"Canada","lat":45.5,"lon":-73.5}],
+	body := `{"speed_servers":[{"id":"1993","sponsor":"CalNect","name":"Montreal, QC","country":"Canada","lat":45.5,"lon":-73.5}],
 		"speed_server_id":"1993"}`
 	if w := do(t, h, "POST", "/api/settings", body); w.Code != http.StatusOK {
 		t.Fatalf("POST %d: %s", w.Code, w.Body)
 	}
-	want := []settings.SavedServer{{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Country: "Canada", Lat: 45.5, Lon: -73.5}}
+	want := []settings.SavedServer{{ID: "1993", Sponsor: "CalNect", Name: "Montreal, QC", Country: "Canada", Lat: 45.5, Lon: -73.5}}
 	if got := s.settings.SpeedServers(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("stored %+v, want %+v", got, want)
 	}
@@ -260,7 +260,7 @@ func TestSettingsSpeedServersRoundTrip(t *testing.T) {
 // are the catalogue's own, so they - and only they - go on the wire.
 func TestBrowseServersCarryTheCatalogueCoordinate(t *testing.T) {
 	b, err := json.Marshal(browseServers([]speedtest.ServerInfo{
-		{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
+		{ID: "1993", Sponsor: "CalNect", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
 		{ID: "42", Sponsor: "ByID", Name: "Nowhere"}, // as GetOoklaServer leaves it
 	}))
 	if err != nil {
@@ -289,7 +289,7 @@ func TestBrowseServersCarryTheCatalogueCoordinate(t *testing.T) {
 func TestBrowseEndpointSendsTheCoordinate(t *testing.T) {
 	old := listOoklaServers
 	listOoklaServers = func(_ context.Context, lat, lon float64) ([]speedtest.ServerInfo, error) {
-		return []speedtest.ServerInfo{{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5}}, nil
+		return []speedtest.ServerInfo{{ID: "1993", Sponsor: "CalNect", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5}}, nil
 	}
 	t.Cleanup(func() { listOoklaServers = old })
 	s := &Server{netinfo: stubNetInfo{}}
@@ -312,7 +312,7 @@ func TestBrowseEndpointSendsTheCoordinate(t *testing.T) {
 	if body.Servers[0]["lat"] != 45.5 || body.Servers[0]["lon"] != -73.5 {
 		t.Errorf("the browse listing did not carry the coordinate: %v", body.Servers[0])
 	}
-	if body.Servers[0]["sponsor"] != "EBOX" {
+	if body.Servers[0]["sponsor"] != "CalNect" {
 		t.Errorf("the wrapper dropped a ServerInfo field: %v", body.Servers[0])
 	}
 }
@@ -428,7 +428,7 @@ func TestBrowseByIDStatusDistinguishesNotFoundFromUnreachable(t *testing.T) {
 	// And the shape the picker relies on when it does answer: exactly one row,
 	// with fallback_ok absent (not false) when the probe was inconclusive.
 	getOoklaServer = func(_ context.Context, id string) (speedtest.ServerInfo, error) {
-		return speedtest.ServerInfo{ID: id, Sponsor: "EBOX", Name: "Montreal, QC"}, nil
+		return speedtest.ServerInfo{ID: id, Sponsor: "CalNect", Name: "Montreal, QC"}, nil
 	}
 	rec := ask(t)
 	if rec.Code != http.StatusOK {
@@ -487,7 +487,7 @@ func TestBrowseByIDSendsNoCoordinate(t *testing.T) {
 	old := getOoklaServer
 	getOoklaServer = func(_ context.Context, id string) (speedtest.ServerInfo, error) {
 		// As the endpoint answers for an ISP-owned server: our coordinates, its name.
-		return speedtest.ServerInfo{ID: id, Sponsor: "EBOX", Name: "Montreal, QC", Lat: 43.65, Lon: -79.38}, nil
+		return speedtest.ServerInfo{ID: id, Sponsor: "CalNect", Name: "Montreal, QC", Lat: 43.65, Lon: -79.38}, nil
 	}
 	t.Cleanup(func() { getOoklaServer = old })
 	s := &Server{netinfo: stubNetInfo{}}

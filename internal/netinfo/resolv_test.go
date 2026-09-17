@@ -29,7 +29,7 @@ func TestASNDisplayName(t *testing.T) {
 		{"GOOGLE - Google LLC", "Google LLC"},
 		{"nextdns - NextDNS, Inc.", "NextDNS, Inc."},
 		{"AS-VULTR - The Constant Company, LLC", "The Constant Company, LLC"},
-		{"EBOX - EBOX", "EBOX"},
+		{"CalNect - CalNect", "CalNect"},
 		{"Deutsche Telekom AG", "Deutsche Telekom AG"},               // no handle prefix -> unchanged
 		{"Some Company - Other Thing", "Some Company - Other Thing"}, // handle has a space -> kept whole
 		{"", ""},

@@ -945,7 +945,7 @@ func pickCymruASN(txts []string) (asn, country string) {
 // parseCymruASN extracts the origin ASN, prefix length, and registration country
 // from one Cymru TXT record ("13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11" ->
 // "13335", 24, "AU"). prefixLen is -1 when the record carries no parseable prefix;
-// for a true multi-origin record ("1403 577 | ...") the first ASN is returned.
+// for a true multi-origin record ("64500 64501 | ...") the first ASN is returned.
 func parseCymruASN(txt string) (asn string, prefixLen int, country string) {
 	parts := strings.Split(txt, "|")
 	f := strings.Fields(parts[0])

@@ -418,14 +418,14 @@ func TestPoolCutBreaksATieByEchoAndSeatsTheISP(t *testing.T) {
 		tied("slow4", "Delta", 37), tied("slow5", "Echo", 36), tied("slow6", "Foxtrot", 35),
 		tied("bell2", "Bell Canada", 16), tied("bell1", "Bell Canada", 15), // one provider, two boxes: one seat, for diversity
 		tied("fast", "Golf", 9),
-		tied("ebox3", "EBOX", 24), tied("ebox2", "EBOX", 23), // the ISP's boxes: cityPoolISPMax lanes, its fastest echoes first...
-		tied("1993", "EBOX", 21),
+		tied("calnect3", "CalNect", 24), tied("calnect2", "CalNect", 23), // the ISP's boxes: cityPoolISPMax lanes, its fastest echoes first...
+		tied("1993", "CalNect", 21),
 	}
 	pool[len(pool)-1].Latency = -1 // ...though 1993's echo failed (the library's PingTimeout), so it yields to its siblings here
 	fetches := stubOriginPools(t, map[string]ookla.Servers{"exit": pool})
-	pings := stubRacePing(t, map[string]int{"fast": 9, "bell1": 15, "bell2": 16, "ebox2": 12, "ebox3": 13, "1993": 11, "slow6": 35, "slow5": 36})
+	pings := stubRacePing(t, map[string]int{"fast": 9, "bell1": 15, "bell2": 16, "calnect2": 12, "calnect3": 13, "1993": 11, "slow6": 35, "slow5": 36})
 	o := NewOokla()
-	o.ISPFn = func() string { return "AS1403 EBOX - EBOX" }
+	o.ISPFn = func() string { return "AS64500 CalNect - CalNect" }
 	o.OriginsFn = func() []Origin {
 		return []Origin{{Kind: "exit", Label: "Montréal, CA", Lat: 45.51, Lon: -73.59, Anchored: true}}
 	}
@@ -433,7 +433,7 @@ func TestPoolCutBreaksATieByEchoAndSeatsTheISP(t *testing.T) {
 	if !ok || fetches.fetches() != 1 {
 		t.Fatalf("race: ok=%v fetches=%d", ok, fetches.fetches())
 	}
-	for _, id := range []string{"ebox2", "ebox3", "fast", "bell1", "slow6", "slow5"} {
+	for _, id := range []string{"calnect2", "calnect3", "fast", "bell1", "slow6", "slow5"} {
 		if pings.count(id) != 1 {
 			t.Errorf("%s pinged %d times, want 1: %d ISP lanes, then the fastest echoes with one box per sponsor, then the rest by echo", id, pings.count(id), cityPoolISPMax)
 		}

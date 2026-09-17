@@ -3113,15 +3113,15 @@ test('the last measured server is reported, and only when there is one', () => {
 
 // A dropdown row survives the fields the daemon cannot promise: the by-ID
 // resolve returns an empty country on sparse Ookla records (measured - it
-// shipped as "EBOX - Montréal, QC," with a dangling comma), and a 0 distance
+// shipped as "CalNect - Montréal, QC," with a dangling comma), and a 0 distance
 // means unknown, not adjacent, so no "(0 km)".
 test('a server row renders without a dangling comma or a bogus 0 km', () => {
-  assert.equal(F.serverOptionText({sponsor:'EBOX', name:'Montréal, QC', country:'', distance_km:0}),
-    'EBOX - Montréal, QC');
+  assert.equal(F.serverOptionText({sponsor:'CalNect', name:'Montréal, QC', country:'', distance_km:0}),
+    'CalNect - Montréal, QC');
   assert.equal(F.serverOptionText({sponsor:'Bell Canada', name:'Scarborough, ON', country:'Canada', distance_km:4.2}),
     'Bell Canada - Scarborough, ON, Canada (4 km)');
-  assert.equal(F.serverOptionText({sponsor:'EBOX', name:'Montréal, QC', country:'Canada', distance_km:297}),
-    'EBOX - Montréal, QC, Canada (297 km)');
+  assert.equal(F.serverOptionText({sponsor:'CalNect', name:'Montréal, QC', country:'Canada', distance_km:297}),
+    'CalNect - Montréal, QC, Canada (297 km)');
 });
 
 // THE SAVED IMAGE CARRIES THE AVERAGES THE SCREEN SHOWS. A PNG leaves the app
@@ -5082,16 +5082,16 @@ test('a kept server the current search does not cover is still shown', () => {
 
 test('a row names the server well enough to act on', () => {
   const p = drivePicker();
-  p.fpAdopt([{ id: 1993, sponsor: 'EBOX', name: 'Montréal, QC', distance_km: 356.4 }]);
+  p.fpAdopt([{ id: 1993, sponsor: 'CalNect', name: 'Montréal, QC', distance_km: 356.4 }]);
   assert.deepEqual(fpIds(p.els.fpAll), ['1993'],
     'ids arrive as whatever JSON held them and are compared against a string everywhere else');
   const btn = fpBtn(fpRowOf(p.els.fpAll, '1993'));
   assert.match(btn.innerHTML, /#1993/, 'the ID is what gets typed into the search box and shows in the runs table');
   assert.match(btn.innerHTML, /356 km/, 'distance is most of why one server is picked over another');
-  assert.match(btn.innerHTML, /EBOX/);
+  assert.match(btn.innerHTML, /CalNect/);
   assert.match(btn.innerHTML, /Montréal, QC/);
   p.fpToggleStar('1993');
-  assert.equal(p.saved()[0].sponsor, 'EBOX',
+  assert.equal(p.saved()[0].sponsor, 'CalNect',
     'a numeric id must still find its own row, or the server is kept with no name at all');
 });
 
@@ -5156,14 +5156,14 @@ test('the Auto row is a choice, not a server', () => {
 
 test('starring captures the coordinate the browse listing reported', () => {
   const p = drivePicker();
-  p.fpAdopt([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', distance_km: 356, lat: 45.5, lon: -73.5 }]);
+  p.fpAdopt([{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', country: 'Canada', distance_km: 356, lat: 45.5, lon: -73.5 }]);
   p.fpToggleStar('1993');
-  assert.deepEqual(p.saved(), [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }],
+  assert.deepEqual(p.saved(), [{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }],
     'the catalogue position and country are stored with the server: the row draws from this record alone, and a pinned run can place it when the catalogue cannot');
   // The by-ID reply carries no coordinate on purpose (handleSpeedtestServers
   // omits it): that endpoint reports OUR position for a server on our own ISP.
   const q = drivePicker();
-  q.fpAdopt([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC' }]);
+  q.fpAdopt([{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC' }]);
   q.fpToggleStar('1993');
   assert.equal(q.saved()[0].lat, 0, 'no coordinate is kept as none, never as a borrowed one');
   assert.equal(q.saved()[0].lon, 0);
@@ -5221,7 +5221,7 @@ test('rows show the ping the daemon listed them with', () => {
 
 test('a kept server shows the median of past runs until the listing or a refresh measures it', () => {
   const p = drivePicker();
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   const kept = p.saved()[0];
   kept.ping = 8.4; kept.pingSrc = 'history';   // what fpLoadStoredPings writes
   p.fpDraw();
@@ -5239,7 +5239,7 @@ test('a kept server shows the median of past runs until the listing or a refresh
 
 test('the saved pane refresh measures the kept servers and shows itself busy', () => {
   const p = drivePicker();
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   let hdr = p.fpHeader(true).innerHTML;
   assert.match(hdr, /<button class="fp-refresh" id="fpRefreshPings" type="button" title="Measure/, 'the refresh is live, not disabled');
   assert.doesNotMatch(hdr, /not wired up/);
@@ -5261,7 +5261,7 @@ test('the saved pane refresh measures the kept servers and shows itself busy', (
 
 test('a refresh result is shown even when the listing also carries the server', () => {
   const p = drivePicker();
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   p.fpAdopt([SRV('1993', { ping_ms: 31 })]);
   // What fpRefreshPings writes (the harness stubs the fetch): onto the kept row AND the listing's copy.
   const kept = p.saved()[0]; kept.ping = 6.2; kept.pingSrc = 'live';
@@ -5293,9 +5293,9 @@ test('a list fetch in flight says so where the list is', () => {
 // measure it again.
 test('a kept server keeps its ping across a Save', () => {
   const p = drivePicker();
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   const kept = p.saved()[0]; kept.ping = 13.2; kept.pingSrc = 'live';   // what fpRefreshPings writes
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);  // the settings reload a Save triggers
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);  // the settings reload a Save triggers
   assert.match(fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML, /class="fp-ping">13 ms/,
     'the measurement was seconds old and the pane blanked it');
   assert.equal(p.saved()[0].pingSrc, 'live', 'and it is still a live measurement, not a history median');
@@ -5369,7 +5369,7 @@ test('the saved pane refresh is inert when nothing is kept', () => {
   assert.match(hdr, /class="fp-refresh" id="fpRefreshPings" type="button" disabled/,
     'a button that cannot do anything must not look like one that can');
   assert.match(hdr, /title="Star a server[^"]*"/, 'and it says what would make it work');
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   assert.doesNotMatch(p.fpHeader(true).innerHTML, /disabled/, 'with something kept it is live again');
 });
 
@@ -5431,7 +5431,7 @@ test('a server at the city\u2019s own point is near, not unknown', () => {
   assert.equal(km('3'), '', 'a literal 0 is the catalogue saying it does not know');
   // A kept server sitting on the list's own centre point reads near, not blank.
   p.setCentre({ lat: 45.5017, lon: -73.5673 });
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal', lat: 45.5017, lon: -73.5673 }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal', lat: 45.5017, lon: -73.5673 }]);
   assert.match(fpBtn(fpRowOf(p.els.fpFav, '1993')).innerHTML, /<span class="fp-km">&lt;1 km<\/span>/, 'a saved server at the centre itself is "<1 km", never "unknown"');
   assert.equal(km('4'), '');
 });
@@ -5464,7 +5464,7 @@ test('a chosen server keeps its name, ping and distance when the list moves away
   p.fpChoose('47343');
   // Auto lands in Montréal: the chosen server is in neither pane now.
   p.setCentre({ lat: 45.5017, lon: -73.5673 });
-  p.fpAdopt([SRV('1993', { sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 1 })]);
+  p.fpAdopt([SRV('1993', { sponsor: 'CalNect', name: 'Montréal, QC', ping_ms: 8, distance_km: 1 })]);
   const held = fpRowOf(p.els.fpAll, '47343');
   assert.ok(held, 'the chosen server still has a row');
   const html = fpBtn(held).innerHTML;
@@ -5537,7 +5537,7 @@ test('server list: the last listing is remembered - a Find by its place, an Auto
   assert.deepEqual(api.state().remembered, ['{"loc":"45.42,-75.69","label":"Ottawa"}'], 'a successful Find is remembered, place and label');
   const race = { winner: { kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 },
     origins: [{ kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 }, { kind: 'isp', label: 'Toronto, CA', lat: 43.65, lon: -79.38 }],
-    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
+    servers: [{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
   api.fetchServers({ candidates: true });
   await tick();
   fetches[1].ok(race);
@@ -5581,7 +5581,7 @@ test('the saved servers are re-measured on reopen when their pings are stale', (
   const p = drivePicker();
   p.fpRefreshPingsIfStale();
   assert.equal(p.refreshes(), 0, 'nothing kept, nothing to measure');
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal' }]);
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal' }]);
   p.fpRefreshPingsIfStale();
   assert.equal(p.refreshes(), 1, 'never measured this page: measure');
   p.pinged(Date.now() - 60 * 1000, false);
@@ -5669,7 +5669,7 @@ function driveSettingsBody(speedServers) {
 }
 
 test('starring a server reaches what Save posts, and the dirty check with it', () => {
-  const kept = [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }];
+  const kept = [{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', country: 'Canada', lat: 45.5, lon: -73.5 }];
   const body = driveSettingsBody(kept);
   assert.deepEqual(body.speed_servers, kept,
     'without this the star changes nothing: Save posts a body that never mentions it');
@@ -6147,7 +6147,7 @@ test('a list put back from memory is not un-latched by a request already superse
   api.fetchServers({ city: 'Toronto' });   // ... and a newer request supersedes A
   await tick();
   const race = { winner: { kind: 'exit', label: 'Montréal, CA', lat: 45.5, lon: -73.57 }, origins: [],
-    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
+    servers: [{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', ping_ms: 8, distance_km: 0.01 }] };
   api.state().setAutoCache({ at: Date.now(), servers: race.servers, winner: race.winner, origins: [] });
   api.state().setStartOnAuto(true);
   const before = fetches.length, shown = log.populated.length;
@@ -6280,7 +6280,7 @@ test('server list: Auto shows the candidates a run would race, and says so', asy
   fetches[0].ok({ winner: { kind: 'saved', label: 'Montréal, QC, Canada', lat: 45.5, lon: -73.57 },
     origins: [{ kind: 'exit', label: 'Montreal, CA', lat: 45.5017, lon: -73.5673 }, { kind: 'isp', label: 'Toronto, CA', lat: 43.65, lon: -79.38 },
       { kind: 'saved', label: 'Montréal, QC, Canada', lat: 45.5, lon: -73.57 }, { kind: 'geo', label: 'your connection' }],
-    servers: [{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC', ping_ms: 10.4, origin: 'saved' }] });
+    servers: [{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC', ping_ms: 10.4, origin: 'saved' }] });
   await tick();
   let st = api.state();
   assert.equal(st.listLabel, 'Candidates', 'the results pane is headed as the race field');
@@ -8503,7 +8503,7 @@ test('every save that does not save turns the button red', () => {
 test('the chosen server is always shown, even when neither list holds it', () => {
   const p = drivePicker();
   p.els.setServer.value = '1993';
-  p.els.setServer.selectedOptions = [{ textContent: 'EBOX - Montréal, QC, Canada (356 km)' }];
+  p.els.setServer.selectedOptions = [{ textContent: 'CalNect - Montréal, QC, Canada (356 km)' }];
   p.fpAdoptSaved([]);
   p.fpAdopt([{ id: '55', sponsor: 'Rogers', name: 'North York, ON' },
              { id: '66', sponsor: 'Bell', name: 'Toronto, ON' }]);
@@ -8511,7 +8511,7 @@ test('the chosen server is always shown, even when neither list holds it', () =>
   assert.ok(ids.includes('1993'),
     `the chosen server has no row: results were ${JSON.stringify(ids)}`);
   const row = fpRowOf(p.els.fpAll, '1993');
-  assert.match(fpBtn(row).innerHTML, /EBOX/, 'its label should come from the resolved option');
+  assert.match(fpBtn(row).innerHTML, /CalNect/, 'its label should come from the resolved option');
   assert.ok(fpBtn(row).className.includes('on'), 'and it should read as the chosen one');
 });
 
@@ -8527,8 +8527,8 @@ test('a chosen server already listed is not shown twice', () => {
 test('unstarring the last copy of a chosen server leaves a row to re-star', () => {
   const p = drivePicker();
   p.els.setServer.value = '1993';
-  p.els.setServer.selectedOptions = [{ textContent: 'EBOX - Montréal, QC (356 km)' }];
-  p.fpAdoptSaved([{ id: '1993', sponsor: 'EBOX', name: 'Montréal, QC' }]);
+  p.els.setServer.selectedOptions = [{ textContent: 'CalNect - Montréal, QC (356 km)' }];
+  p.fpAdoptSaved([{ id: '1993', sponsor: 'CalNect', name: 'Montréal, QC' }]);
   p.fpAdopt([{ id: '7', sponsor: 'Bell', name: 'Toronto, ON' }]);
   p.fpToggleStar('1993');
   assert.deepEqual(p.saved(), [], 'it should leave the saved list');
@@ -8592,12 +8592,12 @@ test('starring the held row keeps the server\u2019s name and coordinate', () => 
   // rebuilds it from what it learned earlier. Starring it used to read the
   // browse listing alone, which by definition does not hold it.
   const p = drivePicker({ chosen: '1993' });
-  p.fpAdopt([SRV('1993', { sponsor: 'EBOX', name: 'Montreal, QC', country: 'CA', lat: 45.5, lon: -73.57 })]);
+  p.fpAdopt([SRV('1993', { sponsor: 'CalNect', name: 'Montreal, QC', country: 'CA', lat: 45.5, lon: -73.57 })]);
   p.fpAdopt([SRV('77', { sponsor: 'Rogers', name: 'Toronto, ON', lat: 43.7, lon: -79.4 })]); // 1993 is now held, not listed
   p.fpToggleStar('1993');
   const kept = p.saved().find(s => s.id === '1993');
   assert.ok(kept, 'the star took');
-  assert.equal(kept.sponsor, 'EBOX', 'and kept the name the row was showing a moment earlier');
+  assert.equal(kept.sponsor, 'CalNect', 'and kept the name the row was showing a moment earlier');
   assert.equal(kept.name, 'Montreal, QC');
   assert.equal(kept.lat, 45.5, 'and its coordinate - without one the daemon cannot enter its city in the race, which is what starring is for');
   assert.equal(kept.lon, -73.57);

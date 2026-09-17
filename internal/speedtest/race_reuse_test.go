@@ -132,9 +132,9 @@ func TestPromoteIncumbent(t *testing.T) {
 		{"incumbent already fastest is plainly fastest_ranked", ookla.Servers{ms("A", 9, ""), ms("B", 10, "")}, "A", "", "", []string{"A", "B"}},
 		{"incumbent that never answered is not promoted", ookla.Servers{ms("A", 9, ""), ms("B", 0, "")}, "B", "", "", []string{"A", "B"}},
 		{"incumbent not in the field: nothing to keep", ookla.Servers{ms("A", 9, ""), ms("B", 10, "")}, "Z", "", "", []string{"A", "B"}},
-		{"no incumbent: the ISP's box within the band leads", ookla.Servers{ms("A", 9, "Bell"), ms("B", 10.5, "EBOX")}, "", "EBOX - EBOX", winReasonOnNet, []string{"B", "A"}},
-		{"the ISP's box outside the band does not", ookla.Servers{ms("A", 9, "Bell"), ms("B", 12, "EBOX")}, "", "EBOX - EBOX", "", []string{"A", "B"}},
-		{"incumbent beats the on-net tie-break", ookla.Servers{ms("A", 9, "Bell"), ms("B", 10, "EBOX"), ms("C", 10.5, "Vidéotron")}, "C", "EBOX - EBOX", winReasonIncumbent, []string{"C", "A", "B"}},
+		{"no incumbent: the ISP's box within the band leads", ookla.Servers{ms("A", 9, "Bell"), ms("B", 10.5, "CalNect")}, "", "CalNect - CalNect", winReasonOnNet, []string{"B", "A"}},
+		{"the ISP's box outside the band does not", ookla.Servers{ms("A", 9, "Bell"), ms("B", 12, "CalNect")}, "", "CalNect - CalNect", "", []string{"A", "B"}},
+		{"incumbent beats the on-net tie-break", ookla.Servers{ms("A", 9, "Bell"), ms("B", 10, "CalNect"), ms("C", 10.5, "Vidéotron")}, "C", "CalNect - CalNect", winReasonIncumbent, []string{"C", "A", "B"}},
 		{"nothing answered: ranking stands", ookla.Servers{ms("A", 0, ""), ms("B", 0, "")}, "B", "", "", []string{"A", "B"}},
 		{"one server: nothing to promote", ookla.Servers{ms("A", 9, "")}, "A", "", "", []string{"A"}},
 	}

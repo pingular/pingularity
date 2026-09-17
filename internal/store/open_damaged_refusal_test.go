@@ -296,7 +296,7 @@ func TestShellQuotePathSurvivesAShell(t *testing.T) {
 	for _, goos := range []string{"linux", "darwin"} {
 		for _, p := range []string{
 			"/var/lib/pingularity/pingularity.db",
-			"/Users/mu/Library/Application Support/pingularity/pingularity.db",
+			"/Users/x/Library/Application Support/pingularity/pingularity.db",
 			"/Library/Application Support/pingularity/pingularity.db",
 			"/home/$USER/db/pingularity.db",
 			"/tmp/it's mine/pingularity.db",

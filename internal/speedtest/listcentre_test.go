@@ -9,7 +9,7 @@ import (
 const pinLat, pinLon = 45.50, -73.57 // Montreal: the server the user pinned
 
 func pinAt(lat, lon string) *ookla.Server {
-	return &ookla.Server{ID: "1993", Lat: lat, Lon: lon, Sponsor: "EBOX", Name: "Montreal"}
+	return &ookla.Server{ID: "1993", Lat: lat, Lon: lon, Sponsor: "CalNect", Name: "Montreal"}
 }
 
 // A pinned server plus best-of centres on the PIN, not the exit. Centring on the

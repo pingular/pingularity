@@ -15,7 +15,7 @@ func TestRaceVerdictRoundTripsOnTheSpeedRow(t *testing.T) {
 	ctx := context.Background()
 	ms, n, la, lo := 8.4, int64(14), 45.5017, -73.5673
 	ts := time.Now().Add(-time.Minute).Unix()
-	if err := st.InsertSpeed(ctx, SpeedSample{TS: ts, DownMbps: 100, UpMbps: 20, PingMS: 9, Server: "EBOX, Montréal",
+	if err := st.InsertSpeed(ctx, SpeedSample{TS: ts, DownMbps: 100, UpMbps: 20, PingMS: 9, Server: "CalNect, Montréal",
 		ServerID: "1993", Trigger: "scheduled", Engine: "ookla",
 		RaceOutcome: "decided", RaceOrigins: "exit:Montréal(8.4ms),isp:Toronto(15.1ms),geo(-)",
 		RaceWinnerKind: "exit", RaceWinnerLabel: "Montréal", RaceWinnerMS: &ms, RaceRacers: &n,

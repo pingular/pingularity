@@ -12,7 +12,7 @@ import (
 	"github.com/pingular/pingularity/internal/stats"
 )
 
-// The measured case, from the user's connection. The pin is EBOX's Montreal
+// The measured case. The pin is CalNect's Montreal
 // server 1993; the caller is geolocated near Toronto. api/ios-config.php
 // splices the caller's own ISP server into its reply at index 0 wearing the
 // CALLER'S coordinates, so the by-ID resolve of this pin - and only of a pin
@@ -113,14 +113,14 @@ func pinnedBestOf(t *testing.T) *Ookla {
 func TestRunReasonCentresAPinnedBestOfRunOnTheServersOwnCoordinate(t *testing.T) {
 	o := pinnedBestOf(t)
 	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 		Lat: callerLat, Lon: callerLon, Distance: 0,
 	})
 	// The pin is not the first row: the sponsor's other servers are real rows
 	// with real coordinates, so the recovery has to match on ID.
 	cat := stubCatalogue(t, ookla.Servers{
-		{ID: "44444", Sponsor: "EBOX", Name: "Quebec City", Lat: "46.81", Lon: "-71.21", Distance: 720},
-		{ID: "1993", Sponsor: "EBOX", Name: "Montreal", Lat: realLat, Lon: realLon, Distance: 504.6},
+		{ID: "44444", Sponsor: "CalNect", Name: "Quebec City", Lat: "46.81", Lon: "-71.21", Distance: 720},
+		{ID: "1993", Sponsor: "CalNect", Name: "Montreal", Lat: realLat, Lon: realLon, Distance: 504.6},
 	}, nil)
 	// A saved pair is a snapshot from star time; the live catalogue outranks it
 	// whenever it answers. A decoy here proves the order.
@@ -145,8 +145,8 @@ func TestRunReasonCentresAPinnedBestOfRunOnTheServersOwnCoordinate(t *testing.T)
 	if loc.Lat != 45.5017 || loc.Lon != -73.5673 {
 		t.Fatalf("centred on %v,%v, want the pin's registered 45.5017,-73.5673", loc.Lat, loc.Lon)
 	}
-	if got := cat.all(); len(got) != 1 || got[0] != "EBOX" {
-		t.Errorf("catalogue searched for %q, want exactly one search for the sponsor %q", got, "EBOX")
+	if got := cat.all(); len(got) != 1 || got[0] != "CalNect" {
+		t.Errorf("catalogue searched for %q, want exactly one search for the sponsor %q", got, "CalNect")
 	}
 }
 
@@ -157,7 +157,7 @@ func TestRunReasonCentresAPinnedBestOfRunOnTheServersOwnCoordinate(t *testing.T)
 func TestRunReasonTrustsAByIDCoordinateWithADistance(t *testing.T) {
 	o := pinnedBestOf(t)
 	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 		Lat: realLat, Lon: realLon, Distance: 5.36,
 	})
 	cat := stubCatalogue(t, nil, errors.New("the catalogue must not be consulted"))
@@ -182,11 +182,11 @@ func TestRunReasonTrustsAByIDCoordinateWithADistance(t *testing.T) {
 func TestRunReasonRacesWhenThePinsCoordinateCannotBeRecovered(t *testing.T) {
 	o := pinnedBestOf(t)
 	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 		Lat: callerLat, Lon: callerLon, Distance: 0,
 	})
 	stubCatalogue(t, ookla.Servers{
-		{ID: "44444", Sponsor: "EBOX", Name: "Quebec City", Lat: "46.81", Lon: "-71.21"},
+		{ID: "44444", Sponsor: "CalNect", Name: "Quebec City", Lat: "46.81", Lon: "-71.21"},
 	}, nil)
 
 	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
@@ -208,11 +208,11 @@ func TestRunReasonRacesWhenThePinsCoordinateCannotBeRecovered(t *testing.T) {
 func TestRunReasonIgnoresTheRowsOfAFailedCatalogueFetch(t *testing.T) {
 	o := pinnedBestOf(t)
 	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 		Lat: callerLat, Lon: callerLon, Distance: 0,
 	})
 	stubCatalogue(t, ookla.Servers{
-		{ID: "1993", Sponsor: "EBOX", Name: "Montreal", Lat: "1.0", Lon: "1.0"},
+		{ID: "1993", Sponsor: "CalNect", Name: "Montreal", Lat: "1.0", Lon: "1.0"},
 	}, errors.New("unexpected EOF"))
 
 	if _, err := o.RunReason(context.Background(), "manual"); err != nil {
@@ -305,7 +305,7 @@ func TestSponsorCoordMakesNoRequestWithoutASponsor(t *testing.T) {
 func TestSponsorCoordBoundsItsFetch(t *testing.T) {
 	cat := stubCatalogue(t, nil, nil)
 	start := time.Now()
-	if _, _, err := sponsorCoord(context.Background(), "EBOX", "1993"); err == nil {
+	if _, _, err := sponsorCoord(context.Background(), "CalNect", "1993"); err == nil {
 		t.Fatal("want an error for a pin absent from the catalogue")
 	}
 	dl := cat.deadline(0)
@@ -331,7 +331,7 @@ func TestSponsorCoordBoundsItsFetch(t *testing.T) {
 func TestKeywordConfigCarriesTheSponsorByte(t *testing.T) {
 	for _, sponsor := range []string{
 		"Télécoms Vidéotron ltée ",
-		"EBOX",
+		"CalNect",
 		"Claro Fibra - SPO",
 		"fdcservers.net",
 	} {
@@ -339,7 +339,7 @@ func TestKeywordConfigCarriesTheSponsorByte(t *testing.T) {
 			t.Errorf("keywordConfig(%q).Keyword = %q, want it unchanged", sponsor, got)
 		}
 	}
-	if keywordConfig("EBOX").UserAgent == "" {
+	if keywordConfig("CalNect").UserAgent == "" {
 		t.Error("the catalogue fetch needs a user agent like every other Ookla call")
 	}
 }
@@ -357,7 +357,7 @@ func TestRunReasonFallsBackToTheSavedCoordinateWhenRecoveryFails(t *testing.T) {
 		return 0, 0, false
 	}
 	stubPinByID(t, &ookla.Server{
-		ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+		ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 		Lat: callerLat, Lon: callerLon, Distance: 0,
 	})
 	stubCatalogue(t, nil, nil)
@@ -393,7 +393,7 @@ func TestASavedCoordinateOfZeroIsNoCoordinate(t *testing.T) {
 		o := pinnedBestOf(t)
 		o.SavedCoordFn = fn
 		stubPinByID(t, &ookla.Server{
-			ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+			ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 			Lat: callerLat, Lon: callerLon, Distance: 0,
 		})
 		stubCatalogue(t, nil, nil)
@@ -432,7 +432,7 @@ func TestPinnedBestOfRecordsAPinnedWinReason(t *testing.T) {
 	} {
 		o := pinnedBestOf(t)
 		stubPinByID(t, &ookla.Server{
-			ID: "1993", Sponsor: "EBOX", Name: "Montreal",
+			ID: "1993", Sponsor: "CalNect", Name: "Montreal",
 			Lat: realLat, Lon: realLon, Distance: 504.6, // a trusted position: no recovery needed
 		})
 		stubMeasure(t, func(_ *Ookla, _ context.Context, srv *ookla.Server, _ string, _ int) (Result, error) {

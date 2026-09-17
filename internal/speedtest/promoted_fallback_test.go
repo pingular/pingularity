@@ -313,7 +313,7 @@ func TestTheOnNetPromotionAlsoCarriesAFallback(t *testing.T) {
 			return &ookla.Server{ID: id, URL: "http://127.0.0.1:1/speedtest/upload.php",
 				Lat: "52.1", Lon: "4.1", Sponsor: sponsor, Name: "N" + id, Distance: dist, Context: client}
 		}
-		return ookla.Servers{mk("1", "Cogeco", 1), mk("2", "EBOX", 2), mk("3", "Bell", 3)}, nil
+		return ookla.Servers{mk("1", "Cogeco", 1), mk("2", "CalNect", 2), mk("3", "Bell", 3)}, nil
 	}
 	t.Cleanup(func() { fetchServerList = old })
 	countingPing(t, map[string]time.Duration{"1": 8 * time.Millisecond, "2": 9 * time.Millisecond, "3": 20 * time.Millisecond})
@@ -329,7 +329,7 @@ func TestTheOnNetPromotionAlsoCarriesAFallback(t *testing.T) {
 	o.LossFn = func() bool { return false }
 	// No incumbent; server 2 is the ISP's own box, inside the band behind the
 	// fastest, so it is promoted for on_net rather than incumbency.
-	o.ISPFn = func() string { return "AS1403 EBOX" }
+	o.ISPFn = func() string { return "AS64500 CalNect" }
 	res, err := o.RunReason(context.Background(), "scheduled")
 	if err != nil {
 		t.Fatalf("an on-net head that cannot measure must not sink the run: %v", err)

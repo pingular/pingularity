@@ -54,8 +54,8 @@ type Ookla struct {
 	// uncentred and the Ookla API places our source address.
 	OriginsFn func() []Origin
 
-	// ISPFn, if set, supplies the user's ISP display name (e.g. "AS1403 EBOX -
-	// EBOX"), so auto-select can guarantee the ISP's own server a lane in the
+	// ISPFn, if set, supplies the user's ISP display name (e.g. "AS64500 CalNect -
+	// CalNect"), so auto-select can guarantee the ISP's own server a lane in the
 	// ping race (see autoCandidates). Nil / "" = no guarantee.
 	ISPFn func() string
 
@@ -3354,7 +3354,7 @@ func (o *Ookla) pickServers(ctx context.Context, client *ookla.Speedtest, server
 			"rank", i+1, "distance_km", util.Round1(s.Distance), "ping_ms", util.Round1(f64v(rankPings[s.ID])))
 	}
 	// The report's rank order is the PING order, snapshotted here before any
-	// promotion: a report that read "#1 EBOX 8.3ms, #2 Fibrenoire 7.5ms"
+	// promotion: a report that read "#1 CalNect 8.3ms, #2 Fibrenoire 7.5ms"
 	// looked like a sorting bug, and a reader asking "how often was the
 	// measured server not the fastest?" needs the ranks to mean ping. Which
 	// row was measured, and why (win_reason), says the rest.
@@ -4876,7 +4876,7 @@ var ispGenericWords = map[string]bool{
 }
 
 // sponsorMatchesISP reports whether an Ookla server sponsor plausibly IS the
-// user's ISP (sponsor "EBOX" vs ISP "AS1403 EBOX - EBOX"). Word-level and
+// user's ISP (sponsor "CalNect" vs ISP "AS64500 CalNect - CalNect"). Word-level and
 // case-insensitive: some sponsor word of 3+ characters, not a generic industry
 // word, must appear as a whole word in the ISP name. Best-effort - a false
 // negative just loses the guaranteed lane, a false positive only grants one

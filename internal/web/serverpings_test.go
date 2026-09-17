@@ -107,7 +107,7 @@ func TestServerPingsEndpointServesTheHistorysMedians(t *testing.T) {
 	f := func(v float64) *float64 { return &v }
 	for i, ms := range []float64{30, 10, 12} {
 		if err := s.store.InsertSpeedServers(ctx, []store.SpeedServerRow{
-			{RunTS: base + int64(i)*60, ServerID: "1993", Server: "EBOX", RankOrder: 1, RankPingMS: f(ms)},
+			{RunTS: base + int64(i)*60, ServerID: "1993", Server: "CalNect", RankOrder: 1, RankPingMS: f(ms)},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -174,7 +174,7 @@ func TestCandidatesEndpointCarriesInField(t *testing.T) {
 func TestAnExportCarryingARaceVerdictStampsSix(t *testing.T) {
 	s := newTestServer(t)
 	ms := 8.4
-	smp := store.SpeedSample{TS: time.Now().Add(-time.Minute).Unix(), Server: "EBOX", ServerID: "1993",
+	smp := store.SpeedSample{TS: time.Now().Add(-time.Minute).Unix(), Server: "CalNect", ServerID: "1993",
 		Trigger: "scheduled", Engine: "ookla", DownMbps: 100, UpMbps: 20, PingMS: 9,
 		RaceOutcome: "decided", RaceWinnerKind: "exit", RaceWinnerLabel: "Montréal", RaceWinnerMS: &ms}
 	if err := s.store.InsertSpeed(context.Background(), smp); err != nil {
@@ -211,14 +211,14 @@ func TestRunsListingCarriesTheWinReason(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 	ts := time.Now().Add(-time.Minute).Unix()
-	if err := s.store.InsertSpeed(ctx, store.SpeedSample{TS: ts, DownMbps: 100, UpMbps: 20, PingMS: 9, Server: "EBOX", ServerID: "1993", Engine: "ookla"}); err != nil {
+	if err := s.store.InsertSpeed(ctx, store.SpeedSample{TS: ts, DownMbps: 100, UpMbps: 20, PingMS: 9, Server: "CalNect", ServerID: "1993", Engine: "ookla"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.store.InsertSpeed(ctx, store.SpeedSample{TS: ts - 60, DownMbps: 90, UpMbps: 20, PingMS: 9, Server: "old", Engine: "ookla"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.store.InsertSpeedServers(ctx, []store.SpeedServerRow{
-		{RunTS: ts, ServerID: "1993", Server: "EBOX", RankOrder: 2, Selected: true, Measured: true, Winner: true, WinReason: "incumbent"},
+		{RunTS: ts, ServerID: "1993", Server: "CalNect", RankOrder: 2, Selected: true, Measured: true, Winner: true, WinReason: "incumbent"},
 	}); err != nil {
 		t.Fatal(err)
 	}

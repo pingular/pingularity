@@ -120,13 +120,13 @@ func TestIncumbentScoresFnReadsTheRecord(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	base := time.Now().Add(-time.Hour).Unix()
 	rows := []store.SpeedServerRow{
-		{RunTS: base, ServerID: "1993", Server: "EBOX", RankOrder: 1, Measured: true, Winner: true, Score: 50, DownMbps: 100, UpMbps: 20},
-		{RunTS: base + 60, ServerID: "1993", Server: "EBOX", RankOrder: 1, Measured: true, Winner: true, Score: 60, DownMbps: 100, UpMbps: 20},
-		{RunTS: base + 120, ServerID: "1993", Server: "EBOX", RankOrder: 1, Measured: true, Winner: true, Score: 70, DownMbps: 100, UpMbps: 20},
+		{RunTS: base, ServerID: "1993", Server: "CalNect", RankOrder: 1, Measured: true, Winner: true, Score: 50, DownMbps: 100, UpMbps: 20},
+		{RunTS: base + 60, ServerID: "1993", Server: "CalNect", RankOrder: 1, Measured: true, Winner: true, Score: 60, DownMbps: 100, UpMbps: 20},
+		{RunTS: base + 120, ServerID: "1993", Server: "CalNect", RankOrder: 1, Measured: true, Winner: true, Score: 70, DownMbps: 100, UpMbps: 20},
 		// A download-only run: judged under another direction, not comparable to a "both" record.
-		{RunTS: base + 180, ServerID: "1993", Server: "EBOX", RankOrder: 1, Measured: true, Winner: true, Score: 90, DownMbps: 100},
+		{RunTS: base + 180, ServerID: "1993", Server: "CalNect", RankOrder: 1, Measured: true, Winner: true, Score: 90, DownMbps: 100},
 		// A partial run whose upload failed scores 0: not a record, and must not eat a window slot.
-		{RunTS: base + 240, ServerID: "1993", Server: "EBOX", RankOrder: 1, Measured: true, Winner: true, Score: 0, DownMbps: 100, UpMbps: 20},
+		{RunTS: base + 240, ServerID: "1993", Server: "CalNect", RankOrder: 1, Measured: true, Winner: true, Score: 0, DownMbps: 100, UpMbps: 20},
 		{RunTS: base + 240, ServerID: "2", Server: "X", RankOrder: 2},
 	}
 	for _, r := range rows {

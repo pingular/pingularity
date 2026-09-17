@@ -21,17 +21,17 @@ func TestCityPoolSeatsTheISPFromOutsideTheWindow(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		list = append(list, srv(string(rune('a'+i-1)), 1)) // eight sponsors at the city centre
 	}
-	onNet := srv("ebox", 60) // the subscriber's own PoP, past autoMarginKM
-	onNet.Sponsor = "EBOX"
+	onNet := srv("calnect", 60) // the subscriber's own PoP, past autoMarginKM
+	onNet.Sponsor = "CalNect"
 	list = append(list, onNet)
 	stubOriginPools(t, map[string]ookla.Servers{"exit": list})
 
 	origins := []Origin{{Kind: "exit", Label: "Montréal", Lat: 45.5, Lon: -73.57, Anchored: true}}
-	pools, _, fetched := fetchOriginPools(context.Background(), origins, "AS1403 EBOX - EBOX", cityPoolSize)
+	pools, _, fetched := fetchOriginPools(context.Background(), origins, "AS64500 CalNect - CalNect", cityPoolSize)
 	<-fetched
 	seated := false
 	for _, s := range pools[0] {
-		if s.ID == "ebox" {
+		if s.ID == "calnect" {
 			seated = true
 		}
 	}

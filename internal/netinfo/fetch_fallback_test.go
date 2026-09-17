@@ -191,12 +191,12 @@ func TestFetchFlipsToIPv6OnlyAfterPersistentV4Loss(t *testing.T) {
 	// Speed history holds the dual-stack identity: its IPv6 matches, so the
 	// flipped fetch fills its ISP from it (Cymru fails under the cancelled ctx).
 	m.LastKnownFn = func() *Info {
-		return &Info{PublicIP: "203.0.113.5", PublicIPv6: "2001:db8::1234", ISP: "AS1403 EBOX"}
+		return &Info{PublicIP: "203.0.113.5", PublicIPv6: "2001:db8::1234", ISP: "AS64500 CalNect"}
 	}
 	// prev: a dual-stack identity with speed history - the state that used to
 	// veto the IPv6-only branch forever.
 	m.mu.Lock()
-	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS1403 EBOX", City: "Oldtown",
+	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS64500 CalNect", City: "Oldtown",
 		PublicIPv6: "2001:db8::1234", UpdatedAt: time.Now().Unix()}
 	m.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,10 +255,10 @@ func TestFetchStaleMissRunRestartsInsteadOfFlipping(t *testing.T) {
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.http = canned(200, `{"success":true,"city":"Sixtown","country_code":"NL"}`)
 	m.LastKnownFn = func() *Info {
-		return &Info{PublicIP: "203.0.113.5", PublicIPv6: "2001:db8::1234", ISP: "AS1403 EBOX"}
+		return &Info{PublicIP: "203.0.113.5", PublicIPv6: "2001:db8::1234", ISP: "AS64500 CalNect"}
 	}
 	m.mu.Lock()
-	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS1403 EBOX", City: "Oldtown",
+	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS64500 CalNect", City: "Oldtown",
 		PublicIPv6: "2001:db8::1234", UpdatedAt: time.Now().Unix()}
 	m.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,7 +312,7 @@ func TestFetchV4BlipDoesNotFlip(t *testing.T) {
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.http = canned(500, "")
 	m.mu.Lock()
-	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS1403 EBOX", UpdatedAt: time.Now().Unix()}
+	m.info = Info{PublicIP: "203.0.113.5", ISP: "AS64500 CalNect", UpdatedAt: time.Now().Unix()}
 	m.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -348,7 +348,7 @@ func TestFetchISPFallbackSameIP(t *testing.T) {
 	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.http = canned(500, "")
 	m.LastKnownFn = func() *Info {
-		return &Info{PublicIP: "203.0.113.5", ISP: "AS1403 EBOX"}
+		return &Info{PublicIP: "203.0.113.5", ISP: "AS64500 CalNect"}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -357,8 +357,8 @@ func TestFetchISPFallbackSameIP(t *testing.T) {
 	if info.PublicIP != "203.0.113.5" {
 		t.Fatalf("ip = %q, want 203.0.113.5", info.PublicIP)
 	}
-	if info.ISP != "AS1403 EBOX" {
-		t.Fatalf("isp = %q, want the persisted fallback AS1403 EBOX", info.ISP)
+	if info.ISP != "AS64500 CalNect" {
+		t.Fatalf("isp = %q, want the persisted fallback AS64500 CalNect", info.ISP)
 	}
 	if info.Error != "" {
 		t.Errorf("error = %q, want empty (fallback filled the ISP)", info.Error)

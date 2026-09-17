@@ -21,7 +21,7 @@ func TestSavedCoordFnReadsTheStarredCoordinate(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	set, err := settings.New(ctx, st, settings.Values{SpeedServers: []settings.SavedServer{
-		{ID: "1993", Sponsor: "EBOX", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
+		{ID: "1993", Sponsor: "CalNect", Name: "Montreal, QC", Lat: 45.5, Lon: -73.5},
 		{ID: "7", Sponsor: "ByID", Name: "Nowhere"}, // starred from a by-ID reply: no coordinate
 	}})
 	if err != nil {
