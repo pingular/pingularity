@@ -1,7 +1,7 @@
 # HTTP API
 
 Every endpoint the dashboard talks to, and the rules they share. Summarised
-in the [README](../README.md#http-api).
+in the [README](../README.md#documentation).
 
 Responses are gzip-encoded when the client sends `Accept-Encoding: gzip` and the
 body is at least 1 KiB (smaller ones are sent as-is - gzip's framing can make a

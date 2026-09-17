@@ -1,7 +1,7 @@
 # Commands & flags
 
 Every subcommand and flag `pingularity` accepts. Summarised in the
-[README](../README.md#commands--flags).
+[README](../README.md#documentation).
 
 ```
 pingularity [run] [flags]    monitor + serve the UI (default)
@@ -27,7 +27,7 @@ systemd would otherwise expand or choke on.
 a database is refused, and a database that will not open is left where it
 stands - it never creates a database and never sets one aside (that recovery is
 the daemon's, and only when asked for it: see `-on-corrupt` below and
-[the README](../README.md#run-in-the-background-systemd--launchd--windows-service)).
+[the README](install.md#run-in-the-background-systemd--launchd--windows-service)).
 It also releases the hold a store rebuilt with `-on-corrupt rebuild` keeps on
 network access until a password is set and the daemon restarted or reloaded -
 the way back for a container that cannot reach its own dashboard to set one.
@@ -46,7 +46,7 @@ and the power toggle aren't part of that form and are unaffected.
 | --- | --- | --- |
 | `-listen` | `:9000` | UI + metrics address (`127.0.0.1:9000` = local-only at the socket). Port `0` is refused: it asks the OS for a random port, which nothing can then find - not a bookmark, not a scrape target, not the container health check, which runs as its own process and cannot discover it |
 | `-access` | `local` | who may open the dashboard: `local` (loopback only) or `network` (reachable from the LAN - set a login). A container that publishes a port needs `network` (or `PINGULARITY_ACCESS=network`), or the published port returns 403. Also settable in the UI - but unlike every other flag here, an explicitly passed `-access` / `PINGULARITY_ACCESS` re-asserts itself at **every** start, overwriting a disagreeing saved choice in either direction (and logging that it did), so while it stays in your unit or compose file a change made in the UI is undone at the next restart. Drop it to let the UI choice stick. The one store it cannot open is one rebuilt after damage (`-on-corrupt` below): that store has no password, so `network` is held to loopback at every start until a password is set on it and the daemon restarted or reloaded, network access is switched on from the machine itself, or `reset-auth` releases the hold |
-| `-db` | per-OS ([details](../README.md#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
+| `-db` | per-OS ([details](install.md#run-in-the-background-systemd--launchd--windows-service)) | SQLite path (dir auto-created) |
 | `-on-corrupt` | `refuse` | what a start does when that database is damaged and will not open: `refuse` leaves the file where it is and does not start, so `sqlite3 <db> .recover` can still try to get the data back - the message gives the command, and the one that checks the copy lists the install's settings before it replaces anything, since a torn first page can leave nothing; `rebuild` renames it to `<db>.<UTC>.corrupt` and starts over on an empty store, so a service set to restart forever comes back monitoring instead of crash-looping on the same bad file - at the cost of the history and every saved setting, login included. A start that rebuilds answers `/readyz` `503` while it runs, and the rebuilt store stays loopback-only even under `-access network` - at that start and every later one, answering `503` while the hold keeps the network out - until a password is set on it and the daemon restarted or reloaded, network access is switched on from the machine itself, or `reset-auth` releases it, because the password it would have needed went with the old file |
 | `-interval` | `5s` | time between probe rounds, `1s`-`1h` (a value saved in the UI takes precedence) |
 | `-timeout` | `3s` | per-target dial timeout, `1s`-`30s` (a value saved in the UI takes precedence) |

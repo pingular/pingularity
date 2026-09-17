@@ -269,10 +269,10 @@ its `image:` tag to the release, and when the release changes what the
 compose has to say, change the file in the same deploy - for the
 private-by-default access change, the commented `ports: ["9000:9000"]`
 fallback gains a commented `environment: ["PINGULARITY_ACCESS=network"]`
-partner plus uncomment-both-or-neither guidance, per the README's
-"iperf3 in a container" section. The README sends readers to the served file instead of an inline
+partner plus uncomment-both-or-neither guidance, per the "iperf3 in a
+container" section of docs/speedtests.md. That section sends readers to the served file instead of an inline
 snapshot precisely because this step keeps it matching the released daemon;
-skipping it is the drift the README promises cannot happen.
+skipping it is the drift it promises cannot happen.
 
 Installs pick it up within their daily poll and show the update badge; the
 button links to `install.pingularity.dev` - an owned indirection (served by

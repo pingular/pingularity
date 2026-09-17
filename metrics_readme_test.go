@@ -175,7 +175,7 @@ func TestSpeedHealthyBulletDescribesTheVerdictTheScrapeCarries(t *testing.T) {
 		return string(b)
 	}
 	bullet := bulletContaining(t, read(filepath.Join("docs", "metrics.md")), "`pingularity_speed_healthy` - ")
-	alerts := bulletContaining(t, read("README.md"), "*Thresholds* (min download/upload")
+	alerts := bulletContaining(t, read(filepath.Join("docs", "dashboard.md")), "*Thresholds* (min download/upload")
 
 	body := scrapeWithThresholdsCleared(t)
 	line, present := metricLine(body, "pingularity_speed_healthy")

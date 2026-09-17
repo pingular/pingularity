@@ -54,7 +54,7 @@ func TestStartupLine(t *testing.T) {
 // ListenAddr) and the fail-closed default access mode (defaultSettings sets
 // AccessLocalOnly unless -access network was passed).
 func TestREADMEStartupLineExampleIsWhatTheDaemonPrints(t *testing.T) {
-	readme, err := os.ReadFile("README.md")
+	readme, err := os.ReadFile("docs/install.md")
 	if err != nil {
 		t.Fatalf("read README.md: %v", err)
 	}

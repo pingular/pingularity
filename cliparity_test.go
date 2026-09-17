@@ -247,7 +247,7 @@ func TestSpeedtestFlagSaysTheDegradedTriggerNeedsIt(t *testing.T) {
 	if row == "" {
 		t.Fatal("docs/cli.md has no `-speedtest` row in its flag table")
 	}
-	para := paragraphsMentioning(mustReadRepoFile(t, "README.md"), "**while degraded**")
+	para := paragraphsMentioning(mustReadRepoFile(t, "docs/speedtests.md"), "**while degraded**")
 	if para == "" {
 		t.Fatal("README.md no longer has a paragraph about the **while degraded** toggle")
 	}
@@ -408,7 +408,7 @@ func TestOnCorruptSurfacesAgreeOnTheDefault(t *testing.T) {
 	// skimming it is the whole answer to which way a damaged database falls when
 	// they pass nothing.
 	var headline string
-	for _, l := range strings.Split(mustReadRepoFile(t, "README.md"), "\n") {
+	for _, l := range strings.Split(mustReadRepoFile(t, "docs/install.md"), "\n") {
 		if strings.HasPrefix(l, "- **A database that won't open is ") {
 			headline = l
 			break

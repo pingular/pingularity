@@ -21,7 +21,7 @@ func TestStatusElevationIsDocumented(t *testing.T) {
 	if !strings.Contains(usage, "On macOS that goes for status too") || !strings.Contains(usage, "unknown") {
 		t.Errorf("usage() does not say status needs sudo on macOS and reports unknown otherwise:\n%s", usage)
 	}
-	for _, doc := range []string{"docs/cli.md", "README.md"} {
+	for _, doc := range []string{"docs/cli.md", "docs/install.md"} {
 		b, err := os.ReadFile(doc)
 		if err != nil {
 			t.Fatalf("read %s: %v", doc, err)

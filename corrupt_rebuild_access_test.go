@@ -819,7 +819,7 @@ func TestAHealthyStoreKeepsTheAccessTheFlagAsksFor(t *testing.T) {
 // one at a time - the table as one paragraph would find the exception in the
 // -on-corrupt row and excuse an -access row that never names it.
 func TestTheDocsThatPromiseTheAccessFlagAlwaysWinsNameTheStoreItDoesNot(t *testing.T) {
-	for _, doc := range []string{"README.md", filepath.Join("docs", "security-model.md"), filepath.Join("docs", "cli.md")} {
+	for _, doc := range []string{filepath.Join("docs", "install.md"), filepath.Join("docs", "security-model.md"), filepath.Join("docs", "cli.md")} {
 		stated := 0
 		for _, unit := range docUnits(mustReadRepoFile(t, doc)) {
 			flat := flatDoc(unit)
@@ -849,7 +849,7 @@ func TestTheDocsThatPromiseTheAccessFlagAlwaysWinsNameTheStoreItDoesNot(t *testi
 // and /readyz answers 503 while it lasts. Each of these sentences has been
 // deleted or reverted once with every test still green.
 func TestTheDocsSayWhatARebuiltStoreDoes(t *testing.T) {
-	readme := flatDoc(mustReadRepoFile(t, "README.md"))
+	readme := flatDoc(mustReadRepoFile(t, "docs/install.md"))
 	i := strings.Index(readme, "`-on-corrupt rebuild` takes the other road")
 	if i < 0 {
 		t.Fatal("README.md's corruption notes have no `-on-corrupt rebuild` entry")
