@@ -1306,14 +1306,6 @@ type destResolved struct {
 	expires time.Time
 }
 
-// flushDestResolveCache empties the memo. Tests only: a scripted resolver in
-// one test must not answer for the previous one's names.
-func flushDestResolveCache() {
-	destResolveMu.Lock()
-	clear(destResolveCache)
-	destResolveMu.Unlock()
-}
-
 // resolveProxiedDest resolves a proxied request's destination host, memoized
 // for destResolveTTL.
 //
@@ -2073,18 +2065,6 @@ const (
 	// speedtest-go requires, permanently. Retrying them is pure waste.
 	endpointUnknown // the probe itself failed (timeout, DNS, reset): decide nothing
 )
-
-// String keeps log lines and test failures readable - "retired" rather than "1".
-func (e endpointState) String() string {
-	switch e {
-	case endpointOK:
-		return "ok"
-	case endpointRetired:
-		return "no-legacy-fallback"
-	default:
-		return "unknown"
-	}
-}
 
 // probeEndpointBody is deliberately tiny. A 1 KB POST returns the same status as
 // the ~1 MB chunk a real transfer sends - verified against migrated,
@@ -4925,13 +4905,6 @@ func rankPingLatency(err error, sampled bool, latency time.Duration) (time.Durat
 	return latency, true
 }
 
-// rankedServers returns the ranked candidates, their ranking pings, and the IDs
-// dropped for having no HTTP Legacy Fallback (see fallbackHealth) so the caller
-// can say so in the log.
-func rankedServers(ctx context.Context, servers ookla.Servers, isp string) (ookla.Servers, map[string]*float64, []string, bool) {
-	return rankedServersRaced(ctx, servers, isp, nil, false, nil, 1)
-}
-
 // rankedServersRaced is rankedServers with the city race's pings carried in:
 // a server in raced was pinged by the race seconds ago, with the same probe
 // set and the same statistic (the floor), so its entry is the ranking ping and
@@ -5173,18 +5146,6 @@ func rankLess(a, b *ookla.Server) bool {
 func serverLabel(s *ookla.Server) string {
 	return fmt.Sprintf("%s, %s", s.Sponsor, s.Name)
 }
-
-// bestResult picks the winner of a best-of-N run, by the user's stated rule:
-// total throughput discounted by ping (see resultScore) first, then latency,
-// then jitter, then bufferbloat. Every tie-break is a strict improvement test,
-// so an exact tie keeps the earlier result - and the earlier result is the
-// higher-ranked server (the pinned one, or the lowest ping), which is the
-// right thing to fall back on.
-//
-// Later keys are near-impossible to reach in practice: two separate runs would
-// have to agree to the full float precision. They exist so the choice is
-// deterministic rather than accidental.
-func bestResult(rs []Result, dir string) Result { return rs[bestIndex(rs, dir)] }
 
 // pingWeightMS sets how much latency discounts throughput in resultScore: a
 // result's down+up is multiplied by pingWeightMS/(pingWeightMS+ping). At 100,

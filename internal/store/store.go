@@ -353,16 +353,6 @@ func OpenExisting(path string) (*Store, error) {
 	return openAtClock(path, now.Unix(), now, true)
 }
 
-// openAt is Open against a caller-supplied judging clock (the same seam
-// repairInsanePausesAt gives the repair), so tests can open a store the way an
-// RTC-less board does - at service start, before NTP, under an implausible
-// clock - without faking time. The detector baseline stays the real clock,
-// which is exactly the shape of the scenario being modelled: rows judged by
-// one clock, the machine actually running on another.
-func openAt(path string, nowU int64) (*Store, error) {
-	return openAtClock(path, nowU, time.Now(), false)
-}
-
 // containerDataDir is the image's own data directory - the Dockerfile VOLUME,
 // with the ENTRYPOINT pinning -db inside it. The container carve-out below
 // fires only for exactly this path. Var so tests can point it at a temp dir.
@@ -1303,12 +1293,6 @@ func repairFutureReachingPausesAt(db *sql.DB, nowU int64) error {
 // armed. Reading after the observation orders the clock after the event.
 func (s *Store) maybeRepairFuturePauses() {
 	s.maybeRepairFuturePausesFn(func() int64 { return time.Now().Unix() })
-}
-
-// maybeRepairFuturePausesAt is the test seam: an injected reading, delivered
-// through the same after-the-observation path.
-func (s *Store) maybeRepairFuturePausesAt(nowU int64) {
-	s.maybeRepairFuturePausesFn(func() int64 { return nowU })
 }
 
 func (s *Store) maybeRepairFuturePausesFn(nowFn func() int64) {

@@ -70,7 +70,7 @@ const DEFS = {
   speedtestBusy: 'function speedtestBusy',
   speedtestAbortable: 'function speedtestAbortable',
   speedtestPicksServer: 'function speedtestPicksServer',
-  autoOptionText: 'const autoOptionText', autoScopeText: 'const autoScopeText',
+  autoOptionText: 'const autoOptionText',
   serverOptionText: 'const serverOptionText',
   spdExportAvgSegments: 'function spdExportAvgSegments',
   bloatBins: 'function bloatBins', bloatCeiling: 'function bloatCeiling',
@@ -2065,7 +2065,7 @@ test('parseRange: one unambiguous slash date settles the order for the whole lin
 // ---------------------------------------------------------------------------
 const CHART_DEFS = {
   drawXAxis: 'function drawXAxis', axFmtLadder: 'function axFmtLadder',
-  fmtAxisTime: 'function fmtAxisTime', AXF: 'const AXF',
+  AXF: 'const AXF',
   spdSyncPlan: 'function spdSyncPlan', xMap: 'function xMap',
 };
 const CNAMES = Object.keys(CHART_DEFS);
@@ -2223,11 +2223,11 @@ test('drawXAxis: the label format is fine enough that neighbouring ticks differ'
     assert.equal(new Set(rendered).size, rendered.length, 'ladder rungs are not distinct');
   }
   // The top of each ladder is still what the span picked before - unchanged.
-  const d = new Date(2026, 6, 25, 9, 30, 15), s = Math.floor(d.getTime() / 1000);
-  assert.equal(C.fmtAxisTime(s, 10 * 60), '09:30:15');
-  assert.equal(C.fmtAxisTime(s, 6 * 3600), '09:30');
-  assert.equal(C.fmtAxisTime(s, 10 * 86400), '25 Jul');
-  assert.equal(C.fmtAxisTime(s, 400 * 86400), 'Jul 26');
+  const d = new Date(2026, 6, 25, 9, 30, 15);
+  assert.equal(C.axFmtLadder(10 * 60)[0](d), '09:30:15');
+  assert.equal(C.axFmtLadder(6 * 3600)[0](d), '09:30');
+  assert.equal(C.axFmtLadder(10 * 86400)[0](d), '25 Jul');
+  assert.equal(C.axFmtLadder(400 * 86400)[0](d), 'Jul 26');
 });
 
 test('spdSyncPlan: a status poll cannot repaint a span selected after it left', () => {
@@ -3066,51 +3066,6 @@ test('autoOptionText names a searched city, never the browse centre', () => {
   assert.ok(!/Miami|Montreal/.test(F.autoOptionText('')));
 });
 
-test('a fallback browse centre is never credited to auto', () => {
-  const t = F.autoScopeText('the fastest server', 'Miami', '');
-  assert.ok(/races the cities/.test(t), t);
-  assert.ok(/for browsing/.test(t), t);
-  // The two claims the old string made, both false: that auto picks near this
-  // place, and that the place is the ISP's exit.
-  assert.ok(!/picks .* near/.test(t), t);
-  assert.ok(!/exit/.test(t), t);
-});
-
-test('with no browse centre the sentence is still true', () => {
-  const t = F.autoScopeText('the fastest server', '', '');
-  assert.ok(/for browsing/.test(t), t);
-  assert.ok(!/<b>/.test(t), t);
-});
-
-// THE CENTRE MAY BE NAMED AS WHERE AUTO LAST LANDED - past tense, and only
-// when the daemon says so (centre 'last_run': the browse list was centred on
-// the last auto run's server). A fallback centre keeps the weaker "may test
-// from a different city" wording: before any auto run there is nothing to
-// remember, and crediting a candidate city to auto is the old defect back.
-test('last-run centring is named in the past tense, fallback centring is not', () => {
-  const t = F.autoScopeText('the fastest server', 'Newtown, QC', 'Example ISP, Newtown', true);
-  assert.ok(/centred on <b>Newtown, QC<\/b> where your last auto test ran - not where the next one will/.test(t), t);
-  // The disclaimer is the point: toggling auto on shows the LAST run's city for
-  // browsing, but the note must not read as where the NEXT test will go (it is
-  // raced fresh each run, so no city is known until the test runs).
-  assert.ok(/chosen fresh when the next test runs/.test(t), t);
-  assert.ok(!/different city/.test(t), t);
-  const f = F.autoScopeText('the fastest server', 'Oldtown', 'Example ISP, Newtown', false);
-  assert.ok(/auto may test from a different city/.test(f), f);
-  assert.ok(!/last auto test ran/.test(f), f);
-  // The flag without a centre has nothing to name; the sentence must not dangle.
-  assert.ok(!/last auto test ran/.test(F.autoScopeText('the fastest server', '', '', true)));
-});
-
-// Reports what the last run MEASURED, in the past tense, so it stays true
-// however that server was chosen - and it is the honest answer to "which city
-// did auto use?" without the daemon remembering a race.
-test('the last measured server is reported, and only when there is one', () => {
-  assert.ok(/last test measured <b>Example ISP, Oldtown<\/b>/.test(
-    F.autoScopeText('the fastest server', 'Oldtown', 'Example ISP, Oldtown')));
-  assert.ok(!/last test measured/.test(F.autoScopeText('the fastest server', 'Oldtown', '')));
-});
-
 // A dropdown row survives the fields the daemon cannot promise: the by-ID
 // resolve returns an empty country on sparse Ookla records (measured - it
 // shipped as "CalNect - Montréal, QC," with a dangling comma), and a 0 distance
@@ -3148,12 +3103,6 @@ test('the saved speed image carries the on-screen averages', () => {
   const noted = F.spdExportAvgSegments({down: 1, up: 1, ping: 1}, ' (mean of the 500 runs charted, of 1200 in range)');
   assert.equal(noted[noted.length - 1][1], 'axis');
   assert.ok(/mean of the 500/.test(noted[noted.length - 1][0]));
-});
-
-test('the panel escapes place names the daemon supplies', () => {
-  assert.ok(F.autoScopeText('x', '<img src=x>', '').includes('&lt;img'));
-  // The past-tense branch interpolates a server-derived place of its own.
-  assert.ok(F.autoScopeText('x', '<img src=z>', '', true).includes('&lt;img'));
 });
 
 // A 30-day window returns hundreds of runs into ~900px. Below one bar per ~2px
@@ -5417,8 +5366,7 @@ test('the runs table says how each run chose its centre', () => {
 test('the picker explains itself on the buttons, not in a paragraph under the list', () => {
   assert.match(html, /id="serverSearchBtn" type="button" title="List the Ookla servers near a place[^"]*Ookla ID[^"]*"/, 'Find says what it does on hover');
   assert.match(html, /id="serverAuto" type="button" title="Show what Auto would pick right now[^"]*no speedtest runs[^"]*"/, 'Auto says it lists and pings, never runs or chooses');
-  assert.match(html, /<span class="muted hidden" id="serverLoc"/, 'the caption under the list stays hidden');
-  assert.doesNotMatch(extract('function updateScopeNote'), /nearest responsive/, 'and what it would say is at least not the old lie');
+  assert.doesNotMatch(html, /id="serverLoc"/, 'there is no caption under the list');
   assert.doesNotMatch(script, /setAutoLoc/, 'nothing reads the deleted Auto-location checkbox');
 });
 
@@ -5568,7 +5516,7 @@ test('server list: the last listing is remembered - a Find by its place, an Auto
   api.state().stale();
   assert.equal(api.state().autoCache.at, 0, 'a run spends the remembered Auto');
   assert.equal(JSON.parse(api.state().remembered[api.state().remembered.length - 1]).at, 0, 'and says so in the browser\u2019s memory');
-  assert.match(script, /if \(hadRun\)\{ autoCentreLastRun=false; serversLoaded=false; fpAutoStale\(\); \}/, 'wired to the status poll\u2019s new-run detection');
+  assert.match(script, /if \(hadRun\)\{ serversLoaded=false; fpAutoStale\(\); \}/, 'wired to the status poll\u2019s new-run detection');
   assert.match(script, /pendingServer=''; browseLoc=''; browseLabel=''; fpListLabel='Server'; startOnAuto=false; fpAutoCache=null; rememberFind\(\);/, 'Reset to defaults forgets both');
   assert.match(script, /if\(drawerReopening && reopenHadList && !\$\('serverAuto'\)\.disabled\)\{[^\n]*\n\s*serversLoaded=false;[^\n]*\n\s*if\(fpListLabel==='Candidates'\) startOnAuto=true;/, 'a reopen shows or re-races an Auto the same way');
   assert.doesNotMatch(extract('function fpShowAutoCache'), /as of|ago/i, 'no "as of" note: the list is either fresh enough to stand or raced again');
@@ -5609,8 +5557,6 @@ test('Best of is a count, not a switch: a number box that drives the data estima
     'the estimate multiplies by the count, read the same way Save reads it (intOf, not parseInt: they disagreed on "1e1")');
   assert.match(est, /const min=Math\.max\(1, intOf\(\$\('setSpeed'\)\.value\)\|\|60\);/,
     'and prices the interval the same way');
-  assert.match(extract('function updateScopeNote'), /intOf\(\$\('setSpeedBestOf'\)\.value\)/,
-    'as does the scope note - every reader of a box agrees with what Save writes for it');
   assert.match(est, /const heavy = n>4;/, 'and marks a heavy round above four servers');
   assert.match(est, /wi\.textContent = heavy \? '\\u26A0\\uFE0E' : '\\u2248'/,
     'with the GLYPH, not a hue: both states wear the accent, so the mark (and the heavy ring drawn in its colour) is what tells them apart');
@@ -5719,8 +5665,6 @@ test('the search bar is the results header, with Find and Auto matched', () => {
   assert.match(html, /#serverRow \.fp-find \.btn\{min-width:72px;\}/,
     'two ways of filling the same list, so the two buttons are one size');
   assert.match(extract('async function searchServers'), /btnBusy\(b, true\)/);
-  assert.doesNotMatch(extract('function updateAutoLocUI'), /checked \? 'none'/,
-    'the box is the pane header now; hiding it would take the results pane header with it');
 });
 
 // The Server tab is two tabs now, one per engine, and both are always on the bar:
@@ -5958,7 +5902,7 @@ function driveServers() {
     'applyPendingServer', 'updateScopeNote', 'clearServerFieldError', 'serverFieldError', 'serverTabActive', 'btnBusy', 'fpDraw',
     'setTimeout',
     'let serversLoaded=false, serversScope="", serversLatchGen=0, serverTabSeen=true, pendingServer="", '
-    + 'autoDefaultLoc="", autoCentreLastRun=false, serverSearchInFlight=null, serverSearchFailed=false, '
+    + 'autoDefaultLoc="", serverSearchInFlight=null, serverSearchFailed=false, '
     // Every page-level name the lifted functions write, or a sloppy-mode
     // assignment creates a global that leaks between drives and a test passes
     // only because an earlier one ran.
@@ -5990,7 +5934,7 @@ function driveServers() {
     // would be a writer the page does not have.
     + 'function writeFooter(t){ settingsMsgSeq++; $(\'settingsMsg\').textContent=t; }\n'
     + 'return { fetchServers, searchServers, fpAutoList, loadServers, writeFooter, '
-    + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, autoCentreLastRun, pinRefused: serverPinRefused, autoCities: fpAutoCities, remembered, startOnAuto, setStartOnAuto: v => { startOnAuto = v; }, autoCache: fpAutoCache, ageAuto: ms => { fpAutoCache.at = Date.now() - ms; }, stale: fpAutoStale,'
+    + 'state: () => ({ browseLoc, browseLabel, pendingServer, autoDefaultLoc, pinRefused: serverPinRefused, autoCities: fpAutoCities, remembered, startOnAuto, setStartOnAuto: v => { startOnAuto = v; }, autoCache: fpAutoCache, ageAuto: ms => { fpAutoCache.at = Date.now() - ms; }, stale: fpAutoStale,'
     + ' searchFailed: serverSearchFailed, pinUnverified: serverPinUnverified, errShown: serverErrShown, listLabel: fpListLabel,'
     + ' setAutoCache: c => { fpAutoCache = c; }, loaded: serversLoaded, scope: serversScope, latch: serversLatchGen, gen: serversGen }) };')(
     id => els[id], fetchStub, on => log.loading.push(on), s => log.populated.push(s),
@@ -6286,7 +6230,6 @@ test('server list: Auto shows the candidates a run would race, and says so', asy
   assert.equal(st.listLabel, 'Candidates', 'the results pane is headed as the race field');
   assert.equal(st.autoDefaultLoc, 'Montréal', 'the winner is where a run now would centre');
   assert.deepEqual(st.autoCities, ['Montréal', 'Toronto'], 'every city that raced, the winner first, each once (the star in Montréal folds into it; the unanchored placement has no place)');
-  assert.equal(st.autoCentreLastRun, false, 'and it is not a past-tense claim about the last run');
   assert.equal(st.pendingServer, '', 'listing the field chooses nothing');
   assert.deepEqual(log.populated[0][0].ping_ms, 10.4, 'the ping reaches the rows');
   assert.equal(log.populated[0][0].distance_km, undefined,
@@ -8999,11 +8942,11 @@ function driveReset() {
     + body + '\nreturn { palettePrefs, vizPrefs, defaults: { pal: defaultPalette(), viz: defaultViz() } };';
   const note = n => () => calls.push(n);
   const api = new Function('$', 'calls', 'setFields', 'syncLatencyDeps', 'syncSpeedDeps', 'rememberFind',
-    'fpAdoptSaved', 'loadServers', 'clearServerFieldError', 'updateAutoLocUI', 'mapIperfServer',
+    'fpAdoptSaved', 'loadServers', 'clearServerFieldError', 'mapIperfServer',
     'nextIperfId', 'applyTheme', 'applyBrightness', 'applyFade', 'applyWide', 'applyCorners',
     'applyPalette', 'syncPaletteControls', 'applyViz', 'syncVizControls', 'updateEngineUI', src)(
     $, calls, note('setFields'), note('syncLatencyDeps'), note('syncSpeedDeps'), note('rememberFind'),
-    note('fpAdoptSaved'), note('loadServers'), note('clearServerFieldError'), note('updateAutoLocUI'),
+    note('fpAdoptSaved'), note('loadServers'), note('clearServerFieldError'),
     v => v, () => 1, note('applyTheme'), note('applyBrightness'), note('applyFade'), note('applyWide'),
     note('applyCorners'), note('applyPalette'), note('syncPaletteControls'), note('applyViz'),
     note('syncVizControls'), note('updateEngineUI'));
