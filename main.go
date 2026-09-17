@@ -2410,8 +2410,7 @@ const accessAmbiguousWarnMsg = "container install with no recorded access choice
 //     build that already defaulted closed, so its missing access key means never
 //     chose and the install was never reachable to begin with". Sound for
 //     markers written under the creation verdict (settings.WithDatabaseCreated);
-//     not for the ones v0.70.0-rc.1 through v0.80.0-rc.2 wrote on emptiness
-//     alone, so a 0.61 container still un-established when one of those releases
+//     not for the ones v0.70.0 and v0.70.1 wrote on emptiness alone, so a 0.61 container still un-established when one of those releases
 //     opened it came out marked, and this gate stays silent about its 403.
 //     Accepted: nothing can un-stamp those markers, and ignoring presence would
 //     instead warn every genuinely fresh container born in that window;

@@ -160,8 +160,8 @@ const (
 //
 // Presence is trustworthy only for markers written under that rule, which is
 // forward-only: it changes what gets stamped from here on and touches nothing
-// already on disk. Markers from v0.70.0-rc.1 (the marker's first release)
-// through v0.80.0-rc.2 prove nothing about who created the database - those
+// already on disk. Markers from v0.70.0 (the marker's first release) and
+// v0.70.1 prove nothing about who created the database - those
 // releases stamped any store that merely read NOT established when they opened
 // it. Nothing can re-derive their truth, so main's gate goes on trusting
 // presence anyway; see warnAmbiguousContainerAccess for what that costs.

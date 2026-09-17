@@ -75,8 +75,8 @@ Below that:
   local hit for a different name and read low. Either way the two are not
   comparable, and the change can move the number in either direction - re-baseline
   any DNS alert thresholds rather than assuming which way it went. Readings from
-  **0.80.0-rc.1 and earlier** also sit a few ms above later versions and spike
-  harder: every version through 0.80.0-rc.1 asked an IPv4/IPv6 question *pair*
+  **0.70.1 and earlier** also sit a few ms above later versions and spike
+  harder: every version through 0.70.1 asked an IPv4/IPv6 question *pair*
   and timed the slower answer, and on the Linux binaries - which use Go's
   built-in resolver - one lost reply pinned a "healthy" reading at the full 3s
   budget (the macOS and Windows binaries resolve through the system resolver,

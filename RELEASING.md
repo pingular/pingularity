@@ -180,10 +180,10 @@ afterwards, while the person working backwards from a graph that stepped - or
 upgrading an install four releases behind - has only what is in the repo. Three
 shapes of change earn a line there whatever else is in the release: a release
 that **removes a field from an API response**, **retires a setting**, or
-**changes a default**. v0.100.4 did all three and recorded none of them: the
-auto-location setting went, taking two settings keys and a `/api/status` field
-with it, and a provisioning script that pinned the scope kept being answered
-`200` and kept writing nothing. `changelog_test.go` holds this paragraph and
+**changes a default**. v0.100.4 did all three, and its first draft recorded
+none of them: the auto-location setting went, taking two settings keys and a
+`/api/status` field with it, and a provisioning script that pinned the scope
+was being answered `200` while writing nothing. `changelog_test.go` holds this paragraph and
 that file to each other; holds the toolchain's platform floor and URL rule to
 the cask and the parser that enforce them; holds the clauses it names in the
 `-db`, iperf3, schedule, retired-city and package-upgrade entries to the store,

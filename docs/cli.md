@@ -27,7 +27,7 @@ systemd would otherwise expand or choke on.
 a database is refused, and a database that will not open is left where it
 stands - it never creates a database and never sets one aside (that recovery is
 the daemon's, and only when asked for it: see `-on-corrupt` below and
-[the README](install.md#run-in-the-background-systemd--launchd--windows-service)).
+[the install guide](install.md#run-in-the-background-systemd--launchd--windows-service)).
 It also releases the hold a store rebuilt with `-on-corrupt rebuild` keeps on
 network access until a password is set and the daemon restarted or reloaded -
 the way back for a container that cannot reach its own dashboard to set one.
