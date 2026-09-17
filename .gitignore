@@ -8,24 +8,21 @@
 *.db-wal
 *.db-shm
 
-# Scratch artifacts from local testing - these have been committed by accident
-# before (two copies of /bin/sleep and a saved curl response), so they are
-# named explicitly rather than trusted to discipline.
+# Scratch artifacts from local testing.
 busybin*
 r.json
 
-# Local, machine-specific helper scripts
+# Local helper scripts
 deploy.sh
 
-# Private engineering notes - the public posture lives in docs/security-model.md
+# Local notes
 .notes/
 
 # OS cruft
 .DS_Store
 
-# Agent scratch: workflow worktrees are created here at runtime and are not
-# part of the product. They are real git worktrees, so an unguarded `git add -A`
-# commits them as embedded repositories.
+# Tooling scratch directories (real git worktrees, which `git add -A` would
+# otherwise commit as embedded repositories).
 .claude/
 /compose.yaml
 
@@ -52,10 +49,10 @@ id_ed25519*
 *.pfx
 
 # Local build and profiling artifacts. Preventative too: nothing in the tree
-# produces them today - CI runs plain `go test ./... -count=1 -race`
-# (.github/workflows/ci.yml:58) and `node --test internal/web/ui/*.test.mjs`
-# (.github/workflows/ci.yml:61), with no coverage or profiling flag on any `go
-# test` line in .github/ and no npm/yarn/pnpm step anywhere in it. These are just
+# produces them today - CI runs plain `go test ./... -count=1 -race` and
+# `node --test internal/web/ui/*.test.mjs` (.github/workflows/ci.yml), with no
+# coverage or profiling flag on any `go test` line in .github/ and no
+# npm/yarn/pnpm step anywhere in it. These are just
 # the default output names a local `go test -c`, `-coverprofile` or `-cpuprofile`
 # run leaves behind, listed so an afternoon of profiling cannot ride along in
 # someone's commit. node_modules/ is the same bet on a future `npx`: there is no
