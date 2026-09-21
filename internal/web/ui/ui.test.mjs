@@ -5049,12 +5049,12 @@ test('an unsupported server cannot be chosen, but can still be kept', () => {
   p.fpAdopt([SRV('1'), SRV('9')]);
   p.fpChoose('9');
   assert.equal(p.els.setServer.value, '',
-    'every transfer against it fails, so choosing it would schedule a run that cannot work');
+    'its endpoint answers errors, so choosing it would schedule a run that cannot measure properly');
   assert.match(p.els.settingsMsg.textContent, /Server 9 has no speedtest endpoint/,
     'a refused click says why - a silent no-op is how the row click and the ID search came to disagree');
   const row = fpRowOf(p.els.fpAll, '9');
   assert.ok(fpBtn(row).classList.contains('bad'), 'the row has to say it is unusable');
-  assert.match(fpBtn(row).innerHTML, /<span class="fp-badge bad" title="This server has no HTTP speedtest endpoint[^"]*cannot be chosen[^"]*">Unsupported<\/span>/,
+  assert.match(fpBtn(row).innerHTML, /<span class="fp-badge bad" title="This server’s HTTP speedtest endpoint[^"]*answers errors[^"]*measure speed with no ping[^"]*cannot be chosen[^"]*">Unsupported<\/span>/,
     'hovering the badge says why');
   p.fpToggleStar('9');
   assert.deepEqual(p.saved().map(s => s.id), ['9'],

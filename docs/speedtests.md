@@ -10,7 +10,10 @@ invisible: the **address family** the transfer actually used (IPv4, IPv6, or
 `mixed` when one run genuinely used both) - read back from the run's own
 connections, never guessed - and **which direction** its
 loss/jitter probe sampled. Not every field is present on every run: a download-only
-or upload-only run has no figures for the direction it skipped, packet loss is
+or upload-only run has no figures for the direction it skipped, ping and jitter
+are blank on an Ookla run whose server answered its latency requests with HTTP
+errors and still served its files (the time to an error answer is not a
+latency; the log says what was answered), packet loss is
 optional and not always measurable, family and probe direction are recorded
 only when the run really established them (the engine notes below say when
 that is), and bufferbloat is absent when a transfer
@@ -311,18 +314,23 @@ runs consult it; reconnect, degraded and **Run now** go regardless.
 
 For Ookla, choose a server (Find by place or Ookla ID, then pick its row) or
 leave **Auto - fastest near you**. A row badged **Unsupported** cannot be
-chosen: that server has no HTTP speedtest endpoint (Ookla's legacy upload
-path), so every test against it would fail - clicking it says so in the
-footer instead of selecting it, and typing its ID into Find lists it with the
-badge rather than pinning it (hover the badge for the reason). Such a server
-can still be starred, and a server that is already chosen keeps its radio
-even if it later earns the badge, so the picker never hides what the next run
-will use. That badge comes from a cheap check - fetching the server's latency
-file - which a host whose *upload* endpoint refuses everything still passes.
-Those only reveal themselves when a run tries them, so when one refuses every
-upload the daemon stops offering it to automatic selection for twelve hours,
-and remembers that across a restart. A server that comes back and refuses
-everything again earns a longer rest each time - twelve hours, then a day,
+chosen: that server's HTTP speedtest endpoint (Ookla's legacy upload path)
+answers errors, so tests against it fail, or measure speed with no ping -
+clicking it says so in the footer instead of selecting it, and typing its ID
+into Find lists it with the badge rather than pinning it (hover the badge for
+the reason). Such a server can still be starred, and a server that is already
+chosen keeps its radio even if it later earns the badge, so the picker never
+hides what the next run will use. That badge comes from a cheap check -
+fetching the server's latency file - which a host whose *upload* endpoint
+refuses everything still passes. (The reverse also exists, rarely: a server
+that refuses only its latency file and serves everything else. That check
+badges it all the same, and a run against one that is already chosen stores
+the speeds the server delivers, with the ping left blank.)
+A host with a dead upload endpoint only reveals itself when a run tries it, so
+when one refuses every upload the daemon stops offering it to automatic
+selection for twelve hours, and remembers that across a restart. A server
+that comes back and refuses everything again earns a longer rest each time -
+twelve hours, then a day,
 then three - because re-admitting a still-broken server costs a whole
 measurement turn to rediscover. It is never permanent: a repaired server is
 back within three days on its own, and one that has behaved for a week starts

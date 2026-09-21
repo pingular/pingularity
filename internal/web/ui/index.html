@@ -8454,8 +8454,9 @@ async function fetchServers(opts){
     }
     if(opts.id){
       // An ID typed in Find pins that server - unless the daemon's by-ID
-      // probe says it has no speedtest endpoint: every transfer against it
-      // fails, so it is listed with its Unsupported mark and NOT chosen,
+      // probe says its speedtest endpoint answers errors: tests against it
+      // fail, or measure speed with no ping, so it is listed with its
+      // Unsupported mark and NOT chosen,
       // the same refusal a click on such a row gets (see fpChoose). The
       // search reports it (fpRefusedID) once the box is cleared.
       const s=(d.servers||[])[0];
@@ -8593,7 +8594,7 @@ let fpRefusedID='', serverPinRefused='';
 // closing the drawer retire it. The design's rule: a silent no-op click is
 // how two entry points came to disagree, so a refusal always says so.
 function fpRefuse(id){
-  serverErrShown='Server '+id+' has no speedtest endpoint - every test against it would fail, so it cannot be chosen.';
+  serverErrShown='Server '+id+' has no speedtest endpoint - tests against it fail, or measure speed with no ping, so it cannot be chosen.';
   $('settingsMsg').textContent=serverErrShown;
 }
 async function searchServers(){
@@ -8821,7 +8822,7 @@ function fpPingText(ms){ const v=Math.round(ms*10)/10; return v<10 ? v.toFixed(1
 function fpKmText(km){ return !(km>0) ? '' : km<1 ? '&lt;1 km' : Math.round(km)+' km'; }
 // Why a server is Unsupported, on the badge: the verdict without the reason
 // reads as a judgement rather than a fact about the server.
-const FP_UNSUPPORTED_TIP='This server has no HTTP speedtest endpoint (Ookla\u2019s legacy upload path), so every test against it fails. It cannot be chosen, but it can still be kept.';
+const FP_UNSUPPORTED_TIP='This server\u2019s HTTP speedtest endpoint (Ookla\u2019s legacy upload path) answers errors, so tests against it fail, or measure speed with no ping. It cannot be chosen, but it can still be kept.';
 // fpRow renders one server: the radio and its name in a full-width button, the
 // star as a control of its own in the last column.
 function fpRow(s){
@@ -10550,7 +10551,7 @@ function saveFailed(text){
   // A typed ID the search refused to pin (no speedtest endpoint) must not save
   // around silently: the drawer would close on the old pin and report success.
   if(serverPinRefused){ const id=serverPinRefused; serverPinRefused='';
-    saveFailed(serverErrShown || ('Server '+id+' has no speedtest endpoint - every test against it would fail, so it cannot be chosen. Pick another server or clear the box before saving.')); return; }
+    saveFailed(serverErrShown || ('Server '+id+' has no speedtest endpoint - tests against it fail, or measure speed with no ping, so it cannot be chosen. Pick another server or clear the box before saving.')); return; }
   // Don't save the old scope under a failed search - but an emptied box means the
   // user gave up on that query (Auto location's programmatic clear included), so it
   // no longer blocks. The failed text is kept in the box, so "fix" is followable.

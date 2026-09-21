@@ -242,6 +242,19 @@ func newOoklaClient(uc *ookla.UserConfig) *ookla.Speedtest {
 // transport chain. Only the measurement path needs the recorder; every other
 // caller (server browse, search, city race) uses the plain constructor.
 func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder) {
+	c, rec, _ := newOoklaClientDoer(uc)
+	return c, rec
+}
+
+// newOoklaClientDoer is the constructor itself, and also hands back the
+// http.Client the library was given as its doer - the top of the transport
+// chain built below. The library keeps its doer unexported and offers no way
+// to send one request of our own through it, and measure() has exactly one to
+// send: the download-file check behind a refused ping (see downloadFileServed),
+// which has to be judged by the same chain, behind the same dial guard and
+// proxy routing, as the transfer it stands in for. Only freshManager asks for
+// it, so the doer is never held longer than the attempt it was built for.
+func newOoklaClientDoer(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder, *http.Client) {
 	// New writes http.DefaultClient.Transport (the stamp) and the tail check
 	// clears it; both are unsynchronized writes to a process-global. Serialize
 	// them so concurrent newOoklaClient calls don't race each other on it -
@@ -301,11 +314,17 @@ func newOoklaClientRec(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder)
 	// be unwound straight past (it has no recover of its own) and would report
 	// "no upload requests were issued" for a run whose POSTs all panicked.
 	rec := &uploadRecorder{}
+	// The status guard sits between the two, above the containment for the
+	// recorder's reason: a panic beneath it is an error by the time it gets
+	// here - tallied as a request that got no answer - never a response it has
+	// to judge. Top to bottom the chain reads: recorder (POSTs), status guard
+	// (marked GETs), panic containment, ping cap, the hook's stand-in if any,
+	// the library's own transport.
 	doer.Transport = recordingTransport{
-		base: panicSafeTransport{base: base, panics: &panicThrottle{}},
+		base: statusGuardTransport{base: panicSafeTransport{base: base, panics: &panicThrottle{}}},
 		rec:  rec,
 	}
-	return client, rec
+	return client, rec, doer
 }
 
 // currentEndpoint rewrites a server's URL to the location the catalogue says is
@@ -423,7 +442,7 @@ func (r *uploadRecorder) refusedByServer() bool {
 		switch {
 		case status >= 200 && status < 300:
 			return false
-		case status == 408 || status == 429 || status == 502 || status == 503 || status == 504:
+		case loadSymptomStatus(status):
 			return false
 		case status >= 300 && status < 400:
 			return false
@@ -432,6 +451,14 @@ func (r *uploadRecorder) refusedByServer() bool {
 		}
 	}
 	return refusals >= uploadRejectMinRefusals
+}
+
+// loadSymptomStatus is the list refusedByServer's comment argues for, in one
+// place because two judges read it: the upload's conviction above and the
+// download's retry predicate (guardedGets.retryable). Two copies of a list
+// like this drift apart.
+func loadSymptomStatus(status int) bool {
+	return status == 408 || status == 429 || status == 502 || status == 503 || status == 504
 }
 
 // snapshot returns attempts so far and how many of them were confirmed (2xx).
@@ -493,7 +520,8 @@ func (r *uploadRecorder) summary() string {
 }
 
 // recordingTransport feeds the recorder. It only watches upload POSTs; download
-// GETs and the ping probes ride through untouched.
+// GETs and the ping probes ride through it untouched, to the status guard
+// beneath, which judges those (see statusGuardTransport).
 type recordingTransport struct {
 	base http.RoundTripper
 	rec  *uploadRecorder
@@ -571,7 +599,10 @@ type pingDrainKey struct{}
 
 // pingDrainContext marks ctx so every request made under it - the echoes of
 // one PingTestContext call, redirect hops included - is read no further than
-// probeDrainCap.
+// probeDrainCap. The same mark is what makes statusGuardTransport judge the
+// echo's status: one marker, because "this request is a ping echo" is one fact
+// and every ping - the run's own, the ranking's, the city race's - already
+// sets it.
 func pingDrainContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, pingDrainKey{}, true)
 }
@@ -589,6 +620,429 @@ func (t pingDrainTransport) RoundTrip(req *http.Request) (*http.Response, error)
 type cappedBody struct {
 	io.Reader
 	io.Closer
+}
+
+// statusGuardTransport turns a ping or download GET that was answered with an
+// HTTP error into a request error.
+//
+// The library checks the status of its upload POSTs and of nothing else
+// (speedtest-go v1.7.11 request.go): HTTPPing takes a latency sample from ANY
+// response, and downloadRequest hands ANY response body to the byte counter.
+// So a server that answers 500 to its whole legacy bundle - about one in seven
+// of the catalogue, see fallbackVerdict - pings fast and plausible, "downloads"
+// its error page at whatever rate the page and the round trip allow, and only
+// then fails its upload, which a "both" run keeps as a partial. An operator's
+// forward proxy does the same for ANY server that is down, because a dead
+// origin comes back as the proxy's own 502 at the proxy's round trip. Measured
+// on this tree before the guard, through Scheduler.RunOnce against loopback
+// (status_guard_test.go reproduces all but the Best-of round): a pinned
+// server answering 500 with a 2 KB page was stored as 3.7 Mbps down / 6 ms on
+// every scheduled run, with a below-threshold alert each time; a never-seen
+// one won an Auto run's ranking (fallbackHealth needs two strikes), was the
+// server measured, and was sent over 50,000 download requests in a one-second
+// window; as a Best-of member it was sent 18,362 in one round; and behind a
+// proxy answering 502 the dead server was stored at 2.7 Mbps and the proxy's
+// 6 ms. Upstream fixed both reads after v1.8.3 (#281, #282) and has not
+// released them.
+//
+// As an ERROR the library already does the right thing with it. A ping echo
+// that errors is skipped, and the ping fails as a whole only when every echo
+// did, so one bad answer among good ones costs one sample. A download chunk
+// that errors counts toward the N/A rule, so a window of nothing but refusals
+// comes back as -1 and rides naErr and the retry, fallback-seat and incumbent
+// machinery a dead server already rides.
+//
+// What it judges is decided by the request's CONTEXT, like pingDrainTransport
+// and for its reason: only a ping (pingDrainContext - the run's own ping, the
+// ranking ping and the city race's) and the download leg (guardGets) are
+// marked. The server list, the by-ID resolve and the keyword search pass
+// untouched, and so do the upload POSTs, whose status the library and the
+// recorder already read; the probes never come this way at all - they use a
+// client of their own (probeClient) precisely to read these statuses. A 3xx
+// passes too: the doer follows a GET redirect itself and the hop re-enters
+// here under the same context, so it is the final answer that gets judged.
+// (One the doer does not follow - a 304, a 300 with no Location - reaches the
+// library as it always did; a transport cannot know which it is looking at,
+// and the probes likewise refuse to condemn on an unfollowed redirect.)
+//
+// One kind of server needs more than the guard: one whose latency.txt ALONE
+// is refused while its files are served. Its throughput is genuine and only
+// its "ping" was the time to an error answer; pinned, it was stored before the
+// guard with that figure (measured through Scheduler.RunOnce against loopback,
+// latency.txt answering 404: 274.66 Mbps down / 6.70 ms). A latency taken from
+// an error answer is not a measurement - but failing the run at the ping, which
+// is what the guard alone does with eleven refused echoes, throws away a
+// download and an upload that would have measured. So when refusals are what
+// left a run with no latency figure, measure() asks for one download file
+// before giving up (downloadFileServed): served, the run carries on and is
+// stored with its real speeds and the ping left BLANK - the "not measured"
+// every surface already knows, the one an iperf3 run stores when its latency
+// probes all fail; refused as well, it is the server that refuses everything,
+// and the run fails at the ping as before, naming both answers. The population
+// should be close to empty - the fleet probe found latency.txt and upload.php
+// agreeing on every server it asked (see fallbackVerdict) - and Auto retires
+// such a server on the latency answer alone (fallbackHealth), which is also
+// why the picker badges it unsupported. Only a pin meets it for more than a
+// run or two, and a pin is the user saying "this server": it now gets the
+// speeds that server really delivers.
+//
+// There is deliberately NO wait before the error surfaces. The library's
+// worker loops have no backoff (see panicThrottle), so a server refusing every
+// chunk is asked again as fast as the round trip allows for the whole window -
+// but that is the rate its error pages were being fetched at before the guard,
+// each refusal still costs a real round trip (it is not the instant local
+// error panicThrottle exists for), and a wait taxes honest measurements: a
+// busy server shedding one chunk request in eight with a 503 measured 694 Mbps
+// on the tree before the guard and 499 Mbps with a guard that waited 500 ms
+// (the guard as shipped, with no wait, measured level with the tree before
+// it). Refused uploads set the
+// precedent - no brake, no second window (uploadRetryable) - and the download
+// follows it (guardedGets.retryable).
+type statusGuardTransport struct {
+	base http.RoundTripper
+}
+
+// getGuardKey is the context key guardGets sets; see statusGuardTransport.
+type getGuardKey struct{}
+
+// guardedGets is what became of the GETs made under one context: one ping, or
+// one download attempt. Carried in the CONTEXT, the way traceConnFamilies
+// carries connFamilies, and not hung on the client like the upload recorder:
+// a run's client is shared - the ranking pings every candidate on it at once,
+// a Best-of round measures every member on it - so a per-client tally could
+// not say which server was refusing, and would need the recorder's reset
+// discipline on top. A tally made for one call is scoped to it for free. The
+// download's is rebuilt per attempt (beside freshManager) for the recorder's
+// reason: the retry predicate and the error text must read the window that
+// just failed. The library's download workers reach note concurrently, and an
+// ORPHANED transfer's workers keep reaching the tally of the attempt that was
+// abandoned for as long as they live, hence the lock; nothing acts on that tally
+// again.
+type guardedGets struct {
+	mu       sync.Mutex
+	accepted int         // answered 2xx
+	refused  map[int]int // answered with an HTTP error: status -> count
+	noAnswer int         // failed beneath us: a dial, a reset, a contained panic
+}
+
+// guardGets marks ctx so every GET made under it is judged by status and
+// tallied into g.
+func guardGets(ctx context.Context, g *guardedGets) context.Context {
+	return context.WithValue(ctx, getGuardKey{}, g)
+}
+
+// note records what became of one request; status 0 is "no answer", the
+// recorder's convention. Nil-safe because the ranking and race pings are
+// judged without a tally, and because this runs on the library's worker
+// goroutines ABOVE the panic containment: a nil dereference here would end the
+// process.
+func (g *guardedGets) note(status int) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	switch {
+	case status == 0:
+		g.noAnswer++
+	case status >= 200 && status < 300:
+		g.accepted++
+	default:
+		if g.refused == nil {
+			g.refused = map[int]int{}
+		}
+		g.refused[status]++
+	}
+}
+
+// onlyRefusals reports whether every request under this context got an answer
+// and every answer was an HTTP error.
+func (g *guardedGets) onlyRefusals() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.accepted == 0 && g.noAnswer == 0 && len(g.refused) > 0
+}
+
+// allAnswered reports whether every request under this context got an answer
+// of some kind: none failed beneath us. It is onlyRefusals' question for the
+// ping whose warm-up echo was accepted, where one acceptance is expected and
+// must not count against the rest.
+func (g *guardedGets) allAnswered() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.noAnswer == 0
+}
+
+// retryable is the download's retry predicate, the counterpart of
+// uploadRetryable and drawn on refusedByServer's lines: a window in which
+// nothing was served and every answer was a refusal will be answered the same
+// way again, and the second window costs the run another capture window and
+// the server another few hundred doomed requests. The exemptions are the
+// upload's, for the upload's reasons: a load symptom (see loadSymptomStatus)
+// says "not right now" and acquits the whole window, and fewer than
+// uploadRejectMinRefusals is too small a sample to judge. Requests that got no
+// answer neither convict nor acquit, exactly as the recorder treats its
+// transport errors; a window with no refusal at all is retried as it always
+// was. It ships WITH the guard because the guard alone would make this case
+// worse: the default budget of one retry would turn a refused window, stored
+// as a false result before, into two refused windows.
+func (g *guardedGets) retryable() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.accepted > 0 {
+		return true
+	}
+	refusals := 0
+	for status, n := range g.refused {
+		if loadSymptomStatus(status) {
+			return true
+		}
+		refusals += n
+	}
+	return refusals < uploadRejectMinRefusals
+}
+
+// summary renders the tally for an error string, or "" when nothing was
+// refused - so a failure that is not a refusal keeps the text it always had.
+// Requests that got no answer are named beside the refusals: "3x HTTP 500"
+// alone would read as the whole story of a ping whose other eight echoes never
+// got through.
+func (g *guardedGets) summary(what string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.refused) == 0 {
+		return ""
+	}
+	codes := make([]int, 0, len(g.refused))
+	for c := range g.refused {
+		codes = append(codes, c)
+	}
+	sort.Ints(codes)
+	total := g.accepted + g.noAnswer
+	parts := make([]string, 0, len(codes)+2)
+	if g.accepted > 0 {
+		parts = append(parts, fmt.Sprintf("%d accepted", g.accepted))
+	}
+	for _, c := range codes {
+		total += g.refused[c]
+		parts = append(parts, fmt.Sprintf("%dx HTTP %d", g.refused[c], c))
+	}
+	if g.noAnswer > 0 {
+		parts = append(parts, fmt.Sprintf("%d got no answer", g.noAnswer))
+	}
+	return fmt.Sprintf("%d %s requests: %s", total, what, strings.Join(parts, ", "))
+}
+
+// errPingRefused is a ping whose every echo was answered, each with an HTTP
+// error. It replaces the library's own error for that case, ErrConnectTimeout
+// ("server connect timeout"), which says the opposite of what happened - the
+// far end connected and answered at once - and would send the user to look at
+// their network. The wording names the ANSWER and not the server: behind an
+// operator's proxy the status can be the proxy's own, for an origin that never
+// answered at all.
+var errPingRefused = errors.New("every latency request was answered with an HTTP error")
+
+func (t statusGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if req.Method != http.MethodGet {
+		return resp, err
+	}
+	ctx := req.Context()
+	g, _ := ctx.Value(getGuardKey{}).(*guardedGets)
+	if g == nil && ctx.Value(pingDrainKey{}) == nil {
+		return resp, err // not a measurement request
+	}
+	if err != nil || resp == nil || resp.Body == nil {
+		// A response-less, error-less answer is a RoundTripper breaking
+		// net/http's contract - the real transport never does it - and is
+		// handed on untouched, the way panicSafeTransport beneath treats it,
+		// rather than dereferenced here on a library worker's stack.
+		if err == nil {
+			return resp, err
+		}
+		// Tallied so the error text can tell "refused" from "never got
+		// through" - unless the context is what ended it: the requests a closing
+		// download window cancels, or an abort, say nothing about the far end.
+		if ctx.Err() == nil {
+			g.note(0)
+		}
+		return resp, err
+	}
+	code := resp.StatusCode
+	if code >= 300 && code < 400 {
+		return resp, nil // the doer's to follow; the hop comes back through here
+	}
+	g.note(code)
+	if code >= 200 && code < 300 {
+		return resp, nil
+	}
+	// Read the error page off (bounded, like the probes) so the connection
+	// goes back to the pool: the next echo, or the next chunk, would otherwise
+	// pay a fresh dial for every refusal. These bytes are not payload and are
+	// not counted; docs/metrics.md names them among the exclusions, at the
+	// size they really are - which is not this cap. A page past the cap is
+	// closed short of EOF, and what that costs is net/http's call exactly as
+	// it is for a capped echo (see pingDrainTransport): the transport drains on
+	// for up to 256 KiB or 50 ms to keep the connection, so a page up to that
+	// size still crosses the wire whole, and a longer one costs the drain,
+	// whatever the peer had already pushed, and a fresh dial. And a refused
+	// download window is not a ping's eleven requests: the worker loop asks
+	// again, unbraked, until the window closes. Measured on go1.27 against
+	// loopback, one 1 s window on 2 connections, the server taking 5 ms per
+	// request - some 318 requests every time: a 512-byte page put 196 KB on the
+	// wire, a 1 KiB page 358 KB, a 4 KiB page 1.3 MB, a 64 KiB page 20.6 MB
+	// (65.7 KB per request - the whole page - on 7 connections), a 256 KiB page
+	// 83.8 MB, and a 1 MiB page 106 MB (about 360 KB and a fresh connection per
+	// request), with DownloadBytes 0 each time. Before the guard the library
+	// counted those bytes as the payload of its false result (20,185,088 of
+	// 20,291,348 for the 64 KiB page), so for this one class - the echo
+	// answers, the files are refused; a server refusing everything never gets
+	// past its ping - the guard moves real traffic out of the data-used
+	// figure. A production window is 15 s on as many connections as the
+	// machine has cores by default, up to 16 by setting, at internet round
+	// trips: thousands of requests, a few megabytes for the usual sub-kilobyte
+	// page, as much as the link carries for a big one. It is one window unless
+	// the statuses are the busy kind, which get the usual retries
+	// (guardedGets.retryable), and counting the little this read sees
+	// would not close the gap where it is widest, so it is named rather than
+	// counted.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, probeDrainCap))
+	_ = resp.Body.Close()
+	// The library discards this error (a failed echo, a failed chunk); the
+	// tally is what carries the status to the run's error text.
+	return nil, fmt.Errorf("answered with HTTP %d", code)
+}
+
+// refusedStatus is the HTTP error status in the tally, for a context that
+// carried ONE request (the download-file check), or 0 when nothing was
+// refused. Should more than one ever be there it names the lowest, so the text
+// it feeds is stable.
+func (g *guardedGets) refusedStatus() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	status := 0
+	for c := range g.refused {
+		if status == 0 || c < status {
+			status = c
+		}
+	}
+	return status
+}
+
+// downloadCheckFile is the smallest file the library's download can ask for
+// (dlSizes[0] in speedtest-go v1.7.11 request.go; the transfer itself asks for
+// random1000x1000.jpg), about 245 KB on a stock bundle.
+const downloadCheckFile = "random350x350.jpg"
+
+// downloadCheckTimeout bounds the download-file check by itself, inside
+// whatever is left of the run's slice. The check follows a ping that was
+// answered promptly eleven times over, so a server that accepts this one
+// request and then stalls is the exception - and it must cost seconds, not the
+// slice the transfers behind it, or the next Best-of member, would have had.
+// The fallback probe's ceiling, because it is the same kind of request: one
+// GET for a file of the bundle, judged by its status. A var so a test can
+// shorten it, like bestOfServerSettle.
+var downloadCheckTimeout = fallbackProbeTimeout
+
+// downloadCheckRequest builds the GET for downloadCheckFile the way the
+// library builds a download chunk's (request.go downloadRequest): beside
+// whatever srv.URL names, so a URL probeEndpoint adopted from a redirect, or a
+// bundle that does not live under /speedtest/, is asked where the transfer
+// will ask.
+func downloadCheckRequest(ctx context.Context, srv *ookla.Server) (*http.Request, error) {
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = path.Dir(u.Path)
+	return http.NewRequestWithContext(ctx, http.MethodGet, u.JoinPath(downloadCheckFile).String(), nil)
+}
+
+// downloadFileServed asks the server for ONE download file and reports whether
+// it was served; when it was not, outcome says what happened instead, in words
+// fit for the run's error. measure() calls it when refusals left a run with no
+// latency figure, to tell a server that refuses only its latency file - whose
+// transfers will measure - from one that refuses its whole bundle (see
+// statusGuardTransport).
+//
+// The request rides a client built the way every transfer attempt's is
+// (freshManager), through that client's own doer, so it is judged by the chain
+// the download is about to use and nothing else: the status guard under a
+// tally of its own - a 2xx, after any redirect the doer followed, is served; an
+// HTTP error comes back as the guard's error with the status in the tally - the
+// dial guard and the proxy's destination check on every hop, and an operator's
+// proxy answering 502 for a dead origin refused exactly as the echoes were. A
+// probe client would have been simpler and wrong in each of those respects.
+// Rebuilding here, before the first transfer attempt rebuilds again, follows
+// the per-attempt discipline rather than bending it: the run's client is
+// shared - by the ranking, by every member of a Best-of round - while this one
+// is ours alone, its idle socket is released by the next rebuild (attemptT)
+// like any abandoned attempt's, and nothing has transferred yet, so there are
+// no totals on the old manager to lose. Everything here runs on the run's own
+// goroutine, the doer's RoundTrip included, and this measurement has started no
+// transfer yet, so no library worker of its own is alive to see the swap.
+//
+// Only the status is read. The body is closed unread and its bytes are not
+// counted - they are not payload - though closing is not free: net/http drains
+// a body closed early for up to 256 KiB or 50 ms to keep the connection (see
+// pingDrainTransport), which on a fast link is the whole file. docs/metrics.md
+// names it with the other exclusions. One request per measure() call, whatever
+// the retry budget: it is asked before the retry loops exist.
+func (o *Ookla) downloadFileServed(ctx context.Context, srv *ookla.Server) (served bool, outcome string) {
+	cctx, cancel := context.WithTimeout(ctx, downloadCheckTimeout)
+	defer cancel()
+	gets := &guardedGets{}
+	req, err := downloadCheckRequest(guardGets(cctx, gets), srv)
+	if err != nil {
+		return false, "a download file could not be asked for: " + err.Error()
+	}
+	resp, err := freshManager(o, srv, o.uc).Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return true, ""
+		}
+		// A redirect the doer did not follow (a 304, a 300 with no Location):
+		// the guard passes it, and it is not a file.
+		return false, fmt.Sprintf("a download file was not served either: HTTP %d", resp.StatusCode)
+	}
+	switch status := gets.refusedStatus(); {
+	case status != 0:
+		return false, fmt.Sprintf("a download file was refused too: HTTP %d", status)
+	case cctx.Err() != nil:
+		// Its own deadline - or the run's, which the caller tells apart and
+		// reports as the cancellation it is.
+		return false, fmt.Sprintf("a download file got no answer within %s either", downloadCheckTimeout)
+	default:
+		// Worded for everything that lands here, which is more than silence: a
+		// reset, a hop the dial guard or the proxy's destination check refused
+		// before anything was sent, a redirect loop the doer gave up on after
+		// ten answers. The client's own error says which.
+		return false, "a download file could not be fetched either: " + err.Error()
+	}
+}
+
+// carryOnWithoutPing is what measure() does when refusals left the run with no
+// latency figure: check one download file, and either let the run go on - nil,
+// with a warning, because what becomes history has changed shape - or fail it
+// with the error it always failed with, the check's outcome appended. The
+// "ping:" prefix stays first either way, so the stage is still "ping". A run
+// cut short during the check reports the cancellation and nothing about the
+// server, as a run cut short during the ping does.
+func (o *Ookla) carryOnWithoutPing(ctx context.Context, srv *ookla.Server, failure error, diag string) error {
+	served, outcome := o.downloadFileServed(ctx, srv)
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("ping: %w", ctx.Err())
+	case !served:
+		return fmt.Errorf("%w; %s", failure, outcome)
+	}
+	// Warn, like the kept partial further down the run: the row this run goes
+	// on to store has no ping, and nothing else will say why once it has
+	// succeeded.
+	o.warnf("ookla latency requests refused, run continues without a ping",
+		"server", serverLabel(srv), "detail", diag+"; a download file was served")
+	return nil
 }
 
 // starvationCeiling bounds what counts as the starvation signature: at most one
@@ -670,15 +1124,26 @@ const uploadRescueSettle = 5 * time.Second
 // HEALTHIER than non-migrated ones, which is the opposite of what a planned
 // retirement would look like.
 //
-// Ranking cannot see any of this on its own. speedtest-go's HTTPPing GETs
+// The library cannot see any of this on its own. speedtest-go's HTTPPing GETs
 // /speedtest/latency.txt - the same bundle - and NEVER CHECKS THE STATUS CODE,
-// so a server answering 500 to everything returns a fast, plausible latency and
-// sorts normally. Left alone it wins the race, and every run against it fails.
+// so a server answering 500 to everything handed it a fast, plausible latency
+// and sorted normally; left alone it won the race. And the run against it did
+// not even fail once a "both" run began keeping its download as a partial: the
+// download read the error pages as payload, so the run was STORED, with a
+// false low download and a false below-threshold alert. statusGuardTransport
+// closes that on the measurement client - a refused echo is no sample, so such
+// a server ranks unanswered and a run against it fails at the ping, the one
+// download file it is asked for refused like its echoes - and it
+// covers what this cache cannot: a pin (which bypasses ranking), a first
+// encounter (the two-strike rule below has not retired the server yet), and a
+// status that is really an operator proxy's.
 //
-// The check is therefore just reading the status of a request ranking already
-// makes. Measured over 200 random servers, latency.txt and upload.php agreed on
-// health 200/200 - no misses, no false exclusions - so the cheap GET stands in
-// for the POST.
+// This cache is what REMEMBERS: it keeps a retired server out of the pool for
+// hours rather than re-learning it every run, and it feeds the picker's
+// "unavailable" mark. Its check is just reading the status of a request
+// ranking already makes. Measured over 200 random servers, latency.txt and
+// upload.php agreed on health 200/200 - no misses, no false exclusions - so
+// the cheap GET stands in for the POST.
 type fallbackVerdict struct {
 	state   endpointState
 	expires time.Time
@@ -2008,7 +2473,10 @@ func noteConvictionLocked(id string, now time.Time) bool {
 }
 
 // probeFallback GETs the bundle's latency probe and judges by STATUS, which is
-// exactly what the library's ping omits.
+// exactly what the library's ping omits. The measurement client now refuses
+// such an echo as well (statusGuardTransport), but only as a failed request:
+// the verdict, its two strikes and its hours-long memory live here, on a
+// client of the probe's own that the guard never sees.
 var probeFallback = func(ctx context.Context, s *ookla.Server) endpointState {
 	u, err := url.Parse(s.URL)
 	if err != nil || u.Host == "" {
@@ -3827,7 +4295,13 @@ func promoteIncumbent(ranked ookla.Servers, incumbent, isp string) (ookla.Server
 //
 // The caller must read any per-attempt totals off the OLD manager first - they
 // do not carry over. That is the same discipline Reset() already required.
-func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
+//
+// It returns the new client's doer, the top of its transport chain, for the one
+// caller with a request of its own to send through it (downloadFileServed);
+// the transfer attempts ignore it. Returned rather than kept on the Ookla
+// beside attemptT: nothing outlives the call that asked for it, so there is no
+// field for a later attempt, or an orphan's workers, to find stale.
+func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) *http.Client {
 	if uc == nil {
 		// A direct measure() call (tests, or any caller that did not come through
 		// RunReason) has no run config. The library's own default is the right
@@ -3851,7 +4325,7 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 	// the pointer fields it shares (Location, DialerControl) are only read by
 	// the library on the paths a rebuilt client uses.
 	attempt := *uc
-	client, rec := newOoklaClientRec(&attempt)
+	client, rec, doer := newOoklaClientDoer(&attempt)
 	if carry > 0 {
 		client.SetCaptureTime(carry)
 	}
@@ -3867,6 +4341,7 @@ func freshManager(o *Ookla, srv *ookla.Server, uc *ookla.UserConfig) {
 		o.attemptT = attempt.T // the transport New stamped for THIS attempt
 		o.upRec = rec          // diagnostics follow the client the transfer actually uses
 	}
+	return doer
 }
 
 // managerCaptureTime reads the transfer capture window configured on a
@@ -3910,7 +4385,8 @@ var (
 // ooklaPing is the ranking latency probe, a swap-a-var seam (like ooklaDownload/
 // ooklaUpload) so rankedServers' selection logic - which reachable/failed server
 // wins - is testable without a live server. The context is marked so the
-// client's transport caps what each echo reads (see pingDrainTransport).
+// client's transport caps what each echo reads (see pingDrainTransport) and
+// drops an echo answered with an HTTP error (see statusGuardTransport).
 var ooklaPing = func(ctx context.Context, srv *ookla.Server, cb func(time.Duration)) error {
 	return srv.PingTestContext(pingDrainContext(ctx), cb)
 }
@@ -4235,16 +4711,78 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	// Same ten samples the library already sends - the callback only keeps the
 	// fastest alongside the mean it returns, so this costs no extra probe.
 	var bestPing time.Duration
-	if err := ooklaPing(ctx, srv, keepFastestPing(&bestPing)); err != nil {
-		return Result{}, fmt.Errorf("ping: %w", err)
+	// The echoes are judged by status and tallied (see statusGuardTransport):
+	// the library takes a sample from whatever answers, and a server - or an
+	// operator's proxy - answering 5xx to everything used to hand this run a
+	// fast, plausible ping and then its error pages as a download.
+	pingGets := &guardedGets{}
+	// blankPing: refusals left this run with no latency figure, a download file
+	// was served all the same, and the run goes on to store its speeds with the
+	// ping left blank (see carryOnWithoutPing). Two arms below can set it, and
+	// they are one if/else so a run can never be checked twice.
+	blankPing := false
+	if err := ooklaPing(guardGets(ctx, pingGets), srv, keepFastestPing(&bestPing)); err != nil {
+		// In every arm the "ping:" prefix stays first, so speedFailStage
+		// classifies the failure as before.
+		diag := pingGets.summary("latency")
+		switch {
+		case ctx.Err() != nil || diag == "":
+			// A run that was cut short - the cause is the cancellation, and the
+			// echoes it had time for prove nothing - or a ping that failed with
+			// no refusal in it, which keeps the text it always had.
+			return Result{}, fmt.Errorf("ping: %w", err)
+		case pingGets.onlyRefusals():
+			// Every echo answered, every answer an HTTP error: say that, with
+			// the codes, rather than the library's "server connect timeout" -
+			// unless it is only the latency file that is refused, which one
+			// download file settles.
+			failure := fmt.Errorf("ping: %w [%s]", errPingRefused, diag)
+			if err := o.carryOnWithoutPing(ctx, srv, failure, diag); err != nil {
+				return Result{}, err
+			}
+			blankPing = true
+		default:
+			// Refusals among echoes that never got through. The library's
+			// error stands - some of this may well be the network - with the
+			// whole tally beside it, and no download file is asked for: a
+			// served file would not make a half-silent path a healthy one.
+			return Result{}, fmt.Errorf("ping: %w [%s]", err, diag)
+		}
+	} else if diag := pingGets.summary("latency"); bestPing == 0 && diag != "" && ctx.Err() == nil {
+		// The library returns nil with NO sample when only its warm-up echo was
+		// answered (request.go compares the failures against all eleven; the
+		// ranking guards the same hole with its sampled flag). With a refusal
+		// now an error that is reachable by status alone - a rate limiter that
+		// lets the first echo through and answers 429 to the burst behind it,
+		// which the library sends unpaced because it skips its 200 ms pause
+		// after a failed echo. It is the errored ping by another door, and is
+		// sorted the way that one is. When every echo behind the warm-up was
+		// ANSWERED, refusals are what left the run with no latency figure: a
+		// download file that is served lets the run go on with a blank ping,
+		// one that is refused too fails it here. When some of them never got
+		// through it is the mixed arm above - part of it may well be the
+		// network - and it fails with the whole tally and no file asked for;
+		// whether the one warm-up echo happened to land must not decide which
+		// of the two a ping is. What it must not do is fall through
+		// unexamined, which would store whatever Latency the server object
+		// arrived with beside the transfers. Scoped to refusals on purpose:
+		// with none in the tally this is the library's old edge, a stubbed
+		// ping included, and stays as it was. Not on a run that was cut short,
+		// for the reason above.
+		failure := fmt.Errorf("ping: no latency sample was taken, only the warm-up request was accepted [%s]", diag)
+		if !pingGets.allAnswered() {
+			return Result{}, failure
+		}
+		if err := o.carryOnWithoutPing(ctx, srv, failure, diag); err != nil {
+			return Result{}, err
+		}
+		blankPing = true
 	}
 	// Idle baseline for latency-under-load: same method/target as the loaded
 	// samplers below (NOT the Ookla ping above), taken while the link is quiet, so
 	// the idle-vs-loaded delta isolates the load effect.
 	probeAddr := lulRunEndpoint(ctx)
 	idleMS := measureIdleLatency(ctx, probeAddr)
-	anyErr := func(error) bool { return true } // a failed transfer is worth retrying
-
 	// The family the transfers ACTUALLY used, from their real connections (see
 	// connFamilies). One recorder spans every attempt of both directions: the
 	// per-attempt client rebuilds (freshManager) must not lose the download's
@@ -4267,12 +4805,23 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	var downBytes, upBytes int64
 	upPartial := false // a "both" run keeping its download after a failed upload
 	if dir != "up" {
-		err = withRetryPred(ctx, retries, anyErr, func() error {
+		// What became of the LAST attempt's chunk requests (see guardedGets).
+		// Rebuilt per attempt, beside freshManager, like the upload recorder's
+		// reset: the retry predicate and the error below must both read the
+		// window that just failed, not a sum over windows. Assigned and read on
+		// this goroutine only; the library's workers reach it through the
+		// transfer's context, under its lock.
+		var dlGets *guardedGets
+		// A failed window is normally worth another turn; one the far end
+		// refused outright is not (see guardedGets.retryable).
+		dlRetryable := func(error) bool { return dlGets.retryable() }
+		err = withRetryPred(ctx, retries, dlRetryable, func() error {
 			freshManager(o, srv, o.uc) // per-attempt manager; see freshManager
+			dlGets = &guardedGets{}
 			stop := startLoadSampler(ctx, probeAddr)
 			// traceConnFamilies scopes the family record to the transfer's own
 			// requests - the load sampler above probes a different host.
-			finished, e := runTransfer(traceConnFamilies(ctx, fams), srv, ooklaDownload)
+			finished, e := runTransfer(guardGets(traceConnFamilies(ctx, fams), dlGets), srv, ooklaDownload)
 			loadedDown = stop() // our own sampler, always joined
 			// Tally what THIS attempt really pulled, whatever became of it. The
 			// bytes came off the user's allowance either way, and the figure is
@@ -4328,6 +4877,20 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 			// measurement survived. An ABANDONED transfer's bytes are in there
 			// too - its counter is read before the guard above returns - so a
 			// cancelled run reports what it moved instead of 0.
+			//
+			// A window the far end refused says so, the tally appended the way
+			// the upload's recorder summary is: %w keeps errMeasurementNA in the
+			// chain and the "download:" prefix first, so the stage still reads
+			// "na". Only on an N/A - the verdict of a window that RAN to its end
+			// with the context alive. An abandoned or cancelled attempt carries
+			// its cancellation and nothing else: the few refusals it had time
+			// for are not what ended it.
+			if errors.Is(err, errMeasurementNA) {
+				if diag := dlGets.summary("download"); diag != "" {
+					return Result{DownloadBytes: downBytes, UploadBytes: upBytes},
+						fmt.Errorf("download: %w [%s]", err, diag)
+				}
+			}
 			return Result{DownloadBytes: downBytes, UploadBytes: upBytes}, fmt.Errorf("download: %w", err)
 		}
 	}
@@ -4570,13 +5133,29 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		}
 	}
 
+	// A blank ping is blanked HERE, by name, and not left to the server object
+	// happening to hold zeroes: on that path the ping wrote nothing to it, so
+	// Latency and Jitter are whatever it arrived with - the catalogue fetch's
+	// own one-shot echo, which the library times against any answer at all, an
+	// error page included (speedtest-go v1.7.11 server.go), or a figure the
+	// ranking or the city race left there. Zero with no floor and no jitter is
+	// the "ping not measured" every consumer already reads: the store and
+	// /metrics gate on it, the dashboard shows "-" and keeps it out of charts
+	// and averages, a Best-of round scores it as unmeasuredPingMS and never
+	// lets it win on latency, and a Max ping or Max jitter threshold records
+	// no verdict rather than a pass.
+	pingMS, pingBest, jitter := util.DurMS(srv.Latency), msIfPositive(bestPing), f64p(util.DurMS(srv.Jitter))
+	if blankPing {
+		pingMS, pingBest, jitter = 0, nil, nil
+	}
+
 	return Result{
 		Engine:          "ookla",
 		DownloadMbps:    srv.DLSpeed.Mbps(),
 		UploadMbps:      upMbps,
-		PingMS:          util.DurMS(srv.Latency),
-		PingBestMS:      msIfPositive(bestPing),
-		JitterMS:        f64p(util.DurMS(srv.Jitter)),
+		PingMS:          pingMS,
+		PingBestMS:      pingBest,
+		JitterMS:        jitter,
 		Server:          fmt.Sprintf("%s, %s", srv.Sponsor, srv.Name),
 		ServerID:        srv.ID,
 		PacketLoss:      loss,
@@ -5029,10 +5608,11 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 				defer func() { <-slots }()
 				// The per-sample callback is the only honest success signal: the
 				// library can return a nil error WITHOUT collecting a single sample
-				// (every measured echo failing at transport level after a good
-				// warm-up), leaving Latency untouched at its stale fetch-echo
-				// value - so "err == nil && Latency > 0" would record a one-shot
-				// echo as an answered ten-sample ranking ping.
+				// (every measured echo failing after a good warm-up - at transport
+				// level, or refused by status, see statusGuardTransport), leaving
+				// Latency untouched at its stale fetch-echo value - so "err == nil
+				// && Latency > 0" would record a one-shot echo as an answered
+				// ten-sample ranking ping.
 				if floor, ok := raced[s.ID]; ok {
 					pings[i] = applyRankPing(s, nil, floor > 0, floor)
 					health[i] = fallbackHealth(ctx, s)
@@ -5051,7 +5631,10 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 				pings[i] = applyRankPing(s, err, sampled, floor)
 				// Same fan-out, so this costs the phase nothing it was not already
 				// spending: judge the fallback by STATUS, which the library's ping
-				// does not do (see fallbackHealth).
+				// does not do (see fallbackHealth). The ping above does fail on a
+				// refusing server now (statusGuardTransport), which costs it THIS
+				// run's ranking; the verdict here is what remembers it for the
+				// next.
 				health[i] = fallbackHealth(ctx, s)
 			}(i, s)
 		}
@@ -5064,8 +5647,10 @@ func rankedServersRaced(ctx context.Context, servers ookla.Servers, isp string, 
 
 	// Drop servers whose legacy fallback is gone. They are not slow or flaky -
 	// every transfer against them fails - so ranking them at all only guarantees
-	// a wasted run, and because their 500 is served instantly they otherwise sort
-	// as if healthy.
+	// a wasted run. (Their instantly served 500 used to sort them as if healthy;
+	// a refused ranking ping now ranks unanswered - see statusGuardTransport -
+	// but a server held as unknown on its first strike is still in the pool, and
+	// a dropped one makes room for a reserve.)
 	health := probe(cand)
 	usable := make(ookla.Servers, 0, len(cand))
 	var dropped []string

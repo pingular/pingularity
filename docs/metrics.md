@@ -138,8 +138,21 @@ self-describing):
   hundred kilobytes per echo and a few megabytes over its probe set, none of it
   counted; a well-behaved one answers nine bytes), the echo the server
   catalogue sends every server it lists (two GETs apiece, read whole, within
-  their own four-second limit), the UDP loss/jitter probe, TCP/TLS/IP
-  overhead, and retransmits. A
+  their own four-second limit), the error pages of download requests that
+  were answered with an HTTP error instead of the file (a server refusing
+  every file is asked again for the whole capture window - hundreds to
+  thousands of requests, where a ping makes eleven; the daemon reads a few
+  kilobytes of each page and hangs up, and its HTTP client drains on as it
+  does for an echo, so a typical sub-kilobyte error page adds up to a few
+  megabytes over the window and a large one to tens or hundreds - as much as
+  the link carries in that time - none of it counted; a window refused
+  outright is not run a second time unless the answers were the busy-server
+  kind - 408, 429, 502, 503, 504 - which get the usual retries), the one
+  download file a run asks for, and does not read, when its latency requests
+  were answered with HTTP errors (up to 256 KiB of it may arrive before the
+  HTTP client lets go), the UDP
+  loss/jitter probe,
+  TCP/TLS/IP overhead, and retransmits. A
   run that failed or was aborted partway still contributes the bytes its
   engine had counted by then, but bytes an engine never got to count - and a
   run cut short by daemon shutdown - are lost. On a metered link, budget with

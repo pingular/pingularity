@@ -228,7 +228,10 @@ var racePing = func(ctx context.Context, s *ookla.Server) {
 	// measured whatever it measured, and that is a real reading of this server.
 	// Marked so the transport caps each echo's body (see pingDrainTransport):
 	// the timeout above bounds a server that goes quiet, the cap one that
-	// keeps talking.
+	// keeps talking. The same mark has an echo answered with an HTTP error
+	// dropped (see statusGuardTransport), so a host serving instant 500s - or
+	// a proxy's 502 for a dead one - scores nothing here instead of the
+	// fastest time in the race.
 	_ = s.PingTestContext(pingDrainContext(ctx), keepFastestPing(&best))
 	s.Latency = best
 }
