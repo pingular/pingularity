@@ -27,7 +27,6 @@ import (
 	"unicode"
 
 	ookla "github.com/showwin/speedtest-go/speedtest"
-	"github.com/showwin/speedtest-go/speedtest/transport"
 
 	"github.com/pingular/pingularity/internal/stats"
 	"github.com/pingular/pingularity/internal/util"
@@ -1867,7 +1866,7 @@ func guardProxiedDestination(ctx context.Context, hostport string) error {
 
 // serverDestination is the network destination a server's requests will name:
 // the catalogue Host when present (currentEndpoint copies it into s.URL, and
-// the packet-loss analyzer dials it), else the URL's own host.
+// the packet-loss probe dials it), else the URL's own host.
 func serverDestination(s *ookla.Server) string {
 	if s == nil {
 		return ""
@@ -4692,9 +4691,10 @@ func traceConnFamilies(ctx context.Context, rec *connFamilies) context.Context {
 }
 
 // ooklaLoss indirects measurePacketLoss the same way ooklaPing/ooklaDownload/
-// ooklaUpload stand in for the network: the loss probe needs a live UDP
-// protocol no offline test can serve, and what measure() records about a
-// SUCCESSFUL probe (UDPDirection) was otherwise unreachable in tests.
+// ooklaUpload stand in for the network, so what measure() records about a
+// SUCCESSFUL probe (UDPDirection) can be reached without a peer that speaks
+// the loss protocol (loss_probe_test.go has one, but measure()'s own tests
+// should not need it).
 var ooklaLoss = measurePacketLoss
 
 // measure runs one full measurement against an already-chosen server.
@@ -5125,7 +5125,7 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 	var udpDir string
 	if !upPartial && (o.LossFn == nil || o.LossFn()) {
 		loss = ooklaLoss(ctx, srv)
-		// The probe SENDS its datagrams (speedtest-go's PacketLossSender), so a
+		// The probe SENDS its datagrams (runLossProbe, lossprobe.go), so a
 		// successful one measured the upstream path - the only direction this
 		// engine can honestly claim for loss.
 		if loss != nil {
@@ -5175,8 +5175,10 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 
 // packetLossSampleDuration bounds the best-effort loss measurement. Loss uses a
 // UDP protocol many networks/servers don't support, so this is kept short and
-// failures are silently ignored (nil result).
-const packetLossSampleDuration = 5 * time.Second
+// failures are silently ignored (nil result). A variable so a test can run the
+// whole probe, bound included, in a fraction of a second; production never
+// writes it.
+var packetLossSampleDuration = 5 * time.Second
 
 // plCooldown: where the UDP loss protocol is blocked, the probe wastes seconds
 // per run for nothing. After two consecutive failures against a server we skip
@@ -5236,36 +5238,13 @@ func measurePacketLoss(ctx context.Context, srv *ookla.Server) *float64 {
 		return nil                   // server recently didn't support it - skip the slow probe
 	}
 
+	// The probe samples for packetLossSampleDuration and asks once more after
+	// its last datagram; the extra second is room for that last answer and the
+	// hard bound on the whole call. runLossProbe returns by pctx's end whatever
+	// the peer does (see lossprobe.go), so nothing here can hold the run.
 	pctx, cancel := context.WithTimeout(ctx, packetLossSampleDuration+time.Second)
 	defer cancel()
-	// Both dialers carry the SSRF dial guard: the destination is third-party
-	// catalogue data like every other one this file reaches, and left nil the
-	// analyzer builds bare dialers of its own, so its TCP sampler connect and
-	// UDP sends would bypass the guard entirely. probeDialControl rather than
-	// probeDialGuard so allowLoopbackProbes relaxes this path too. The timeout
-	// mirrors the library's own default (PacketSendingTimeout).
-	analyzer := ookla.NewPacketLossAnalyzer(&ookla.PacketLossAnalyzerOptions{
-		SamplingDuration: packetLossSampleDuration,
-		TCPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl()},
-		UDPDialer:        &net.Dialer{Timeout: 5 * time.Second, Control: probeDialControl()},
-	})
-	var loss *float64
-	// Upstream leak (speedtest-go v1.7.11): RunWithContext opens a TCP sampler conn
-	// and a UDP sender conn internally and never Disconnect()s them - on pctx.Done()
-	// its sampler/sender loops just return, leaving both sockets for the Go runtime's
-	// netpoll finalizer to close on the next GC rather than closing them promptly.
-	// The conns are locals inside RunWithContext and never surface through the API,
-	// so there is no handle to close them from here - a clean fix needs an upstream
-	// Disconnect on ctx cancellation (or vendoring one). At one probe per run this is
-	// a couple of fds living until the next GC, bounded and finalizer-reclaimed, not
-	// an unbounded leak, so we accept it rather than fork.
-	// TODO: drop this note once a released speedtest-go closes those conns on cancel.
-	_ = analyzer.RunWithContext(pctx, dest, func(pl *transport.PLoss) {
-		if v := pl.LossPercent(); v >= 0 { // -1 means no packets acknowledged yet
-			f := v
-			loss = &f
-		}
-	})
+	loss := runLossProbe(pctx, dest, packetLossSampleDuration)
 
 	// A probe cut short by the caller (aborted run, shutdown) says nothing about
 	// the server's UDP support: don't advance the cooldown or count the outcome.

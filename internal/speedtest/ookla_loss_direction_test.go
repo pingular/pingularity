@@ -9,7 +9,7 @@ import (
 )
 
 // Ookla results must describe themselves as honestly as iperf ones do: a
-// successful loss probe knows which way it sampled (the analyzer sends the
+// successful loss probe knows which way it sampled (the probe sends the
 // datagrams, so it is the upstream path), and the transfer's IP family is
 // knowable from the connections the run REALLY made - and only from those.
 
@@ -29,7 +29,7 @@ func stubOoklaTransfers(t *testing.T) {
 }
 
 // A run whose loss probe yielded data must record WHICH path it sampled: the
-// Ookla analyzer sends UDP client->server, so a successful probe is "up".
+// Ookla probe sends UDP client->server, so a successful probe is "up".
 // Stored without it, loss on an asymmetric link is ambiguous forever.
 func TestOoklaLossProbeRecordsUpstreamDirection(t *testing.T) {
 	stubOoklaTransfers(t)
