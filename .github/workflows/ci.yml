@@ -55,7 +55,11 @@ jobs:
       - name: test
         # -race is the gate: three test files only observe the unsynchronized
         # access they were written to catch when the race detector is on.
-        run: go test ./... -count=1 -race
+        # -timeout: internal/speedtest alone takes 9-10 minutes here (about 600 s
+        # under -race on a 2026 MacBook), right at go test's default per-package
+        # limit of ten minutes, which kills the binary with "test timed out"
+        # rather than failing a test. The job's own limit stays the backstop.
+        run: go test ./... -count=1 -race -timeout 25m
 
       - name: test (file-backed store)
         # The ordinary run's ":memory:" stores pin the SQLite pool to ONE
@@ -163,7 +167,7 @@ jobs:
           node-version: '22'
 
       - name: test
-        run: go test ./... -count=1
+        run: go test ./... -count=1 -timeout 25m # see the test job for why
 
       - name: ui test
         run: node --test internal/web/ui/*.test.mjs
