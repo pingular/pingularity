@@ -17,9 +17,9 @@ func TestMonitorAlertCallbacks(t *testing.T) {
 		dur    int
 	}
 	var calls []call
-	reconnects := 0
+	reconnects, reconnectDown := 0, -1
 	m.OnTransition = func(online bool, durationS int) { calls = append(calls, call{online, durationS}) }
-	m.OnReconnect = func() { reconnects++ }
+	m.OnReconnect = func(downtimeS int) { reconnects++; reconnectDown = downtimeS }
 
 	feed(m, false, time.Unix(1000, 0)) // bad round 1 of 2 - not yet confirmed
 	feed(m, false, time.Unix(1002, 0)) // confirms DOWN
@@ -33,5 +33,8 @@ func TestMonitorAlertCallbacks(t *testing.T) {
 	}
 	if reconnects != 1 {
 		t.Fatalf("OnReconnect fired %d times, want 1", reconnects)
+	}
+	if reconnectDown != 8 {
+		t.Fatalf("OnReconnect was told the link was down %ds, want the up event's 8s", reconnectDown)
 	}
 }

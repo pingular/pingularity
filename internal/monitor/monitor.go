@@ -58,9 +58,10 @@ type Monitor struct {
 	famOrder []string                // stable display order of families
 	active   map[string]bool         // families probed in the most recent round
 
-	// OnReconnect, if set, fires when the link comes back online; used to trigger
+	// OnReconnect, if set, fires when the link comes back online, with how long
+	// it was down in seconds (what the up event records); used to trigger
 	// a speedtest. Called synchronously from the probe loop; keep it quick or async.
-	OnReconnect func()
+	OnReconnect func(downtimeS int)
 
 	// OnDegraded, if set, fires when the link is online but its base latency stays
 	// above DegradedPingFn()'s threshold for degradedRounds rounds - catching a
@@ -1664,7 +1665,7 @@ func (m *Monitor) transition(ctx context.Context, online bool, res prober.Result
 			m.bufferPendingEvent(evWall, "up", duration)
 		}
 		if m.OnReconnect != nil {
-			m.OnReconnect()
+			m.OnReconnect(duration)
 		}
 	} else {
 		// Self-explanatory at the default level: which families failed quorum

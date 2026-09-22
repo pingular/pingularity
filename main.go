@@ -990,7 +990,7 @@ func (p *program) run(ctx context.Context) {
 	// gates are separate so the cheap lookup and the expensive speedtest keep
 	// their own last-fire time and their own floor.
 	var netinfoGate, speedGate reconnectGate
-	m.OnReconnect = func() {
+	m.OnReconnect = func(downtimeS int) {
 		// One clock reading for the whole callback, so the two gates and the speed
 		// schedule all judge the same instant.
 		now := time.Now()
@@ -1012,18 +1012,10 @@ func (p *program) run(ctx context.Context) {
 		// must not consume the window and space out the next allowed one.
 		if monitoringLive() && set.SpeedtestOnReconnect() && set.SpeedAllowed(now) {
 			if speedGate.allow(now, reconnectSpeedGap(set.SpeedInterval())) {
+				settle := reconnectSettleFor(time.Duration(downtimeS) * time.Second)
 				spawn(func() {
-					// A dispatch that bounces off RunOnce's single-flight has measured
-					// nothing, so it must not consume the window: the run it collided
-					// with may have started BEFORE this reconnect, in which case it is
-					// measuring the link that was still down, and keeping the window
-					// would suppress the real recovery test for up to a day. Bounced
-					// dispatches are free (the busy check returns before any network
-					// work), so handing the window back cannot cost a flap storm
-					// anything.
-					if _, err := sched.RunOnce(ctx, "reconnect"); errors.Is(err, speedtest.ErrBusy) {
-						speedGate.release(now)
-					}
+					reconnectDispatch(ctx, &speedGate, now, settle, downtimeS,
+						func() bool { return m.Snapshot().Online }, sched.RunOnce, p.log)
 				})
 			} else {
 				stats.Inc("speed.reconnect_suppressed") // too soon after the last reconnect test
@@ -1900,7 +1892,87 @@ const (
 	// megabytes and takes 30-60s, so this is the shortest spacing that is still
 	// defensible on a metered LTE/5G backup link.
 	minReconnectSpeedGap = 15 * time.Minute
+
+	// reconnectSettleAfter separates a real outage from a blip. A link that was
+	// down for minutes comes back whole: the three reconnect tests on record
+	// after outages of 2-12 minutes all took their idle latency baseline at
+	// once. A link that was down for hours comes back in stages - the modem
+	// re-provisions, the address lease renews, the resolver is cold - and the
+	// one reconnect test after such an outage (four hours, 2026-09-22) fired
+	// within seconds of the up event and found no path yet for its baseline,
+	// so the run stored speeds with no bufferbloat beside them. Every outage on
+	// that install's record was under 13 minutes except that one, so ten
+	// minutes parts the two cleanly.
+	reconnectSettleAfter = 10 * time.Minute
 )
+
+// reconnectSettle is how long a reconnect test waits after a real outage
+// before it starts. The argument for firing at once - a flapping link must be
+// measured while it is up, and the test also answers "is the link back" - does
+// not apply here: a line that was down ten minutes is not flapping, and the up
+// event has already answered the question. A minute is enough for the stages
+// above; the run's own upload sampler showed the path settled within tens of
+// seconds. A variable so a test does not have to wait it out.
+var reconnectSettle = time.Minute
+
+// reconnectSettleFor returns how long a reconnect test should wait before it
+// starts, given how long the link was down: nothing after a blip, reconnectSettle
+// after a real outage. Pure so the boundary is testable.
+func reconnectSettleFor(downtime time.Duration) time.Duration {
+	if downtime >= reconnectSettleAfter {
+		return reconnectSettle
+	}
+	return 0
+}
+
+// reconnectDispatch runs the reconnect-triggered speedtest: after a real
+// outage it first waits for the link to settle (see reconnectSettleFor), then
+// runs unless the run is no longer worth starting. Extracted from run() for the
+// reason degradedDispatch was: the window-release branches are the whole point
+// and no test can reach them inside the closure.
+//
+// The gate's window was reserved at dispatch. It is handed back whenever the
+// run does not happen - the daemon is stopping, the link is down again after
+// the settle, or RunOnce bounced off its single-flight - because a window held
+// by a run that measured nothing would suppress the real recovery test for up
+// to a day (see reconnectGate.release). A bounced dispatch is free: the busy
+// check returns before any network work, and the run it collided with may have
+// started BEFORE this reconnect, measuring the link while it was still down.
+func reconnectDispatch(ctx context.Context, gate *reconnectGate, now time.Time, settle time.Duration, downtimeS int,
+	online func() bool, run func(context.Context, string) (store.SpeedSample, error), log *slog.Logger) {
+	if settle > 0 {
+		log.Info("reconnect speedtest waiting for the link to settle", "downtime_s", downtimeS, "settle", settle)
+	}
+	if !settleBeforeReconnectRun(ctx, settle, online) {
+		if ctx.Err() == nil {
+			log.Info("reconnect speedtest skipped: the link went down again while it waited", "downtime_s", downtimeS)
+		}
+		gate.release(now)
+		return
+	}
+	if _, err := run(ctx, "reconnect"); errors.Is(err, speedtest.ErrBusy) {
+		gate.release(now)
+	}
+}
+
+// settleBeforeReconnectRun waits out settle unless ctx ends first, and reports
+// whether the run should still go ahead: not when the daemon is stopping, and
+// not when the link has gone down again meanwhile (online reports the monitor's
+// current verdict) - measuring a link that is down again would record a failed
+// run and spend the reconnect window on it, while the next up event brings its
+// own reconnect.
+func settleBeforeReconnectRun(ctx context.Context, settle time.Duration, online func() bool) bool {
+	if settle > 0 {
+		t := time.NewTimer(settle)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+		}
+	}
+	return online()
+}
 
 // reconnectSpeedGap returns the minimum spacing between reconnect-triggered
 // speedtests for a configured scheduled interval.

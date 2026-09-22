@@ -52,7 +52,13 @@ reason a video call breaks up the moment a big download starts. Pingularity
 measures it by pinging before the test (idle) and during it (loaded) - both
 against a fixed target of its own (`one.one.one.one`, Cloudflare) rather than
 the speedtest server, so only the gap between them is meaningful, and the idle figure will not match the **ping**
-recorded above:
+recorded above. When the idle burst before an Ookla test finds no path - a test
+fired seconds after a long outage can meet a link that is not fully back - the
+baseline is taken again after the test, once the line is quiet: an idle link
+after the transfers is as idle as one before them. A test that follows an
+outage of ten minutes or more also waits a minute before it starts, so it does
+not walk into that half-restored link at all; a test after a shorter blip
+starts at once, as before:
 
 ```mermaid
 flowchart LR

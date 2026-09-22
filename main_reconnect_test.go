@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/pingular/pingularity/internal/config"
+	"github.com/pingular/pingularity/internal/speedtest"
+	"github.com/pingular/pingularity/internal/store"
 )
 
 // clockBase is an arbitrary fixed instant the gate tests advance by hand. Nothing
@@ -224,5 +229,141 @@ func TestASuccessfulReconnectRunKeepsTheWindow(t *testing.T) {
 	// No release: the run measured something.
 	if g.allow(now.Add(time.Minute), gap) {
 		t.Error("a second reconnect ran a minute after a completed one; the gate is not spacing")
+	}
+}
+
+// A reconnect test after a blip starts at once; after a real outage - ten
+// minutes or more - it waits for the link to settle first. The boundary is the
+// line between the outages on record that came back whole and the one that did
+// not (see reconnectSettleAfter).
+func TestReconnectSettleFor(t *testing.T) {
+	for _, c := range []struct {
+		down time.Duration
+		want time.Duration
+	}{
+		{0, 0},
+		{90 * time.Second, 0},
+		{reconnectSettleAfter - time.Second, 0},
+		{reconnectSettleAfter, reconnectSettle},
+		{4 * time.Hour, reconnectSettle},
+	} {
+		if got := reconnectSettleFor(c.down); got != c.want {
+			t.Errorf("reconnectSettleFor(%v) = %v, want %v", c.down, got, c.want)
+		}
+	}
+}
+
+// The wait is real, and a link that is still up at the end of it gets its test.
+func TestASettledReconnectRunWaitsOutTheSettle(t *testing.T) {
+	start := time.Now()
+	if !settleBeforeReconnectRun(context.Background(), 60*time.Millisecond, func() bool { return true }) {
+		t.Fatal("a link still up after the settle was not run")
+	}
+	if took := time.Since(start); took < 60*time.Millisecond {
+		t.Errorf("returned after %v, before the settle had passed", took)
+	}
+}
+
+// A link that went down again while the run was waiting is not measured: the
+// run would fail and spend the reconnect window on it, and the next up event
+// brings its own reconnect.
+func TestASettledReconnectRunSkipsALinkThatDroppedAgain(t *testing.T) {
+	if settleBeforeReconnectRun(context.Background(), time.Millisecond, func() bool { return false }) {
+		t.Fatal("a link that dropped again during the settle was run anyway")
+	}
+}
+
+// A daemon stopping mid-settle does not wait the settle out.
+func TestASettledReconnectRunStopsWithTheDaemon(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	start := time.Now()
+	if settleBeforeReconnectRun(ctx, 10*time.Second, func() bool { return true }) {
+		t.Fatal("a run was started on a stopping daemon")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("returned after %v; the cancel should have ended the wait at once", took)
+	}
+}
+
+// With nothing to wait for the decision is the link's state alone, taken now.
+func TestAnUnsettledReconnectRunStartsAtOnce(t *testing.T) {
+	start := time.Now()
+	if !settleBeforeReconnectRun(context.Background(), 0, func() bool { return true }) {
+		t.Fatal("an up link with no settle was not run")
+	}
+	if took := time.Since(start); took > 50*time.Millisecond {
+		t.Errorf("a zero settle took %v", took)
+	}
+}
+
+// The settle itself is a real wait, not a placeholder: a minute, enough for a
+// modem to re-provision and a lease to renew.
+func TestReconnectSettleIsAMinute(t *testing.T) {
+	if reconnectSettle != time.Minute {
+		t.Fatalf("reconnectSettle = %v, want 1m", reconnectSettle)
+	}
+	if reconnectSettleAfter != 10*time.Minute {
+		t.Fatalf("reconnectSettleAfter = %v, want 10m", reconnectSettleAfter)
+	}
+}
+
+// reconnectDispatch through its outcomes. A run that happened keeps the window;
+// every way a run does not happen hands it back, so the next reconnect gets its
+// test instead of waiting out a window spent on nothing.
+func TestReconnectDispatchKeepsTheWindowOnlyForARunThatHappened(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	gap := reconnectSpeedGap(time.Hour)
+	ran := func() func(context.Context, string) (store.SpeedSample, error) {
+		return func(context.Context, string) (store.SpeedSample, error) { return store.SpeedSample{}, nil }
+	}
+	busy := func(context.Context, string) (store.SpeedSample, error) {
+		return store.SpeedSample{}, speedtest.ErrBusy
+	}
+	up, down := func() bool { return true }, func() bool { return false }
+
+	cases := []struct {
+		name    string
+		settle  time.Duration
+		online  func() bool
+		run     func(context.Context, string) (store.SpeedSample, error)
+		cancel  bool
+		wantRun bool
+		reopen  bool // the window is handed back
+	}{
+		{"blip, link up, run happens", 0, up, ran(), false, true, false},
+		{"real outage, link still up after the settle", time.Millisecond, up, ran(), false, true, false},
+		{"real outage, link down again after the settle", time.Millisecond, down, ran(), false, false, true},
+		{"daemon stopping during the settle", 10 * time.Second, up, ran(), true, false, true},
+		{"run bounced off a run already in flight", 0, up, busy, false, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var g reconnectGate
+			now := time.Now()
+			if !g.allow(now, gap) {
+				t.Fatal("an open gate refused the first dispatch")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if c.cancel {
+				time.AfterFunc(10*time.Millisecond, cancel)
+			}
+			calls := 0
+			run := func(ctx context.Context, reason string) (store.SpeedSample, error) {
+				calls++
+				if reason != "reconnect" {
+					t.Errorf("run reason = %q, want reconnect", reason)
+				}
+				return c.run(ctx, reason)
+			}
+			reconnectDispatch(ctx, &g, now, c.settle, 4*3600, c.online, run, quiet)
+			if (calls > 0) != c.wantRun {
+				t.Errorf("run called %d times, want called=%v", calls, c.wantRun)
+			}
+			if got := g.allow(now.Add(time.Second), gap); got != c.reopen {
+				t.Errorf("a reconnect a second later allowed=%v, want %v", got, c.reopen)
+			}
+		})
 	}
 }

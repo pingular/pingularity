@@ -5133,6 +5133,26 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		}
 	}
 
+	// A run whose baseline burst came back empty can still take one now, once
+	// the link is quiet again: the transfers and the loss probe are over, and
+	// they proved the path works. The burst went before the transfers so the
+	// loaded samples have something to measure against, and an idle link after
+	// the run is as idle as one before it - what it must not be is a link still
+	// draining what the run pushed, hence the settle, the same one a Best-of
+	// round leaves between servers. Not on a kept partial: the failed upload's
+	// orphan transfers may still be running (the reason the loss probe is
+	// skipped too). Measured need: a reconnect test fired seconds after a
+	// four-hour outage (2026-09-22) found no path for its burst, stored its
+	// speeds with no bufferbloat, and had a working path by its upload phase.
+	if idleMS == nil && !upPartial && ctx.Err() == nil {
+		if sleepCtx(ctx, bestOfServerSettle) {
+			idleMS = measureIdleLatency(ctx, probeAddr)
+			if idleMS != nil {
+				o.logf("idle latency baseline taken after the transfers: the burst before them found no path")
+			}
+		}
+	}
+
 	// A blank ping is blanked HERE, by name, and not left to the server object
 	// happening to hold zeroes: on that path the ping wrote nothing to it, so
 	// Latency and Jitter are whatever it arrived with - the catalogue fetch's
