@@ -1188,6 +1188,10 @@ func seedKnownCounters() {
 		// An upload retried single-stream because no chunk completed in the capture
 		// window - the uplink is slower than the parallel chunk set needs.
 		"speed.upload_starvation_retry", "speed.upload_starvation_rescued",
+		// An upload window was answered with nothing but redirects (a listed
+		// server whose catalogue entry lags its move), the endpoint's new home
+		// was found, and the retry went there.
+		"speed.upload_redirect_resolved",
 		// A by-ID lookup (the picker's Find, its pin probe, or the browse list's
 		// last-run centring) found a server with no HTTP legacy fallback - one
 		// that fails every run. One user action can count more than once.

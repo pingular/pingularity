@@ -277,7 +277,7 @@ func newOoklaClientDoer(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder
 	if uc != nil && uc.DialerControl == nil {
 		uc.DialerControl = probeDialControl()
 	}
-	doer := &http.Client{}
+	doer := &http.Client{CheckRedirect: keepUploadRedirect}
 	client := ookla.New(ookla.WithDoer(doer), ookla.WithUserConfig(uc))
 	if _, ok := http.DefaultClient.Transport.(*ookla.Speedtest); ok {
 		http.DefaultClient.Transport = nil
@@ -324,6 +324,39 @@ func newOoklaClientDoer(uc *ookla.UserConfig) (*ookla.Speedtest, *uploadRecorder
 		rec:  rec,
 	}
 	return client, rec, doer
+}
+
+// keepUploadRedirect is the measurement doer's redirect policy: a request that
+// STARTED as a POST is never followed; everything else keeps net/http's
+// default (follow, at most ten hops).
+//
+// The only POST the library sends through this client is an upload chunk.
+// net/http will not follow a 307 or 308 for it (the body cannot be replayed),
+// so those answers already came back as-is and the run ended N/A with the
+// redirect diagnosis below. A 301, 302 or 303 is different: net/http follows
+// those by turning the POST into a GET with NO body. A target that answers
+// that GET 200 - a catch-all vhost, a static file server, a front proxy's
+// block page - made the library credit a full chunk per answer, and the run
+// reported an upload figure with no error while not one chunk had been
+// accepted anywhere. Measured on a loopback fake: 347 Mbps reported, zero
+// POSTs answered 2xx, the recorder showing "44x HTTP 302". Handing the 3xx
+// back makes the library fail the chunk on its status check, so every
+// redirect code ends the way 307 always has, and the bodyless GETs are no
+// longer sent to an address the server picked. No real Ookla server has been
+// seen to answer 301-303 (six weekly fleet probes, ~4,600 answers: 200, 307,
+// 500 and nothing else), so this is insurance, not a repair.
+//
+// via[0] is the request as first issued; req.Method is already the rewritten
+// GET by the time this runs, so it cannot be the test. The ping echo, the
+// download chunks and the catalogue fetches start as GETs and are untouched.
+func keepUploadRedirect(_ *http.Request, via []*http.Request) error {
+	if len(via) > 0 && via[0].Method == http.MethodPost {
+		return http.ErrUseLastResponse
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects") // net/http's own cap, which setting CheckRedirect replaces
+	}
+	return nil
 }
 
 // currentEndpoint rewrites a server's URL to the location the catalogue says is
@@ -450,6 +483,27 @@ func (r *uploadRecorder) refusedByServer() bool {
 		}
 	}
 	return refusals >= uploadRejectMinRefusals
+}
+
+// redirectedOnly reports whether every POST that got an answer was answered
+// with a redirect: the endpoint has moved, and every chunk of the next window
+// would be sent to the old address and turned away the same way. Transport
+// errors are ignored (the window's close cancels the chunks in flight); the
+// floor is the abort-edge guard refusedByServer uses.
+func (r *uploadRecorder) redirectedOnly() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for status, c := range r.byStatus {
+		switch {
+		case status == 0:
+		case status >= 300 && status < 400:
+			n += c
+		default:
+			return false
+		}
+	}
+	return n >= uploadRejectMinRefusals
 }
 
 // loadSymptomStatus is the list refusedByServer's comment argues for, in one
@@ -2552,9 +2606,11 @@ const probeEndpointTimeout = 8 * time.Second
 // - self-correcting, unlike deriving a hostname from the ID, which was measured
 // to fail (server-46433.prod.hosts.ooklaserver.net does not resolve).
 //
-// Only needed where the catalogue's Host field is unavailable: the by-ID
-// endpoint (api/ios-config.php) returns Host="" and cannot be fixed by
-// currentEndpoint. List-derived servers carry Host and need no probe.
+// Run before a measurement where the catalogue's Host field is unavailable:
+// the by-ID endpoint (api/ios-config.php) returns Host="" and cannot be fixed
+// by currentEndpoint. List-derived servers carry Host and are not probed up
+// front; the upload's retry predicate runs this same probe for one of them
+// whose Host form has started redirecting (catalogue lag; see measure).
 //
 // A package var so tests can drive selection without a network.
 var probeEndpoint = func(ctx context.Context, s *ookla.Server) endpointState {
@@ -4923,7 +4979,40 @@ func (o *Ookla) measure(ctx context.Context, srv *ookla.Server, dir string, retr
 		// constant would clobber a caller that set its own (tests do).
 		attempt := 0
 		rescued := false
-		err = withRetryPred(ctx, retries, o.uploadRetryable, func() error {
+		// A window in which every answer was a redirect will be answered the
+		// same way again, so the retry is worth its window only if the
+		// endpoint's new home is found first. This is the run-time twin of the
+		// pre-measure probe, for the servers that probe never reaches: a
+		// LISTED server whose catalogue Host is still its old name while the
+		// daemon behind it already redirects every upload to its new one. The
+		// weekly fleet probe finds 0-5 of ~760 servers in that state (13623
+		// two weeks running in August 2026), a live survey found 73623 there
+		// on 2026-09-19, and a user
+		// pinned to one - or nearest to one - lost every upload, two doomed
+		// windows per run, until the catalogue caught up. probeEndpoint keeps
+		// its rules (guarded dial, one hop, host-only adoption, scheme stays
+		// http), so nothing new is reachable. A by-ID pin whose probe timed
+		// out before the run gets the same second chance. Never runs on a
+		// dead context (withRetryPred checks that first), which is also the
+		// only time srv could belong to an orphaned transfer.
+		retryable := func(e error) bool {
+			if !o.uploadRetryable(e) {
+				return false
+			}
+			if o.upRec == nil || !o.upRec.redirectedOnly() {
+				return true
+			}
+			before := srv.URL
+			_ = probeEndpoint(ctx, srv)
+			if srv.URL == before {
+				return false // nowhere new to go: the next window is doomed too
+			}
+			o.logf("upload endpoint redirected every request; retrying at the address it named",
+				"server", serverLabel(srv), "url", srv.URL)
+			stats.Inc("speed.upload_redirect_resolved")
+			return true
+		}
+		err = withRetryPred(ctx, retries, retryable, func() error {
 			attempt++
 			starved := false
 			if attempt > 1 && o.upRec != nil {

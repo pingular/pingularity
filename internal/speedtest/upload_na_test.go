@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -41,7 +42,7 @@ import (
 // (the mutex is held across the sleep on purpose - that is what makes the budget
 // shared, like a real uplink).
 type naServer struct {
-	mode    string        // "" = healthy 200, else "403" / "307" / "500"
+	mode    string        // "" = healthy 200, else "403" / "307" / "302" / "500"
 	rateBPS float64       //
 	capture time.Duration // 0 = naCaptureTime; set to 0-override for production timing
 	retries int           // attempts-1; production default is speedDefaultRetries (1)
@@ -57,6 +58,7 @@ type naServer struct {
 	mu    sync.Mutex
 	posts atomic.Int64
 	read  atomic.Int64
+	gets  atomic.Int64 // GETs at the 302 target: the shape net/http turns a followed POST into
 
 	trace     bool // per-POST timeline, for diagnosing the rescue path
 	t0        time.Time
@@ -135,6 +137,15 @@ func (s *naServer) start(t *testing.T) string {
 	if pth == "" {
 		pth = "/speedtest/upload.php"
 	}
+	// The 302 mode's target: a page that answers ANY method 200 (a catch-all
+	// vhost, a block page). A followed POST arrives here as a bodyless GET.
+	mux.HandleFunc("/elsewhere/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.gets.Add(1)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.HandleFunc(pth, func(w http.ResponseWriter, r *http.Request) {
 		n0 := s.posts.Add(1)
 		fl := s.inflight.Add(1)
@@ -187,6 +198,9 @@ func (s *naServer) start(t *testing.T) string {
 		case "307":
 			w.Header().Set("Location", "https://"+r.Host+r.URL.Path)
 			w.WriteHeader(http.StatusTemporaryRedirect)
+		case "302":
+			w.Header().Set("Location", "/elsewhere/upload")
+			w.WriteHeader(http.StatusFound)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -339,17 +353,24 @@ func assertNA(t *testing.T, err error, wantDiag string) {
 // (see uploadpartial_test.go), so the error contract these diagnosis strings
 // ride lives on runs with nothing to keep.
 func TestUploadNA_Rejection(t *testing.T) {
-	for _, mode := range []string{"403", "500", "307"} {
+	for _, mode := range []string{"403", "500", "307", "302"} {
 		t.Run(mode, func(t *testing.T) {
 			s := &naServer{mode: mode, dir: "up"} // no throttle: starvation cannot be the cause
 			_, err := runNACase(t, s)
 			wantDiag := "server rejects the upload endpoint"
-			if mode == "307" {
+			if mode == "307" || mode == "302" {
 				wantDiag = "server redirects the upload POST"
 			}
 			assertNA(t, err, wantDiag)
 			if s.read.Load() == 0 {
 				t.Fatal("no bytes reached the server - harness fault, not the bug")
+			}
+			// A 302 used to be FOLLOWED: net/http re-sent each chunk as a
+			// bodyless GET, the target answered 200, and the run reported an
+			// upload figure with nothing accepted anywhere (see
+			// keepUploadRedirect). Now the 302 comes back like a 307 does.
+			if n := s.gets.Load(); n != 0 {
+				t.Fatalf("%d bodyless GETs reached the redirect target: the doer followed the POST's redirect", n)
 			}
 		})
 	}

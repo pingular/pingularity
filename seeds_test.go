@@ -23,6 +23,7 @@ func TestSeedListCoversRecordedFixedKeys(t *testing.T) {
 		"import.event_duration_dropped",
 		"import.pause_dropped",
 		"netinfo.cymru_fallback",
+		"speed.upload_redirect_resolved",
 	} {
 		if _, ok := snap.Counters[k]; !ok {
 			t.Errorf("recorded fixed-key counter %q is not seeded", k)
