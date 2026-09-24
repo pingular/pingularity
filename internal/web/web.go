@@ -446,7 +446,8 @@ func (s *Server) middleware(routes http.Handler) http.Handler {
 // attributes a hash cannot cover. Referrer-Policy stops a dashboard URL (which
 // can carry an auth token in a link the operator pastes) leaking cross-origin,
 // and /api responses are marked no-store so a shared cache never retains config,
-// logs, or history.
+// logs, or history. The two probes are marked no-store as well, for the
+// opposite reason: not what they hold but how fresh they must be.
 func securityHeaders(next http.Handler) http.Handler {
 	csp := contentSecurityPolicy()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +465,15 @@ func securityHeaders(next http.Handler) http.Handler {
 		// either. The public demo is a separate build on its own host and is
 		// unaffected.
 		h.Set("X-Robots-Tag", "noindex, nofollow")
-		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics" {
+		// The probes too. They are the two routes deliberately open to an
+		// outside checker, and they answered 200 with no cache header at all:
+		// a reverse proxy or CDN told to cache everything (the docs name
+		// cloudflared and nginx as supported fronts) had no instruction from
+		// the origin against storing "ok", so an uptime check through it could
+		// stay green after the daemon died. A verdict is only worth anything
+		// fresh.
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics" ||
+			r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			h.Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
