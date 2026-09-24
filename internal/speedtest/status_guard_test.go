@@ -841,7 +841,12 @@ func stubTransfersOnly(t *testing.T) {
 // used to BE a sample.
 func TestOneRefusedEchoCostsOneSampleAndTheRunStands(t *testing.T) {
 	allowLoopbackProbes(t)
-	b := &legacyBundle{pingStatus: func(n int64) int {
+	// The echoes take a few milliseconds each on purpose: a loopback round
+	// trip under a millisecond reads as 0 on Windows (its clock is coarser
+	// than the latency), and a mean of zeros is the "not measured" figure
+	// this test says must NOT be stored - so an undelayed fake failed there
+	// for a reason that has nothing to do with the refused echo.
+	b := &legacyBundle{delay: 5 * time.Millisecond, pingStatus: func(n int64) int {
 		if n == 5 {
 			return 503
 		}
