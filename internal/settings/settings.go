@@ -82,6 +82,8 @@ const (
 	keyDegradedPingMS  = "degraded_ping_ms"      // latency (ms) that counts as degraded; 0 = off
 	keySpeedSkipBusy   = "speedtest_skip_busy"   // defer a scheduled test while the link is already busy
 	keySpeedBusyMbps   = "speedtest_busy_mbps"   // throughput (Mbps) above which the link counts as busy
+	// Record failed tests: list each wholly failed speedtest in the runs table.
+	keySpeedRecordFail = "speedtest_record_failures"
 	// Speedtest engine selection (see internal/speedtest).
 	keySpeedEngine  = "speed_engine"  // ookla|iperf3 - which backend runs speedtests
 	keyIperfServer  = "iperf_server"  // host[:port] of the ACTIVE iperf3 server (engine=iperf3)
@@ -396,6 +398,11 @@ type Values struct {
 	DegradedPingMS      float64 // latency (ms) that counts as degraded; 0 = off
 	SpeedtestSkipBusy   bool    // defer a scheduled test while the link is already moving data
 	SpeedBusyMbps       float64 // throughput (Mbps) above which the link counts as busy
+	// SpeedtestRecordFailures keeps a runs-table record of each wholly failed
+	// speedtest (a user's stop is not one). Off by default: the rows are listed
+	// only, never charted, averaged or judged, and turning it off stops new ones
+	// without hiding those already kept.
+	SpeedtestRecordFailures bool
 
 	// Speedtest engine. "ookla" uses the Ookla server network; "iperf3" runs
 	// against the user's own server (IperfServer), and is honored only when the
@@ -950,6 +957,9 @@ func overlay(v Values, m map[string]string) Values {
 	if f, ok := pfloat(m[keySpeedBusyMbps]); ok {
 		v.SpeedBusyMbps = f
 	}
+	if b, ok := pbool(m[keySpeedRecordFail]); ok {
+		v.SpeedtestRecordFailures = b
+	}
 	if val := m[keySpeedEngine]; val != "" {
 		v.SpeedEngine = val
 	}
@@ -1457,6 +1467,10 @@ func (c *Controller) OoklaLoss() bool            { return c.get().OoklaLoss }
 func (c *Controller) SpeedDiscardLosers() bool   { return c.get().SpeedDiscardLosers }
 func (c *Controller) SpeedBestOfCount() int      { return c.get().SpeedBestOfCount }
 
+// SpeedtestRecordFailures reports whether a wholly failed speedtest leaves a
+// failure record in the runs table (speedtest.Scheduler.RecordFailuresFn).
+func (c *Controller) SpeedtestRecordFailures() bool { return c.get().SpeedtestRecordFailures }
+
 // Direction and Retries are per-engine: Speed* is Ookla's, Iperf* is iperf3's.
 // honor them.
 func (c *Controller) SpeedDirection() string  { return c.get().SpeedDirection }
@@ -1776,6 +1790,8 @@ type Patch struct {
 	SchedLatWindows      []Window
 	SchedSpeedEnabled    *bool
 	SchedSpeedWindows    []Window
+	// Record failed tests (Values.SpeedtestRecordFailures), a Speedtest-tab switch.
+	SpeedtestRecordFailures *bool
 }
 
 // apply overlays the patch's non-nil fields onto v.
@@ -1804,6 +1820,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.DegradedPingMS, p.DegradedPingMS)
 	setIf(&v.SpeedtestSkipBusy, p.SpeedtestSkipBusy)
 	setIf(&v.SpeedBusyMbps, p.SpeedBusyMbps)
+	setIf(&v.SpeedtestRecordFailures, p.SpeedtestRecordFailures)
 	setIf(&v.SpeedEngine, p.SpeedEngine)
 	setIf(&v.IperfServer, p.IperfServer)
 	if p.IperfServers != nil {
@@ -1892,6 +1909,7 @@ func (p Patch) keys() map[string]bool {
 	mark(p.DegradedPingMS != nil, keyDegradedPingMS)
 	mark(p.SpeedtestSkipBusy != nil, keySpeedSkipBusy)
 	mark(p.SpeedBusyMbps != nil, keySpeedBusyMbps)
+	mark(p.SpeedtestRecordFailures != nil, keySpeedRecordFail)
 	mark(p.SpeedEngine != nil, keySpeedEngine)
 	mark(p.IperfServer != nil, keyIperfServer)
 	mark(p.IperfServers != nil, keyIperfServers)
@@ -2056,6 +2074,7 @@ func formKeys(v Values) map[string]string {
 		keyDegradedPingMS:      f2s(v.DegradedPingMS),
 		keySpeedSkipBusy:       b2s(v.SpeedtestSkipBusy),
 		keySpeedBusyMbps:       f2s(v.SpeedBusyMbps),
+		keySpeedRecordFail:     b2s(v.SpeedtestRecordFailures),
 		keySpeedEngine:         v.SpeedEngine,
 		keyIperfServer:         v.IperfServer,
 		keyIperfServers:        iperfServersJSON(v.IperfServers),

@@ -26,7 +26,11 @@ unmeasurable one. Missing is stored as missing rather than as a zero, so charts
 and thresholds can tell "not measured" from "measured, and it was bad". A run
 that failed outright isn't a measurement at all: it is kept only as a flagged
 data-usage row, which every measurement view filters out (see the data-usage
-bullet under [Metrics](metrics.md)).
+bullet under [Metrics](metrics.md)). Turn on **Record failed tests** (Speedtest
+settings, off by default) and that same row also records why the run failed,
+and the all-runs table and its CSV list it as a failed test. It still never
+reaches a chart, an average, a threshold verdict, the latest run or `/metrics`
+(see [Failed tests](#failed-tests)).
 
 The **ping** shown is the engine's own number, a mean over ten samples, so it
 keeps matching what speedtest.net would report. A mean has no defence against an
@@ -315,6 +319,58 @@ clears. "Busy" is traffic on the busiest interface above **Busy above** (default
 `5` Mbps) - and unlike the alert thresholds, `0` is not "off" here: it makes any
 measurable traffic count as busy, so scheduled tests stop firing. Only scheduled
 runs consult it; reconnect, degraded and **Run now** go regardless.
+
+## Failed tests
+
+A test that ends without a result - every server it tried failed, the server
+list could not be fetched, iperf3 could not start - is not a measurement. By
+default it leaves only the flagged data-usage row described above, and nothing
+on the dashboard lists it.
+
+Turn on **Record failed tests** (Speedtest settings, off by default) to keep a
+row for each one in the **Show all runs** table and its CSV. The row shows when
+the test ended, what started it, the engine, the server the failure was about
+when one is known, the data it used, a red *failed* badge in the Health column,
+and the reason in plain words. The speed and latency cells stay blank. It is
+the same row as the data-usage one, so its bytes are counted once. It never
+reaches a chart, an average, a stat tile, a threshold verdict, an alert, the
+adaptive cadence, the degraded trigger, the digest, the latest run in
+`/api/status` or the latest-run gauges on `/metrics`.
+
+| Reason shown | `fail_stage` | What happened |
+|---|---|---|
+| couldn't get the server list | `server_list` | The Ookla server list could not be downloaded, usually because the connection or DNS was down. |
+| couldn't look up the pinned server | `server_fetch` | The pinned Ookla server could not be looked up. |
+| no usable server | `no_servers` | No Ookla server was left to test against. |
+| server didn't answer the ping | `ping` | The server failed the latency check before the test. |
+| server gave no result | `na` | The server finished the test but reported no speed. |
+| download failed | `download` | The download part of the test failed. |
+| upload failed | `upload` | The upload part of the test failed. |
+| two-way test failed | `bidir` | iperf3's test that moves both directions at once failed. |
+| see the log for details | `other` | Anything else, for example no iperf3 server set, or iperf3 authentication failing. The `speedtest failed` log line has the error. |
+
+When a Best-of round or an automatic run's fallback tried more than one server,
+the reason is the first server's failure and the server named is that one.
+When the failure was not about a particular server (no server list, no iperf3
+server set), the server is left blank rather than guessed.
+
+Not recorded: a test you stop yourself, a test cut short by the daemon shutting
+down, a run where one direction measured (that is a result, with the other
+direction blank), a Best-of round where at least one server measured, and a
+scheduled test that never started (schedule window closed, link busy, another
+test already running).
+
+A scheduled test that fails while the line is down is recorded like any other,
+so an outage adds a row each time a test comes due: once an hour on the default
+schedule, or every one to five minutes while **Test more often while failing**
+has shortened the interval. The Downtime panel shows the outage for the same
+time.
+
+Turning the switch off stops new rows. The ones already recorded stay listed
+until you delete them (the bin on each row), clear speed data (Data tab), or
+speed retention removes them. The failure counters on `/metrics`
+(`pingularity_speed_failures_total{stage}`) count every failed test whether the
+switch is on or not.
 
 ## Choosing an Ookla server
 

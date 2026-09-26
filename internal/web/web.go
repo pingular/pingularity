@@ -1352,7 +1352,9 @@ func (s *Server) handleSpeedHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSpeedRuns returns recent speedtest runs (newest first) with full
-// connection context, for the expandable history table.
+// connection context, for the expandable history table. With Record failed
+// tests on, a failed test is a row too: failed plus fail_stage, its speeds and
+// ping zero and meaningless - a reader checks failed first.
 func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 	// locate=<ts>: report a run's position (how many runs are newer) so the
 	// dashboard can open the table on the row for a clicked chart point.
@@ -1367,7 +1369,9 @@ func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, err)
 			return
 		}
-		total, err := s.store.SpeedCount(r.Context())
+		// The table's own total, failed tests included (SpeedListedCount), so
+		// the page this offset lands on is a page the table really has.
+		total, err := s.store.SpeedListedCount(r.Context())
 		if err != nil {
 			s.internalError(w, err)
 			return
@@ -1376,7 +1380,10 @@ func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, offset := parsePage(r, 50)
-	total, err := s.store.SpeedCount(r.Context())
+	// SpeedListedCount, not SpeedCount: the rows below include the failed tests
+	// Record failed tests keeps, and a total that left them out would end the
+	// pager before the last page.
+	total, err := s.store.SpeedListedCount(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -1412,10 +1419,11 @@ func (s *Server) handleSpeedRuns(w http.ResponseWriter, r *http.Request) {
 // why the winner won. GET /api/speed/runs/servers?ts=<unix>. In production the
 // DB often sits inside a Docker volume the operator cannot open, so this is
 // the report's only reachable surface. 404 means no such RUN; a run that
-// exists but has no rows (pre-feature history, an old backup, an iperf3 run)
-// answers 200 with an empty list - a missing explanation is normal, a missing
-// run is the error. Distinct from /api/speedtest/servers, the server-BROWSE
-// endpoint: that one lists pinnable servers, this one explains a past run.
+// exists but has no rows (pre-feature history, an old backup, an iperf3 run,
+// a failed test kept by Record failed tests) answers 200 with an empty list -
+// a missing explanation is normal, a missing run is the error. Distinct from
+// /api/speedtest/servers, the server-BROWSE endpoint: that one lists pinnable
+// servers, this one explains a past run.
 func (s *Server) handleSpeedRunServers(w http.ResponseWriter, r *http.Request) {
 	ts, err := strconv.ParseInt(r.URL.Query().Get("ts"), 10, 64)
 	if err != nil || ts <= 0 {
@@ -1543,7 +1551,8 @@ func (s *Server) invalidateAggregates() {
 	s.aggMu.Unlock()
 }
 
-// handleSpeedRunsCSV streams every recorded run as CSV (newest first) for export.
+// handleSpeedRunsCSV streams every recorded run as CSV (newest first) for export:
+// the runs table as a file, so the failed tests it lists are rows here too.
 func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 	// Cap concurrent exports so a stalled client can't pin a read cursor (see
 	// exportGate); refuse rather than queue when the gate is full.
@@ -1580,20 +1589,31 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 		// to answer, though it already carries round_of - the other half of the
 		// same Best-of story. Appended at the end, like everything before them,
 		// so consumers indexing by position keep working.
-		"win_reason", "race_outcome", "race_winner_label", "race_winner_ms", "race_racers"})
+		"win_reason", "race_outcome", "race_winner_label", "race_winner_ms", "race_racers",
+		// fail_stage: the stage a failed test stopped at, on the rows Record
+		// failed tests keeps (blank on every run that measured something).
+		// Appended at the end like everything before it, and always in the
+		// header whatever the switch says: a header that changed with the data
+		// would break a consumer indexing by position.
+		"fail_stage"})
 	// Stream newest-first straight from a descending row iterator (no whole-history
 	// slice), flushing per row so back-pressure from a slow client bounds memory and
 	// the write deadline keeps advancing only while bytes actually move.
 	err := s.store.SpeedHistoryDescFunc(r.Context(), func(sp store.SpeedSample) error {
+		// A direction that wasn't measured (down-only/up-only/partial run) has a
+		// nil byte pointer AND a zero Mbps, which as "0.00" reads as a catastrophic
+		// measured result rather than "not tested" - so blank the cell on that pair,
+		// the same test the tiles and /metrics apply. See csvMbps for why the byte
+		// pointer cannot carry it alone.
+		down, up := csvMbps(sp.DownMbps, sp.DownBytes), csvMbps(sp.UpMbps, sp.UpBytes)
+		if sp.Failed {
+			// A failed test measured nothing, but it can carry the bytes it spent,
+			// which csvMbps reads as a measured direction and prints as 0.00.
+			down, up = "", ""
+		}
 		cw.Write([]string{
 			time.Unix(sp.TS, 0).UTC().Format(time.RFC3339),
-			// A direction that wasn't measured (down-only/up-only/partial run) has a
-			// nil byte pointer AND a zero Mbps, which as "0.00" reads as a catastrophic
-			// measured result rather than "not tested" - so blank the cell on that pair,
-			// the same test the tiles and /metrics apply. See csvMbps for why the byte
-			// pointer cannot carry it alone.
-			csvMbps(sp.DownMbps, sp.DownBytes),
-			csvMbps(sp.UpMbps, sp.UpBytes),
+			down, up,
 			csvPing(sp.PingMS),
 			fptr1(sp.PingBestMS),
 			fptr1(sp.JitterMS), fptr(sp.PacketLoss),
@@ -1614,6 +1634,9 @@ func (s *Server) handleSpeedRunsCSV(w http.ResponseWriter, r *http.Request) {
 			// three are TEXT columns a crafted backup can implant formulas in.
 			csvSafe(sp.WinReason), csvSafe(sp.RaceOutcome), csvSafe(sp.RaceWinnerLabel),
 			fptr(sp.RaceWinnerMS), iptr(sp.RaceRacers),
+			// csvSafe despite the closed stage vocabulary: a crafted backup can
+			// implant anything in this TEXT column.
+			csvSafe(sp.FailStage),
 		})
 		cw.Flush()
 		bump()
@@ -2638,6 +2661,8 @@ type settingsDTO struct {
 	DegradedPingMS      *float64 `json:"degraded_ping_ms"`
 	SpeedtestSkipBusy   *bool    `json:"speedtest_skip_busy"`
 	SpeedBusyMbps       *float64 `json:"speedtest_busy_mbps"`
+	// Record failed tests: list each wholly failed speedtest in the runs table.
+	SpeedtestRecordFailures *bool `json:"speedtest_record_failures"`
 	// Speedtest engine selection. The slice fields use nil = keep current,
 	// explicit [] = clear.
 	SpeedEngine      *string          `json:"speed_engine"`
@@ -2769,6 +2794,7 @@ func dtoFrom(v settings.Values) settingsDTO {
 		DegradedPingMS:           ptr(v.DegradedPingMS),
 		SpeedtestSkipBusy:        ptr(v.SpeedtestSkipBusy),
 		SpeedBusyMbps:            ptr(v.SpeedBusyMbps),
+		SpeedtestRecordFailures:  ptr(v.SpeedtestRecordFailures),
 		SpeedEngine:              ptr(v.SpeedEngine),
 		IperfServer:              ptr(v.IperfServer),
 		IperfServers:             iperfServersToDTO(v.IperfServers),
@@ -3197,6 +3223,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			SchedLatWindows:     in.SchedLatWindows,
 			SchedSpeedEnabled:   in.SchedSpeedEnabled,
 			SchedSpeedWindows:   in.SchedSpeedWindows,
+			// Record failed tests, a Speedtest-tab switch.
+			SpeedtestRecordFailures: in.SpeedtestRecordFailures,
 		}
 		if in.IperfServers != nil { // nil = keep the saved list (and its passwords)
 			pat.IperfServers = iperfServersFromDTO(in.IperfServers) // blank pw kept by Update
@@ -3474,8 +3502,13 @@ var importReconcileHook func()
 // It went to 7 when the speed table gained round_ts (a Best-of round's kept
 // losers, see store.SpeedSample.RoundTS): one more column on the same
 // content-dependent rule, its version one entry in store.SpeedColumnSchema.
+//
+// It went to 8 when the speed table gained fail_stage (a failed test kept with
+// Record failed tests on, see store.SpeedSample.FailStage): one more column on
+// the same content-dependent rule, so an install that never turned the switch
+// on keeps stamping 7 or lower.
 const (
-	exportSchema    = 7
+	exportSchema    = 8
 	minExportSchema = 1
 )
 

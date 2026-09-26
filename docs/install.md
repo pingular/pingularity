@@ -424,7 +424,8 @@ published.
 > **Rolling back to an older release?** Stepping the binary back (and forward
 > again) is fine on its own - a downgrade does not rewrite your history. The one
 > boundary that matters is **0.70**. That release added a marker on the
-> bookkeeping rows a failed or partly-retried speedtest leaves behind so their
+> bookkeeping rows a failed or partly-retried speedtest leaves behind (and on
+> the failed-test rows **Record failed tests** keeps) so their
 > bytes still count toward **Speedtest data used** without being shown as runs;
 > builds older than 0.70 don't know the column is there. Point one at a database
 > a 0.70-or-newer build has written and it reads those rows as real runs: a
@@ -450,7 +451,12 @@ published.
 > yours to trigger: with **Discard losers** off a round's other servers are kept
 > as rows of their own, which stamps the export a rung higher again, so take the
 > backup before you turn it off (or turn it back on first) if the file has to
-> restore onto an older release.
+> restore onto an older release. **Record failed tests** is another: a backup
+> holding a failed-test row stamps a rung higher again, so delete those rows,
+> or take the backup before turning it on, if the file has to restore onto an
+> older release. Stepping the binary back to 0.70 or newer on the same database
+> is fine: that build hides those rows as the bookkeeping rows they also are,
+> and coming back up lists them again.
 
 ## Run in the background (systemd / launchd / Windows service)
 

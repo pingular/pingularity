@@ -3048,7 +3048,11 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		// pickServers afterwards so this fetch is not repeated.
 		p, err := fetchServerByID(ctx, uc, id)
 		if err != nil {
-			return Result{}, fmt.Errorf("fetch server %s: %w", id, err)
+			// The engine is named even on a failure that moved nothing: a failed
+			// test kept by Record failed tests says which engine failed, and an
+			// empty one reads as the default everywhere (engOf, engineCSV) - right
+			// here by luck, wrong for iperf3. No server: none was reached.
+			return Result{Engine: "ookla"}, fmt.Errorf("fetch server %s: %w", id, err)
 		}
 		currentEndpoint(p)    // a pinned server needs the same rewrite as a listed one
 		o.recentrePin(ctx, p) // the by-ID position can be OURS, not the server's
@@ -3129,7 +3133,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		var err error
 		servers, err = fetchServerList(ctx, client)
 		if err != nil {
-			return Result{}, fmt.Errorf("fetch server list: %w", err)
+			return Result{Engine: "ookla"}, fmt.Errorf("fetch server list: %w", err)
 		}
 	}
 
@@ -3147,7 +3151,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	targets, sel, lead, err := o.pickServers(selCtx, client, servers, id, want, pinned)
 	selCancel()
 	if err != nil {
-		return Result{}, err
+		return Result{Engine: "ookla"}, err
 	}
 
 	// Identity snapshot before anything measures: a failed measurement's server
@@ -3169,6 +3173,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 	// each would measure the other's traffic as congestion.
 	var results []Result
 	var firstErr error
+	firstAt := -1                // the target firstErr came from
 	var spentDown, spentUp int64 // real bytes moved by FAILED candidates (their Results are discarded)
 	for i, srv := range targets {
 		// Let the link settle before the next server's turn. Only in a round:
@@ -3228,7 +3233,7 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		scancel()
 		if err != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr, firstAt = err, i
 			}
 			errByID[targetIDs[i]] = err.Error()
 			// A failed candidate's traffic was still spent - count it toward the
@@ -3308,13 +3313,19 @@ func (o *Ookla) RunReason(ctx context.Context, reason string) (Result, error) {
 		// transfers still moved spentDown/spentUp real bytes, and returning an
 		// empty Result here erased them - the scheduler's error path recorded
 		// 0/0 for traffic that lands on the user's bill (see recordFailedUsage).
-		// Engine too: it is the only field of a total failure that is knowable,
-		// and the usage row's engine column is otherwise empty - which the
-		// metrics path then reads as the DEFAULT engine (a guess that happens to
-		// be right here and wrong for an iperf3 failure, whose Result carries its
-		// own engine on the same path).
+		// Engine too: it is always knowable, and the usage row's engine column
+		// is otherwise empty - which the metrics path then reads as the DEFAULT
+		// engine (a guess that happens to be right here and wrong for an iperf3
+		// failure, whose Result carries its own engine on the same path).
 		spent := Result{Engine: "ookla", DownloadBytes: spentDown, UploadBytes: spentUp}
 		if firstErr != nil {
+			// And the server the returned error BELONGS to - the first that
+			// failed, from the identity snapshot above - so a failed test kept by
+			// Record failed tests names the server its reason is about. Not the
+			// last one tried (the live label OnServer reported): with a fallback
+			// or a round behind the head, that is a different server that failed
+			// in a different way, and "B: didn't answer the ping" would be untrue.
+			spent.Server, spent.ServerID = targetLabels[firstAt], targetIDs[firstAt]
 			return spent, firstErr
 		}
 		return spent, fmt.Errorf("no speedtest servers available")

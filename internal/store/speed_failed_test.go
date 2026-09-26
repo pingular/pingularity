@@ -280,7 +280,9 @@ func TestHasHistoryIgnoresAccountingRows(t *testing.T) {
 
 // The filter list is only trustworthy if it is the WHOLE list. This reads
 // store.go and requires every function that runs SQL against the speed table to
-// either carry speedNotFailed or be classified below as usage/maintenance. A
+// either carry speedNotFailed, be one of the runs table's own reads (which carry
+// speedIsListed and nothing else may), or be classified below as
+// usage/maintenance. A
 // query added without either lands in neither bucket and fails here, which is
 // the mechanical defence the audit asked for: the next helper that forgets the
 // filter is a test failure, not a silent fake measurement.
@@ -293,6 +295,18 @@ func TestSpeedFilterCoversEveryMeasurementRead(t *testing.T) {
 		"DeleteSpeed":                  "delete-by-ts is idempotent and must reach every row",
 		"repairUnreadableIntColumns":   "at-rest repair of columns whose stored type no read can convert",
 		"SpeedColumnsPastSchema4InUse": "asks the opposite question - it LOOKS FOR the rows a filtered read hides, to decide the export's schema stamp",
+	}
+	// The runs TABLE and nothing else: these list failure records (Record failed
+	// tests) beside the measurements, through speedIsListed. A listing is not a
+	// reading, so the predicate is allowed exactly here - and each of these must
+	// carry it, or the page, its total, the jump and the file disagree about
+	// which rows exist.
+	listed := map[string]string{
+		"SpeedRuns":            "the runs table's page",
+		"SpeedListedCount":     "the total that page is paged against",
+		"SpeedRunOffset":       "the chart-to-table jump: how many listed rows are newer",
+		"SpeedHistoryDescFunc": "the runs CSV, which is the table as a file",
+		"SpeedRunExists":       "/api/speed/runs/servers: a run the table lists is a run there, report or not",
 	}
 	src, err := os.ReadFile("store.go")
 	if err != nil {
@@ -347,7 +361,21 @@ func TestSpeedFilterCoversEveryMeasurementRead(t *testing.T) {
 		seen[name] = true
 		// speedIsResult is speedNotFailed narrowed further (the round members a
 		// kept Best-of leaves are hidden too), so a read carrying it is filtered.
-		filtered := strings.Contains(body, "speedNotFailed") || strings.Contains(body, "speedIsResult")
+		// speedIsListed is filtered too, but only where a listing belongs: it
+		// lets failure records through, so anywhere else it is the leak.
+		lists := strings.Contains(body, "speedIsListed")
+		_, isListed := listed[name]
+		switch {
+		case isListed && !lists:
+			t.Errorf("%s is behind the runs table (%s) but does not carry speedIsListed: the table's page, "+
+				"total, jump and CSV must share one predicate", name, listed[name])
+		case lists && !isListed:
+			t.Errorf("%s carries speedIsListed, which lets failure records through, and is not one of the "+
+				"runs table's reads: a failed test would reach whatever it feeds. Use speedNotFailed or "+
+				"speedIsResult, or add it to `listed` with the reason.", name)
+		}
+		filtered := strings.Contains(body, "speedNotFailed") || strings.Contains(body, "speedIsResult") ||
+			(lists && isListed)
 		why, isExempt := exempt[name]
 		switch {
 		case isExempt && filtered:
@@ -364,8 +392,13 @@ func TestSpeedFilterCoversEveryMeasurementRead(t *testing.T) {
 			t.Errorf("exempt lists %q, which no longer runs SQL against the speed table", name)
 		}
 	}
+	for name := range listed {
+		if !seen[name] {
+			t.Errorf("listed names %q, which no longer runs SQL against the speed table", name)
+		}
+	}
 	// Sanity: the scan found the real queries rather than silently matching none.
-	for _, must := range []string{"LatestSpeed", "SpeedRuns", "SpeedCount", "SpeedAvgBytes"} {
+	for _, must := range []string{"LatestSpeed", "SpeedRuns", "SpeedCount", "SpeedAvgBytes", "SpeedListedCount"} {
 		if !seen[must] {
 			t.Errorf("the source scan did not find %s - it is no longer checking anything", must)
 		}

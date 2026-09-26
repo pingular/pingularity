@@ -929,6 +929,9 @@ func (p *program) run(ctx context.Context) {
 	sched.ThresholdsFn = set.Thresholds      // mark each run healthy/unhealthy
 	sched.BreachStreakFn = set.BreachStreak  // debounce: alert only after N consecutive breaches
 	sched.AdaptiveFn = set.SpeedtestAdaptive // shorten the interval while the last run breached
+	// Record failed tests: a wholly failed run also leaves a row the runs table
+	// lists (never a chart, an average or a verdict). Read live, off by default.
+	sched.RecordFailuresFn = set.SpeedtestRecordFailures
 	sched.OnUnhealthy = func(sp store.SpeedSample, failures []string) {
 		// Own goroutine (like Outage's dispatch): RunOnce fires this inline on
 		// the scheduler Loop goroutine, and SpeedThreshold now retries transient

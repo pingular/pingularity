@@ -73,6 +73,9 @@ func TestDefaultSettings(t *testing.T) {
 			t.Errorf("default %s = false, want true", name)
 		}
 	}
+	if v.SpeedtestRecordFailures {
+		t.Error("SpeedtestRecordFailures defaults to true; recording failed tests must be opt-in (with it off, nothing new is written)")
+	}
 	if v.SpeedBestOfCount != 1 {
 		t.Errorf("SpeedBestOfCount defaults to %d; a round costs N times the data and must be opt-in (1 = a single server)", v.SpeedBestOfCount)
 	}

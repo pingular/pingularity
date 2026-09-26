@@ -21,8 +21,10 @@ iperf3, where every direction discards a warm-up second before the count starts
 and the UDP pass moves megabytes of its own - or gigabytes, if you raise that
 probe's rate cap by hand (the daemon warns about the uncounted usage only from
 1 Gbps up, so a smaller raise is silent). Those
-attempts are counted but never shown as measurements: they appear in no chart,
-table, average or CSV, because nothing was measured.
+attempts are counted but never shown as measurements: they appear in no chart
+or average, because nothing was measured. With **Record failed tests** on, a
+test that failed outright is listed in the all-runs table and its CSV as a
+failed test; one you cancelled never is.
 The latency and DNS dots are the theme accent at varying
 **intensity** - full = healthy, fading as latency or DNS gets worse - so the
 bar stays calm at a glance and only the dot that needs attention dims. The
@@ -61,7 +63,8 @@ Below that:
   margins; a span with no runs in reach says so.
   While a fixed range is pinned the stat cards follow it rather than the newest
   run, and a **Live** button returns to the rolling window, and an expandable **all-runs** table
-  (paginated, with **CSV export** and a per-run health badge).
+  (paginated, with **CSV export** and a per-run health badge, or a *failed*
+  badge and the reason for a failed test kept by **Record failed tests**).
 - **Latency** over time - the lowest round-trip across your anchors, plus a
   separate **DNS-resolution** line. Each round resolves a random throwaway name
   through the host's own *system* resolver (the random label dodges caches, so it
@@ -229,6 +232,12 @@ and persist across restarts.
   with one set, only the runs its windows leave room for are counted (plus the
   one each window opening catches up), so confining an hourly test to office
   hours shows the handful of tests you will actually get rather than all 24.
+  **Record failed tests** (off by default) keeps a row in the all-runs table for
+  each test that ends with no result: when, what started it, the engine and
+  server when known, the data it used and the reason in plain words. Those rows
+  are never charted, averaged or judged against thresholds. Turning it off stops
+  new rows; the ones already there stay until you delete them or retention
+  removes them. See [Failed tests](speedtests.md#failed-tests).
 - **Ookla** → the Ookla server picker (kept servers, Find by place or ID, Auto
   to preview what a run would race - the list you were looking at comes back
   when you reopen the drawer or reload the page: a searched place fetched

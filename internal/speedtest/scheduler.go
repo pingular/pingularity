@@ -86,6 +86,13 @@ type Scheduler struct {
 	// have something to fail against.
 	AdaptiveFn func() bool
 
+	// RecordFailuresFn, if set and true, makes a wholly failed run - not a user's
+	// stop, not a shutdown - leave a failure record the runs table lists: the
+	// run's usage row, carrying the stage it failed at (see recordFailedUsage).
+	// Read once per failure, so turning it off stops new records and leaves the
+	// ones already written alone. nil = off.
+	RecordFailuresFn func() bool
+
 	// ReadyFn, if set, reports whether the inputs the startup run's server
 	// selection depends on are as ready as they are going to get (in production:
 	// netinfo has published once, or nothing is coming - see main.go). Only the
@@ -471,22 +478,37 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	}
 	res, err := runTester(runCtx, s.curTester(), reason)
 	if err != nil {
+		// Classify FIRST, then write at most one row. A shutdown (the parent ctx
+		// is gone) is nobody's failure. A user Abort() before any server produced
+		// a result (the parent ctx is still live but runCtx was cancelled) is not
+		// a failure either. What is left is a real measurement failure, the set
+		// speed.fail counts below - and the only set a failure record may hold,
+		// so the runs table and the fleet counter count the same thing.
+		shutdown := ctx.Err() != nil
+		aborted := !shutdown && runCtx.Err() != nil
+		stage := ""
+		if !shutdown && !aborted {
+			stage = speedFailStage(err)
+		}
+		record := ""
+		if stage != "" && s.RecordFailuresFn != nil && s.RecordFailuresFn() {
+			record = stage
+		}
 		// A failed run's traffic was still spent - RunReason returns the
-		// accumulated bytes alongside the error - so record the usage before
-		// deciding how the failure is reported, or a total-failure (or
-		// user-aborted) run bills the link and "data used" shows nothing.
-		s.recordFailedUsage(ctx, res, reason)
-		// A user Abort() before any server produced a result: the parent ctx is still
-		// live but runCtx was cancelled. Not a failure, and nothing to store.
-		if ctx.Err() == nil && runCtx.Err() != nil {
+		// accumulated bytes alongside the error - so record the usage however the
+		// failure is reported, or a total-failure (or user-aborted) run bills the
+		// link and "data used" shows nothing. It is the same one row whether or
+		// not it is also kept as a failure record, so no byte is counted twice.
+		s.recordFailedUsage(ctx, res, reason, record)
+		if aborted {
 			s.log.Info("speedtest aborted", "reason", reason)
 			return store.SpeedSample{}, ErrAborted
 		}
 		// A caller-aborted run (shutdown) isn't a measurement failure - keep the
 		// fleet failure rate honest.
-		if ctx.Err() == nil {
+		if !shutdown {
 			stats.Inc("speed.fail")
-			stats.Inc("speed.fail." + speedFailStage(err)) // which stage (fleet diagnostics)
+			stats.Inc("speed.fail." + stage) // which stage (fleet diagnostics)
 		}
 		s.log.Error("speedtest failed", "reason", reason, "server", s.CurrentServer(), "err", err)
 		return store.SpeedSample{}, fmt.Errorf("speedtest: %w", err)
@@ -739,13 +761,23 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 // is nothing for a cascade to reach it from. Pointing it at its own ts would
 // only assert a measurement that never happened, and this codebase does not
 // write a claim it cannot back.
-func (s *Scheduler) recordFailedUsage(ctx context.Context, res Result, reason string) {
-	if ctx.Err() != nil || (res.DownloadBytes <= 0 && res.UploadBytes <= 0) {
+//
+// stage is set only for a real failure with Record failed tests on (RunOnce
+// decides; never for a user's stop). The row then also carries the stage the run
+// failed at, which makes it a FAILURE RECORD: still hidden from every
+// measurement read by the same marker, but listed in the runs table and its CSV
+// as a failed test (store's speedIsListed). It is written even when nothing
+// moved, because the attempt itself is what the operator asked to see - with no
+// bytes it costs the usage sums nothing. The server on it is the one the engine
+// put on the failing Result, which is the server the error belongs to, or none.
+// With stage empty the row is exactly what it always was.
+func (s *Scheduler) recordFailedUsage(ctx context.Context, res Result, reason, stage string) {
+	if ctx.Err() != nil || (stage == "" && res.DownloadBytes <= 0 && res.UploadBytes <= 0) {
 		return
 	}
 	sp := store.SpeedSample{
 		TS: time.Now().Unix(), Server: res.Server, ServerID: res.ServerID,
-		Trigger: reason, Engine: res.Engine, Failed: true,
+		Trigger: reason, Engine: res.Engine, Failed: true, FailStage: stage,
 		DownBytes: bytesPtr(res.DownloadBytes), UpBytes: bytesPtr(res.UploadBytes),
 	}
 	if err := s.store.InsertSpeed(ctx, sp); err != nil {

@@ -226,7 +226,9 @@ ran on (public IP, ISP, resolver), which address family it actually used
 that couldn't be measured is stored as missing, not as zero, so a chart can
 tell "not measured" from "measured, and it was bad". A run that failed
 outright is not a measurement at all: it is kept only so its bytes count
-toward the data-used figure, and never appears in a chart, table or average.
+toward the data-used figure, and never appears in a chart or average. Turn on
+**Record failed tests** and it is also listed under **Show all runs**, with the
+reason it failed.
 
 The **ping** on the tile is the engine's own number - a mean over ten samples,
 so it matches what speedtest.net would say. One stalled sample can inflate a
@@ -369,8 +371,10 @@ resumes all monitoring.
 ![The settings drawer, open on its Ookla tab: a row of tabs (Speedtest, Ookla, iperf3, Latency, Schedule, Data, Alerts, Access, Appearance, About) above the per-test knobs - Best of, Discard losers, Retries, Packet-loss probe, Direction and Parallel connections, each with a hover-help dot; below them the Saved pane with Auto selected, a Find box that takes a place or an Ookla server ID, and the server list with ID, ping and distance columns and a star on each row; Save and Discard sit at the bottom left, Reset to defaults and Reset tiles at the bottom right](https://raw.githubusercontent.com/pingular/pingularity/main/docs/settings-ookla.png)
 
 - **Speedtest** - the engine, how often to test, the extra triggers above,
-  and a live estimate of the data your schedule will use per day and month,
-  based on what your recent runs actually moved.
+  a live estimate of the data your schedule will use per day and month,
+  based on what your recent runs actually moved, and **Record failed tests**
+  (off by default), which lists each test that failed outright under **Show
+  all runs**, never in the charts.
 - **Ookla** - the server picker: Auto, a pinned server, stars, **Find** by
   place or Ookla ID with live pings; plus direction, retries, parallel
   connections, the packet-loss probe, Best of, and **Discard losers** (keep

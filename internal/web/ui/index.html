@@ -1591,6 +1591,7 @@
      white tint composites to nothing and the row hover simply doesn't exist. Same idiom
      as .win-pop .opt:hover / .data-pop .row:hover. */
   .runs-table tbody tr[data-ts]{cursor:pointer;}
+  .runs-table tbody tr.run-failed{cursor:default;} /* a failed test is on no chart, so a click on it selects nothing */
   /* Clicking a row shows that run on the chart, which left the keyboard nothing to
      press: rows take no focus. The timestamp is a button so there is something to
      tab to, wearing the cell's own type - the affordance is still the whole row,
@@ -2016,6 +2017,12 @@
 • A scheduled test then waits for the link to go quiet before it runs.
 • Available on Linux, macOS, and Windows.">i</span></span>
           <span class="ctl"><input type="number" id="setBusyMbps" min="0" max="10000" step="any"><span class="unit">Mbps</span></span></label>
+        <label class="srow"><span class="lbl">Record failed tests
+          <span class="info" tabindex="0" data-tip="Keep a row in Show all runs for each speedtest that ends without a result: when it ran, what started it, and why it failed.
+• Failed tests never appear in the charts, averages, stat tiles or alerts.
+• A test you stop yourself is not recorded. Tests that fail during an outage are.
+• Turning this off stops new rows. The ones already recorded stay until you delete them.">i</span></span>
+          <span class="ctl"><input type="checkbox" id="setStRecordFail"><span class="unit"></span></span></label>
         <div class="info-note hidden" id="speedDataEst"><span class="wi">≈</span><span id="speedDataEstText"></span></div>
         <div class="info-note hidden" id="busyOsNote"><span class="wi">ℹ&#xFE0E;</span>This host's OS doesn't expose interface byte counters, so <b>Skip when busy</b> has no effect here.</div>
       </div>
@@ -2804,7 +2811,7 @@ Turn it back on in Settings → Latency.">!</span>
             <th>↓&nbsp;Data</th><th>↑&nbsp;Data</th><th>Server</th><th>Server&nbsp;ID</th><th title="How the run chose where to test from: the city whose server answered the ping race fastest, or a pinned server. Hover for every city that raced.">Centre</th>
             <th>ISP</th><th>ISP location</th><th>Public IPv4</th><th>Public IPv6</th>
             <th title="Recursive resolver egress IP - where this run's DNS queries exit to the internet, which can differ from the resolver you configured">DNS server</th><th title="Network operator of the DNS egress IP (from its ASN) - the egress network, not necessarily the DNS service brand">DNS provider</th><th title="Approximate location of the DNS egress IP">DNS location</th>
-            <th>PoP</th><th>Exit path</th><th>Health</th><th title="What started the test: scheduled, manual, reconnect, startup, or degraded latency">Trigger</th>
+            <th>PoP</th><th>Exit path</th><th title="Healthy or unhealthy: the run judged against your alert thresholds. Failed: the test ended without a result (kept when Record failed tests is on, in the Speedtest settings).">Health</th><th title="What started the test: scheduled, manual, reconnect, startup, or degraded latency">Trigger</th>
           </tr></thead>
           <tbody id="runsBody"></tbody>
         </table>
@@ -7256,6 +7263,31 @@ function raceCell(r){
 const healthBadge = v => v===true ? '<span class="badge ok">healthy</span>'
   : v===false ? '<span class="badge bad">unhealthy</span>'
   : '<span class="muted" title="Not graded - set alert thresholds (Settings → Alerts) and future runs get a healthy/unhealthy verdict">-</span>';
+// A failed test kept by Record failed tests (Speedtest tab): the reason a run
+// that produced no result stopped, in plain words, as [words, title] like
+// WIN_TAGS. The token is the closed stage vocabulary the daemon files failures
+// under (speed.fail.<stage> on /metrics); an unknown one - only a crafted
+// backup can hold one - reads as 'other' and is never printed.
+const FAIL_REASONS={
+  server_list:['couldn\u2019t get the server list','The Ookla server list could not be downloaded, usually because the connection or DNS was down'],
+  server_fetch:['couldn\u2019t look up the pinned server','The pinned Ookla server could not be looked up'],
+  no_servers:['no usable server','No Ookla server was left to test against'],
+  ping:['server didn\u2019t answer the ping','The server failed the latency check before the test'],
+  na:['server gave no result','The server finished the test but reported no speed'],
+  download:['download failed','The download part of the test failed'],
+  upload:['upload failed','The upload part of the test failed'],
+  bidir:['two-way test failed','The iperf3 test that moves both directions at once failed'],
+  other:['see the log for details','The test failed for another reason. The log line \u201cspeedtest failed\u201d has the error'],
+};
+// A row is a failed test only with the marker AND a stage, the same pair the
+// daemon lists it by. A function, not an arrow: the tests pull it out by its braces.
+function isFailedRun(r){ return !!(r && r.failed && r.fail_stage); }
+// The Health cell of a failed test: the badge says it failed (in words, so it
+// never rests on colour alone), the muted text says why.
+function failCell(r){
+  const t=FAIL_REASONS[r.fail_stage]||FAIL_REASONS.other;
+  return '<span class="badge bad">failed</span> <span class="muted" title="'+esc(t[1])+'">'+esc(t[0])+'</span>';
+}
 let runsPage=1, runsPerPage=10, runsTotal=0;
 // runsBusy: a delete is in flight. loadRuns() rebuilds the whole tbody, so a
 // refresh landing inside that window would move the row its focus-restore is
@@ -7293,12 +7325,15 @@ async function loadRuns(force){
   if(my!==runsSeq) return true;
   const runs=data.runs||[]; runsTotal=data.total||0;
   if(runs.length===0 && runsPage>1){ runsPage--; return loadRuns(force); } // page emptied (e.g. after delete)
+  // A failed test (isFailedRun) is on no chart, so it has no "show on the chart"
+  // button and a plain click on it pins nothing; its speed cells stay "-" even
+  // when it spent bytes, which spMeasured would otherwise read as a measured 0.
   $('runsBody').innerHTML = runs.length ? runs.map(r=>`
-    <tr data-ts="${r.ts}">
-      <td class="act"><button class="run-del" type="button" data-ts="${r.ts}"${r.round_ts?` data-round="${r.round_ts}"`:''} title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
-      <td class="mono"><button class="run-pick" type="button" title="Show this run on the chart">${fmtTime(r.ts)}</button></td>
-      <td class="mono">${spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
-      <td class="mono">${spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
+    <tr data-ts="${r.ts}"${isFailedRun(r)?' class="run-failed"':''}>
+      <td class="act"><button class="run-del" type="button" data-ts="${r.ts}"${r.round_ts?` data-round="${r.round_ts}"`:''}${isFailedRun(r)?' data-failed="1"':''} title="Delete this run" aria-label="Delete this run">${TRASH_SVG}</button></td>
+      <td class="mono">${isFailedRun(r)?fmtTime(r.ts):`<button class="run-pick" type="button" title="Show this run on the chart">${fmtTime(r.ts)}</button>`}</td>
+      <td class="mono">${!isFailedRun(r)&&spMeasured(r,'down_mbps')?num1(r.down_mbps):'-'}</td>
+      <td class="mono">${!isFailedRun(r)&&spMeasured(r,'up_mbps')?num1(r.up_mbps):'-'}</td>
       <td class="mono">${pingMeasured(r)?num1(r.ping_ms):'-'}</td>
       <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${msStr(r.jitter_ms)}</td>
       <td class="mono"${udpDirTitle(r)?' title="'+udpDirTitle(r)+'"':''}>${lossStr(r.packet_loss)}</td>
@@ -7317,7 +7352,7 @@ async function loadRuns(force){
       <td>${esc(r.dns_location)}</td>
       <td class="mono">${esc(r.cf_colo)}</td>
       <td>${esc(r.exit_summary)}</td>
-      <td>${healthBadge(r.healthy)}</td>
+      <td>${isFailedRun(r)?failCell(r):healthBadge(r.healthy)}</td>
       <td class="muted">${esc(r.trigger)}</td>
     </tr>`).join('')
     : `<tr><td class="muted" colspan="24">No runs recorded yet.</td></tr>`;
@@ -7468,7 +7503,9 @@ $('runsBody').addEventListener('click', async e=>{
     // window the reader had chosen was gone and the copy cost them their place.
     const sel=window.getSelection && window.getSelection();
     if(sel && !sel.isCollapsed && sel.toString().trim()) return;
-    const row=e.target.closest('tr[data-ts]'); if(row) focusRunOnChart(+row.dataset.ts); return; } // a plain row click selects the run on the chart
+    // A failed test is on no chart: pinning its time would draw a cursor on all
+    // three charts at a moment nothing was measured, or move the chart there.
+    const row=e.target.closest('tr[data-ts]'); if(row && !row.classList.contains('run-failed')) focusRunOnChart(+row.dataset.ts); return; } // a plain row click selects the run on the chart
   const ts=+btn.dataset.ts; if(!ts) return;
   // A Best-of round that kept its losers is several rows, and deleting the
   // run's own row takes them all (the daemon cascades on round_ts). Say so:
@@ -7481,7 +7518,12 @@ $('runsBody').addEventListener('click', async e=>{
   // winner rather than itself, so the daemon takes that one row and leaves the
   // round standing. The one sentence for every row promised, on exactly the rows
   // where it was untrue, that a round the reader was not deleting would go too.
-  if(!confirm(btn.dataset.round
+  //
+  // Nor of a failed test (data-failed): it has no round, and it measured
+  // nothing, so what goes is the record of an attempt.
+  if(!confirm(btn.dataset.failed
+    ? 'Delete this failed test? This cannot be undone.'
+    : btn.dataset.round
     ? 'Delete this speedtest run? It is one server of a Best-of round another server won, so the rest of that round stays. This cannot be undone.'
     : 'Delete this speedtest run? Any other servers measured in the same round go with it. This cannot be undone.')) return;
   // Remember this button's row position: loadRuns() rebuilds the whole tbody, so
@@ -7507,7 +7549,7 @@ $('runsBody').addEventListener('click', async e=>{
     // already gone - saying "Run deleted" there told the reader they had just
     // done something they had not.
     let gone=1; try{ const d=await r.json(); gone=(d && typeof d.deleted==='number') ? d.deleted : 1; }catch(e){}
-    const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : (gone===0 ? 'That run was already gone' : 'Run deleted'); tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
+    const tb=$('undoToast'); if(tb){ tb.textContent = gone>1 ? ('Round deleted - '+gone+' runs') : (gone===0 ? 'That run was already gone' : (btn.dataset.failed ? 'Failed test deleted' : 'Run deleted')); tb.hidden=false; clearTimeout(tb._t); tb._t=setTimeout(()=>{ tb.hidden=true; }, 4000); }
   }catch(err){ btn.disabled=false; alert('Delete failed'); refocusDeleteBtn(btn); }
   finally{ runsBusy=false; }
 });
@@ -9159,6 +9201,7 @@ const FIELDS=[
   ['setDegradedPing','degraded_ping_ms','float'],
   ['setStAdaptive','speedtest_adaptive','bool'],
   ['setStSkipBusy','speedtest_skip_busy','bool'],
+  ['setStRecordFail','speedtest_record_failures','bool'],
   ['setBusyMbps','speedtest_busy_mbps','float'],
   ['setRetention','retention_seconds','day'],
   ['setSpeedRet','speed_retention_seconds','day'],

@@ -655,7 +655,10 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	}
 	host, port, err := parseIperfServer(server)
 	if err != nil {
-		return Result{}, err
+		// Named even though nothing ran, so a failed test kept by Record failed
+		// tests reads as the iperf3 failure it is rather than as the default
+		// engine. No server: there is no usable one to name.
+		return Result{Engine: "iperf3"}, err
 	}
 	// The recorded name and the live status read the same now: "iperf3: <label>".
 	label := callStr(i.LabelFn)
@@ -687,7 +690,9 @@ func (i *Iperf) Run(ctx context.Context) (Result, error) {
 	dir := speedDirection(i.DirectionFn)
 	auth, cleanup, err := i.resolveAuth()
 	if err != nil {
-		return Result{}, err
+		// The server is known by now (OnServer has already shown it), and this
+		// failure is about it, so a kept failed test names it.
+		return Result{Engine: "iperf3", Server: name}, err
 	}
 	defer cleanup()
 	// RSA padding is an EXPLICIT per-server choice (PKCS1Fn), never auto-negotiated.

@@ -82,7 +82,12 @@ and `-d '{…}'` where a body is listed below.
   Runs that recorded them carry `ip_family` (`4`/`6`/`mixed`, the family the
   transfer actually used) and `udp_direction` (`down`/`up`, which way the
   loss/jitter probe sampled); on runs that didn't establish one - and rows
-  predating the fields - the keys are omitted rather than sent empty
+  predating the fields - the keys are omitted rather than sent empty.
+  With **Record failed tests** on, a failed test is a row too: `failed: true`
+  plus `fail_stage` (`server_list`, `server_fetch`, `no_servers`, `ping`, `na`,
+  `download`, `upload`, `bidir`, `other`). Its speeds and ping are 0 and mean
+  nothing, so read `failed` first. `total` counts these rows, and so does the
+  `?locate=` offset; `/api/speed` never returns them
 - `GET /api/speed/runs.csv` - all runs as CSV. Everything added since the
   original column set is appended at the END, so consumers indexing existing
   columns by position keep working. In order, the tail is `ip_family` and
@@ -90,7 +95,10 @@ and `-d '{…}'` where a body is listed below.
   a Best-of round that another server won (**Discard losers** off) carries the
   winner's timestamp and is blank on a test's own result; and then the same
   five the runs table's **Centre** column is built from - `win_reason`,
-  `race_outcome`, `race_winner_label`, `race_winner_ms`, `race_racers`
+  `race_outcome`, `race_winner_label`, `race_winner_ms`, `race_racers`; and
+  last `fail_stage`, blank on every run that measured something and the stage
+  on a failed test kept by **Record failed tests** (whose speed cells are
+  blank). The column is always in the header, whether or not the switch is on
 - `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
   Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge
@@ -102,8 +110,9 @@ and `-d '{…}'` where a body is listed below.
   `challenger_failed`, `pinned`, and for Best-of rounds `score`, `favourite`
   (a starred server scored highest), `ping_bootstrap`, `pinned_bestof`,
   `pinned_companion` - the same value the runs table shows as the muted tag). `404` only when no such run exists; a run
-  with no report (an iperf3 run, history from before the report existed, an
-  old backup) answers `200` with an empty `servers` array
+  with no report (an iperf3 run, a failed test kept by **Record failed tests**,
+  history from before the report existed, an old backup) answers `200` with an
+  empty `servers` array
 - `GET /api/speed/usage` - cumulative data used per window
 - `POST /api/speedtest/candidates` - the field an automatic Ookla run would race
   right now: every origin's pool (exit router, ISP city, starred servers' cities,

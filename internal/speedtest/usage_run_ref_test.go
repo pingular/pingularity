@@ -70,7 +70,7 @@ func TestAFailedRunsUsageSurvivesDeletingTheRunBeforeIt(t *testing.T) {
 	s.recordFailedUsage(ctx, Result{
 		Engine: "iperf3", Server: "lab", ServerID: "1",
 		DownloadBytes: 40_000_000,
-	}, "manual")
+	}, "manual", "")
 	rows, err := st.ExportTable(ctx, "speed")
 	if err != nil {
 		t.Fatalf("ExportTable: %v", err)

@@ -112,15 +112,21 @@ func TestAnExportCarryingNewColumnsIsRefusedBeforeAnythingCommits(t *testing.T) 
 	// an arm with `failed` would let the marker alone satisfy the assertion, and
 	// the arm would keep passing on the day usage_run_ts stopped counting toward
 	// the stamp - which is a file older builds accept and then abort on.
+	//
+	// fail_stage arrives on a MEASUREMENT, planted at rest, for the same reason:
+	// the daemon writes it only beside `failed`, and an arm carrying both would
+	// pass on the marker's stamp alone.
 	usageRef := time.Now().Add(-2 * time.Minute).Unix()
 	for _, tc := range []struct {
 		name   string
 		sample store.SpeedSample
+		plant  string // SQL run on the row after it is stored, for a value no writer produces alone
 	}{
-		{"ip_family", store.SpeedSample{IPFamily: "6"}},
-		{"udp_direction", store.SpeedSample{UDPDirection: "up"}},
-		{"failed", store.SpeedSample{Failed: true}},
-		{"usage_run_ts", store.SpeedSample{UsageRunTS: &usageRef}},
+		{"ip_family", store.SpeedSample{IPFamily: "6"}, ""},
+		{"udp_direction", store.SpeedSample{UDPDirection: "up"}, ""},
+		{"failed", store.SpeedSample{Failed: true}, ""},
+		{"usage_run_ts", store.SpeedSample{UsageRunTS: &usageRef}, ""},
+		{"fail_stage", store.SpeedSample{}, `UPDATE speed SET fail_stage = 'download'`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
@@ -137,6 +143,11 @@ func TestAnExportCarryingNewColumnsIsRefusedBeforeAnythingCommits(t *testing.T) 
 			}
 			if err := s.store.InsertSpeed(context.Background(), smp); err != nil {
 				t.Fatalf("InsertSpeed: %v", err)
+			}
+			if tc.plant != "" {
+				if _, err := s.store.DB().ExecContext(context.Background(), tc.plant); err != nil {
+					t.Fatalf("plant %s: %v", tc.name, err)
+				}
 			}
 			rr := httptest.NewRecorder()
 			r := httptest.NewRequest("GET", "/api/export?speed=1", nil)
@@ -161,9 +172,9 @@ func TestAnExportCarryingNewColumnsIsRefusedBeforeAnythingCommits(t *testing.T) 
 			if !carries {
 				t.Fatalf("the run's %s never made it into the backup, so restoring it loses the value", tc.name)
 			}
-			if env.Version < 5 {
-				t.Errorf("a backup carrying %s is stamped %d, so a pre-campaign build accepts the envelope and then "+
-					"aborts on the unknown column partway through the restore, after latency has committed", tc.name, env.Version)
+			if need := store.SpeedColumnSchema(tc.name); env.Version < need {
+				t.Errorf("a backup carrying %s is stamped %d (it needs %d), so an older build accepts the envelope and then "+
+					"aborts on the unknown column partway through the restore, after latency has committed", tc.name, env.Version, need)
 			}
 		})
 	}

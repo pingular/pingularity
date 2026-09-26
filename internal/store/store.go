@@ -122,7 +122,9 @@ CREATE TABLE IF NOT EXISTS speed (
     -- nzFinite, which collapses SQL NULL to 0 - so NULL speeds would come back
     -- from the DB indistinguishable from a genuine 0 Mbps reading. Every
     -- MEASUREMENT query filters this out (see speedNotFailed); the data-usage
-    -- sums deliberately do not.
+    -- sums deliberately do not. The runs table lists such a row only when it
+    -- also carries fail_stage (a failure record, see speedIsListed), and even
+    -- then as a failed test, never as a reading.
     failed             INTEGER,
     -- The run whose spend an ACCOUNTING row bills: joins speed.ts, the same
     -- manual-cascade shape as speed_servers.run_ts (no FK anywhere in this
@@ -139,8 +141,9 @@ CREATE TABLE IF NOT EXISTS speed (
     -- flagged row at ts+1 - which is a GUESS: a manual run that fails one second
     -- after a scheduled measurement writes its own flagged row at exactly that
     -- second, and deleting the scheduled run then destroyed the manual run's
-    -- record. No listing shows a flagged row, so nothing told the operator that
-    -- run existed or that its bytes had just been un-billed.
+    -- record. With Record failed tests off no listing shows a flagged row, so
+    -- nothing told the operator that run existed or that its bytes had just
+    -- been un-billed.
     usage_run_ts       INTEGER,
     -- How the run's centre was chosen (speedtest.RaceVerdict), so a surprising
     -- city is explainable from the DB the way speed_servers explains the server
@@ -170,7 +173,15 @@ CREATE TABLE IF NOT EXISTS speed (
     -- the data estimate, the next race's origin) carry speedIsResult and
     -- skip it; the runs table, its counts and the exports show it.
     -- DeleteSpeed cascades on it, so a deleted run takes its round along.
-    round_ts           INTEGER
+    round_ts           INTEGER,
+    -- The stage a WHOLLY failed run stopped at (speedtest.speedFailStage:
+    -- server_list|server_fetch|no_servers|ping|na|download|upload|bidir|other),
+    -- written beside failed=1 by the scheduler only when the operator turned on
+    -- Record failed tests. It is what turns the run's accounting row into a
+    -- FAILURE RECORD the runs table lists (see speedIsFailure). NULL on every
+    -- measurement, on every accounting row written with the switch off or for a
+    -- user's stop, and on every row older than the column.
+    fail_stage         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_speed_ts ON speed(ts);
 
@@ -998,6 +1009,7 @@ func applySchema(db migrator) error {
 		{"speed", "race_winner_ms", "REAL"}, {"speed", "race_racers", "INTEGER"},
 		{"speed", "race_winner_lat", "REAL"}, {"speed", "race_winner_lon", "REAL"},
 		{"speed", "round_ts", "INTEGER"},
+		{"speed", "fail_stage", "TEXT"},
 		{"samples", "family", "TEXT"},
 	}
 	for _, m := range migrations {
@@ -3606,8 +3618,18 @@ type SpeedSample struct {
 	// produced. Set only by the scheduler's failure path. Rows carrying it are
 	// invisible to every measurement read on this type (see speedNotFailed) and
 	// counted by the data-usage sums; a consumer that reads one out of an export
-	// must treat it as "nothing was measured", NOT as a 0 Mbps reading.
+	// must treat it as "nothing was measured", NOT as a 0 Mbps reading. The one
+	// place such a row is listed is the runs table (and its CSV), and only as a
+	// failure record: Failed plus FailStage, see speedIsListed.
 	Failed bool `json:"failed,omitempty"`
+	// FailStage is the stage a wholly failed run stopped at (the closed
+	// speedtest.speedFailStage vocabulary), set only on a failure record - the
+	// usage row of a failed run the operator asked to keep, with Record failed
+	// tests on. Failed is set too, so every measurement read hides the row; its
+	// speeds and ping were never measured and read back as 0, which means
+	// nothing (check Failed first). Empty on every other row, and never read
+	// back from one: scanSpeed drops a stage that is not beside the marker.
+	FailStage string `json:"fail_stage,omitempty"`
 	// UsageRunTS is the ts of the measurement row an accounting row bills for -
 	// the reference DeleteSpeed cascades on, so removing a run takes the spend of
 	// its abandoned attempts with it and NOTHING else. nil on measurements, on
@@ -3673,12 +3695,15 @@ const speedCols = `ts, down_mbps, up_mbps, ping_ms, COALESCE(server,''), COALESC
 	idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, COALESCE(engine,''),
 	ping_best_ms, COALESCE(ip_family,''), COALESCE(udp_direction,''), failed,
 	COALESCE(race_outcome,''), COALESCE(race_origins,''), COALESCE(race_winner_kind,''), COALESCE(race_winner_label,''),
-	race_winner_ms, race_racers, race_winner_lat, race_winner_lon, round_ts`
+	race_winner_ms, race_racers, race_winner_lat, race_winner_lon, round_ts, COALESCE(fail_stage,'')`
 
 // speedNotFailed is the predicate every MEASUREMENT read of the speed table
 // carries, and the reason the accounting rows recordFailedUsage writes cannot
-// reach a chart, a table, a threshold verdict or a /metrics gauge: this package
-// holds all the SQL, so filtering here covers every consumer at once.
+// reach a chart, an average, a threshold verdict or a /metrics gauge: this
+// package holds all the SQL, so filtering here covers every consumer at once.
+// (The runs table is a LISTING, not a measurement read: it carries
+// speedIsListed, which adds the failure records Record failed tests keeps and
+// nothing else.)
 //
 // Written positively (NULL or 0 is a real run) rather than as `failed IS NOT 1`
 // so an unreadable value - only reachable through a crafted import - HIDES the
@@ -3695,7 +3720,8 @@ const speedNotFailed = `(failed IS NULL OR failed = 0)`
 // are measurements, but of servers the run did not choose, so the reads that
 // decide something - the charts, the latest run, thresholds and baselines,
 // the data estimate, the next race's origin - read this; the runs table, the
-// counts behind its paging, and the exports read speedNotFailed and show them.
+// counts behind its paging, and its CSV read speedIsListed (every row
+// speedNotFailed passes, plus failure records) and show them.
 const speedIsResult = speedNotFailed + ` AND round_ts IS NULL`
 
 // speedIsAccounting is the same question from the other side - "is this row
@@ -3704,7 +3730,8 @@ const speedIsResult = speedNotFailed + ` AND round_ts IS NULL`
 // cascade is the caller: it must reach exactly the rows every measurement read
 // hides, no more (a row it wrongly matches is a reading destroyed with no way
 // back) and no fewer (a row it misses bills bytes for a speedtest that is gone,
-// and no listing shows it for the operator to remove by hand).
+// and no listing shows it for the operator to remove by hand - a row carrying
+// usage_run_ts is never a failure record, see speedIsFailure).
 //
 // Two spellings of this complement have already disagreed in this file: written
 // `failed = 1`, the export's in-use check reported a hand-edited marker of 2 as
@@ -3713,6 +3740,40 @@ const speedIsResult = speedNotFailed + ` AND round_ts IS NULL`
 // tests one column among several in a single SELECT - so it is the place to
 // check first if this predicate ever changes.)
 const speedIsAccounting = `NOT ` + speedNotFailed
+
+// speedHasStage is the ONE spelling of "fail_stage is set": NULL and the empty
+// string both mean unset (an empty one is reachable through an import). The
+// listing and the export's in-use check share it so they cannot disagree about
+// which rows carry one.
+const speedHasStage = `(fail_stage IS NOT NULL AND fail_stage <> '')`
+
+// speedIsFailure is the failure record Record failed tests leaves: a wholly
+// failed run's usage row, carrying the stage it stopped at. Derived from
+// speedIsAccounting so "non-zero marker" means what it means everywhere else,
+// then narrowed three ways:
+//   - typeof(failed) = 'integer', because this predicate SHOWS rows and
+//     scanSpeed reads `failed` through NullInt64: a hand-edited text marker
+//     must hide the row, not fail the whole page with a Scan error.
+//   - speedHasStage, because the stage is what makes it a record. The same
+//     row without one (the switch was off, or the user stopped the run) is
+//     plain accounting and stays hidden, as it always was.
+//   - no usage_run_ts and no round_ts, because an extra-usage row or a round
+//     member is never a run of its own, even if something stamped a stage on it.
+//
+// The marker AND the stage, never the stage alone: a crafted stage on a
+// measurement lists that row as the measurement it is (scanSpeed drops the
+// stage), not as a failure.
+const speedIsFailure = `(` + speedIsAccounting + ` AND typeof(failed) = 'integer' AND ` +
+	speedHasStage + ` AND usage_run_ts IS NULL AND round_ts IS NULL)`
+
+// speedIsListed is what the runs TABLE shows: every row speedNotFailed passes,
+// plus failure records. A LISTING, never a reading - nothing that feeds a
+// chart, an average, a verdict, a gauge or the digest may carry it, and
+// TestSpeedFilterCoversEveryMeasurementRead allows it in exactly the functions
+// behind the table (the page, its total, the chart-to-table jump, the CSV and
+// the run-exists check), so the pager, the jump and the file cannot disagree
+// about which rows exist.
+const speedIsListed = `(` + speedNotFailed + ` OR ` + speedIsFailure + `)`
 
 // speedWindow renders the half-open [since, until) ts filter the speed-history
 // reads share, with its bound args. Shared so the two cannot answer the same
@@ -3764,12 +3825,14 @@ func scanSpeed(sc interface{ Scan(...any) error }, extra ...any) (SpeedSample, e
 	var down, up, ping sql.NullFloat64
 	var ploss, jitter, idle, loadDown, loadUp, loadDownP95, loadUpP95, pingBest, raceMS, raceLat, raceLon sql.NullFloat64
 	var healthy, downB, upB, failed, racers, roundTS sql.NullInt64
+	var stage string
 	err := sc.Scan(append([]any{&sp.TS, &down, &up, &ping, &sp.Server, &sp.ServerID,
 		&sp.PublicIPv4, &sp.PublicIPv6, &sp.ISP, &sp.ISPLocation, &sp.DNSIP, &sp.DNSProvider, &sp.DNSLocation,
 		&ploss, &healthy, &jitter, &downB, &upB, &sp.CFColo, &sp.ExitSummary, &sp.Trigger,
 		&idle, &loadDown, &loadUp, &loadDownP95, &loadUpP95, &sp.Engine, &pingBest,
 		&sp.IPFamily, &sp.UDPDirection, &failed,
-		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon, &roundTS}, extra...)...)
+		&sp.RaceOutcome, &sp.RaceOrigins, &sp.RaceWinnerKind, &sp.RaceWinnerLabel, &raceMS, &racers, &raceLat, &raceLon, &roundTS,
+		&stage}, extra...)...)
 	if roundTS.Valid {
 		v := roundTS.Int64
 		sp.RoundTS = &v
@@ -3801,7 +3864,16 @@ func scanSpeed(sc interface{ Scan(...any) error }, extra ...any) (SpeedSample, e
 		v := upB.Int64
 		sp.UpBytes = &v
 	}
-	sp.Failed = failed.Valid && failed.Int64 == 1
+	// Non-zero, not == 1: the meaning speedNotFailed and the import clamp give
+	// the marker. A listed failure record with a hand-edited marker of 2 must
+	// still render as a failed test, never as a 0 Mbps measurement.
+	sp.Failed = failed.Valid && failed.Int64 != 0
+	// A stage means something only beside the marker. A crafted one on a
+	// measurement never reaches the JSON or the CSV, so that row cannot be
+	// drawn as a failure it was not.
+	if sp.Failed {
+		sp.FailStage = stage
+	}
 	return sp, err
 }
 
@@ -3901,6 +3973,12 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 	if sp.Failed {
 		failed = int64(1)
 	}
+	// A stage is only ever stored beside the marker: on its own it would claim
+	// a failure for a row every read treats as a measurement.
+	stage := nullStr(sp.FailStage)
+	if !sp.Failed {
+		stage = nil
+	}
 	// ONE autocommit statement, deliberately: a deferred read-then-write
 	// transaction here fails with SQLITE_BUSY_SNAPSHOT the moment another
 	// pooled connection commits between the read and the write - the daemon
@@ -3923,7 +4001,7 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 			idle_ms, loaded_down_ms, loaded_up_ms, loaded_down_p95_ms, loaded_up_p95_ms, engine,
 			ping_best_ms, ip_family, udp_direction, failed, usage_run_ts,
 			race_outcome, race_origins, race_winner_kind, race_winner_label, race_winner_ms, race_racers,
-			race_winner_lat, race_winner_lon, round_ts)
+			race_winner_lat, race_winner_lon, round_ts, fail_stage)
 		 SELECT COALESCE((SELECT MIN(t) FROM (
 					SELECT ?1 AS t WHERE NOT EXISTS (SELECT 1 FROM speed WHERE ts = ?1)
 					UNION ALL
@@ -3931,14 +4009,15 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 					  AND NOT EXISTS (SELECT 1 FROM speed s2 WHERE s2.ts = speed.ts + 1)
 				)), ?1),
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?`,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		sp.TS, sp.DownMbps, sp.UpMbps, sp.PingMS, sp.Server, sp.ServerID,
 		sp.PublicIPv4, sp.PublicIPv6, sp.ISP, sp.ISPLocation, sp.DNSIP, sp.DNSProvider, sp.DNSLocation,
 		ptrArg(sp.PacketLoss), healthy, ptrArg(sp.JitterMS), ptrArg(downBytes), ptrArg(upBytes), sp.CFColo, sp.ExitSummary, sp.Trigger,
 		ptrArg(sp.IdleMS), ptrArg(sp.LoadedDownMS), ptrArg(sp.LoadedUpMS), ptrArg(sp.LoadedDownP95MS), ptrArg(sp.LoadedUpP95MS), sp.Engine,
 		ptrArg(sp.PingBestMS), sp.IPFamily, sp.UDPDirection, failed, ptrArg(sp.UsageRunTS),
 		nullStr(sp.RaceOutcome), nullStr(sp.RaceOrigins), nullStr(sp.RaceWinnerKind), nullStr(sp.RaceWinnerLabel),
-		ptrArg(sp.RaceWinnerMS), ptrArg(sp.RaceRacers), ptrArg(sp.RaceWinnerLat), ptrArg(sp.RaceWinnerLon), ptrArg(sp.RoundTS))
+		ptrArg(sp.RaceWinnerMS), ptrArg(sp.RaceRacers), ptrArg(sp.RaceWinnerLat), ptrArg(sp.RaceWinnerLon), ptrArg(sp.RoundTS),
+		stage)
 	if err != nil {
 		recordDBErr(err)
 		return 0, err
@@ -4032,10 +4111,13 @@ func (s *Store) InsertSpeedServers(ctx context.Context, rows []SpeedServerRow) e
 // selection report" (which is normal for pre-feature and iperf3 history).
 func (s *Store) SpeedRunExists(ctx context.Context, ts int64) (bool, error) {
 	var n int
-	// Accounting rows are not runs: /api/speed/runs/servers must 404 for one,
-	// exactly as it does for a ts that never existed - and it can only be asked
-	// about a ts the paged/charted history handed out, which those rows are not in.
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed+` AND ts = ?`, ts).Scan(&n)
+	// Plain accounting rows are not runs: /api/speed/runs/servers must 404 for
+	// one, exactly as it does for a ts that never existed - and it can only be
+	// asked about a ts the paged/charted history handed out, which those rows
+	// are not in. A failure record IS in the runs table, so it is a run here: a
+	// run with no selection report, like an iperf3 one (a failed run writes
+	// none), which answers 200 with an empty list.
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedIsListed+` AND ts = ?`, ts).Scan(&n)
 	if err != nil {
 		recordDBErr(err)
 		return false, err
@@ -4657,7 +4739,9 @@ func (s *Store) SpeedHistoryRange(ctx context.Context, since, until time.Time, b
 // SpeedHistoryDescFunc streams every recorded speedtest newest-first to fn, one
 // row at a time, without materializing the whole table - so the CSV export runs
 // at O(1) memory over a full history instead of building the entire slice. fn is
-// called per row; returning an error stops the scan and propagates it.
+// called per row; returning an error stops the scan and propagates it. The CSV
+// is the runs table as a file, so it lists the same rows (speedIsListed),
+// failure records included.
 func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) error) error {
 	// The scalar subquery resolves each row's win_reason from its selection
 	// report (winner row of speed_servers, walked via idx_speed_servers_ts) so
@@ -4667,7 +4751,7 @@ func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) e
 	// run, and a scalar subquery must not turn that into a duplicated CSV row.
 	rows, err := s.db.QueryContext(ctx, `SELECT `+speedCols+`,
 		COALESCE((SELECT ss.win_reason FROM speed_servers ss WHERE ss.run_ts = speed.ts AND ss.winner = 1 LIMIT 1), '')
-		FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC`)
+		FROM speed WHERE `+speedIsListed+` ORDER BY ts DESC`)
 	if err != nil {
 		return err
 	}
@@ -4686,20 +4770,34 @@ func (s *Store) SpeedHistoryDescFunc(ctx context.Context, fn func(SpeedSample) e
 	return rows.Err()
 }
 
-// SpeedCount returns the total number of recorded speedtests.
+// SpeedCount returns the number of recorded MEASUREMENTS - "has anything ever
+// been measured here?", which newPriorDataFn asks. A failure record is not
+// one, however many the runs table lists; the table pages against
+// SpeedListedCount instead.
 func (s *Store) SpeedCount(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed).Scan(&n)
 	return n, err
 }
 
+// SpeedListedCount is the total the runs TABLE pages against. It must carry
+// the same predicate as SpeedRuns and SpeedRunOffset, or the pager and the
+// jump disagree about which rows exist. SpeedCount is a different question
+// ("has anything been measured", newPriorDataFn) that a failure record must
+// not answer yes to.
+func (s *Store) SpeedListedCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedIsListed).Scan(&n)
+	return n, err
+}
+
 // SpeedRunOffset returns the zero-based position of the run with the given
-// timestamp within the newest-first ordering (i.e. how many runs are newer),
-// which the UI divides by page size to jump straight to a run's row when a
-// chart point is clicked.
+// timestamp within the runs table's newest-first ordering (i.e. how many
+// listed rows are newer, failure records included), which the UI divides by
+// page size to jump straight to a run's row when a chart point is clicked.
 func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedNotFailed+` AND ts > ?`, ts).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM speed WHERE `+speedIsListed+` AND ts > ?`, ts).Scan(&n)
 	return n, err
 }
 
@@ -4715,17 +4813,23 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 // A run that retried a direction also has a usage-accounting row one second
 // later (the scheduler writes it at measuredTS+1 so a backup's ts merge key
 // cannot collapse the two records into one), and that row goes too. It has to:
-// it is invisible to every listing - they all carry speedNotFailed - so the only
-// place it appears is the data-usage total, and the only timestamp any surface
-// ever shows the operator is the measurement's. Left behind it would bill bytes
-// for a run that no longer exists, with nothing to delete it by.
+// it is invisible to every listing - the runs table's speedIsListed never lists
+// a row that carries usage_run_ts - so the only place it appears is the
+// data-usage total, and the only timestamp any surface ever shows the operator
+// is the measurement's. Left behind it would bill bytes for a run that no
+// longer exists, with nothing to delete it by.
+//
+// A failure record (Record failed tests) is removed by rowid like any run. It
+// has nothing to cascade to: a failed run writes no selection report and keeps
+// no round, and its own usage is the row itself.
 //
 // That row is found by the reference it CARRIES (speed.usage_run_ts), not by its
 // position. The position - "the flagged row at ts+1" - was a guess, and it was
 // wrong whenever a second run landed on that second: a manual run that fails one
 // second after a scheduled measurement writes its own flagged row at exactly
 // ts+1, and deleting the scheduled run then destroyed the manual run's whole
-// record, silently, since nothing ever lists a flagged row.
+// record, silently, since with Record failed tests off nothing lists a flagged
+// row.
 //
 // The positional sweep is GONE rather than kept as a fallback for accounting
 // rows written before the column existed. Keeping it would reintroduce the
@@ -5218,7 +5322,9 @@ func (s *Store) SpeedResults(ctx context.Context, limit int) ([]SpeedSample, err
 	return out, rows.Err()
 }
 
-// SpeedRuns returns a page of speedtests, newest first.
+// SpeedRuns returns a page of the runs table, newest first: every measurement,
+// a kept Best-of round's members, and the failure records Record failed tests
+// keeps (speedIsListed). Read Failed before any figure on a row.
 func (s *Store) SpeedRuns(ctx context.Context, limit, offset int) ([]SpeedSample, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 50
@@ -5227,7 +5333,7 @@ func (s *Store) SpeedRuns(ctx context.Context, limit, offset int) ([]SpeedSample
 		offset = 0
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+speedCols+` FROM speed WHERE `+speedNotFailed+` ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
+		`SELECT `+speedCols+` FROM speed WHERE `+speedIsListed+` ORDER BY ts DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -6357,7 +6463,7 @@ var exportTables = map[string]struct {
 		"idle_ms", "loaded_down_ms", "loaded_up_ms", "loaded_down_p95_ms", "loaded_up_p95_ms", "engine",
 		"ping_best_ms", "ip_family", "udp_direction", "failed", "usage_run_ts",
 		"race_outcome", "race_origins", "race_winner_kind", "race_winner_label", "race_winner_ms", "race_racers",
-		"race_winner_lat", "race_winner_lon", "round_ts"},
+		"race_winner_lat", "race_winner_lon", "round_ts", "fail_stage"},
 		keyCols: []string{"ts"},
 		// server is read as a plain string everywhere (and COALESCEd on read as a
 		// second belt) - a crafted row without one must be skipped, not inserted
@@ -6644,7 +6750,9 @@ func (s *Store) HasQuarantinedPausesTx(ctx context.Context, tx *sql.Tx) (bool, e
 //
 // The race verdict columns (race_*) came later still, after the stamp of 5 had
 // shipped, so a file carrying any of them needs 6: the builds that accept 5
-// abort on them the same way. speedColumnSchema is the one place each column's
+// abort on them the same way. round_ts (a kept Best-of round) needs 7, and
+// fail_stage (a failed test kept by Record failed tests) needs 8, each for the
+// same reason one rung up. speedColumnSchema is the one place each column's
 // version lives; the list below and the export's stamp both read it.
 func speedColumnsPastSchema4() []string {
 	out := make([]string, 0, len(speedColumnSchema))
@@ -6661,7 +6769,8 @@ var speedColumnSchema = map[string]int{
 	"ip_family": 5, "udp_direction": 5, "failed": 5, "usage_run_ts": 5,
 	"race_outcome": 6, "race_origins": 6, "race_winner_kind": 6, "race_winner_label": 6,
 	"race_winner_ms": 6, "race_racers": 6, "race_winner_lat": 6, "race_winner_lon": 6,
-	"round_ts": 7,
+	"round_ts":   7,
+	"fail_stage": 8,
 }
 
 // SpeedColumnSchema is the envelope version a file carrying col needs, or 0
@@ -6695,9 +6804,13 @@ func SpeedColumnSchema(col string) int { return speedColumnSchema[col] }
 // cascade on, and a backup that shed it would restore the row beyond the reach
 // of deleting its run. Erring toward "in use" is the safe direction anyway; the
 // cost is a file older builds refuse up front.
+// fail_stage reads speedHasStage, the listing's own spelling of "set", and asks
+// about ANY row rather than only failure records: a stray stage on another row
+// costs a higher stamp, while a stage the file dropped would restore a listed
+// failed test as a hidden accounting row.
 func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
 	var ipFamily, udpDirection, failed, usageRunTS bool
-	var raceOutcome, raceOrigins, raceKind, raceLabel, raceMS, raceRacers, raceLat, raceLon, roundTS bool
+	var raceOutcome, raceOrigins, raceKind, raceLabel, raceMS, raceRacers, raceLat, raceLon, roundTS, failStage bool
 	err := tx.QueryRowContext(ctx, `SELECT
 		EXISTS(SELECT 1 FROM speed WHERE ip_family IS NOT NULL AND ip_family <> ''),
 		EXISTS(SELECT 1 FROM speed WHERE udp_direction IS NOT NULL AND udp_direction <> ''),
@@ -6711,9 +6824,10 @@ func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (m
 		EXISTS(SELECT 1 FROM speed WHERE race_racers IS NOT NULL),
 		EXISTS(SELECT 1 FROM speed WHERE race_winner_lat IS NOT NULL),
 		EXISTS(SELECT 1 FROM speed WHERE race_winner_lon IS NOT NULL),
-		EXISTS(SELECT 1 FROM speed WHERE round_ts IS NOT NULL)`).Scan(
+		EXISTS(SELECT 1 FROM speed WHERE round_ts IS NOT NULL),
+		EXISTS(SELECT 1 FROM speed WHERE `+speedHasStage+`)`).Scan(
 		&ipFamily, &udpDirection, &failed, &usageRunTS,
-		&raceOutcome, &raceOrigins, &raceKind, &raceLabel, &raceMS, &raceRacers, &raceLat, &raceLon, &roundTS)
+		&raceOutcome, &raceOrigins, &raceKind, &raceLabel, &raceMS, &raceRacers, &raceLat, &raceLon, &roundTS, &failStage)
 	if err != nil {
 		return nil, err
 	}
@@ -6721,7 +6835,8 @@ func (s *Store) SpeedColumnsPastSchema4InUse(ctx context.Context, tx *sql.Tx) (m
 		"failed": failed, "usage_run_ts": usageRunTS,
 		"race_outcome": raceOutcome, "race_origins": raceOrigins, "race_winner_kind": raceKind,
 		"race_winner_label": raceLabel, "race_winner_ms": raceMS, "race_racers": raceRacers,
-		"race_winner_lat": raceLat, "race_winner_lon": raceLon, "round_ts": roundTS}, nil
+		"race_winner_lat": raceLat, "race_winner_lon": raceLon, "round_ts": roundTS,
+		"fail_stage": failStage}, nil
 }
 
 // LastDecidedRace is the newest run whose city race was decided and whose

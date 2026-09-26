@@ -159,11 +159,12 @@ self-describing):
   headroom above these numbers rather than against them. That failed run is
   kept as an accounting row, **flagged** as one: the totals and windows above
   count its bytes, while every view that means "a measurement" filters it out -
-  it is not in the runs table, the charts, or `latest`, so it can't become the
-  last run, and it gets no healthy/unhealthy verdict. `avg_run_bytes` skips it
-  too, on purpose: that average projects what the *next* run will cost, and a
-  run that died partway spent a fraction of a full one, so counting it would
-  predict a bill no schedule produces
+  it is not in the charts or `latest`, so it can't become the last run, and it
+  gets no healthy/unhealthy verdict. It is in the runs table only when **Record
+  failed tests** is on, and then as a failed test with no readings.
+  `avg_run_bytes` skips it too, on purpose: that average projects what the
+  *next* run will cost, and a run that died partway spent a fraction of a full
+  one, so counting it would predict a bill no schedule produces
 - `pingularity_process_start_time_seconds` - process start (the Prometheus-conventional
   form; `pingularity_runtime_seconds` kept for compatibility)
 - `pingularity_goroutines` / `pingularity_memory_heap_bytes` / `_memory_sys_bytes` /

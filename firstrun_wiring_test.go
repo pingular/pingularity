@@ -157,6 +157,9 @@ func TestMainWiresFirstRunAndOptsHooks(t *testing.T) {
 		"ni.WakeFn = set.Changed",                     // #3: first speedtest must not race an empty netinfo
 		"sched.ReadyFn = newFirstRunReadyFn(set, ni)", // #3: selection readiness predicate
 		"replayIgnoredOpts(",                          // #7: ignored-PINGULARITY_OPTS warning is replayed at boot
+		// Record failed tests: without this line the switch saves, shows and
+		// round-trips, and no failed run is ever recorded.
+		"sched.RecordFailuresFn = set.SpeedtestRecordFailures",
 	} {
 		if !strings.Contains(string(src), want) {
 			t.Errorf("main.go no longer wires %q - package tests won't catch it; the behavior is silently dead", want)

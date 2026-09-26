@@ -113,3 +113,30 @@ func TestMainWiresPriorDataFnToTheStore(t *testing.T) {
 		t.Errorf("main.go installs .%s = %s, want %s - the predicate this file's other test pins, reading the daemon's OWN store. Anything else and a fresh install's first best-of round is ranked on throughput no measurement has vetted (or counted out of a different database).", field, installed[0], want)
 	}
 }
+
+// A failure record (Record failed tests on) is the same accounting row with a
+// stage on it, and the runs table lists it - but it measured nothing, so it is
+// no more a baseline than the plain row TestFailedFirstSpeedtestIsNotSpeedHistory
+// writes. The table's own count (SpeedListedCount) says 1 here; the predicate
+// must keep reading SpeedCount.
+func TestPriorDataIgnoresAFailureRecord(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	down := int64(125_000_000)
+	if err := st.InsertSpeed(ctx, store.SpeedSample{
+		TS: 1_700_000_000, Server: "Somewhere", Trigger: "startup", Engine: "ookla",
+		Failed: true, FailStage: "download", DownBytes: &down,
+	}); err != nil {
+		t.Fatalf("insert failure record: %v", err)
+	}
+	if n, err := st.SpeedListedCount(ctx); err != nil || n != 1 {
+		t.Fatalf("precondition: the runs table lists the failure record, got %d, %v", n, err)
+	}
+	if newPriorDataFn(st)() {
+		t.Error("a lone failed test counted as speed history: the first real measurement would skip the first-run ping-only path")
+	}
+}

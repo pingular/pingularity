@@ -781,7 +781,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		SpeedServerID:    "1234",
 		SpeedtestEnabled: true, SpeedtestOnReconnect: true, IPv6Mode: "on", ExitTarget: "8.8.8.8", DNSProbe: true, NetinfoEnabled: true,
 		SpeedtestAdaptive: true, SpeedtestOnDegraded: true, DegradedPingMS: 120, SpeedtestSkipBusy: true, SpeedBusyMbps: 5,
-		SpeedEngine: "iperf3", IperfServer: "10.0.0.5:5201",
+		SpeedtestRecordFailures: true, SpeedEngine: "iperf3", IperfServer: "10.0.0.5:5201",
 		IperfDur: 15, IperfStreams: 4, OoklaConnections: 8, OoklaLoss: true, SpeedBestOfCount: 3, IperfOmit: 2, SpeedDirection: "down", IperfUDP: true,
 		// Direction/Retries are per-engine: distinct values from the Ookla pair above.
 		IperfDirection: "bidir", IperfRetries: 3,

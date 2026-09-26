@@ -9033,7 +9033,11 @@ test('a page that fails to load leaves the pager where it was, and says so', asy
 //
 // This drives the REAL loader, pager caption and goTo out of index.html, with the
 // two responses held open so the overlap can be arranged either way round.
-function drivePagerRace(which, rowsFor) {
+// over replaces a stub with a real helper (spMeasured, pingMeasured, num1,
+// bytesStr) for a test that is about what a cell prints: the stubs print
+// nothing, so a cell that should say "-" and says "0.0" instead cannot fail
+// against them.
+function drivePagerRace(which, rowsFor, over = {}) {
   const isRuns = which === 'runs';
   const els = {};
   const $ = id => (els[id] = els[id] || {
@@ -9051,19 +9055,24 @@ function drivePagerRace(which, rowsFor) {
     return { ok: true, json: async () => (isRuns ? { runs: rows, total: 160 } : { events: rows, total: 160 }) };
   };
   const str = () => '';
+  // The failed-test cell is the page's own, so a row listed as a failed test
+  // renders here exactly as it does on the dashboard.
+  const fail = new Function('esc', script.match(/const FAIL_REASONS=\{[\s\S]*?\n\};/)[0] + '\n'
+    + extract('function isFailedRun') + '\n' + extract('function failCell')
+    + '\nreturn { isFailedRun, failCell };')(esc);
   const api = isRuns
     ? new Function('$', 'fetch', 'document', 'chartLoadFailed', 'listLoadFailed',
       'fmtTime', 'spMeasured', 'pingMeasured', 'udpDirTitle', 'msStr', 'lossStr', 'bloatCell',
       'bytesStr', 'showEngine', 'engOf', 'esc', 'winTag', 'famLabel', 'famTitle', 'raceCell',
-      'healthBadge', 'TRASH_SVG', 'num1', 'applyRunHighlight',
+      'healthBadge', 'TRASH_SVG', 'num1', 'applyRunHighlight', 'isFailedRun', 'failCell',
       TILE_GATE + '\nlet runsPage = 1, runsPerPage = 10, runsTotal = 0, runsSeq = 0, runsLoadedPage = 1, pinnedRunTs = null;\n'
       + extract('async function loadRuns') + '\n' + extract('function updateRunsPager') + '\n'
       + extract('async function runsGoTo')
       + '\nreturn { goTo: runsGoTo, page: () => runsPage };')(
       $, respond, gateDoc('speed', false), w => said.push(w), b => blanked.push(b),
-      str, () => false, () => false, str, str, str, str,
-      str, () => false, str, s => String(s == null ? '' : s), str, str, str, str,
-      str, '', str, () => {})
+      str, over.spMeasured || (() => false), over.pingMeasured || (() => false), str, str, str, str,
+      over.bytesStr || str, () => false, str, s => String(s == null ? '' : s), str, str, str, str,
+      str, '', over.num1 || str, () => {}, fail.isFailedRun, fail.failCell)
     : new Function('$', 'fget', 'document', 'chartLoadFailed', 'listLoadFailed',
       'fmtTime', 'fmtDur', 'evHighlighted', 'outageDeletable', 'focusMark', 'refocus', 'TRASH_SVG',
       TILE_GATE + '\nlet outagesPage = 1, outagesPerPage = 10, outagesTotal = 0, outagesSeq = 0, outagesLoadedPage = 1;\n'
@@ -9086,8 +9095,8 @@ function drivePagerRace(which, rowsFor) {
 }
 
 // The runs table's own row markup, rendered by the shipped loadRuns.
-async function renderRuns(runs) {
-  const p = drivePagerRace('runs', () => runs);
+async function renderRuns(runs, over) {
+  const p = drivePagerRace('runs', () => runs, over);
   const done = p.goTo(1);
   await tick();
   p.release(0);
@@ -9246,13 +9255,14 @@ test('a page that fails puts the pager back on the rows that are showing, not on
 // Run one of the page's own delegated click handlers over a fake row. The confirm
 // text and the toast are what the reader is told, and both used to say the same
 // thing whatever the daemon had actually done.
-function driveDelete(which, { round = '', dur = '', deleted = 1, ok = true } = {}) {
+function driveDelete(which, { round = '', dur = '', failed = false, deleted = 1, ok = true } = {}) {
   const src = extract(`$('${which}').addEventListener('click'`);
   const arrow = src.slice(src.indexOf('async e=>'));
   const toast = { textContent: '', hidden: true };
   const btn = { dataset: { ts: '1788279605' }, disabled: false, focus() {}, closest: sel => sel === '.run-del' ? btn : null };
   if (round) btn.dataset.round = round;
   if (dur) btn.dataset.dur = dur;
+  if (failed) btn.dataset.failed = '1';
   const els = { [which]: { querySelectorAll: () => [btn] }, undoToast: toast };
   const $ = id => els[id] || { querySelectorAll: () => [], focus() {} };
   const asked = [];
@@ -9299,6 +9309,126 @@ test('deleting a Best-of round member does not promise the round will go with it
   const rows = await renderRuns([{ ts: 7, round_ts: 6 }, { ts: 6 }]);
   assert.match(rows, /data-ts="7" data-round="6"/, 'a member row carries the round it belongs to');
   assert.doesNotMatch(rows, /data-ts="6" data-round=/, 'a run with no round carries nothing');
+});
+
+// --- Record failed tests ------------------------------------------------------
+//
+// With the switch on (Speedtest tab, off by default) a speedtest that ends with
+// no result leaves one row in Show all runs: failed plus the stage it stopped at.
+// It is listed and nothing else - no chart, no average, no verdict - so the row
+// has to read as an attempt and never as a measurement.
+
+// The cells of the first rendered row, in column order.
+const firstRowCells = rows => (rows.match(/<tr[\s\S]*?<\/tr>/) || [''])[0].match(/<td[^>]*>[\s\S]*?<\/td>/g) || [];
+
+test('Record failed tests is a saved on/off, off by default, last in the Speedtest pane', () => {
+  assert.match(script, /\['setStRecordFail','speedtest_record_failures','bool'\]/, 'a saved on/off');
+  assert.match(html, /<input type="checkbox" id="setStRecordFail">/, 'drawn unticked: it is opt-in');
+  const speed = html.slice(html.indexOf('<div class="tabpane tab-uniform active" data-tab="speedtest">'),
+    html.indexOf('<!-- /speedtest pane -->'));
+  const at = id => speed.indexOf('id="' + id + '"');
+  assert.ok(at('setBusyMbps') > 0 && at('setBusyMbps') < at('setStRecordFail') && at('setStRecordFail') < at('speedDataEst'),
+    'after the last trigger knob, before the notes, so the pairs above it keep their places');
+  const D = driveDeps();
+  D.setFields({ speedtest_record_failures: true });
+  assert.equal(D.settingsBody().speedtest_record_failures, true, 'ticked goes out as true');
+  D.setFields({ speedtest_record_failures: false });
+  assert.equal(D.settingsBody().speedtest_record_failures, false, 'and unticked as false');
+  assert.doesNotMatch(extract('function syncSpeedDeps'), /setStRecordFail/,
+    'it covers every trigger, manual and reconnect included, so Automatic does not grey it');
+});
+
+test('the Record failed tests tip says failures stay out of the charts and a stop is not recorded', () => {
+  const row = html.slice(html.indexOf('<span class="lbl">Record failed tests'), html.indexOf('id="setStRecordFail"'));
+  const tip = (row.match(/data-tip="([^"]*)"/) || [, ''])[1];
+  assert.match(tip, /never appear in the charts, averages, stat tiles or alerts/);
+  assert.match(tip, /A test you stop yourself is not recorded/);
+  assert.match(tip, /fail during an outage are/, 'an outage can add a row every time a test comes due, so say so');
+  assert.match(tip, /already recorded stay until you delete them/,
+    'the switch controls recording, not display: turning it off hides nothing');
+  assert.doesNotMatch(tip, /—/, 'no em dashes in the help text');
+});
+
+test('a failed test renders a failed badge, its reason, and no readings', async () => {
+  // Real num1/bytesStr and a spMeasured that says yes: a failed test that spent
+  // bytes is exactly what spMeasured reads as a measured direction, so only the
+  // row's own check can keep 0.0 out of the speed cells.
+  const num1 = v => (typeof v === 'number' ? v : 0).toFixed(1);
+  const bytesStr = extract('const bytesStr');
+  const realBytes = new Function(bytesStr + '\nreturn bytesStr;')();
+  const rows = await renderRuns([{ ts: 1788290400, failed: true, fail_stage: 'server_list', trigger: 'scheduled',
+    down_mbps: 0, up_mbps: 0, ping_ms: 0, download_bytes: 125000, upload_bytes: 4000 }],
+  { spMeasured: () => true, pingMeasured: () => true, num1, bytesStr: realBytes });
+  const cells = firstRowCells(rows);
+  assert.equal(cells.length, 24, 'the same 24 cells as any run: no colspan, nothing moves');
+  assert.equal(cells[2], '<td class="mono">-</td>', 'download is "-", not a measured 0.0');
+  assert.equal(cells[3], '<td class="mono">-</td>', 'upload is "-", not a measured 0.0');
+  assert.match(cells[8], /125 KB/, 'the data it spent is real and still shown');
+  assert.match(rows, /<span class="badge bad">failed<\/span>/, 'the word, not only a colour');
+  assert.match(rows, /couldn’t get the server list/, 'and the reason in plain words');
+  assert.match(cells[22], /badge bad">failed</, 'in the Health column');
+  assert.doesNotMatch(rows, /run-pick/, 'nothing to show on the chart');
+  assert.match(rows, /<tr data-ts="1788290400" class="run-failed">/);
+  assert.match(rows, /data-failed="1"/, 'the delete button knows what it deletes');
+
+  // A run that measured keeps its chart button and its readings.
+  const ok = await renderRuns([{ ts: 1788290500, down_mbps: 94.5, up_mbps: 12.25, download_bytes: 1, upload_bytes: 1 }],
+    { spMeasured: () => true, num1 });
+  assert.match(ok, /run-pick/);
+  assert.match(firstRowCells(ok)[2], />94\.5</);
+  assert.doesNotMatch(ok, /run-failed|data-failed/);
+});
+
+test('an unknown stage shows the generic words and never the raw token', async () => {
+  const rows = await renderRuns([{ ts: 1788290400, failed: true, fail_stage: 'x_<b>raw</b>' }]);
+  assert.match(rows, /see the log for details/);
+  assert.doesNotMatch(rows, /x_|raw/, 'a crafted backup cannot put its own words in the table');
+  // A stage without the marker is not a failed test: the daemon never lists one,
+  // and the row does not draw one either.
+  const stray = await renderRuns([{ ts: 1788290400, fail_stage: 'download' }]);
+  assert.doesNotMatch(stray, /badge bad">failed|run-failed/);
+});
+
+// Run the table's delegated click handler over a plain (non-button) click on a
+// row, and report whether it pinned the run on the chart.
+function driveRowClick(failed) {
+  const src = extract("$('runsBody').addEventListener('click'");
+  const arrow = src.slice(src.indexOf('async e=>'));
+  const pinned = [];
+  const row = { dataset: { ts: '1788279605' }, classList: { contains: c => failed && c === 'run-failed' } };
+  const target = { closest: sel => (sel === 'tr[data-ts]' ? row : null) };
+  const stub = () => {};
+  const fn = new Function('confirm', '$', 'fetch', 'loadRuns', 'refreshSpeedChart', 'refreshStatus', 'alert',
+    'setTimeout', 'clearTimeout', 'pinPlotted', 'dropGhostPin', 'focusRunOnChart', 'window',
+    'pinnedRunTs', 'runsBusy', 'return (' + arrow + ');')(
+    () => true, () => ({}), stub, stub, stub, stub, stub, stub, stub, () => false, stub,
+    ts => pinned.push(ts), { getSelection: () => null }, null, false);
+  return fn({ target }).then(() => pinned);
+}
+
+test('a failed-test row pins nothing on the chart', async () => {
+  assert.deepEqual(await driveRowClick(false), [1788279605], 'a run that measured is pinned by a row click');
+  assert.deepEqual(await driveRowClick(true), [],
+    'a failed test is on no chart: pinning it drew a cursor on all three charts where nothing was measured');
+  assert.match(html, /\.runs-table tbody tr\.run-failed\{cursor:default;\}/, 'and the row does not look clickable');
+});
+
+test('deleting a failed test says what it is deleting', async () => {
+  const d = await driveDelete('runsBody', { failed: true, deleted: 1 });
+  assert.match(d.msg, /^Delete this failed test\?/, 'Got: ' + d.msg);
+  assert.match(d.msg, /cannot be undone/);
+  assert.doesNotMatch(d.msg, /round/, 'a failed test has no round to take with it');
+  assert.equal(d.toast, 'Failed test deleted');
+  assert.deepEqual(d.asked, [{ ts: 1788279605 }]);
+  const gone = await driveDelete('runsBody', { failed: true, deleted: 0 });
+  assert.equal(gone.toast, 'That run was already gone', 'deleted:0 still says nothing went');
+});
+
+test('the Health header explains failed', () => {
+  const th = (html.match(/<th title="([^"]*)">Health<\/th>/) || [, ''])[1];
+  assert.match(th, /Healthy or unhealthy/);
+  assert.match(th, /Failed: the test ended without a result/);
+  assert.match(th, /Record failed tests/, 'and names the switch that keeps those rows');
 });
 
 test('deleting an outage that was already gone does not report a deletion', async () => {
