@@ -48,6 +48,20 @@ type Scheduler struct {
 	cur       atomic.Pointer[inflight] // the in-flight run's id and cancel; nil when idle
 	abortFor  atomic.Uint64            // the run id an abort was raised for; carries it across RunOnce's startup window
 
+	// wireSeq counts the edges of the wire window: the stretch in which a run's
+	// engine is working (runTester, from its call to its return). Bumped once as
+	// the engine starts and once as it returns, so it is odd exactly while a test
+	// is using the network and moves on every start and finish. One word on
+	// purpose: an observer that reads it before and after an interval of its own
+	// learns, with no clock and no lock, whether a test overlapped that interval
+	// (odd at the first read, or changed by the second). The monitor reads it
+	// around each probe round, so rounds our own test slowed down cannot start an
+	// outage; the dashboard polls it to know when to refetch the speedtest times
+	// behind the latency chart's hover note. A bounced claim (ErrBusy) and the
+	// startup gate's bail never reach the engine, so they never move it.
+	wireSeq     atomic.Uint64
+	wireTrigger atomic.Value // string: the trigger of the latest run to reach the engine, kept after it ends
+
 	// IntervalFn, if set, supplies the schedule interval live so it can change at
 	// runtime. Falls back to the fixed interval when nil.
 	IntervalFn func() time.Duration
@@ -192,6 +206,9 @@ func (s *Scheduler) startupRunWanted(initiallyEnabled bool, entryCompletions uin
 // progress always has an id to name it by. Keeping "is one running" in a separate
 // bool left a window where the dashboard was told yes while there was still no id
 // to send back, and a stop click landing there was dropped.
+//
+// This is the claim, which is wider than the wire window. Observers that care
+// when the network is in use read Activity.
 func (s *Scheduler) Running() bool { return s.curID.Load() != 0 }
 
 // inflight is the in-progress run's identity paired with its cancel, stored as one
@@ -203,7 +220,90 @@ type inflight struct {
 
 // RunID returns the id of the run currently in progress, or 0 when idle. Callers
 // that later want to stop THAT run pass this back to Abort.
+//
+// This is the claim, which is wider than the wire window: it also covers the
+// connection-info refresh and the store writes after the engine returns.
+// Observers that care when the network is in use read Activity.
 func (s *Scheduler) RunID() uint64 { return s.curID.Load() }
+
+// Activity is the wire window as an observer sees it (see Scheduler.wireSeq).
+type Activity struct {
+	Seq     uint64 // odd while a test is using the network; changes whenever one starts or finishes
+	Trigger string // what started the latest test to use the network (the closed trigger enum); "" before the first
+}
+
+// Activity reports the wire window. Safe for concurrent use. The fields are
+// separate loads, so Trigger can lag Seq by one edge; it is for counting, and
+// only Seq decides anything.
+func (s *Scheduler) Activity() Activity {
+	a := Activity{Seq: s.wireSeq.Load()}
+	a.Trigger, _ = s.wireTrigger.Load().(string)
+	return a
+}
+
+// wireSpan is one wire window: when the engine started, and how long it ran on
+// the monotonic clock.
+type wireSpan struct {
+	start time.Time
+	d     time.Duration
+}
+
+// spanSeconds is how long the stored span of a wire window must last, in whole
+// seconds. The row keeps the start rounded down to a second, so it is the END
+// that has to be rounded up. Rounding the length alone can leave the stored end
+// short of the real one by most of a second: a test from 1000.9 that runs
+// 10.5 s ends at 1011.4, but 1000 plus 11 s stops at 1011. A span that ends
+// before the test did leaves its last round without its hover note. At least a second,
+// however short the run.
+func spanSeconds(start time.Time, d time.Duration) int64 {
+	end := start.Add(d)
+	endS := end.Unix()
+	if end.Nanosecond() > 0 {
+		endS++
+	}
+	if secs := endS - start.Unix(); secs > 1 {
+		return secs
+	}
+	return 1
+}
+
+// onWire runs the engine inside the wire window and reports the window. The
+// trigger is published before the opening edge, so an observer that sees the
+// counter odd also sees what started it. The close is deferred so a
+// panicking engine cannot leave the counter odd, which would hold every probe
+// round from then on.
+func (s *Scheduler) onWire(reason string, run func() (Result, error)) (res Result, w wireSpan, err error) {
+	w.start = time.Now()
+	s.wireTrigger.Store(reason)
+	s.wireSeq.Add(1)
+	defer func() {
+		w.d = time.Since(w.start)
+		s.wireSeq.Add(1)
+	}()
+	res, err = run()
+	return res, w, err
+}
+
+// recordSpan stores the wire window of a run that produced a result, for the
+// latency chart's "During a speedtest" hover note. It is called only once the
+// result row is durable: a test that ends without a result is on no chart
+// (Record failed tests lists it in the runs table and nowhere else), though its
+// rounds were held all the same. It runs before the claim is released, so a
+// dashboard that refetches when speedtest_run_id changes finds the row already
+// there. Non-fatal: a lost span costs the chart one test's hover note, never a
+// measurement.
+func (s *Scheduler) recordSpan(ctx context.Context, w wireSpan) {
+	if ctx.Err() != nil {
+		return // shutting down: the store is about to close
+	}
+	stored, err := s.store.InsertSpeedSpan(ctx, w.start, spanSeconds(w.start, w.d))
+	switch {
+	case err != nil:
+		s.log.Error("speedtest span store", "err", err)
+	case !stored:
+		stats.Inc("speed.span_dropped") // an implausible wall clock at run start
+	}
+}
 
 // Abort cancels the run with the given id and reports whether it signalled one.
 // An id of 0 means "whatever is running now", for callers that never observed a
@@ -476,7 +576,10 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 	if s.abortFor.Load() == myID {
 		cancel()
 	}
-	res, err := runTester(runCtx, s.curTester(), reason)
+	// The engine runs inside the wire window (see wireSeq): the monitor holds the
+	// probe rounds it overlaps, and the window is stored below for the latency
+	// chart's hover note if the run produces a result.
+	res, wire, err := s.onWire(reason, func() (Result, error) { return runTester(runCtx, s.curTester(), reason) })
 	if err != nil {
 		// Classify FIRST, then write at most one row. A shutdown (the parent ctx
 		// is gone) is nobody's failure. A user Abort() before any server produced
@@ -640,6 +743,9 @@ func (s *Scheduler) RunOnce(ctx context.Context, reason string) (store.SpeedSamp
 		return sp, fmt.Errorf("speedtest: persist result: %w", err)
 	}
 	sp.TS = finalTS
+	// The result is durable, so the run's time is stored for the latency chart's
+	// hover note.
+	s.recordSpan(ctx, wire)
 	// A retried direction, or one that failed while the other succeeded, spent
 	// bytes that never reach the row above: only the winning attempt's count
 	// lands there, because a byte count on a successful row is what says the

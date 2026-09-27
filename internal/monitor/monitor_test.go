@@ -39,7 +39,13 @@ func newTestMonitorLog(t *testing.T, downAfter, upAfter int, logDst io.Writer) (
 }
 
 func feed(m *Monitor, online bool, ts time.Time) {
-	m.advance(context.Background(), prober.Result{TS: ts, Online: online})
+	m.advance(context.Background(), prober.Result{TS: ts, Online: online}, false, "")
+}
+
+// feedDuring is feed for a round taken while a speedtest (a manual one) was
+// using the network.
+func feedDuring(m *Monitor, online bool, ts time.Time) {
+	m.advance(context.Background(), prober.Result{TS: ts, Online: online}, true, "manual")
 }
 
 func eventCount(t *testing.T, st *store.Store, typ string) int {
@@ -533,7 +539,7 @@ func TestPauseResetsDebounceStreaks(t *testing.T) {
 	stats.ResetForTest()
 	m, st := newTestMonitor(t, 2, 1)
 	feed(m, false, time.Unix(10, 0)) // bad 1 of 2 before the pause
-	m.advanceFamily(prober.FamilyResult{Family: "ipv4", Online: false}, time.Unix(10, 0))
+	m.advanceFamily(prober.FamilyResult{Family: "ipv4", Online: false}, time.Unix(10, 0), false)
 
 	m.resetStreaks() // what Run does when a round is skipped while paused
 
@@ -650,7 +656,7 @@ func famResult(ts time.Time, fams ...string) prober.Result {
 // way round() does (advance each family, then record which were probed).
 func feedFamilies(m *Monitor, res prober.Result) {
 	for _, fr := range res.Families {
-		m.advanceFamily(fr, res.TS)
+		m.advanceFamily(fr, res.TS, false)
 	}
 	m.noteFamilies(res)
 }

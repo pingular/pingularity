@@ -29,8 +29,9 @@ data-usage row, which every measurement view filters out (see the data-usage
 bullet under [Metrics](metrics.md)). Turn on **Record failed tests** (Speedtest
 settings, off by default) and that same row also records why the run failed,
 and the all-runs table and its CSV list it as a failed test. It still never
-reaches a chart, an average, a threshold verdict, the latest run or `/metrics`
-(see [Failed tests](#failed-tests)).
+reaches a chart, an average, a threshold verdict, the latest run in
+`/api/status` or the latest-run gauges on `/metrics` (see
+[Failed tests](#failed-tests)).
 
 The **ping** shown is the engine's own number, a mean over ten samples, so it
 keeps matching what speedtest.net would report. A mean has no defence against an
@@ -305,7 +306,8 @@ also an optional **while degraded**
 toggle in the Speedtest settings (off by default, needs scheduled tests on) that
 fires a test when latency stays high without the link fully dropping - above
 **Degraded above** (default `150` ms, `0` = off) for two probe rounds in a row,
-re-arming once latency recovers. **Run now** (or `POST /api/speedtest`) always
+re-arming once latency recovers. Rounds taken while a test runs are skipped
+there: the test itself raises latency. **Run now** (or `POST /api/speedtest`) always
 works.
 
 Only one speedtest runs at a time, and the triggers do not queue behind each
@@ -319,6 +321,64 @@ clears. "Busy" is traffic on the busiest interface above **Busy above** (default
 `5` Mbps) - and unlike the alert thresholds, `0` is not "off" here: it makes any
 measurable traffic count as busy, so scheduled tests stop firing. Only scheduled
 runs consult it; reconnect, degraded and **Run now** go regardless.
+
+## Speedtests and outage detection
+
+A speedtest fills the line on purpose, and while it does, the probe rounds
+taken beside it read slow or fail for that reason alone. So a failed round
+that overlapped one of our own tests - any trigger, any engine - does not count
+toward **Down after**. It is still stored, drawn as a failed round on the
+latency chart and counted in `monitor.bad_rounds`; it just can't start an
+outage.
+
+- **The hold has a limit.** It lasts at least two minutes and at least one
+  round, measured from the first failed round. After that, failed rounds count
+  again even if the test is still running, because a test does not keep the
+  line full that long on its own, and a dead line can keep a test hanging.
+- **Real outages keep their start.** If the failures carry on after the test,
+  the outage is confirmed once **Down after** rounds have failed outside the
+  hold, and is dated where it would have been without the test: at the round
+  where the failing run first reached Down after. Uptime, the heatmap and the
+  outage log get the same figures; only the alert arrives later, by up to the
+  hold plus Down after rounds. The alert text carries no time, but the recovery
+  alert's duration is right.
+- **The degraded check skips those rounds.** A test neither starts a brownout
+  nor ends one; a brownout that outlasts it is still measured afterwards.
+- **The latency chart's tooltip names the test.** The chart draws nothing for
+  it, but hovering a point taken while a test that produced a result was using
+  the network adds "During a speedtest". A test that ended without one gets no
+  note (like every chart, the latency chart never shows a failed test), though
+  its rounds were held all the same. The record of when tests ran follows the
+  latency retention, goes with **Delete now** for latency, and is not
+  exported: a restored backup has its history without the notes.
+
+What counts as "using the network" is the whole engine run: for Ookla that
+includes the server race, the pings and the packet-loss probe, which barely
+load the line, and an iperf3 test to a server on your own network holds
+rounds too. The only cost of that is a later alert.
+
+Some limits, so none of them surprise you:
+
+- On a default install scheduled tests are off and reconnect tests are on, so
+  the hold mostly applies to the test that starts right after a short outage
+  ends. A second drop during that test is alerted up to the hold plus Down
+  after rounds late, still with the right start time.
+- A long enough test can outlast the hold: Best of with many servers, or the
+  most retries (above all with a 30-second iperf3 run), can keep the line full
+  for longer than two minutes. A badly bloated line can then still log a false
+  outage.
+- A test that is stopped, or cut short by its own time limit, can keep moving
+  data for up to 15 seconds after it ends; rounds in that tail are neither
+  held nor noted in the tooltip.
+- A gap inside the hold - a pause, a suspend, a skipped round, a restart -
+  ends the held run like any failing run. If the line is still down after it,
+  the outage starts after the gap, where a build without the hold would
+  already have written it from before.
+- A digest sent while failures are being held reports that stretch as up. If
+  the outage is then confirmed, its early part can fall between two digests.
+
+`/metrics` shows whether any of this ever mattered on your line, split by what
+started the test (see [Did speedtests cause false outages?](metrics.md#did-speedtests-cause-false-outages)).
 
 ## Failed tests
 

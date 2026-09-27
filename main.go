@@ -1045,6 +1045,15 @@ func (p *program) run(ctx context.Context) {
 			spawn(func() { degradedDispatch(ctx, sched.RunOnce, func() { m.RetryDegraded(id) }) })
 		}
 	}
+	// Probe rounds taken while a speedtest is using the network cannot start an
+	// outage (for at least two minutes and at least one round) or count toward a
+	// brownout: the test fills the line on purpose. The monitor reads the
+	// scheduler's wire counter on both sides of every round to know (see
+	// Monitor.SpeedtestActivityFn).
+	m.SpeedtestActivityFn = func() (uint64, string) {
+		a := sched.Activity()
+		return a.Seq, a.Trigger
+	}
 	// Alert on every confirmed up/down transition, when enabled. Delivery is
 	// serialized (notifier.Outage holds a lock across retries so a flap's up
 	// can't overtake its down), so a dead webhook makes each alert live for the
@@ -1112,6 +1121,7 @@ func (p *program) run(ctx context.Context) {
 	srv.AutoOriginsFn = tester.OriginsFn
 	srv.RaceListingFn = tester.RaceListing        // the picker's Auto button: the field a run would race
 	srv.PingServersFn = speedtest.PingServersByID // the saved pane's refresh: re-measure the kept servers
+	srv.SpeedActivityFn = sched.Activity          // the latency chart's speedtest times (its hover note): when to refetch them
 	srv.Logs = p.ring                             // backs the About-tab log viewer (/api/logs)
 	srv.OnLogClear = func() {
 		// The /api/logs clear already emptied the ring; rewrite the on-disk
@@ -1199,6 +1209,10 @@ func seedKnownCounters() {
 		// last-run centring) found a server with no HTTP legacy fallback - one
 		// that fails every run. One user action can count more than once.
 		"speed.pinned_server_no_fallback",
+		// A finished run's time for the latency chart's hover note that was refused
+		// because the wall clock was not believable when the run started. Expected at most
+		// once on an RTC-less boot; climbing means the clock keeps jumping.
+		"speed.span_dropped",
 		// A scheduled run dropped because another trigger (manual, reconnect,
 		// degraded) already held the single-flight. The slot is not retried, so a
 		// climbing rate explains gaps in an otherwise regular history.
@@ -1269,6 +1283,16 @@ func seedKnownCounters() {
 	}
 	for _, trig := range []string{"startup", "scheduled", "reconnect", "degraded", "manual"} {
 		names = append(names, "speed.run."+trig)
+		// Probe rounds our own speedtests overlapped, and what holding them from
+		// down-after did, by what started the test (monitor.advance and
+		// noteSpeedtestRound). Read against each other - failed over total, and
+		// the delay sum over the delayed count - so a family appearing at 1 while
+		// the rest sit absent skews the ratio, not just its own first step.
+		names = append(names,
+			"monitor.speedtest_rounds."+trig, "monitor.speedtest_bad_rounds."+trig,
+			"monitor.speedtest_tail_bad_rounds."+trig, "monitor.speedtest_downs_suppressed."+trig,
+			"monitor.speedtest_downs_delayed."+trig)
+		stats.SeedF("monitor.speedtest_delay_s_sum." + trig)
 	}
 	for _, stage := range []string{"server_list", "server_fetch", "no_servers", "ping", "na", "download", "upload", "bidir", "other"} {
 		names = append(names, "speed.fail."+stage)

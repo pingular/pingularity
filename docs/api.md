@@ -30,8 +30,13 @@ and `-d '{…}'` where a body is listed below.
   `null` - the dashboard empties its speed panel on the first and leaves it alone
   on the second. A running speedtest is reported as `speedtest_running` plus `speedtest_run_id`
   (`0` when idle) - that id is what `/api/speedtest/abort` takes, so a stop can
-  name the run it was decided against. A fresh install awaiting first-run consent
-  reports `quick_setup_pending`, and `access_local_only` mirrors the loopback-only
+  name the run it was decided against. `speedtest_activity` is a counter that
+  moves whenever a test's engine starts or stops using the network, and is odd
+  while one is. A finished test's time (`/api/speed/spans`) is stored after
+  the counter moves and before `speedtest_run_id` changes, so the dashboard
+  refetches the speedtest times when either one moves. It leaves out the test
+  running now, which may still end without a result. A fresh install awaiting
+  first-run consent reports `quick_setup_pending`, and `access_local_only` mirrors the loopback-only
   access filter (so a client can default the Quick Setup access choice to how the
   install booted); `bridged_container` is present only in a bridged container,
   where measurements describe the container network rather than the host's
@@ -45,6 +50,15 @@ and `-d '{…}'` where a body is listed below.
   kept the rows. The bucket width follows the part of
   the window that can hold data - `[from, min(to, now))` - so an omitted or
   future `to` buckets as if the window ended now rather than coarsening the lot
+- `GET /api/speed/spans?mins=…` - when a speedtest was using the network, for
+  the latency chart's "During a speedtest" hover note (the chart itself draws
+  nothing for them): a bare JSON array of `{start, end}` (unix
+  seconds, `end` exclusive), oldest first. Takes the same window as
+  `/api/series` (`mins`, or `from`/`to`, with the same defaults and floor) and
+  ignores `exclude`. Spans that sit within one bucket width of each other come
+  back merged, so a window answers about as many spans as the chart has
+  points (at most about 1500), however many tests it covers. Only tests that
+  produced a result have a span; a failed test has none
 - `GET /api/events?limit=&offset=` - paginated up/down transition (outage) log.
   `limit` defaults to 10 (50 on `/api/speed/runs`) and is silently capped at 1000,
   the same ceiling `/api/logs` uses - page with `offset` and trust the `total` in
@@ -99,7 +113,9 @@ and `-d '{…}'` where a body is listed below.
   last `fail_stage`, blank on every run that measured something and the stage
   on a failed test kept by **Record failed tests** (whose speed cells are
   blank). The column is always in the header, whether or not the switch is on
-- `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run
+- `POST /api/speed/runs/delete` - `{ts}` delete one speedtest run (its time,
+  behind the latency chart's hover note, stays: the line was busy then all the
+  same)
 - `GET /api/speed/runs/servers?ts=` - the server-selection report for one
   Ookla run (`ts` = the run's unix seconds) - every automatic run, challenge
   run, and pinned run writes one, not only Best-of rounds: every candidate that
@@ -223,6 +239,7 @@ and `-d '{…}'` where a body is listed below.
   arrived since - `since` is ignored unless `epoch` matches, because a restart
   reseeds the buffer and re-uses the same sequence numbers for different lines
 - `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
+  (`latency` also clears the speedtest times `/api/speed/spans` answers)
 - `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
   export / import config + history. Pick at least one of those four categories (any
   non-empty value selects one); with none at all the export is a `400`.
@@ -236,7 +253,10 @@ and `-d '{…}'` where a body is listed below.
   settings; a hand-built or third-party file is applied in *its* key order, so put
   `config` last yourself. A restore that arrives once the daemon has begun shutting
   down is refused with `503` rather than half-applied; one already in flight holds
-  the shutdown open until the login/access repairs that follow it have finished)
+  the shutdown open until the login/access repairs that follow it have finished).
+  The speedtest times behind the latency chart's hover note are not exported:
+  they only feed that note, and a restore simply has no notes for the history
+  it brings
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 - `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
 

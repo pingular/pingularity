@@ -7419,13 +7419,14 @@ test('both restore paths refetch, not just redraw', () => {
 // bump becomes observable.
 const deferred = () => { let go; const p = new Promise(r => { go = r; }); return { p, go }; };
 function chartDriver({ hidden = false, live = false } = {}) {
-  const state = { fetches: 0, fail: false, r503: false, draws: 0, hold: null };
+  const state = { fetches: 0, fail: false, r503: false, draws: 0, hold: null, spanFetches: 0 };
   const api = new Function('latWindowQuery', 'fget', 'isReconcile503', 'retryAfterMs', 'chartLoadFailed',
-    'drawChart', 'syncLatPanel', 'document', 'state',
-    TILE_GATE + '\nlet chartSeq = 0, latLoadedFor = "", latLoadedLive = false, latPoints = [], latBackoffMs = 0;\n'
+    'drawChart', 'syncLatPanel', 'refreshLatSpans', 'document', 'state',
+    TILE_GATE + '\nlet chartSeq = 0, latLoadedFor = "", latLoadedLive = false, latPoints = [], latBackoffMs = 0,'
+    + ' latSpansStale = true, latSpansFor = "";\n'
     + extract('async function refreshChart')
     + '\nreturn { refreshChart, seq: () => chartSeq, backoff: () => latBackoffMs };')(
-    () => ({ q: 'from=1000&to=2000', live }),
+    () => ({ q: 'from=1000&to=2000', live, base: 'from=1000&to=2000' }),
     async () => {
       state.fetches++;
       if (state.hold) await state.hold;
@@ -7434,7 +7435,7 @@ function chartDriver({ hidden = false, live = false } = {}) {
       return { ok: true, json: async () => [{ t: 1 }] };
     },
     () => state.r503, () => 4000, () => {},
-    () => { state.draws++; }, () => {},
+    () => { state.draws++; }, () => {}, () => { state.spanFetches++; },
     gateDoc('latency', hidden), state);
   return Object.assign(api, { state });
 }
@@ -10706,17 +10707,17 @@ function driveChartPoll(which, resp) {
   const toasts = [];
   const isLat = which === 'latency';
   const name = isLat ? 'async function refreshChart' : 'async function refreshSpeedChart';
-  const src = 'let ' + (isLat ? 'latLoadedFor="", latLoadedLive=false, chartSeq=0, latBackoffMs=0, latPoints=[]'
+  const src = 'let ' + (isLat ? 'latLoadedFor="", latLoadedLive=false, chartSeq=0, latBackoffMs=0, latPoints=[], latSpansStale=true, latSpansFor=""'
                               : 'speedLoadedFor="", speedLoadedLive=false, speedSeq=0, speedBackoffMs=0, speedPoints=[]') + ';\n'
     + extract('function isReconcile503') + '\n' + extract('function retryAfterMs') + '\n'
     + extract('function isAuthRequired') + '\n' + extract(name) + '\n'
     + 'return ' + (isLat ? 'refreshChart' : 'refreshSpeedChart') + ';';
   const names = ['fget', 'tileIdle', 'chartLoadFailed', 'drawChart', 'syncLatPanel',
     'latWindowQuery', 'speedWindowQuery', 'drawSpeed', 'syncSpeedPanel', 'spdSampled',
-    'renderSpeedTiles', 'drawQuality', 'drawBloat', '$'];
+    'renderSpeedTiles', 'drawQuality', 'drawBloat', '$', 'refreshLatSpans'];
   const impls = [async () => resp, () => false, what => toasts.push(what), () => {}, () => {},
-    () => ({ q: 'mins=60', live: true }), () => ({ q: 'mins=60', live: true }), () => {}, () => {},
-    () => {}, () => {}, () => {}, () => {}, () => ({ style: {}, classList: { toggle() {} } })];
+    () => ({ q: 'mins=60', live: true, base: 'mins=60' }), () => ({ q: 'mins=60', live: true }), () => {}, () => {},
+    () => {}, () => {}, () => {}, () => {}, () => ({ style: {}, classList: { toggle() {} } }), () => {}];
   return new Function(...names, src)(...impls)(true).then(() => toasts);
 }
 const failResp = { ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' };
@@ -11429,4 +11430,224 @@ test('a focus-raised heatmap tooltip follows the page when it scrolls', () => {
   doc.activeElement = null;
   scroll();
   assert.equal(tip.style.top, '130px', 'a wheel scroll under a still pointer moved a tooltip the pointer owns');
+});
+
+// --- speedtest times in the latency tooltip -----------------------------------
+//
+// A speedtest fills the line on purpose, so the probe rounds taken meanwhile read
+// slow or fail. Hovering a point taken in one of those stretches adds "During a
+// speedtest" to the tooltip (the times come from api/speed/spans), so a spike or
+// a red band explains itself. Nothing is drawn for them: the chart looks the
+// same with or without a test in the window. Only a test that produced a result
+// has a stored time, and the test running now is left out: it may still end
+// without a result.
+
+const DURING = new Function(extract('function latDuringAt') + '\nreturn { latDuringAt };')();
+
+test('latDuringAt: a point overlaps a speedtest when a span covers any of its own stretch', () => {
+  const pts = [{ t: 100 }, { t: 110 }, { t: 120 }];
+  const at = (i, spans) => DURING.latDuringAt(pts, i, spans);
+  assert.equal(at(0, [{ start: 105, end: 108 }]), true, 'inside [t, next.t)');
+  assert.equal(at(1, [{ start: 105, end: 108 }]), false);
+  assert.equal(at(0, [{ start: 110, end: 115 }]), false, 'a span starting where the next point does is the next point\'s');
+  assert.equal(at(1, [{ start: 110, end: 115 }]), true);
+  assert.equal(at(0, [{ start: 95, end: 100 }]), false, 'a span ending as the point starts does not touch it');
+  assert.equal(at(2, [{ start: 120, end: 125 }]), true, 'the last point stands for its own second');
+  assert.equal(at(2, [{ start: 121, end: 125 }]), false);
+  assert.equal(at(0, [{ start: 90, end: 130 }]), true, 'a long span covers every point inside it');
+  assert.equal(at(2, [{ start: 90, end: 130 }]), true);
+  assert.equal(at(1, []), false, 'no stored times, no note');
+});
+
+test('the latency tooltip says when a point was taken during a speedtest', () => {
+  const LT = new Function('fmtTime', 'dnsShown', extract('function latTip') + '\nreturn { latTip };')(() => '9:00', true);
+  assert.equal(LT.latTip({ t: 1, lat: 80, dns: 35 }, true),
+    '<div class="tt-time">9:00</div>80.0 ms<div style="color:var(--muted)">During a speedtest</div><div>DNS 35 ms</div>');
+  assert.equal(LT.latTip({ t: 1, lat: 80, dns: 35 }), '<div class="tt-time">9:00</div>80.0 ms<div>DNS 35 ms</div>',
+    'a point outside every span reads as it always did');
+  for (const fn of ['function latHoverAt']) {
+    assert.match(extract(fn), /latTip\(latPlot\.points\[bi\], latDuringAt\(latPlot\.points, bi, latSpans\)\)/);
+  }
+  const keys = script.slice(script.indexOf("CHART_LABEL['chart']="), script.indexOf("$('chart').addEventListener('blur'"));
+  assert.match(keys, /latTip\(latPlot\.points\[i\], latDuringAt\(latPlot\.points, i, latSpans\)\)/,
+    'the keyboard reads the same line the pointer does');
+});
+
+// The two pieces together, the way latHoverAt and the chart's keydown call them:
+// a point inside a stored test's time gets the note, its neighbours do not.
+test('hovering a point inside a stored speedtest shows the note, and one outside does not', () => {
+  const T = new Function('fmtTime', 'dnsShown', extract('function latTip') + '\n' + extract('function latDuringAt')
+    + '\nreturn { latTip, latDuringAt };')(() => '9:00', false);
+  const pts = [{ t: 100, lat: 20 }, { t: 110, lat: 80 }, { t: 120, lat: null }, { t: 130, lat: 21 }];
+  const spans = [{ start: 111, end: 125 }];
+  const tip = i => T.latTip(pts[i], T.latDuringAt(pts, i, spans));
+  assert.doesNotMatch(tip(0), /During a speedtest/, 'before the test');
+  assert.match(tip(1), /80\.0 ms<div style="color:var\(--muted\)">During a speedtest<\/div>$/, 'a high reading taken during it');
+  assert.match(tip(2), /down<\/span><div style="color:var\(--muted\)">During a speedtest<\/div>$/, 'a failed round taken during it');
+  assert.doesNotMatch(tip(3), /During a speedtest/, 'after the test');
+});
+
+// The user's call: the chart looks exactly as it did before speedtest times were
+// stored. No stripes, no ticks, nothing drawn for a test; the tooltip is the one
+// place a test shows. And a test that fails is on no chart, so neither is the
+// test running now (it may still fail).
+test('the latency chart draws nothing for speedtests, only the tooltip mentions them', () => {
+  assert.doesNotMatch(script, /drawTestSpans/, 'the stripe drawing is gone');
+  // Every reader of the stored times, whatever it is called: the declaration,
+  // the fetch that fills them, and the two tooltip paths (mouse and keyboard).
+  // A fifth one is new code reading them, and the tooltip is the only place a
+  // test may show.
+  const code = script.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  assert.equal(code.match(/\blatSpans\b/g).length, 4,
+    'only the declaration, refreshLatSpans and the two tooltips may touch latSpans');
+  assert.equal((code.match(/latDuringAt\(latPlot\.points, (bi|i), latSpans\)/g) || []).length, 2,
+    'both tooltips pass the stored times to latDuringAt');
+  assert.doesNotMatch(extract('function drawChart'), /latSpans|TestSpans|createPattern/,
+    'drawChart must not read the speedtest times or draw anything for them');
+  assert.doesNotMatch(extract('function redrawLat'), /latSpans/);
+  assert.doesNotMatch(extract('async function refreshLatSpans'), /redrawLat|drawChart/,
+    'a new set of times changes nothing on the canvas, so it redraws nothing');
+  assert.match(html, /<canvas id="chart" role="img" aria-label="Latency to the anchors over time, with DNS lookup time" tabindex="0"><\/canvas>/,
+    'the label names only what the chart shows');
+  assert.doesNotMatch(script, /speedtest_started_ts|speedtestSince|latSpanList/, 'nothing tracks the test running now');
+});
+
+// noteSpeedActivity and refreshLatSpans, from the page, around stubbed fetches.
+function spanDriver({ frozen = false } = {}) {
+  const state = { base: 'mins=5', fetched: [], pending: [], redraws: 0, hidden: false };
+  const api = new Function('fget', 'latFrozen', 'latWindowQuery', 'redrawLat', 'document', 'state',
+    TILE_GATE + '\nlet latSpans=[], latSpansFor="", latSpansKey=null, latSpansStale=true, latSpansReq=0;\n'
+    + extract('async function refreshLatSpans') + '\n' + extract('function noteSpeedActivity')
+    + '\nreturn { refreshLatSpans, noteSpeedActivity, get: () => ({ latSpans, latSpansFor, latSpansStale, latSpansReq }) };')(
+    url => { state.fetched.push(url); return new Promise(go => state.pending.push(go)); },
+    () => frozen, () => ({ base: state.base }), () => { state.redraws++; },
+    { querySelector: sel => sel === '.panel[data-section="latency"]' ? { classList: { contains: c => c === 'section-hidden' && state.hidden } } : null },
+    state);
+  return Object.assign(api, { state });
+}
+const spansOK = spans => ({ ok: true, json: async () => spans });
+
+test('noteSpeedActivity marks the speedtest times stale when a test finishes, and not on a repeat', async () => {
+  const d = spanDriver();
+  const poll = (activity, runID) => d.noteSpeedActivity({ speedtest_activity: activity, speedtest_run_id: runID });
+  const land = async spans => { const f = d.refreshLatSpans(); d.state.pending.shift()(spansOK(spans)); await f; };
+  assert.equal(poll(4, 0), true, 'the first poll is news');
+  await land([]); // the fetch it asks for
+  assert.equal(d.get().latSpansStale, false);
+  const req = d.get().latSpansReq;
+  assert.equal(poll(4, 0), false, 'nothing moved');
+  assert.equal(d.get().latSpansStale, false);
+  assert.equal(poll(5, 7), true, 'a test started');
+  assert.equal(d.get().latSpansStale, true);
+  assert.ok(d.get().latSpansReq > req, 'a fetch already in flight must be retired: it left before this test\'s time could exist');
+  await land([]);
+  assert.deepEqual(d.get().latSpans, [], 'the test running now has no stored time');
+  assert.equal(poll(6, 7), true, 'the engine stopped');
+  // The result and its time are still being stored: this fetch finds neither.
+  await land([]);
+  assert.deepEqual(d.get().latSpans, []);
+  assert.equal(poll(6, 7), false, 'no edge while the run stores its result');
+  assert.equal(poll(6, 0), true, 'the run let go of its claim: its time is stored by now');
+  assert.equal(d.get().latSpansStale, true, 'so the times are fetched again');
+  await land([{ start: 1790000000, end: 1790000031 }]);
+  assert.deepEqual(d.get().latSpans, [{ start: 1790000000, end: 1790000031 }], 'and the finished test\'s time is there for the tooltip');
+  assert.equal(d.state.redraws, 0, 'nothing is drawn for it, so nothing is redrawn');
+});
+
+test('noteSpeedActivity leaves an ended pinned window alone', () => {
+  const d = spanDriver({ frozen: true });
+  d.state.base = 'from=1000&to=2000';
+  d.noteSpeedActivity({ speedtest_activity: 0, speedtest_run_id: 0 });
+  d.refreshLatSpans(); d.state.pending.shift()(spansOK([{ start: 1100, end: 1200 }]));
+  return new Promise(r => setTimeout(r, 0)).then(() => {
+    const req = d.get().latSpansReq;
+    assert.equal(d.noteSpeedActivity({ speedtest_activity: 1, speedtest_run_id: 3 }), true);
+    assert.equal(d.get().latSpansStale, false, 'a span that has ended cannot gain new speedtest times');
+    assert.equal(d.get().latSpansReq, req);
+  });
+});
+
+test('refreshLatSpans lands only the newest answer, keeps what it has on a failure, and waits while hidden', async () => {
+  const d = spanDriver();
+  d.state.hidden = true;
+  await d.refreshLatSpans();
+  assert.deepEqual(d.state.fetched, [], 'a hidden tile fetches nothing');
+  assert.equal(d.get().latSpansStale, true, 'and stays stale, so the next load fetches');
+  d.state.hidden = false;
+
+  const first = d.refreshLatSpans();
+  assert.deepEqual(d.state.fetched, ['api/speed/spans?mins=5'], 'the window alone, without the anchor excludes');
+  const second = d.refreshLatSpans();
+  d.state.pending[1](spansOK([{ start: 1, end: 2 }]));
+  await second;
+  d.state.pending[0](spansOK([{ start: 9, end: 10 }]));
+  await first;
+  assert.deepEqual(d.get().latSpans, [{ start: 1, end: 2 }], 'an older answer landing late must not replace a newer one');
+  assert.equal(d.get().latSpansFor, 'mins=5');
+
+  let drained = 0;
+  const failed = d.refreshLatSpans();
+  d.state.pending[2]({ ok: false, status: 500, text: async () => { drained++; return 'boom'; } });
+  await failed;
+  assert.deepEqual(d.get().latSpans, [{ start: 1, end: 2 }], 'a failed fetch keeps the times the tooltip already has');
+  assert.equal(drained, 1, 'and reads the body, so the request does not hang open');
+  const thrown = d.refreshLatSpans();
+  d.state.pending[3](Promise.reject(new Error('gone')));
+  await thrown;
+  assert.deepEqual(d.get().latSpans, [{ start: 1, end: 2 }]);
+  assert.doesNotMatch(extract('async function refreshLatSpans'), /chartLoadFailed|toast/,
+    'the times only add a tooltip line: a failed fetch raises nothing');
+
+  // Retired by a finishing test while in flight: it must not mark the times fresh.
+  const inFlight = d.refreshLatSpans();
+  d.noteSpeedActivity({ speedtest_activity: 9, speedtest_run_id: 0 });
+  d.state.pending[4](spansOK([]));
+  await inFlight;
+  assert.equal(d.get().latSpansStale, true);
+  assert.deepEqual(d.get().latSpans, [{ start: 1, end: 2 }]);
+  assert.equal(d.state.redraws, 0, 'no fetch, landed or not, redraws the chart');
+});
+
+// refreshChart fetches the speedtest times when the chart loads and when its
+// window moves - never on the ordinary latency poll, whose cost perfmatrix measures.
+test('refreshChart refetches the speedtest times on a forced load or a new window, never on a poll', async () => {
+  const state = { base: 'mins=5', spanFetches: 0 };
+  const api = new Function('latWindowQuery', 'fget', 'isReconcile503', 'retryAfterMs', 'chartLoadFailed',
+    'drawChart', 'syncLatPanel', 'document', 'state',
+    TILE_GATE + '\nlet chartSeq = 0, latLoadedFor = "", latLoadedLive = false, latPoints = [], latBackoffMs = 0,'
+    + ' latSpansStale = true, latSpansFor = "";\n'
+    + 'function refreshLatSpans(){ state.spanFetches++; latSpansStale = false; latSpansFor = state.base; }\n'
+    + extract('async function refreshChart') + '\nreturn { refreshChart };')(
+    () => ({ q: state.base + '&exclude=x', live: true, base: state.base }),
+    async () => ({ ok: true, json: async () => [{ t: 1 }] }), () => false, () => 0, () => {},
+    () => {}, () => {}, gateDoc('latency', false), state);
+  await api.refreshChart(true);
+  assert.equal(state.spanFetches, 1, 'the first load brings its speedtest times');
+  await api.refreshChart();
+  await api.refreshChart();
+  assert.equal(state.spanFetches, 1, 'the latency poll must not fetch them');
+  await api.refreshChart(true);
+  assert.equal(state.spanFetches, 2, 'a forced load (a delete, a clear) refetches them');
+  state.base = 'mins=60';
+  await api.refreshChart();
+  assert.equal(state.spanFetches, 3, 'a new window needs its own speedtest times');
+});
+
+test('the status poll keeps the speedtest times current', () => {
+  assert.match(extract('async function refreshStatus'), /if\(noteSpeedActivity\(s\) && latSpansStale\) refreshLatSpans\(\);/);
+});
+
+test('the tips say what a test does to the checks, and describe no stripes', () => {
+  const chartTip = html.slice(html.indexOf('data-tip="What\'s on this chart:'), html.indexOf('<span class="win-dd" id="latencyWindow"'));
+  assert.match(chartTip, /• Shaded bands - rounds where the link failed its checks\. Failed checks during a speedtest start an outage only if they last over 2 minutes or outlast the test\.\n/);
+  const dataTip = html.slice(html.indexOf('<span class="dname" id="dnameLatency">'), html.indexOf('id="setRetention"'));
+  assert.match(dataTip, /and the record of when speedtests ran, used for the latency chart's 'During a speedtest' hover note\.\nDelete now clears them all\./);
+  for (const tip of [chartTip, dataTip]) {
+    assert.doesNotMatch(tip, /stripe|striped|solid band/i, 'the chart draws no stripes, so no tip may describe them');
+    assert.doesNotMatch(tip, /\u2014/, 'no em-dashes in new text');
+  }
+  const downTip = html.slice(html.indexOf('Failed rounds in a row before the link is marked DOWN'));
+  assert.match(downTip.slice(0, 600), /Rounds taken while a speedtest runs don't count, for at least 2 minutes and at least one round/);
+  const degTip = html.slice(html.indexOf('Latency that counts as degraded'));
+  assert.match(degTip.slice(0, 400), /Rounds taken while a speedtest runs are skipped: the test itself raises latency\./);
 });

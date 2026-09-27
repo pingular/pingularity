@@ -48,11 +48,17 @@ function build(hidden, count) {
   const make = new Function('latWindowQuery', 'fget', 'isReconcile503', 'retryAfterMs', 'chartLoadFailed',
     'drawChart', 'syncLatPanel', 'document',
     gateSrc + '\nlet chartSeq=0, latLoadedFor="", latLoadedLive=false, latPoints=[], latBackoffMs=0;\n'
+    // The speedtest times (for the tooltip's "During a speedtest" note) are
+    // fetched once per window, not per poll, so they are not part of the cost
+    // measured here: the stub just marks them loaded. Unused on trees from
+    // before they were stored.
+    + 'let latSpansStale=true, latSpansFor="";\n'
+    + 'function refreshLatSpans(){ latSpansStale=false; latSpansFor="mins=1440"; }\n'
     + chart + '\nreturn refreshChart;');
   return make(
     // A LIVE window, the case the poll loop exists for: a pinned span stops
     // fetching after one load whether or not the tile is on screen.
-    () => ({ q: 'mins=1440', live: true }),
+    () => ({ q: 'mins=1440', live: true, base: 'mins=1440' }),
     async () => { count.n++; return { ok: true, json: async () => [{ t: 1 }] }; },
     () => false, () => 0, () => {}, () => {}, () => {},
     gateDoc(hidden),

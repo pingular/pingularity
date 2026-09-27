@@ -128,6 +128,12 @@ type Server struct {
 	// -allow-host before Serve; nil is fine.
 	AllowedHosts []string
 
+	// SpeedActivityFn reports the speedtest wire window
+	// (speedtest.Scheduler.Activity). /api/status carries it so the dashboard
+	// knows when the speedtest times behind the latency chart's hover note may
+	// have changed, and when the running test started. Nil answers zeros.
+	SpeedActivityFn func() speedtest.Activity
+
 	// AutoOriginsFn enumerates the candidate cities auto server-selection races
 	// - main's autoOrigins, the same closure the tester gets, so the two cannot
 	// drift. The settings server-BROWSING list centres on the last auto run's
@@ -384,6 +390,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/speed/runs/servers", s.handleSpeedRunServers)
 	mux.HandleFunc("/api/speed/runs.csv", s.handleSpeedRunsCSV)
 	mux.HandleFunc("/api/speed/usage", s.handleSpeedUsage)
+	mux.HandleFunc("/api/speed/spans", s.handleSpeedSpans)
 	mux.HandleFunc("/api/notify/test", s.handleNotifyTest)
 	mux.HandleFunc("/api/notify/heartbeat/test", s.handleNotifyHeartbeatTest)
 	mux.HandleFunc("/api/speedtest", s.handleSpeedtest)
@@ -1095,6 +1102,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		dnsMS = &v
 	}
 
+	// The wire window, read BEFORE the run id. A finished run's time is stored
+	// after its engine stops and before it lets go of the claim, and the
+	// dashboard refetches the speedtest times when either field moves. Read in
+	// this order, a poll that finds the counter past the run's engine and no
+	// claim read the run id after the claim was released, so after the time was
+	// stored: the pair can only come to rest once the time is there to fetch.
+	var wire speedtest.Activity
+	if s.SpeedActivityFn != nil {
+		wire = s.SpeedActivityFn()
+	}
 	// One snapshot for every speedtest field (see speedRunStatus): separate
 	// calls re-split the scheduler's one-word running/id pair, and a run ending
 	// between them said "running with no id" - arming an id-0 abort.
@@ -1118,6 +1135,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"speedtest_running": speedRunning,
 		"speedtest_run_id":  speedRun, // 0 when idle; pass back to abort THIS run
 		"speedtest_server":  speedServer,
+		// The wire window (see speedtest.Scheduler.Activity): the counter moves
+		// whenever a test starts or stops using the network and is odd while one
+		// is. The dashboard refetches the speedtest times behind the latency
+		// chart's hover note when the counter or speedtest_run_id moves.
+		"speedtest_activity": wire.Seq,
 		// True only when a run will ACTUALLY race candidates: no pinned Ookla
 		// server AND the Ookla engine is the one that will run. iperf3 connects to
 		// the server the operator configured - it has no candidate pool and does
@@ -1909,18 +1931,27 @@ func speedRunStatus(sp SpeedTrigger) (running bool, id uint64, server string) {
 	return true, id, sp.CurrentServer()
 }
 
-func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
+// seriesWindow reads the latency chart's window from a request: ?mins= (default
+// 120, bad values ignored) or an absolute ?from=&to=, which wins. Shared by
+// /api/series and /api/speed/spans so the speedtest times are always asked for
+// the very window the points were.
+func seriesWindow(r *http.Request, now time.Time) (since, until time.Time) {
 	mins := 120
 	if v := r.URL.Query().Get("mins"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= maxWinMins {
 			mins = n
 		}
 	}
-	now := time.Now()
-	since, until := now.Add(-time.Duration(mins)*time.Minute), time.Time{}
+	since, until = now.Add(-time.Duration(mins)*time.Minute), time.Time{}
 	if f, u, ok := parseRangeParams(r, now); ok {
 		since, until = f, u
 	}
+	return since, until
+}
+
+func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	since, until := seriesWindow(r, now)
 	// Downsample so wide windows stay small/fast; see seriesBucket for the rule.
 	bucket := seriesBucket(since, until, now)
 	// ?exclude=name,name drops those targets from the lowest-latency line (the
@@ -1941,6 +1972,27 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 		pts = []store.SeriesPoint{}
 	}
 	writeJSON(w, pts)
+}
+
+// handleSpeedSpans answers when speedtests ran, for the latency chart's
+// "During a speedtest" hover note, over the same window /api/series takes
+// (?mins= or ?from=&to=): a bare array of {start, end} in unix seconds, oldest
+// first. Spans closer together than the window's bucket width come back merged,
+// which bounds the answer to about as many entries as the chart has points,
+// however many tests the window covers. Only runs that produced a result have a
+// span.
+func (s *Server) handleSpeedSpans(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	since, until := seriesWindow(r, now)
+	spans, err := s.store.SpeedSpans(r.Context(), since, until, int64(seriesBucket(since, until, now)))
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	if spans == nil {
+		spans = []store.SpeedSpan{}
+	}
+	writeJSON(w, spans)
 }
 
 func (s *Server) handleNetinfo(w http.ResponseWriter, r *http.Request) {
@@ -5681,7 +5733,7 @@ func writeNamedStats(w io.Writer, snap stats.Snap) {
 		{"monitor.rounds", "pingularity_probe_rounds_total", "Probe rounds completed.", 1},
 		{"monitor.downs", "pingularity_outages_total", "Debounced outages started.", 1},
 		{"monitor.outage_s_sum", "pingularity_outage_duration_seconds_total", "Cumulative observed outage duration (seconds).", 1},
-		{"monitor.blips", "pingularity_probe_blips_total", "Sub-threshold connectivity blips that did not reach an outage.", 1},
+		{"monitor.blips", "pingularity_probe_blips_total", "Sub-threshold connectivity blips that did not reach an outage; failed rounds taken during a speedtest are not counted toward one.", 1},
 		{"dns.attempts", "pingularity_dns_attempts_total", "DNS resolve probes attempted.", 1},
 		{"db.prune_count", "pingularity_database_prunes_total", "Database prune passes completed.", 1},
 		{"db.prune_ms_sum", "pingularity_database_prune_duration_seconds_total", "Cumulative database prune time (seconds).", 0.001},
@@ -5760,6 +5812,22 @@ func writeNamedStats(w io.Writer, snap stats.Snap) {
 	emitFamily("dns.fail.", "pingularity_dns_failures_total", "reason", "DNS resolve failures by class.")
 	emitFamily("speed.run.", "pingularity_speed_runs_total", "trigger", "Speedtest runs by trigger.")
 	emitFamily("speed.fail.", "pingularity_speed_failures_total", "stage", "Speedtest failures by stage.")
+	// Probe rounds our own speedtests overlapped, and what holding their failures
+	// from down-after did - each by what started the test, since reconnect tests
+	// (on by default, and started the moment a short outage ends) behave nothing
+	// like scheduled ones.
+	emitFamily("monitor.speedtest_rounds.", "pingularity_probe_speedtest_rounds_total", "trigger",
+		"Probe rounds that overlapped a speedtest, by what started the test.")
+	emitFamily("monitor.speedtest_bad_rounds.", "pingularity_probe_speedtest_failed_rounds_total", "trigger",
+		"Probe rounds that overlapped a speedtest and failed their checks, by what started the test.")
+	emitFamily("monitor.speedtest_tail_bad_rounds.", "pingularity_probe_speedtest_tail_failed_rounds_total", "trigger",
+		"Failed probe rounds taken just after a speedtest finished, by what started the test.")
+	emitFamily("monitor.speedtest_downs_suppressed.", "pingularity_outages_suppressed_during_speedtest_total", "trigger",
+		"Failure streaks that reached Down after only on rounds taken during a speedtest, then recovered; no outage was recorded.")
+	emitFamily("monitor.speedtest_downs_delayed.", "pingularity_outages_delayed_by_speedtest_total", "trigger",
+		"Outages confirmed later than Down after alone would have, because some of their failed rounds overlapped a speedtest.")
+	emitFamily("monitor.speedtest_delay_s_sum.", "pingularity_outage_speedtest_delay_seconds_total", "trigger",
+		"Cumulative time those outages waited for confirmation (seconds), by what started the test.")
 
 	// Background-worker health. worker.<name>.restarts is a counter (acc); worker.<name>.up
 	// is a gauge (snap.Gauges): 1 while the loop runs, 0 on death (give-up,

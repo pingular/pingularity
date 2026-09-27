@@ -194,6 +194,10 @@ the DNS line means "online, but DNS was failing"; on the wider windows a
 point averages many lookups and only the ones that succeeded count. Red bands
 mark rounds that failed their checks - including blips too short to count as
 an outage, since they come from the raw samples rather than the outage log.
+Hover a point taken while a speedtest was running and its tooltip says
+"During a speedtest": the test fills the line on purpose, so latency climbs
+and checks can fail then. The note appears once the test has finished, and
+never for a test that ended without a result.
 Click a landmark's pill under the chart to see just that one.
 
 ### Downtime and outages
@@ -289,7 +293,8 @@ test runs at the interval you choose - hourly by default - and:
 - **after a reconnect**, once the connection comes back from an outage (on by
   default; spaced out so a flapping line can't fire tests back to back);
 - **while degraded**, optionally, when latency stays high for two rounds in a
-  row without the link actually dropping (off by default);
+  row without the link actually dropping (off by default; rounds taken while a
+  test runs are skipped, since the test itself raises latency);
 - **more often while failing**, optionally: while the last run breaches an
   alert threshold, the interval drops to a quarter of what you set, between
   one and five minutes, until a run passes.
@@ -299,6 +304,12 @@ Tests can be confined to a weekly **schedule**, and scheduled ones can be
 test runs at a time: a scheduled slot that comes due while another test is
 running is skipped, not run late; a slot held back by a closed schedule window
 or a busy link waits and fires as soon as it can. **Run** always works.
+
+A test fills the line on purpose, so the probe rounds taken while it runs can
+read slow or fail. Those rounds are still recorded and drawn, but they can't
+start an outage unless the failures carry on after the test, or last at least
+two minutes and at least one round. More in
+[Speedtests and outage detection](docs/speedtests.md#speedtests-and-outage-detection).
 
 ### Which server
 
@@ -587,12 +598,16 @@ and IPv6 as two separate votes. A family counts as up while most of its
 landmarks answer, and the connection counts as up while either family is. A
 change has to hold for a few rounds in a row before it is believed - that is
 what keeps one dropped packet, or one flaky landmark, from becoming a false
-outage.
+outage. Rounds taken while a speedtest is using the line don't count toward
+that, for at least two minutes and at least one round: a check that fails
+because our own test filled the line says nothing about the connection. If
+the failures carry on after the test, the outage is confirmed later, but it
+keeps the start it would have had without the test.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Online: starts optimistic
-  Online --> Offline: down-after consecutive failed rounds<br/>→ write 'down' event + alert
+  Online --> Offline: down-after consecutive failed rounds,<br/>not counting rounds held for a speedtest<br/>→ write 'down' event + alert
   Offline --> Online: up-after consecutive ok rounds<br/>→ write 'up' (with duration) + speedtest + alert
 ```
 
@@ -607,7 +622,10 @@ flowchart LR
   quorum --> samples[("samples")]
   quorum --> fsm["debounce FSM"]
   fsm -->|confirmed flip| events[("events")]
+  test["speedtest using the line"] -.->|holds failed rounds| fsm
+  test -.->|run with a result| spans[("speed_spans")]
   samples --> chart["latency chart"]
+  spans -->|hover note| chart
   events --> uptime["uptime % (24h / 7d)"]
   events --> heatmap["downtime heatmap"]
   events --> log["recent outages"]

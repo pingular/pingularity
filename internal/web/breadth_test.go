@@ -36,6 +36,11 @@ func TestListEndpointParamsDontError(t *testing.T) {
 		"/api/series?from=abc",
 		"/api/series?from=-5",
 		"/api/series?from=1700000000&to=1600000000", // reversed
+		// the speedtest times behind the latency chart's hover note take the series window
+		"/api/speed/spans?mins=-5",
+		"/api/speed/spans?mins=x",
+		"/api/speed/spans?from=abc",
+		"/api/speed/spans?from=1700000000&to=1600000000", // reversed
 	} {
 		if w := do(t, h, "GET", p, ""); w.Code != http.StatusOK {
 			t.Errorf("GET %s -> %d (want 200; bad params must default, not 500)", p, w.Code)

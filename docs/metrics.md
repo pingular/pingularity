@@ -160,8 +160,10 @@ self-describing):
   kept as an accounting row, **flagged** as one: the totals and windows above
   count its bytes, while every view that means "a measurement" filters it out -
   it is not in the charts or `latest`, so it can't become the last run, and it
-  gets no healthy/unhealthy verdict. It is in the runs table only when **Record
-  failed tests** is on, and then as a failed test with no readings.
+  gets no healthy/unhealthy verdict. A run that failed outright while **Record
+  failed tests** was on is also listed in the runs table, as a failed test with
+  no readings, until it is deleted. Runs that failed while it was off, and runs
+  you stopped, are never listed.
   `avg_run_bytes` skips it too, on purpose: that average projects what the
   *next* run will cost, and a run that died partway spent a fraction of a full
   one, so counting it would predict a bill no schedule produces
@@ -216,7 +218,21 @@ self-describing):
   `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`,
   `pingularity_database_prune_duration_seconds_total`,
   `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
-  `pingularity_probe_blips_total`, `pingularity_login_failures_total`,
+  `pingularity_probe_blips_total` (failure streaks that ended before Down after;
+  failed rounds taken during a speedtest don't count toward one),
+  the speedtest-hold families, each split by `{trigger}` (what started the
+  test: `startup`, `scheduled`, `reconnect`, `degraded`, `manual`) -
+  `pingularity_probe_speedtest_rounds_total` (probe rounds a test overlapped),
+  `pingularity_probe_speedtest_failed_rounds_total` (those that failed their
+  checks), `pingularity_probe_speedtest_tail_failed_rounds_total` (the first
+  round after a test, when it still failed - the tail the hold does not
+  cover), `pingularity_outages_suppressed_during_speedtest_total` (failure
+  streaks that reached Down after only on held rounds and then recovered, so
+  no outage was recorded), `pingularity_outages_delayed_by_speedtest_total`
+  (outages confirmed later than Down after alone would have) and
+  `pingularity_outage_speedtest_delay_seconds_total` (how long those waited in
+  all; see [Did speedtests cause false outages?](#did-speedtests-cause-false-outages)),
+  `pingularity_login_failures_total`,
   `pingularity_rate_limit_trips_total`, and the chart-aggregate cache accounting:
   `pingularity_series_cache_hits_total`, `pingularity_series_cache_expired_total`,
   `pingularity_series_cache_new_total`, `pingularity_series_cache_empty_total`,
@@ -240,10 +256,19 @@ self-describing):
   `monitor.bad_rounds`), the probe-failure taxonomy (`probe.fail.<class>` -
   timeout/refused/dns/…), the DNS-resolve failure taxonomy (`dns.fail.<class>`),
   family flaps, IPv4-only vs IPv6-only downtime (`monitor.v4_only_down_s` /
-  `monitor.v6_only_down_s`), brownouts (`monitor.degraded_episodes`), pause
+  `monitor.v6_only_down_s`), brownouts (`monitor.degraded_episodes`), rounds
+  held during speedtests (`monitor.speedtest_rounds.<trigger>`,
+  `monitor.speedtest_bad_rounds.<trigger>`,
+  `monitor.speedtest_tail_bad_rounds.<trigger>`,
+  `monitor.speedtest_downs_suppressed.<trigger>`,
+  `monitor.speedtest_downs_delayed.<trigger>` and
+  `monitor.speedtest_delay_s_sum.<trigger>`, the same figures as the named
+  families above), pause
   accounting (`monitor.pauses` / `monitor.paused_s` - why gauges froze),
   speedtest **runs by trigger** (`speed.run.<trigger>`) and **failures by
-  stage** (`speed.fail.<stage>` - server_fetch/ping/download/…), exit-discovery
+  stage** (`speed.fail.<stage>` - server_fetch/ping/download/…), speedtest
+  times (for the latency chart's hover note) refused because the clock was not
+  believable when the test started (`speed.span_dropped`), exit-discovery
   traces and geo lookups (`netinfo.trace_ok` / `netinfo.trace_fail` /
   `netinfo.ipmap_*`, and `netinfo.cymru_fallback` - a Team Cymru lookup answered
   by a public resolver rather than your own; it climbs for every lookup during
@@ -268,6 +293,42 @@ notification-queue loss (`notify.outage_dropped`), and security signals
   settings change, dashboard loads) are **not recorded at all** - those
   emitters were removed; the `promStat` allowlist stays only as a guard so a
   future product counter can't leak onto `/metrics`.
+
+## Did speedtests cause false outages?
+
+Probe rounds taken while a speedtest runs are held from Down after (see
+[Speedtests and outage detection](speedtests.md#speedtests-and-outage-detection)).
+These queries show whether that ever mattered on your line, and what it cost.
+Each family is split by what started the test, and reconnect tests (on by
+default, and started the moment a short outage ends) usually behave nothing
+like scheduled ones, so read them per trigger.
+
+- **Do checks fail more during tests?** Compare
+  `rate(pingularity_probe_speedtest_failed_rounds_total[30d]) / rate(pingularity_probe_speedtest_rounds_total[30d])`
+  with `rate(pingularity_stat_total{stat="monitor.bad_rounds"}[30d]) / rate(pingularity_probe_rounds_total[30d])`.
+- **Did it ever matter?**
+  `increase(pingularity_outages_suppressed_during_speedtest_total[30d])` counts
+  failure streaks that reached Down after only on rounds taken during a
+  speedtest, then recovered. With Up after 1, each one is an outage a build
+  without the hold would have recorded, with its alerts and, on recovery, a
+  reconnect test. That build could have logged more, because each false outage
+  could set off another test. With Up after above 1, a streak can fall inside
+  an outage that build still had open, so the counter can read higher than the
+  false outages it would have logged. Compare it with
+  `pingularity_outages_total`.
+- **What did it cost?** `pingularity_outages_delayed_by_speedtest_total`
+  counts real outages confirmed late, and
+  `pingularity_outage_speedtest_delay_seconds_total` divided by it is the
+  average wait. An average near 120 s means the two-minute limit is doing the
+  work.
+- **Is the hold too short?**
+  `pingularity_probe_speedtest_tail_failed_rounds_total` against
+  `pingularity_probe_speedtest_rounds_total`: a tail that often fails means
+  the line is still recovering when the test ends.
+
+Without Prometheus, open `/metrics` in a browser. With logging on, each case
+also leaves a line: "outage not recorded: it reached down-after only on rounds
+taken during a speedtest", or "outage confirmed after a speedtest".
 
 ## Health endpoints
 

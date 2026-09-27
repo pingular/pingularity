@@ -41,6 +41,9 @@ type Monitor struct {
 	okStreak      int            // consecutive online rounds (monitor goroutine only)
 	badStreak     int            // consecutive offline rounds (monitor goroutine only)
 	lastNoteAt    time.Time      // previous round's TS, for asymmetry spacing (monitor goroutine only)
+	run           failRun        // what the link's current failing run knows about speedtests (monitor goroutine only)
+	prevDuring    bool           // the previous round overlapped a speedtest (monitor goroutine only)
+	prevTrigger   string         // and what started that test (monitor goroutine only)
 
 	downPausedAt time.Time     // when the current pause episode began while down; folded into pausedGap on resume (monitor goroutine only)
 	pausedGap    time.Duration // total unwatched paused time in the current outage, excluded from its recorded duration (monitor goroutine only)
@@ -98,6 +101,87 @@ type Monitor struct {
 	// DNSFn is the DNS-probe sub-toggle (nil = on). Also gated by probing(), so it
 	// never runs when latency probing or the master switch is off.
 	DNSFn func() bool
+
+	// SpeedtestActivityFn, if set, reports the speedtest scheduler's wire counter
+	// (speedtest.Scheduler.Activity): seq is odd while a test is using the
+	// network and changes whenever one starts or finishes; trigger is what
+	// started the latest one. round reads it on both sides of the probe, so a
+	// test that overlapped any part of the round is seen. Nil means no
+	// speedtests: every round counts.
+	SpeedtestActivityFn func() (seq uint64, trigger string)
+}
+
+// speedActivity reads SpeedtestActivityFn, answering "no test, ever" when unset.
+func (m *Monitor) speedActivity() (uint64, string) {
+	if m.SpeedtestActivityFn == nil {
+		return 0, ""
+	}
+	return m.SpeedtestActivityFn()
+}
+
+// speedtestHoldMax is how long a speedtest may keep a failing run's rounds from
+// counting toward down-after, measured from the run's first failed round on the
+// monotonic clock res.TS carries. A default Ookla run keeps the line full for
+// about 30 s at a time (15 s each way), about a minute with its one retry, so
+// failures that outlast two minutes are not the test's doing, and the outage
+// they describe must not wait on a test that may itself be hanging on the dead
+// line. Past it, rounds count again even while the test runs. (Best of with
+// many servers, more retries or a long iperf3 run can keep the line full for
+// longer; docs/speedtests.md says so.) The first failed round is always inside
+// it, so with a long probe interval the hold is one round rather than two
+// minutes.
+const speedtestHoldMax = 2 * time.Minute
+
+// failRun is what one run of consecutive failed rounds knows about speedtests,
+// kept beside a badStreak (the link's, and each family's). A failed round that
+// overlapped a test inside the hold cap is HELD: it stays in the streak - the
+// evidence is kept, and the run's date still comes from it - but it does not
+// count toward down-after. Reset wherever the streak it describes resets.
+type failRun struct {
+	held    int       // failed rounds of this run that were held
+	start   time.Time // res.TS of the run's first failed round: the hold cap's anchor
+	due     time.Time // res.TS of the round at which the run first reached down-after: the date its outage gets, held or not, which is the date it gets without a test too
+	trigger string    // what started the test the run's latest held round overlapped (the closed trigger enum)
+}
+
+func (r *failRun) reset() { *r = failRun{} }
+
+// fail folds one failed round into the run; bad is the streak INCLUDING it, and
+// trigger is set only when the round overlapped a test.
+func (r *failRun) fail(ts time.Time, bad, downAfter int, during bool, trigger string) {
+	if bad == 1 {
+		*r = failRun{start: ts}
+	}
+	if during && ts.Sub(r.start) < speedtestHoldMax {
+		r.held++
+		r.trigger = trigger
+	}
+	if r.due.IsZero() && bad >= downAfter {
+		r.due = ts
+	}
+}
+
+// counted is how many of the run's bad failed rounds count toward down-after.
+func (r *failRun) counted(bad int) int { return bad - r.held }
+
+// dated is the timestamp a confirmed flip gets. due is always set by then
+// (counted <= bad), so the fallback is a belt, not a path.
+func (r *failRun) dated(ts time.Time) time.Time {
+	if r.due.IsZero() {
+		return ts
+	}
+	return r.due
+}
+
+// speedtestTrigger keeps the per-trigger counter keys a closed set: the five
+// triggers RunOnce is ever called with, and "other" for anything else, so a
+// caller passing something new cannot mint an unbounded family of series.
+func speedtestTrigger(t string) string {
+	switch t {
+	case "startup", "scheduled", "reconnect", "degraded", "manual":
+		return t
+	}
+	return "other"
 }
 
 // dnsEnabled reports whether the per-round DNS probe should run.
@@ -211,6 +295,7 @@ type familyState struct {
 	since     time.Time
 	okStreak  int     // monitor goroutine only
 	badStreak int     // monitor goroutine only
+	run       failRun // the family's current failing run and its held rounds (monitor goroutine only)
 	latency   float64 // last round's min latency in ms across this family's successful targets (0 only when no target answered)
 }
 
@@ -1049,8 +1134,11 @@ func ceilSeconds(d time.Duration) int64 {
 // pausing can't confirm a transition with a single round after resume.
 func (m *Monitor) resetStreaks() {
 	m.okStreak, m.badStreak = 0, 0
+	m.run.reset()
+	m.prevDuring, m.prevTrigger = false, ""
 	for _, fs := range m.fams {
 		fs.okStreak, fs.badStreak = 0, 0
+		fs.run.reset()
 	}
 	// Same "a streak can't survive a pause" contract for degradation: otherwise a
 	// host one round shy of the threshold before a pause could fire OnDegraded on
@@ -1127,7 +1215,10 @@ func (m *Monitor) round(ctx context.Context) {
 	// a 'down' that was never written - so this retry is the only path back.
 	m.flushPendingEvents(ctx)
 
+	// The speedtest wire counter, read on both sides of the probe (see during below).
+	seq0, _ := m.speedActivity()
 	res := m.prober.Probe(ctx, time.Now())
+	seq1, trig := m.speedActivity()
 	// A round raced by shutdown measured nothing real: cancelled dials read as
 	// all-failed targets (NOT Skipped), and confirming them would fabricate a
 	// LINK DOWN - an FSM flip, a down-alert, a monitor.downs bump and a doomed
@@ -1148,6 +1239,16 @@ func (m *Monitor) round(ctx context.Context) {
 	if res.Skipped {
 		m.resetStreaks()
 		return
+	}
+	// Whether one of our own speedtests was using the network during this round.
+	// Odd before the probe: a test was already running. Changed by the end: one
+	// started, ended, or both, while the probe was out. Either way the round's
+	// latency and any failed checks may be the test's doing, so its failures are
+	// held from down-after and its latency from the degraded check.
+	during := seq0%2 == 1 || seq1 != seq0
+	trigger := ""
+	if during {
+		trigger = speedtestTrigger(trig)
 	}
 	stats.Set("probe.last_round_ts", res.TS.Unix()) // freshness anchor (monitor.rounds already counts rounds)
 
@@ -1271,21 +1372,52 @@ func (m *Monitor) round(ctx context.Context) {
 	}
 
 	for _, fr := range res.Families {
-		m.advanceFamily(fr, res.TS)
+		m.advanceFamily(fr, res.TS, during)
 		m.log.Debug("family round", "family", fr.Family, "online", fr.Online,
 			"ok", fr.OK, "total", fr.Total, "latency_ms", util.Round1(util.DurMS(fr.Latency)))
 	}
 	m.noteFamilies(res)
-	m.advance(ctx, res)
-	// Base latency for degradation detection: the lowest latency among families that
-	// PASSED quorum (FamilyResult.Latency is already each family's min over its
-	// successful targets). Keying off online families means a lone fast responder in
-	// a DOWNED family can't mask a brownout on the family carrying traffic, and a
-	// partial outage (some anchor answers but quorum failed) stays owned by the
-	// up/down machine instead of mis-firing as degraded. Gate on the DEBOUNCED
-	// state (m.online, updated by advance above), not the raw per-round res.Online,
-	// so a single failed-quorum blip inside a continuous brownout doesn't re-arm the
-	// once-per-episode latch. haveBest is false when no family answered this round.
+	m.advance(ctx, res, during, trigger)
+	m.noteSpeedtestRound(res, during, trigger)
+	best := m.noteDegraded(res, during)
+	m.log.Debug("probe round", "online", res.Online, "best_ms", util.Round1(best),
+		"ok_streak", m.okStreak, "bad_streak", m.badStreak,
+		"during_speedtest", during, "held", m.run.held)
+}
+
+// noteSpeedtestRound counts the rounds a speedtest overlapped, by what started
+// the test, so whether tests trouble this line can be measured (docs/metrics.md):
+// how many rounds overlapped one, how many of those failed, and how often the
+// first round after a test still failed - the tail the hold does not cover.
+func (m *Monitor) noteSpeedtestRound(res prober.Result, during bool, trigger string) {
+	switch {
+	case during:
+		stats.Inc("monitor.speedtest_rounds." + trigger)
+		if !res.Online {
+			stats.Inc("monitor.speedtest_bad_rounds." + trigger)
+		}
+	case m.prevDuring && !res.Online:
+		stats.Inc("monitor.speedtest_tail_bad_rounds." + m.prevTrigger)
+	}
+	m.prevDuring, m.prevTrigger = during, trigger
+}
+
+// noteDegraded feeds one round's base latency to the degraded check and returns
+// it (for the round's debug line). Base latency is the lowest latency among
+// families that PASSED quorum (FamilyResult.Latency is already each family's min
+// over its successful targets). Keying off online families means a lone fast
+// responder in a DOWNED family can't mask a brownout on the family carrying
+// traffic, and a partial outage (some anchor answers but quorum failed) stays
+// owned by the up/down machine instead of mis-firing as degraded. Gate on the
+// DEBOUNCED state (m.online, updated by advance), not the raw per-round
+// res.Online, so a single failed-quorum blip inside a continuous brownout doesn't
+// re-arm the once-per-episode latch.
+//
+// A round taken while a speedtest was using the network has no reading here: its
+// latency is the test's, not the line's. checkDegraded holds the episode through
+// a round with no reading, so a test neither starts a false brownout nor ends a
+// real one, and a brownout that outlasts the test is still measured after it.
+func (m *Monitor) noteDegraded(res prober.Result, during bool) float64 {
 	best, haveBest := 0.0, false
 	for _, fr := range res.Families {
 		if !fr.Online {
@@ -1295,9 +1427,8 @@ func (m *Monitor) round(ctx context.Context) {
 			best, haveBest = ms, true
 		}
 	}
-	m.checkDegraded(best, haveBest, m.online)
-	m.log.Debug("probe round", "online", res.Online, "best_ms", util.Round1(best),
-		"ok_streak", m.okStreak, "bad_streak", m.badStreak)
+	m.checkDegraded(best, haveBest && !during, m.online)
+	return best
 }
 
 // degradedRounds debounces the degradation trigger: latency must stay over the
@@ -1427,6 +1558,7 @@ func (m *Monitor) noteFamilies(res prober.Result) {
 	for fam, fs := range m.fams {
 		if !act[fam] {
 			fs.okStreak, fs.badStreak = 0, 0
+			fs.run.reset()
 		}
 	}
 
@@ -1458,7 +1590,10 @@ func (m *Monitor) noteFamilies(res prober.Result) {
 // advanceFamily debounces and records one family's up/down state. Family
 // transitions are logged (and reflected in the live snapshot) but do not write
 // to the events table - the overall state owns the outage history/heatmap.
-func (m *Monitor) advanceFamily(fr prober.FamilyResult, ts time.Time) {
+// Rounds taken during a speedtest are held from down-after exactly as the
+// link's are (see failRun), or the pills and monitor.flap.* would flip on our
+// own tests while the link state did not.
+func (m *Monitor) advanceFamily(fr prober.FamilyResult, ts time.Time, during bool) {
 	fs := m.fams[fr.Family]
 	if fs == nil {
 		// A family not probed at startup (IPv6 toggled on live, or appearing under
@@ -1470,17 +1605,22 @@ func (m *Monitor) advanceFamily(fr prober.FamilyResult, ts time.Time) {
 		sort.Strings(m.famOrder) // keep display order stable ("ipv4" < "ipv6")
 		m.mu.Unlock()
 	}
+	// Read once for the whole round, as advance does: the run's date and the
+	// flip must be judged against the same Down after.
+	downAfter := m.downAfter()
 	if fr.Online {
 		fs.okStreak++
 		fs.badStreak = 0
+		fs.run.reset()
 	} else {
 		fs.badStreak++
 		fs.okStreak = 0
+		fs.run.fail(ts, fs.badStreak, downAfter, during, "")
 	}
 	flip := 0
 	if !fs.online && fs.okStreak >= m.upAfter() {
 		flip = 1
-	} else if fs.online && fs.badStreak >= m.downAfter() {
+	} else if fs.online && fs.run.counted(fs.badStreak) >= downAfter {
 		flip = -1
 	}
 
@@ -1491,7 +1631,7 @@ func (m *Monitor) advanceFamily(fr prober.FamilyResult, ts time.Time) {
 		fs.since = ts
 	} else if flip == -1 {
 		fs.online = false
-		fs.since = ts
+		fs.since = fs.run.dated(ts) // the round the failing run reached down-after, as for the link
 	}
 	m.mu.Unlock()
 
@@ -1515,42 +1655,90 @@ func (m *Monitor) advanceFamily(fr prober.FamilyResult, ts time.Time) {
 
 // advance applies debouncing: a state flip requires DownAfter consecutive
 // failures (or UpAfter consecutive successes) to suppress flapping.
-func (m *Monitor) advance(ctx context.Context, res prober.Result) {
+//
+// Failed rounds taken while one of our own speedtests was using the network
+// (during) are held for up to speedtestHoldMax: they stay in the failing run,
+// but only the others count toward DownAfter (see failRun). A test fills the
+// line on purpose, so a check that fails under it says nothing about the
+// connection. If the failures carry on after the test, the outage is confirmed
+// later than it would have been, but dated at the round where the run reached
+// DownAfter - the date it gets without a test. trigger names what started the
+// test, for the per-trigger counters.
+func (m *Monitor) advance(ctx context.Context, res prober.Result, during bool, trigger string) {
 	// Every completed round, good or bad: the denominator for bad_rounds, and the
 	// liveness signal a wedged probe loop can't fake (rate == 0 on /metrics while
 	// monitoring_paused is 0 means the prober stopped, not that the link is quiet).
 	stats.Inc("monitor.rounds")
+	// Down after is read once for the whole round. The setting can be saved at
+	// any moment, and a save landing between two reads could date the run at
+	// this round (fail) without confirming it here (the flip below): the outage
+	// would then be confirmed later yet dated back to this round, and counted as
+	// delayed by a speedtest when no test was running.
+	downAfter := m.downAfter()
 	if res.Online {
 		// A failure streak ending while still officially online is a blip:
 		// sub-debounce instability that never became a confirmed outage, so the
 		// events table never records it. (Paused rounds clear streaks via
 		// resetStreaks, not here, so a pause is never counted as a blip.)
 		if m.online && m.badStreak > 0 {
-			stats.Inc("monitor.blips")
-			stats.SetMax("monitor.blip_streak_max", int64(m.badStreak))
-			// A blip is the textbook "shows down but seems fine" cause; surface it at
-			// the default level so it's visible without reproducing under debug.
-			m.log.Info("blip", "bad_streak", m.badStreak, "down_after", m.downAfter())
+			// A blip is instability of the LINE, so only the failed rounds that
+			// did not overlap a speedtest are evidence of one.
+			if counted := m.run.counted(m.badStreak); counted > 0 {
+				stats.Inc("monitor.blips")
+				stats.SetMax("monitor.blip_streak_max", int64(counted))
+				// A blip is the textbook "shows down but seems fine" cause; surface it at
+				// the default level so it's visible without reproducing under debug.
+				m.log.Info("blip", "bad_streak", counted, "during_speedtest", m.run.held,
+					"down_after", downAfter)
+			}
+			// The run reached DownAfter only by counting rounds a speedtest
+			// overlapped, then recovered. A build without the hold would have
+			// confirmed an outage on this run - alerted on it, and run a
+			// reconnect test at the end - unless, with Up after above 1, one
+			// from an earlier run was still open there.
+			if !m.run.due.IsZero() {
+				stats.Inc("monitor.speedtest_downs_suppressed." + m.run.trigger)
+				m.log.Info("outage not recorded: it reached down-after only on rounds taken during a speedtest",
+					"failed_rounds", m.badStreak, "during_speedtest", m.run.held, "down_after", downAfter)
+			}
 		}
 		m.okStreak++
 		m.badStreak = 0
+		m.run.reset()
 	} else {
-		stats.Inc("monitor.bad_rounds") // every failed quorum round, confirmed or not
+		stats.Inc("monitor.bad_rounds") // every failed quorum round, confirmed or not, held or not
 		m.badStreak++
 		m.okStreak = 0
+		m.run.fail(res.TS, m.badStreak, downAfter, during, trigger)
 	}
 
 	switch {
 	case !m.online && m.okStreak >= m.upAfter():
-		m.transition(ctx, true, res)
-	case m.online && m.badStreak >= m.downAfter():
-		m.transition(ctx, false, res)
+		m.transition(ctx, true, res, res.TS)
+	case m.online && m.run.counted(m.badStreak) >= downAfter:
+		at := m.run.dated(res.TS)
+		// Dated before this round only when held rounds kept the run from being
+		// confirmed where it reached DownAfter. (Held rounds alone are not enough
+		// to say so: DownAfter can be lowered while a run is held, and then the
+		// run is confirmed on the very round that sets its date.)
+		if at.Before(res.TS) {
+			stats.Inc("monitor.speedtest_downs_delayed." + m.run.trigger)
+			stats.AddF("monitor.speedtest_delay_s_sum."+m.run.trigger, res.TS.Sub(at).Seconds())
+			m.log.Info("outage confirmed after a speedtest", "failed_rounds", m.badStreak,
+				"during_speedtest", m.run.held, "dated_from", at)
+		}
+		m.transition(ctx, false, res, at)
 	}
 }
 
-// transition records and logs a confirmed state change.
-func (m *Monitor) transition(ctx context.Context, online bool, res prober.Result) {
-	ts := res.TS
+// transition records and logs a confirmed state change. at is when the change is
+// dated: res.TS for every 'up', and for a 'down' confirmed on the round that
+// reached down-after. When rounds were held during a speedtest (see failRun) it
+// is the earlier round that reached down-after, so the outage keeps the start
+// it would have had without the test. It is a res.TS either way, so it carries
+// the monotonic reading that elapsed and m.since rely on.
+func (m *Monitor) transition(ctx context.Context, online bool, res prober.Result, at time.Time) {
+	ts := at
 	m.mu.Lock()
 	// Outage duration comes from ts.Sub(m.since). In production ts is time.Now(),
 	// so it carries a MONOTONIC reading and the elapsed measurement is immune to a

@@ -1942,7 +1942,8 @@
           <span class="info" tabindex="0" data-tip="How often to run a probe round.">i</span></span>
           <span class="ctl"><input type="number" id="setLatency" step="1" min="1"><span class="unit">sec</span></span></label>
         <label class="srow"><span class="lbl">Down after
-          <span class="info" tabindex="0" data-tip="Failed rounds in a row before the link is marked DOWN. Higher = fewer false alarms, slower detection.">i</span></span>
+          <span class="info" tabindex="0" data-tip="Failed rounds in a row before the link is marked DOWN. Higher = fewer false alarms, slower detection.
+• Rounds taken while a speedtest runs don't count, for at least 2 minutes and at least one round: the test fills the line and can make checks fail. If the failures carry on after it, the outage keeps the start it would have had without the test, and only the alert comes later.">i</span></span>
           <span class="ctl"><input type="number" id="setDown" step="1" min="1" max="10"><span class="unit">fails</span></span></label>
         <label class="srow"><span class="lbl">Up after
           <span class="info" tabindex="0" data-tip="Successful rounds in a row before the link is marked back UP.">i</span></span>
@@ -1996,6 +1997,7 @@
           <span class="ctl"><input type="checkbox" id="setOnRecon"><span class="unit"></span></span></label>
         <label class="srow"><span class="lbl">Degraded above
           <span class="info" tabindex="0" data-tip="Latency that counts as degraded. Fires after two probe rounds over this, then re-arms once latency recovers.
+• Rounds taken while a speedtest runs are skipped: the test itself raises latency.
 • 0 = off: nothing counts as degraded.">i</span></span>
           <span class="ctl"><input type="number" id="setDegradedPing" min="0" max="5000" step="any"><span class="unit">ms</span></span></label>
         <label class="srow"><span class="lbl">Test more often while failing
@@ -2275,8 +2277,8 @@
           <div class="dtable-head"><span>Dataset</span><span>Keep for</span><span></span></div>
           <div class="drow">
             <span class="dname" id="dnameLatency">Latency
-              <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest.
-Delete now clears all three.">i</span></span>
+              <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest - and the record of when speedtests ran, used for the latency chart's 'During a speedtest' hover note.
+Delete now clears them all.">i</span></span>
             <span class="ctl"><input type="number" id="setRetention" step="1" min="0" required aria-labelledby="dnameLatency"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delLatency" type="button">Delete now</button>
           </div>
@@ -2825,7 +2827,7 @@ Turn it back on in Settings → Latency.">!</span>
       <span class="h2-tools"><span class="info chart-tip" tabindex="0"  data-tip="What's on this chart:
 • Latency line - how long it takes to reach the nearest of Cloudflare, Google or Quad9. Your distance to the internet's edge, not to a particular site.
 • DNS line - how long a name lookup takes on the DNS server this machine uses. Gaps mean lookups were failing, or the DNS check was off.
-• Shaded bands - rounds where the link failed its checks.
+• Shaded bands - rounds where the link failed its checks. Failed checks during a speedtest start an outage only if they last over 2 minutes or outlast the test.
 • Pills below - each anchor's latest latency; click one to drop it from the line, or bring it back.
 • The window button takes a duration (1h) or a typed date range - jul 1 to jul 8, since jul 1, yesterday. It echoes the dates it read before you apply; the chart zooms to the data the range holds.">i</span>
       <span class="win-dd" id="latencyWindow" style="margin-left:0"></span></span>
@@ -5488,6 +5490,11 @@ async function refreshStatus() {
   // running=true still applies: it carries the server name once known.
   if(!(speedtestPending && !s.speedtest_running))
     setSpeedtestRunning(s.speedtest_running, s.speedtest_server, s.speedtest_auto, s.speedtest_run_id);
+  // When speedtests ran, for the latency chart's "During a speedtest" hover
+  // note: a finished test's time is fetched once it is stored. The test running
+  // now is left out, since it may end without a result, and a test without a
+  // result is never on a chart.
+  if(noteSpeedActivity(s) && latSpansStale) refreshLatSpans();
   // A new run has landed. The SERVER name is not the signal - the incumbent
   // rule keeps the same server run after run - so the timestamp is, and the
   // poll already carries it.
@@ -6082,20 +6089,31 @@ let latLoadedFor=''; // the query the drawn latency points came from
 // final tail and raises the Live button.
 let latLoadedLive=false;
 let latPoints=[];    // last points drawn, so an EMPTY chart can still repaint
+// When speedtests ran (api/speed/spans), for the latency tooltip's "During a
+// speedtest" note: the finished ones for the window last fetched, [{start,end}]
+// in unix seconds. Nothing is drawn for them. They change only when a test
+// finishes with a result, or when the window moves, so they are fetched on
+// those edges (see noteSpeedActivity) and never by the latency poll.
+// latSpansKey is the status fields that move on those edges, as last seen.
+let latSpans=[], latSpansFor='', latSpansKey=null, latSpansStale=true, latSpansReq=0;
 // latFrozen: a span with a closed upper bound cannot gain new rounds, so it is
 // fetched once and never polled. Same rule as the speed chart.
 const latFrozen = () => latencyRange.kind==='range' && rangeEnded(latencyRange.to);
+// base is the window alone, without the excluded anchors: what the speedtest
+// times are fetched for, since which anchors feed the line does not change when
+// tests ran.
 function latWindowQuery(){
   const r=latencyRange;
   const ex=latExcluded.size?'&exclude='+[...latExcluded].map(encodeURIComponent).join(','):'';
-  if(r.kind==='win') return {q:'mins='+r.mins+ex, live:true};
+  if(r.kind==='win') return {q:'mins='+r.mins+ex, live:true, base:'mins='+r.mins};
   // An open start goes over as 1 so the query string stays constant between
   // polls and the server floor cannot overtake the end (see speedWindowQuery).
-  return {q:'from='+(r.from||1)+(r.to?'&to='+r.to:'')+ex, live:!rangeEnded(r.to)};
+  const base='from='+(r.from||1)+(r.to?'&to='+r.to:'');
+  return {q:base+ex, live:!rangeEnded(r.to), base};
 }
 async function refreshChart(force){
   if(tileIdle('latency', force)) return; // nothing on screen to update
-  const {q, live}=latWindowQuery();
+  const {q, live, base}=latWindowQuery();
   // Invalidate the marker as the forced load BEGINS, not only when it succeeds.
   // The success line at the bottom is the only one that RECORDS a load, and both
   // of the ways this can end without data - the catch, and the reconcile-503
@@ -6118,7 +6136,7 @@ async function refreshChart(force){
   // in the catch instead would avoid even that, but it would only cover the
   // catch: a forced load that takes the 503 return would still leave a pinned
   // span frozen on rows that are gone.
-  if(force){ latLoadedFor=''; latLoadedLive=false; }
+  if(force){ latLoadedFor=''; latLoadedLive=false; latSpansStale=true; }
   if(!force && !live && latLoadedFor===q && !latLoadedLive) return;
   const my=++chartSeq; let d;
   try{
@@ -6138,6 +6156,40 @@ async function refreshChart(force){
   catch(e){ if(my===chartSeq) chartLoadFailed('latency chart'); return; }
   if(my!==chartSeq) return;
   latLoadedFor=q; latLoadedLive=live; latPoints=d; drawChart(d); syncLatPanel();
+  if(latSpansStale || latSpansFor!==base) refreshLatSpans();
+}
+// refreshLatSpans fetches the speedtest times for the window on screen. They
+// only add a line to the tooltip, so a failed fetch keeps the ones it has and
+// raises no toast; a 401 or a reconcile 503 is answered by the chart's own poll
+// anyway. Only the newest fetch lands, and noteSpeedActivity retires one in
+// flight when a test finishes, so a reply that left before the new test's time
+// was stored cannot mark the times fresh. Nothing is redrawn: the tooltip reads
+// latSpans when it opens.
+async function refreshLatSpans(){
+  if(tileIdle('latency')) return; // stays stale: the next chart load fetches it
+  const {base}=latWindowQuery(), my=++latSpansReq;
+  let d;
+  try{
+    const r=await fget('api/speed/spans?'+base);
+    if(!r.ok){ try{ await r.text(); }catch(_){} return; }
+    d=await r.json();
+  }catch(_){ return; }
+  if(my!==latSpansReq) return;
+  latSpans=Array.isArray(d)?d:[]; latSpansFor=base; latSpansStale=false;
+}
+// noteSpeedActivity reads one status poll's speedtest fields and reports whether
+// they moved, which can mean a new speedtest time. A finished test's time is
+// written as its result is stored: after the engine stops (speedtest_activity
+// moves) and before the run lets go of its claim (speedtest_run_id changes). So
+// either one moving can mean a new time, and a test that ran between two polls
+// still moves the counter. An ended pinned window cannot gain new times, so it
+// is left alone.
+function noteSpeedActivity(s){
+  const key=(s.speedtest_activity||0)+':'+(s.speedtest_run_id||0);
+  if(key===latSpansKey) return false;
+  latSpansKey=key;
+  if(!(latFrozen() && latSpansFor===latWindowQuery().base)){ latSpansStale=true; latSpansReq++; }
+  return true;
 }
 // The last included anchor can't be dropped (see toggleTarget), so don't promise a click
 // that does nothing - say why instead. Counts the pills currently in the line.
@@ -6878,9 +6930,19 @@ applyChartVis();
 const touchPt = h => e => { const t=e.touches[0]; if(t) h({clientX:t.clientX, clientY:t.clientY, currentTarget:e.currentTarget}); };
 // What a latency point says, in one place: the pointer and the keyboard show the
 // same reading, and the keyboard also speaks it (see chartTipText below).
-function latTip(p){
+// during: the point overlapped a speedtest (see latDuringAt). The chart draws
+// nothing for the test, so this line is the one place it shows, and the test
+// explains a high reading or a failed round.
+function latTip(p, during){
   const dnsLine = (dnsShown && p.dns!=null) ? '<div>DNS '+p.dns.toFixed(0)+' ms</div>' : '';
-  return '<div class="tt-time">'+fmtTime(p.t)+'</div>'+(p.lat!=null? p.lat.toFixed(1)+' ms' : '<span style="color:var(--down)">down</span>')+dnsLine;
+  const testLine = during ? '<div style="color:var(--muted)">During a speedtest</div>' : '';
+  return '<div class="tt-time">'+fmtTime(p.t)+'</div>'+(p.lat!=null? p.lat.toFixed(1)+' ms' : '<span style="color:var(--down)">down</span>')+testLine+dnsLine;
+}
+// Whether the point at i overlapped a speedtest: a point stands for the time up
+// to the next one, so it overlaps when a span covers any of [t, next.t).
+function latDuringAt(points, i, spans){
+  const p=points[i], n=points[i+1], end=(n && n.t>p.t) ? n.t : p.t+1;
+  return spans.some(s=>s.start<end && s.end>p.t);
 }
 function latHoverAt(e){
   chartPtrDrew('chart');
@@ -6888,7 +6950,7 @@ function latHoverAt(e){
   const {bi,bd}=nearestIdx(latPlot, e.clientX-e.currentTarget.getBoundingClientRect().left);
   if(bi<0||bd>60){ if(latHover>=0){ latHover=-1; redrawLat(); } $('chartTip').hidden=true; return; }
   if(bi!==latHover){ latHover=bi; redrawLat(); }
-  showChartTip(latTip(latPlot.points[bi]), e);
+  showChartTip(latTip(latPlot.points[bi], latDuringAt(latPlot.points, bi, latSpans)), e);
 }
 $('chart').addEventListener('mousemove', latHoverAt);
 $('chart').addEventListener('touchstart', touchPt(latHoverAt), {passive:true});
@@ -7082,7 +7144,7 @@ $('chart').addEventListener('keydown', e=>{
   if(i<0) return;
   e.preventDefault();
   latHover=i; redrawLat();
-  const html=latTip(latPlot.points[i]);
+  const html=latTip(latPlot.points[i], latDuringAt(latPlot.points, i, latSpans));
   showChartTip(html, chartPointXY($('chart'), latPlot, i));
   chartSay($('chart'), latPlot, i, html);
   chartKeyed='chart'; chartKeyTip=true;

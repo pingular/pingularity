@@ -206,6 +206,21 @@ CREATE TABLE IF NOT EXISTS speed_servers (
 );
 CREATE INDEX IF NOT EXISTS idx_speed_servers_ts ON speed_servers(run_ts);
 
+-- When a speedtest that produced a result was using the network: one row per
+-- such run, written once its result row is stored (speedtest.Scheduler's
+-- recordSpan). Hovering a latency chart point in one of these stretches says
+-- "During a speedtest", because a test fills the line and the probe rounds taken
+-- meanwhile read slow, or fail, for that reason alone. Nothing is drawn for them.
+-- Not a result: no outcome is stored. It only feeds that one chart's tooltip, so
+-- it follows the chart's data: pruned on the latency retention, cleared with the
+-- latency data, and left out of export like server_health. DeleteSpeed leaves
+-- it, because the link was busy then whatever became of the run's row.
+CREATE TABLE IF NOT EXISTS speed_spans (
+    ts         INTEGER NOT NULL,   -- unix seconds the run started using the network
+    duration_s INTEGER NOT NULL    -- how long it did (monotonic), so ts + duration_s is its end rounded up; 1..3600
+);
+CREATE INDEX IF NOT EXISTS idx_speed_spans_ts ON speed_spans(ts);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -2063,6 +2078,89 @@ func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int6
 		`INSERT INTO pauses (ts, duration_s) VALUES (?, ?)`, start.Unix(), durationS)
 	recordDBErr(err)
 	return err == nil, err
+}
+
+// SpeedSpan is one stretch in which a speedtest was using the network, as the
+// latency chart draws it (unix seconds, End exclusive).
+type SpeedSpan struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+// maxSpeedSpanS bounds one span. Both engines bound a run far below an hour (a
+// sixteen-server Best-of round is budgeted at under half of one); a longer
+// duration is clamped by InsertSpeedSpan. It is also the look-back that lets
+// SpeedSpans find a span straddling the window's start through the ts index.
+const maxSpeedSpanS = 3600
+
+// speedSpanSane is the rule a span must meet to be stored: a believable start,
+// a positive bounded length, and an end no later than the present. The future
+// allowance is pauseFutureSkew, the same one PauseSpanSane uses, on purpose: a
+// span is a stretch of wall time already gone by, exactly like a pause, so the
+// two tables answer to one idea of how far a clock may honestly disagree.
+func speedSpanSane(ts, dur, nowU int64) bool {
+	return ts >= plausibleEpoch && dur >= 1 && dur <= maxSpeedSpanS && ts+dur <= nowU+pauseFutureSkew
+}
+
+// InsertSpeedSpan records that a speedtest used the network for durationS
+// seconds from start. It mirrors InsertPause: a span the rule refuses (a wall
+// clock that was not yet believable when the run started) is dropped and
+// reported as stored=false, not as an error. A durationS above maxSpeedSpanS is
+// clamped first, because a monotonic duration is honest even when absurd.
+func (s *Store) InsertSpeedSpan(ctx context.Context, start time.Time, durationS int64) (stored bool, err error) {
+	if durationS > maxSpeedSpanS {
+		durationS = maxSpeedSpanS
+	}
+	if !speedSpanSane(start.Unix(), durationS, time.Now().Unix()) {
+		return false, nil
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO speed_spans (ts, duration_s) VALUES (?, ?)`, start.Unix(), durationS)
+	recordDBErr(err)
+	return err == nil, err
+}
+
+// SpeedSpans returns the spans overlapping [since, until), oldest first, with
+// any two that sit mergeS seconds apart or closer merged into one. A zero until
+// means up to currentHorizon, like every open-ended read of the present.
+// mergeS is the caller's bucket width: merged that way, the spans left are more
+// than a bucket apart, so a window holds about as many as it holds chart points
+// (maxSeriesPoints) however many tests it covers.
+func (s *Store) SpeedSpans(ctx context.Context, since, until time.Time, mergeS int64) ([]SpeedSpan, error) {
+	lo := since.Unix()
+	hi := until.Unix()
+	if until.IsZero() {
+		hi = currentHorizon(time.Now().Unix())
+	}
+	// ts >= lo - maxSpeedSpanS keeps the scan on the index while still finding a
+	// span that began before the window and runs into it.
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, duration_s FROM speed_spans
+		 WHERE ts >= ? AND ts < ? AND ts + duration_s > ?
+		 ORDER BY ts`, lo-maxSpeedSpanS, hi, lo)
+	if err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpeedSpan
+	for rows.Next() {
+		var ts, dur int64
+		if err := rows.Scan(&ts, &dur); err != nil {
+			return nil, err
+		}
+		sp := SpeedSpan{Start: ts, End: ts + dur}
+		if n := len(out); n > 0 && sp.Start <= out[n-1].End+mergeS {
+			out[n-1].End = max(out[n-1].End, sp.End)
+			continue
+		}
+		out = append(out, sp)
+	}
+	if err := rows.Err(); err != nil {
+		recordDBErr(err)
+		return nil, err
+	}
+	return out, nil
 }
 
 // LastObservedTS returns the newest plausible samples/events timestamp - the last
@@ -4495,7 +4593,7 @@ func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
 	// dns and pauses were both absent, and pauses is the one that matters: it is
 	// the uptime denominator, so a row left behind changes the numbers while being
 	// invisible to any count.
-	for _, t := range []string{"samples", "dns", "speed", "speed_servers", "events", "pauses", "pauses_quarantine", "settings"} {
+	for _, t := range []string{"samples", "dns", "speed_spans", "speed", "speed_servers", "events", "pauses", "pauses_quarantine", "settings"} {
 		var n int64
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t).Scan(&n); err != nil {
 			return nil, err
@@ -4838,6 +4936,11 @@ func (s *Store) SpeedRunOffset(ctx context.Context, ts int64) (int, error) {
 // accounting row and the column that references it are both unreleased work. An
 // unreferenced row in a developer database is simply not swept, which costs a
 // stale usage total there and nothing anywhere else.
+//
+// The run's time (speed_spans, behind the latency chart's hover note) is
+// deliberately left. It says the link was busy then, which stays true whatever
+// became of the row, and it is what explains the slow or failed probe rounds
+// taken during it.
 func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 	// One transaction with the run's selection report (speed_servers has no FK;
 	// the cascade is manual): a run deleted without its report rows would leave
@@ -6215,6 +6318,18 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	} else if n, err := res.RowsAffected(); err == nil {
 		total += n
 	}
+	// The speedtest times ride the LATENCY retention: the latency chart's hover
+	// note is their only reader, and it has no point to hover once the samples
+	// they cover are gone. Like a pause they have length, so a span goes only
+	// once its END is past the cutoff; one that runs into the kept window stays
+	// until it does. The future arm is the same horizon every table gets.
+	if res, err := s.db.ExecContext(ctx, `DELETE FROM speed_spans WHERE ts > ? OR (ts < ? AND ts + duration_s < ?)`,
+		horizon, samplesBefore.Unix(), samplesBefore.Unix()); err != nil {
+		recordDBErr(err)
+		return total, err
+	} else if n, err := res.RowsAffected(); err == nil {
+		total += n
+	}
 	// Events (outage transitions) prune as WHOLE outages: a 'down' older than the
 	// cutoff whose paired 'up' is at/after it straddles the boundary, so keep it -
 	// deleting only the 'down' would orphan the 'up' and split one outage into
@@ -6334,12 +6449,14 @@ func (s *Store) invalidateReadCaches() {
 // Clear deletes all rows of one data kind ("latency" -> samples + dns, "speed"
 // -> speed, "downtime" -> events) and returns rows removed. DNS rides the
 // latency dataset (same chart, same retention), so clearing latency clears it
-// too - otherwise orphaned DNS rows keep feeding the chart after a clear.
+// too - otherwise orphaned DNS rows keep feeding the chart after a clear. The
+// speedtest times go with it for the same reason: that chart's hover note is
+// their only reader, and a chart with no data has no point to hover.
 func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 	var tables []string
 	switch kind {
 	case "latency":
-		tables = []string{"samples", "dns"}
+		tables = []string{"samples", "dns", "speed_spans"}
 	case "speed":
 		// The selection reports go with their runs (manual cascade, no FKs):
 		// rows kept here would describe runs the operator just deleted.
@@ -6418,6 +6535,13 @@ func ptrArg[T any](p *T) any {
 // whether its values mean anything. Only tables whose rows are intervals need it:
 // a duration is not merely a number, it is the length of a span that other code
 // adds to a timestamp, and both of those have values a type check cannot catch.
+//
+// Two tables are left out on purpose. server_health is a cache of which servers
+// refused uploads, re-earned on the machine that runs the tests. speed_spans only
+// feeds the latency chart's hover note: carrying it would stamp nearly every
+// backup with a newer schema (reconnect tests are on by default, so almost every
+// install has rows) and make older releases refuse the whole file, for no number
+// anywhere. A restore simply has no hover notes for the history it brings.
 var exportTables = map[string]struct {
 	cols     []string
 	keyCols  []string

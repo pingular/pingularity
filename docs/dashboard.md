@@ -102,7 +102,15 @@ Below that:
   marking **rounds that failed their checks**. Those come from the latency samples
   themselves, not from the debounced outage log below - so a blip too short to
   become an outage event still shows a band, and deleting an outage does not
-  erase the bands underneath it. Hover either chart to read the exact point.
+  erase the bands underneath it. Nothing on the chart marks a speedtest, but
+  hovering a point taken while one was running adds "During a speedtest" to its
+  tooltip: the test fills the line on purpose, so latency climbs and checks can
+  fail then, and those failures don't start an outage unless they carry on
+  after the test, or last at least two minutes and at least one round (see
+  [Speedtests and outage detection](speedtests.md#speedtests-and-outage-detection)).
+  The note appears once its test has finished, and only if the test produced a
+  result (like every other chart, this one never shows a failed test). Hover
+  either chart to read the exact point.
 - **Downtime heatmap** - a GitHub-style year of daily outages. A cell's shade is
   **how many outages that day**, not how long they lasted: one 23-hour outage and
   one 1-second blip are both a single event and shade identically, while three
@@ -213,7 +221,9 @@ and persist across restarts.
 ![The settings drawer, open on its Ookla tab: a row of tabs (Speedtest, Ookla, iperf3, Latency, Schedule, Data, Alerts, Access, Appearance, About) above the per-test knobs - Best of, Discard losers, Retries, Packet-loss probe, Direction and Parallel connections, each with a hover-help dot; below them the Saved pane with Auto selected, a Find box that takes a place or an Ookla server ID, and the server list with ID, ping and distance columns and a star on each row; Save and Discard sit at the bottom left, Reset to defaults and Reset tiles at the bottom right](https://raw.githubusercontent.com/pingular/pingularity/main/docs/settings-ookla.png)
 
 - **Latency** → latency probing on/off, latency interval, probe timeout, and
-  sensitivity (failures→down / successes→up, IPv6 mode auto/on/off), plus the
+  sensitivity (failures→down / successes→up, IPv6 mode auto/on/off; rounds
+  taken while a speedtest runs don't count toward failures→down, for at least
+  two minutes and at least one round), plus the
   **DNS resolution** probe (on by default), the **Connection info** lookups, and
   the **Exit-path target** - the host or IP the exit traceroute heads toward
   (blank = `1.1.1.1`; it must resolve to IPv4, see [How it works](architecture.md#how-it-works)).
@@ -327,7 +337,10 @@ and persist across restarts.
   **latency** takes the DNS-resolution series with the ping samples, **speed**
   takes the server-selection reports with the runs, and **downtime** takes the
   pause/unobserved spans with the outage events, so clearing downtime also resets
-  observation coverage. And **Export** / **Import** on the same tab: pick any of
+  observation coverage. **Latency** also takes the record of when speedtests
+  ran, which the latency chart's "During a speedtest" hover note reads and
+  which rides its retention too; it is the one thing no export carries, so a
+  restored backup's history has no such notes. And **Export** / **Import** on the same tab: pick any of
   config / latency / speed / downtime, export them to a JSON file, and import one
   back - time-series data is **merged** (existing/newer local rows are kept, only
   missing rows are added) while **config is overwritten** and reloaded live.

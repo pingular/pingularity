@@ -81,13 +81,29 @@ targets, and overall is up when *either* family is. A confirmed flip needs
 ```mermaid
 stateDiagram-v2
   [*] --> Online: starts optimistic
-  Online --> Offline: down-after consecutive failed rounds<br/>→ write 'down' event + alert
+  Online --> Offline: down-after consecutive failed rounds,<br/>not counting rounds held for a speedtest<br/>→ write 'down' event + alert
   Offline --> Online: up-after consecutive ok rounds<br/>→ write 'up' (with duration) + speedtest + alert
 ```
 
 Any round that does not meet the threshold leaves the state where it is: a single
 bad round while Online, or a run of successes shorter than `-up-after` while
 Offline, changes nothing and writes nothing.
+
+**Rounds our own speedtests overlap are held.** The speedtest scheduler keeps a
+counter that moves once as a test's engine starts and once as it returns, so it
+is odd exactly while a test is using the network. The monitor reads it before
+and after each probe; if it was odd, or moved, a test overlapped the round. A
+failed round like that stays in the failing run - it is stored, drawn and
+counted in `monitor.bad_rounds` - but does not count toward `down-after`, for
+at least two minutes and at least one round, measured from the run's first
+failed round. An outage then needs `down-after` failed rounds that were not
+held. When one is confirmed that way, it is dated where the build without the
+hold dates that failing run: at the round where the run first reached
+`down-after`. Only the alert moves later. The same rule holds for the
+per-family state (the IPv4/IPv6 pills and `monitor.flap.*`), and the degraded
+check treats such a round as having no reading. Rounds kept apart by a gap (a
+pause, a suspend, a skipped round) never join one failing run, so the date
+never reaches back across one.
 
 **Each round fans out into the raw series and the derived records.** Outage
 *events* - not per-probe success - drive uptime and the heatmap, so those views
@@ -99,13 +115,16 @@ flowchart LR
   quorum --> samples[("samples")]
   quorum --> fsm["debounce FSM"]
   fsm -->|confirmed flip| events[("events")]
+  test["speedtest using the line"] -.->|holds failed rounds| fsm
+  test -.->|run with a result| spans[("speed_spans")]
   samples --> chart["latency chart"]
+  spans -->|hover note| chart
   events --> uptime["uptime % (24h / 7d)"]
   events --> heatmap["downtime heatmap"]
   events --> log["recent outages"]
 ```
 
-**The store is seven independent time-series tables** (plus a key/value settings
+**The store is eight independent time-series tables** (plus a key/value settings
 table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
 
 | table | columns |
@@ -117,6 +136,7 @@ table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
 | `pauses_quarantine` | `ts` int · `duration_s` int - pause rows held aside by clock repair, returned if the clock corrects |
 | `speed` | `ts` int · `down_mbps` `up_mbps` `ping_ms` `jitter_ms` `packet_loss` real · `healthy` int · `server` text · `race_outcome` text (how the centre was chosen: `decided` \| `silent` \| `unanchored` \| `failed` \| `skipped` \| `bypassed_pin`) · `race_origins` text (every city that raced, with its fastest answer) · `race_winner_label` text · `race_winner_ms` real |
 | `speed_servers` | `run_ts` int - joins `speed.ts`, one row per candidate in that run's server-selection report · `server_id` text · `rank_ping_ms` real · `score` real · `winner` int · `win_reason` text |
+| `speed_spans` | `ts` int · `duration_s` int - when a speedtest that produced a result was using the network; only the latency chart reads it (its "During a speedtest" hover note), so it follows the latency retention and clear, and is not exported |
 | `settings` | `key` text · `value` text - the key/value table, not a time series |
 
 **Exit-node discovery** traces toward `1.1.1.1`, attributes each hop to an ASN,
@@ -168,6 +188,11 @@ flowchart TB
   applies a majority rule, and a confirmed up/down flip needs `down-after` /
   `up-after` consecutive rounds - so one flapping anchor or a single dropped
   packet can't manufacture a false outage.
+- **Our own tests are not outages.** A speedtest fills the line on purpose, so
+  probe rounds taken while one runs can fail for that reason alone. They are
+  kept as evidence but held from `down-after` for at least two minutes and at
+  least one round; failures that outlast the test still become an outage,
+  dated where they would have been without it, and only the alert waits.
 - **Address families are independent.** IPv4 and IPv6 are each their own quorum;
   overall status is online when *either* is up, so an IPv6-only outage is
   recorded and shown without falsely reporting the whole link down. (IPv6 is
