@@ -11658,3 +11658,64 @@ test('the tips say what a test does to the checks, and describe no stripes', () 
   const degTip = html.slice(html.indexOf('Latency that counts as degraded'));
   assert.match(degTip.slice(0, 400), /Rounds taken while a speedtest runs are skipped: the test itself raises latency\./);
 });
+
+// Latency readings wait in memory and are written in batches. The setting for
+// how long is an ordinary number field, with one thing the others beside it do
+// not have: 0 is one of its values.
+test('Save to disk every: 30 by default, 0 is a value, and the bounds are the daemon\'s', () => {
+  const entry = html.match(/\['setSaveEvery','save_every_seconds','int',(\d+)\]/);
+  assert.ok(entry, 'the FIELDS entry is there');
+  assert.equal(entry[1], '30', 'a blank box falls back to the shipping default (defaultSettings in main.go)');
+  assert.match(html, /<input type="number" id="setSaveEvery" step="1" min="0" max="120">/,
+    'the box takes 0 and stops at the maximum the store holds to');
+  assert.match(script, /if\(s\.max_save_every_seconds\)\{ \$\('setSaveEvery'\)\.max=s\.max_save_every_seconds; \}/,
+    'and the maximum comes from the daemon when it sends one');
+
+  const D = driveDeps();
+  D.$('setSaveEvery').min = '0'; D.$('setSaveEvery').max = '120';
+  D.setFields({ latency_enabled: true, save_every_seconds: 30 });
+  assert.equal(D.settingsBody().save_every_seconds, 30);
+  D.$('setSaveEvery').value = '0';
+  assert.equal(D.settingsBody().save_every_seconds, 0, 'a typed 0 is posted as 0: it means every round is written at once');
+  D.$('setSaveEvery').value = '';
+  assert.equal(D.settingsBody().save_every_seconds, 30, 'a blank box posts the default');
+  // A daemon that saved 0 sends 0, and the box shows it.
+  D.setFields({ latency_enabled: true, save_every_seconds: 0 });
+  assert.equal(String(D.$('setSaveEvery').value), '0');
+  assert.equal(D.settingsBody().save_every_seconds, 0);
+  // Greyed, a number the box refuses is replaced by what it was loaded with.
+  D.setFields({ latency_enabled: false, save_every_seconds: 45 });
+  D.$('setSaveEvery').value = '999'; D.$('setSaveEvery').disabled = true;
+  assert.equal(D.settingsBody().save_every_seconds, 45);
+});
+
+// Labels on the Latency tab stay on one line, and this one is wider than any
+// of them. On one line the row needs more room than a column has in a window
+// of 901 to 977px, or 601 to 683px, and its box stood out of line with the
+// others and ran past the window's edge. The Ookla tab's labels wrap for the
+// same reason.
+test('Save to disk every wraps where its column is too narrow for it', () => {
+  assert.match(html, /\.tabpane\[data-tab="latency"\] \.lbl\{white-space:nowrap;\}/,
+    'the labels of the Latency tab stay on one line');
+  assert.match(html, /\.tabpane\[data-tab="latency"\] \.srow:has\(#setSaveEvery\) \.lbl\{white-space:normal;\}/,
+    'and the widest of them wraps, or its box is pushed out of line');
+  const row = html.slice(html.indexOf('<label class="srow"><span class="lbl">Save to disk every'));
+  assert.match(row.slice(0, row.indexOf('</label>')), /id="setSaveEvery"/,
+    'the rule finds the row by the box inside it');
+});
+
+test('Save to disk every greys with latency probing, like the rest of the round\'s settings', () => {
+  assert.match(extract('function syncLatencyDeps'),
+    /\['setLatency','setDown','setUp','setTimeout','setSaveEvery','setIPv6','setDNSProbe'\]\.forEach/);
+});
+
+test('the Save to disk every tip says what a crash costs and what it never costs', () => {
+  const row = html.slice(html.indexOf('Save to disk every'), html.indexOf('id="setSaveEvery"'));
+  const tip = (row.match(/data-tip="([^"]*)"/) || [, ''])[1];
+  assert.match(tip, /A crash or a power cut can lose up to this many seconds of latency readings\./);
+  assert.match(tip, /Outage records are never delayed\./);
+  assert.match(tip, /A normal stop or restart writes what is waiting\./);
+  assert.match(tip, /• 0 = write every round at once\./);
+  assert.match(tip, /• Capped at 120 sec\./);
+  assert.doesNotMatch(tip, /—/, 'no em-dashes in new text');
+});

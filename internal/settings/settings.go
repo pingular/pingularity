@@ -33,6 +33,7 @@ const (
 	keySpeedRet          = "speed_retention_s"    // speed history; 0 = keep forever
 	keyDowntimeRet       = "downtime_retention_s" // outages; 0 = keep forever
 	keyTimeout           = "timeout_s"
+	keySaveEvery         = "save_every_s" // probe readings wait in memory this long before they are written; 0 = write every round
 	keyDownAfter         = "down_after"
 	keyUpAfter           = "up_after"
 	keySpeedServer       = "speed_server_id"
@@ -308,6 +309,10 @@ const (
 	// MaxDuration caps every persisted duration (secs() clamps reads to it) -
 	// exported so config's flag validation can reject what storage would rewrite.
 	MaxDuration = 10 * 365 * 24 * time.Hour
+	// MaxSaveEvery is the longest probe readings may wait in memory before
+	// they are written. It is the store's own bound, and the store clamps to
+	// it whatever it is handed, so the two cannot disagree.
+	MaxSaveEvery = store.MaxSaveEvery
 )
 
 // Values is a snapshot of all runtime settings.
@@ -321,6 +326,7 @@ type Values struct {
 	SpeedRetention       time.Duration // speed history
 	DowntimeRetention    time.Duration // outage history (heatmap)
 	Timeout              time.Duration
+	SaveEvery            time.Duration // probe readings are written in batches this far apart; 0 = every round at once
 	DownAfter            int
 	UpAfter              int
 	SpeedServerID        string        // Ookla server ID ("" = auto)
@@ -895,6 +901,9 @@ func overlay(v Values, m map[string]string) Values {
 	if d, ok := secs(m[keyTimeout]); ok {
 		v.Timeout = d
 	}
+	if d, ok := secs(m[keySaveEvery]); ok {
+		v.SaveEvery = d
+	}
 	if n, ok := atoi(m[keyDownAfter]); ok {
 		v.DownAfter = n
 	}
@@ -1441,6 +1450,7 @@ func (c *Controller) Retention() time.Duration         { return c.get().Retentio
 func (c *Controller) SpeedRetention() time.Duration    { return c.get().SpeedRetention }
 func (c *Controller) DowntimeRetention() time.Duration { return c.get().DowntimeRetention }
 func (c *Controller) Timeout() time.Duration           { return c.get().Timeout }
+func (c *Controller) SaveEvery() time.Duration         { return c.get().SaveEvery }
 func (c *Controller) DownAfter() int                   { return c.get().DownAfter }
 func (c *Controller) UpAfter() int                     { return c.get().UpAfter }
 func (c *Controller) SpeedServerID() string            { return c.get().SpeedServerID }
@@ -1738,6 +1748,7 @@ type Patch struct {
 	SpeedRetention       *time.Duration
 	DowntimeRetention    *time.Duration
 	Timeout              *time.Duration
+	SaveEvery            *time.Duration
 	DownAfter            *int
 	UpAfter              *int
 	SpeedServerID        *string
@@ -1805,6 +1816,7 @@ func (p Patch) apply(v *Values) {
 	setIf(&v.SpeedRetention, p.SpeedRetention)
 	setIf(&v.DowntimeRetention, p.DowntimeRetention)
 	setIf(&v.Timeout, p.Timeout)
+	setIf(&v.SaveEvery, p.SaveEvery)
 	setIf(&v.DownAfter, p.DownAfter)
 	setIf(&v.UpAfter, p.UpAfter)
 	setIf(&v.SpeedServerID, p.SpeedServerID)
@@ -1896,6 +1908,7 @@ func (p Patch) keys() map[string]bool {
 	mark(p.SpeedRetention != nil, keySpeedRet)
 	mark(p.DowntimeRetention != nil, keyDowntimeRet)
 	mark(p.Timeout != nil, keyTimeout)
+	mark(p.SaveEvery != nil, keySaveEvery)
 	mark(p.DownAfter != nil, keyDownAfter)
 	mark(p.UpAfter != nil, keyUpAfter)
 	mark(p.SpeedServerID != nil, keySpeedServer)
@@ -2053,6 +2066,7 @@ func formKeys(v Values) map[string]string {
 		keySpeedRet:            sec(v.SpeedRetention),
 		keyDowntimeRet:         sec(v.DowntimeRetention),
 		keyTimeout:             sec(v.Timeout),
+		keySaveEvery:           sec(v.SaveEvery),
 		keyDownAfter:           strconv.Itoa(v.DownAfter),
 		keyUpAfter:             strconv.Itoa(v.UpAfter),
 		keySpeedServer:         v.SpeedServerID,
@@ -2851,6 +2865,9 @@ func normalize(v Values) Values {
 	v.Latency = clampD(v.Latency, MinLatency, MaxLatency)
 	v.Speed = clampD(v.Speed, MinSpeed, MaxSpeed)
 	v.Timeout = clampD(v.Timeout, MinTimeout, MaxTimeout)
+	// 0 is a value here, not a missing one: it means every round is written
+	// at once. clampD maps a negative to it.
+	v.SaveEvery = clampD(v.SaveEvery, 0, MaxSaveEvery)
 	// Retention windows: 0 means "keep forever". Clamp to [0, MaxDuration]. The
 	// stored-string load path clamps via secs(), but the API Patch pointer path does
 	// not, so without this a caller could set a multi-century window that normalize

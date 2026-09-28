@@ -72,6 +72,13 @@ an unrecognised value for `-ipv4` / `-ipv6` / `-access` / `-quick-setup` /
 stray positional argument (`pingularity install run -listen :9000` fails rather
 than quietly dropping the flags).
 
+How often latency readings are saved to disk has no flag. Set it on the
+Latency tab (**Save to disk every**), or as `save_every_seconds` through
+`/api/settings`. Readings wait in memory in between, so a tool that reads the
+database file of a running daemon, `sqlite3` for one, sees them up to the last
+save. A request to `/api/status` or `/metrics` saves first, and `/healthz`
+never does. After a clean stop the file is complete.
+
 > **Headless installs:** a genuinely fresh install waits (monitoring paused) for
 > a first-run consent - either the browser **Quick Setup** dialog or an explicit
 > flag - so it does not start probing until someone has said to, or until the

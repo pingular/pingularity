@@ -494,8 +494,8 @@ another machine keeps that machine's own "monitoring since" date, so its
 uptime never claims time it didn't watch; an older release refuses a backup it
 can't fully read rather than restoring half of it. For a very large backup,
 copy the database file by hand instead, with the service stopped - a copy
-taken while it runs misses the recent rows in the `-wal` sidecar - and copy
-the key file with it.
+taken while it runs misses the recent rows in the `-wal` sidecar, and the
+latest readings, which are still in memory - and copy the key file with it.
 
 **Disk space.** The database file grows until it holds what your retention
 windows keep, then stops. It does not get smaller. Lowering a window or using
@@ -617,8 +617,14 @@ stateDiagram-v2
   Offline --> Online: up-after consecutive ok rounds<br/>→ write 'up' (with duration) + speedtest + alert
 ```
 
-Each round writes the raw latency samples, and only a confirmed change writes
-an outage event. The latency chart reads the samples; uptime, the heatmap and
+Each round records the raw latency samples, and only a confirmed change writes
+an outage event. The samples wait in memory and are written to disk in
+batches, 30 seconds apart by default, and at once whenever something reads
+them. That wears an SD card or eMMC far less than a write every round. A crash
+or a power cut can lose up to that many seconds of latency readings. Outage
+events are never delayed. **Save to disk every** on the Latency tab sets the
+interval, and 0 writes every round at once. The latency chart reads the
+samples; uptime, the heatmap and
 the outage log all read the events - which is why they always agree with each
 other, and why a probe success rate is not what uptime means here.
 

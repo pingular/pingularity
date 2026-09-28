@@ -94,6 +94,12 @@ func TestDefaultSettings(t *testing.T) {
 	if v.DegradedPingMS != 150 || v.SpeedBusyMbps != 5 {
 		t.Errorf("DegradedPingMS/SpeedBusyMbps = %v/%v, want 150/5", v.DegradedPingMS, v.SpeedBusyMbps)
 	}
+	// Probe readings are written in batches by default, on a new install and
+	// on one that upgrades alike: neither has the key stored. The figure is in
+	// the dashboard's help, its blank-field fallback and the docs.
+	if v.SaveEvery != 30*time.Second {
+		t.Errorf("SaveEvery default = %v, want 30s", v.SaveEvery)
+	}
 
 	// Access is EXPLICIT, not guessed: loopback-only by default everywhere, and
 	// off ONLY when the operator set -access network. No container heuristic.

@@ -112,9 +112,11 @@ all agree.
 ```mermaid
 flowchart LR
   round["probe round"] --> quorum{"per-family<br/>quorum"}
-  quorum --> samples[("samples")]
+  quorum --> held["held in memory"]
+  held -->|saved in batches| samples[("samples")]
   quorum --> fsm["debounce FSM"]
   fsm -->|confirmed flip| events[("events")]
+  events -.->|saves what is held first| held
   test["speedtest using the line"] -.->|holds failed rounds| fsm
   test -.->|run with a result| spans[("speed_spans")]
   samples --> chart["latency chart"]
@@ -125,7 +127,8 @@ flowchart LR
 ```
 
 **The store is eight independent time-series tables** (plus a key/value settings
-table), tuned for a constant writer with WAL + `synchronous=NORMAL`.
+table), tuned for a steady writer that saves in batches, with WAL +
+`synchronous=NORMAL`.
 
 | table | columns |
 | --- | --- |
@@ -205,9 +208,39 @@ flowchart TB
   font, and favicon mean a single static binary with no runtime, no CDN, and no
   external database - install and run.
 - **SQLite is tuned for a 24/7 writer.** WAL + `synchronous=NORMAL` keep the
-  constant probe-write load cheap, a small connection pool lets dashboard reads
+  steady probe-write load cheap, a small connection pool lets dashboard reads
   proceed without blocking the writer, and the expensive uptime aggregation is
   cached briefly so the 3-second status poll stays light.
+- **Latency readings are saved in batches.** A round's samples and its DNS
+  reading wait in memory and are written with the rounds around them, in one
+  transaction. A round written by itself costs about 4.7 pages of write-ahead
+  log. On a dual-stack install at the default 5 second interval that came to
+  about 330 MB of writes a day, and six rounds to a save bring it to about
+  85 MB. A save runs:
+  - when the oldest waiting reading is as old as **Save to disk every** on the
+    Latency tab (30 seconds by default, 120 at most, 0 to write every round at
+    once);
+  - before anything reads the readings: a dashboard or API request,
+    `/metrics`, an export;
+  - before an outage event, a pause or a speedtest result is written, so none
+    of them is ever on disk ahead of the readings taken before it;
+  - before a cleanup, a **Delete now** or a restore;
+  - when 8,192 readings are waiting;
+  - when the daemon stops.
+
+  An open dashboard polls every 3 seconds, and a scraper may poll faster than
+  the interval. Each poll saves what is waiting, so the daemon then writes
+  about as often as it did before. The saving is for the hours nobody is
+  looking. A crash or a power cut loses the readings that were waiting, up to
+  the chosen number of seconds of them. Outage events are written at once and
+  are never delayed. If the database is busy with a long write, such as a
+  restore or a big delete, a request does not wait for it: after a tenth of a
+  second it is answered from what is already saved, and the readings are
+  written once the database is free. A save that fails keeps its readings in
+  memory and is tried again every 5 seconds. Setting the interval to 0 while
+  readings wait through failed saves does not drop them: they are retried
+  until they are written, and the rounds that arrive meanwhile wait behind
+  them.
 - **Charts read in time order.** A latency chart reads its window's samples
   through the time index and adds them up into buckets in Go, rather than asking
   SQLite to group them. The rows arrive already in order, so a wide chart needs

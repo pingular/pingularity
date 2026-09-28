@@ -777,6 +777,7 @@ func TestSettingsDTORoundTrip(t *testing.T) {
 		SpeedRetention:    30 * 24 * time.Hour,
 		DowntimeRetention: 365 * 24 * time.Hour,
 		Timeout:           5 * time.Second,
+		SaveEvery:         45 * time.Second, // without it the field passes as zero on both sides
 		DownAfter:         3, UpAfter: 2,
 		SpeedServerID:    "1234",
 		SpeedtestEnabled: true, SpeedtestOnReconnect: true, IPv6Mode: "on", ExitTarget: "8.8.8.8", DNSProbe: true, NetinfoEnabled: true,

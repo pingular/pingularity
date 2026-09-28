@@ -201,8 +201,12 @@ func waitForSetting(t *testing.T, dbPath, key, want string) {
 // every wait run's own shutdown can take - otherwise the daemon dies with the
 // store still open and the restore's repair still trying to land, which is the
 // state waiting was supposed to prevent.
+//
+// Two of those waits are for the probe readings that were still in memory:
+// run writes them when the monitor has stopped, and the close writes what
+// that save could not. Each may spend store.FinalSaveBudget.
 func TestStopOutwaitsTheWorkerDrain(t *testing.T) {
-	if worst := shutdownWorkerGrace + web.RestoreDrainBudget(); stopWait() <= worst {
+	if worst := shutdownWorkerGrace + web.RestoreDrainBudget() + 2*store.FinalSaveBudget; stopWait() <= worst {
 		t.Fatalf("Stop waits %v but run's shutdown can take %v: the process exits out from under the store close", stopWait(), worst)
 	}
 }

@@ -436,8 +436,43 @@ func (s *Server) Handler() http.Handler {
 // handler through the REAL ordering: the panic/compression interaction this
 // ordering exists to fix is invisible to a test that composes the chain by hand
 // and drifts from it.
+//
+// saveFirst sits inside guard, so a request that guard refuses never causes a
+// write.
 func (s *Server) middleware(routes http.Handler) http.Handler {
-	return s.logRequests(securityHeaders(writeDeadline(s.guard(compressResponses(s.recoverPanics(routes))))))
+	return s.logRequests(securityHeaders(writeDeadline(s.guard(s.saveFirst(compressResponses(s.recoverPanics(routes)))))))
+}
+
+// saveFirst has the probe readings that still wait in memory written before a
+// request that may read them is served, so nothing the dashboard, the API or
+// a scrape shows is behind what the monitor has measured. The store's own
+// reads do the same one by one. This is the one place every request passes.
+//
+// The save waits a tenth of a second for the database and no longer. With a
+// long write in the way the request is served from what is saved, and the
+// store counts and retries.
+func (s *Server) saveFirst(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if savesFirst(r) {
+			s.store.SaveBuffered(store.SaveRequest) // safe without a store
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// savesFirst picks the requests that save: /metrics, and the API routes that
+// need the login. Those are the ones that read measurements. It leaves out
+// what anyone can reach without a login, so a stranger cannot make the daemon
+// write through it: the two probes, which guard lets past every check (and
+// /readyz gives the database two seconds, which a save must not use up), the
+// page and its files, and the routes authExempt names.
+//
+// That is this place only. /healthz never touches the store. /readyz reads
+// through it, and that read saves, only while the status aggregates are cold
+// (handleReadyz).
+func savesFirst(r *http.Request) bool {
+	p := r.URL.Path
+	return p == "/metrics" || (strings.HasPrefix(p, "/api/") && !authExempt(r))
 }
 
 // securityHeaders adds defense-in-depth headers to every response: nosniff
@@ -2698,6 +2733,7 @@ type settingsDTO struct {
 	SpeedRetentionSeconds    *int64  `json:"speed_retention_seconds"`
 	DowntimeRetentionSeconds *int64  `json:"downtime_retention_seconds"`
 	TimeoutSeconds           *int64  `json:"timeout_seconds"`
+	SaveEverySeconds         *int64  `json:"save_every_seconds"`
 	DownAfter                *int    `json:"down_after"`
 	UpAfter                  *int    `json:"up_after"`
 	SpeedServerID            *string `json:"speed_server_id"`
@@ -2793,6 +2829,8 @@ type settingsDTO struct {
 	MinTimeoutSeconds int64 `json:"min_timeout_seconds,omitempty"`
 	MaxTimeoutSeconds int64 `json:"max_timeout_seconds,omitempty"`
 	MaxStreak         int   `json:"max_streak,omitempty"`
+	// The save interval has no minimum to send: 0 is one of its values.
+	MaxSaveEverySeconds int64 `json:"max_save_every_seconds,omitempty"`
 	// ServerNowUnix/ServerTZOffsetMin (GET only) expose the server's clock and
 	// current UTC offset so the schedule tab can place its "now" marker in the
 	// server's local time - the time the windows are actually evaluated in.
@@ -2832,6 +2870,7 @@ func dtoFrom(v settings.Values) settingsDTO {
 		SpeedRetentionSeconds:    ptr(int64(v.SpeedRetention.Seconds())),
 		DowntimeRetentionSeconds: ptr(int64(v.DowntimeRetention.Seconds())),
 		TimeoutSeconds:           ptr(int64(v.Timeout.Seconds())),
+		SaveEverySeconds:         ptr(int64(v.SaveEvery.Seconds())),
 		DownAfter:                ptr(v.DownAfter),
 		UpAfter:                  ptr(v.UpAfter),
 		SpeedServerID:            ptr(v.SpeedServerID),
@@ -3179,6 +3218,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		out.MaxSpeedSeconds = int64(settings.MaxSpeed.Seconds())
 		out.MinTimeoutSeconds = int64(settings.MinTimeout.Seconds())
 		out.MaxTimeoutSeconds = int64(settings.MaxTimeout.Seconds())
+		out.MaxSaveEverySeconds = int64(settings.MaxSaveEvery.Seconds())
 		out.MaxStreak = settings.MaxStreak
 		out.BusyDeferSupported = netstat.Supported()
 		now := time.Now()
@@ -3220,6 +3260,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			SpeedRetention:       durp(in.SpeedRetentionSeconds),
 			DowntimeRetention:    durp(in.DowntimeRetentionSeconds),
 			Timeout:              durp(in.TimeoutSeconds),
+			SaveEvery:            durp(in.SaveEverySeconds),
 			DownAfter:            in.DownAfter,
 			UpAfter:              in.UpAfter,
 			SpeedtestEnabled:     in.SpeedtestEnabled,
@@ -3304,7 +3345,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"interval", v.Latency.String(), "down_after", v.DownAfter, "up_after", v.UpAfter,
 			"latency", v.LatencyEnabled, "dns_probe", v.DNSProbe, "ipv6_mode", v.IPv6Mode,
 			"speedtest", v.SpeedtestEnabled, "speed_engine", v.SpeedEngine, "speed_interval", v.Speed.String(),
-			"retention", v.Retention.String())
+			"retention", v.Retention.String(), "save_every", v.SaveEvery.String())
 		// Re-run exit discovery in the background when the exit target changed, so
 		// the connection panel reflects the new path on its next poll instead of
 		// serving the now-stale cached trace for up to the 10-minute cache window.
@@ -5113,11 +5154,23 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready: network access is held to this machine - whether the store carries the hold a rebuilt store keeps could not be read; check the log, then reload or restart", http.StatusServiceUnavailable)
 		return
 	}
-	s.aggregates() // warm the cache on demand so a readyz-only probe can flip ready
-	s.aggMu.Lock()
-	warm := !s.aggAt.IsZero()
-	s.aggMu.Unlock()
-	if !warm {
+	// A cold cache is filled on demand, so a readyz-only probe can flip ready.
+	// A warm one is left alone, however old it is. The refresh reads through
+	// the store, and that read saves the probe readings that wait in memory.
+	// Anyone can ask this route, and a probe asks every few seconds: each
+	// refresh was a write the save interval was meant to spare. The verdict
+	// does not need it. A cache that was filled once stays warm whether a
+	// refresh goes through or not, and /api/status and /metrics refresh it
+	// for themselves.
+	warm := func() bool {
+		s.aggMu.Lock()
+		defer s.aggMu.Unlock()
+		return !s.aggAt.IsZero()
+	}
+	if !warm() {
+		s.aggregates()
+	}
+	if !warm() {
 		http.Error(w, "not ready: warming up", http.StatusServiceUnavailable)
 		return
 	}

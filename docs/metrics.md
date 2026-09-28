@@ -303,7 +303,22 @@ self-describing):
   `db.wal_trim_blocked` and `db.wal_trim_failed`: the write-ahead log emptied
   after a large delete, left alone because a chart, an export or another
   writer was using it, or refused. A blocked one is normal while a dashboard
-  is open, and the log is then cut back to 8 MiB once it restarts),
+  is open, and the log is then cut back to 8 MiB once it restarts. Latency
+  readings are saved in batches, and `db.sample_*` follows them:
+  `db.sample_saves.<reason>` counts the saves by what started each (`age` the
+  save interval, `request` a dashboard, API or `/metrics` request, `read` a
+  read inside the daemon, `order` an outage event, pause, speedtest result,
+  cleanup, delete or restore that has to come after the readings, `cap` a
+  full buffer, `stop` a shutdown), `db.sample_rows_buffered` the readings
+  that waited in memory, `db.sample_save_failed` the saves that failed and
+  kept their readings for a retry, `db.sample_save_deferred` the saves for a
+  request or a read that left the readings waiting because the database was
+  busy with a long write, and `db.sample_rows_dropped` the readings lost for
+  good: dropped from a full buffer after saves kept failing, or not saved at
+  shutdown. Alert on `db.sample_save_failed` and `db.sample_rows_dropped`. The
+  gauge `db.sample_rows_waiting` is the readings in memory now. A scrape saves
+  first, so it reads 0 or a round that arrived a moment later. One that stays
+  above zero from scrape to scrape means saves are not going through),
   import/restore repairs (`import.*` - rows a
 restore refused rather than silently dropped), the /metrics self-disclosures
 (`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's

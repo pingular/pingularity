@@ -501,6 +501,7 @@ func TestFormKeysOverlayRoundTrip(t *testing.T) {
 		SpeedRetention:    30 * 24 * time.Hour,
 		DowntimeRetention: 365 * 24 * time.Hour,
 		Timeout:           5 * time.Second,
+		SaveEvery:         45 * time.Second,
 		DownAfter:         3, UpAfter: 2,
 		SpeedServerID: "1234",
 		SpeedServers: []SavedServer{
@@ -794,6 +795,64 @@ func TestNormalizeClampsRetention(t *testing.T) {
 	}
 	if got.DowntimeRetention != 0 {
 		t.Errorf("DowntimeRetention 0 (forever) = %v, want 0", got.DowntimeRetention)
+	}
+}
+
+// The save interval clamps to [0, MaxSaveEvery]. 0 stays 0: it is the setting
+// for writing every round at once, and a minimum above it would take the
+// setting away from whoever chose it.
+func TestNormalizeClampsSaveEvery(t *testing.T) {
+	for _, c := range []struct{ in, want time.Duration }{
+		{0, 0},
+		{-5 * time.Second, 0},
+		{45 * time.Second, 45 * time.Second},
+		{MaxSaveEvery, MaxSaveEvery},
+		{500 * time.Second, MaxSaveEvery},
+	} {
+		if got := normalize(Values{SaveEvery: c.in}).SaveEvery; got != c.want {
+			t.Errorf("a save interval of %v is kept as %v, want %v", c.in, got, c.want)
+		}
+	}
+	if MaxSaveEvery != 120*time.Second {
+		t.Errorf("MaxSaveEvery = %v, want 2 minutes: the dashboard's help and the docs name the figure", MaxSaveEvery)
+	}
+}
+
+// A stored 0 is read back as 0 and not as "nothing stored": an install that
+// chose to write every round must not go back to batches at the next start.
+func TestSaveEveryZeroSurvivesARestart(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	def := Values{
+		Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second,
+		SaveEvery: 30 * time.Second, DownAfter: 3, UpAfter: 2, Monitoring: true,
+	}
+	c, err := New(ctx, st, def)
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	// An install that never stored the key gets the default, with no
+	// migration: that is every install that upgrades.
+	if got := c.SaveEvery(); got != 30*time.Second {
+		t.Fatalf("a store without the key gives a save interval of %v, want the default 30s", got)
+	}
+	zero := time.Duration(0)
+	if _, err := c.Update(ctx, Patch{SaveEvery: &zero}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := c.SaveEvery(); got != 0 {
+		t.Fatalf("after saving 0 the interval is %v", got)
+	}
+	again, err := New(ctx, st, def)
+	if err != nil {
+		t.Fatalf("second controller: %v", err)
+	}
+	if got := again.SaveEvery(); got != 0 {
+		t.Errorf("after a restart the interval is %v, want the 0 that was saved", got)
 	}
 }
 

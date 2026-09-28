@@ -533,8 +533,10 @@ consequences worth knowing before you need them:
 
 - **Copying the database files by hand?** Stop the service first. While it runs,
   recent rows live in a sidecar file (`pingularity.db-wal`) that a copy of just
-  `pingularity.db` misses - on a young install that can be *everything*. A clean
-  stop folds the sidecar back into the main file. (The Data tab's **Export** is
+  `pingularity.db` misses - on a young install that can be *everything*. The
+  latest latency readings are not in any file yet: they wait in memory for up
+  to the save interval (30 seconds by default). A clean
+  stop writes them and folds the sidecar back into the main file. (The Data tab's **Export** is
   the safe way to back up a *running* instance - it streams a single consistent
   read-snapshot, so categories can't skew across it. **A full-retention export
   round-trips**, however large - import puts no ceiling on the total file, only on

@@ -388,12 +388,15 @@
 
   .tabpane{grid-row:2;grid-column:1;display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 48px;align-content:start;}
   .tabpane.active{display:grid;} .sgroup{display:contents;} .sgroup h3{grid-column:1/-1;} .tabpane .sgroup:first-child h3{margin-top:2px;} #serverRow{grid-column:1/-1;} .sgroup p{grid-column:1/-1;margin:6px 0 0;} @media (max-width:600px){ .tabpane{grid-template-columns:1fr;} }
-  /* Latency runs three across, like the iperf test parameters: nine rows of short
-     labels and small controls, which read better as three tight rows than five
+  /* Latency runs three across, like the iperf test parameters: ten rows of short
+     labels and small controls, which read better as four tight rows than five
      wide ones. Narrower screens step back down. */
   .tabpane[data-tab="latency"],
   .tabpane[data-tab="ookla"]{grid-template-columns:repeat(3,minmax(0,1fr));column-gap:24px;}
   .tabpane[data-tab="latency"] .lbl{white-space:nowrap;}   /* Ookla's longer labels wrap instead: nowrap would push a control into the next column between ~900 and ~940px */
+  /* The widest label of the pane wraps too. On one line it pushed its box out of
+     line with the others up to ~980 and ~685px, and past the window's edge. */
+  .tabpane[data-tab="latency"] .srow:has(#setSaveEvery) .lbl{white-space:normal;}
   @media (max-width:900px){ .tabpane[data-tab="latency"],
     .tabpane[data-tab="ookla"]{grid-template-columns:repeat(2,minmax(0,1fr));column-gap:48px;} }
   @media (max-width:600px){ .tabpane[data-tab="latency"],
@@ -1952,6 +1955,14 @@
           <span class="info" tabindex="0" data-tip="How long to wait for each anchor to reply. No answer in this time counts as a failure.
 • Capped at 30 sec.">i</span></span>
           <span class="ctl"><input type="number" id="setTimeout" step="1" min="1"><span class="unit">sec</span></span></label>
+        <label class="srow"><span class="lbl">Save to disk every
+          <span class="info" tabindex="0" data-tip="How often latency readings are written to disk. In between they wait in memory and are then written together, which wears an SD card or eMMC far less.
+• The dashboard, the API and /metrics write what is waiting before they answer.
+• A normal stop or restart writes what is waiting. A crash or a power cut can lose up to this many seconds of latency readings.
+• Outage records are never delayed.
+• 0 = write every round at once.
+• Capped at 120 sec.">i</span></span>
+          <span class="ctl"><input type="number" id="setSaveEvery" step="1" min="0" max="120"><span class="unit">sec</span></span></label>
         <label class="srow"><span class="lbl">IPv6
           <span class="info" tabindex="0" data-tip="Probe IPv6 anchors too. Auto probes them whenever this host holds a public IPv6 address - it doesn't check that IPv6 actually reaches the internet.">i</span></span>
           <span class="ctl"><select id="setIPv6"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="unit"></span></span></label>
@@ -9233,6 +9244,7 @@ const FIELDS=[
   ['setNetinfo','netinfo_enabled','bool'],
   ['setLatency','latency_seconds','int',5],
   ['setTimeout','timeout_seconds','int',3],
+  ['setSaveEvery','save_every_seconds','int',30],
   ['setDown','down_after','int',2],
   ['setUp','up_after','int',1],
   ['setIPv6','ipv6_mode','val'],
@@ -9357,7 +9369,7 @@ function setDep(fieldId, on){
 // target is intentionally excluded - its traceroute runs on a separate loop, not the round.
 function syncLatencyDeps(){
   const on=$('setLatEnabled').checked;
-  ['setLatency','setDown','setUp','setTimeout','setIPv6','setDNSProbe'].forEach(id => setDep(id, on));
+  ['setLatency','setDown','setUp','setTimeout','setSaveEvery','setIPv6','setDNSProbe'].forEach(id => setDep(id, on));
   // Exit-path target belongs to connection info, not the probe round: its trace
   // runs on the netinfo loop, so it greys with that toggle rather than with
   // latency probing.
@@ -9464,6 +9476,7 @@ function applySettings(s){
   // Input bounds ride along on GET responses only.
   if(s.min_latency_seconds){ $('setLatency').min=s.min_latency_seconds; $('setLatency').max=s.max_latency_seconds; }
   if(s.min_timeout_seconds){ $('setTimeout').min=s.min_timeout_seconds; $('setTimeout').max=s.max_timeout_seconds; }
+  if(s.max_save_every_seconds){ $('setSaveEvery').max=s.max_save_every_seconds; }
   if(s.max_streak){ $('setDown').max=s.max_streak; $('setUp').max=s.max_streak; $('setThreshConsec').max=s.max_streak; }
   if(s.min_speed_seconds){ $('setSpeed').min=Math.max(1,Math.round(s.min_speed_seconds/60)); }
   if(s.max_speed_seconds){ $('setSpeed').max=Math.round(s.max_speed_seconds/60); }

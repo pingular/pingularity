@@ -223,7 +223,13 @@ and persist across restarts.
 - **Latency** → latency probing on/off, latency interval, probe timeout, and
   sensitivity (failures→down / successes→up, IPv6 mode auto/on/off; rounds
   taken while a speedtest runs don't count toward failures→down, for at least
-  two minutes and at least one round), plus the
+  two minutes and at least one round), how often latency readings are saved to
+  disk (**Save to disk every**: 30 seconds by default, 120 at most, 0 = every
+  round at once. Readings wait in memory in between, and anything that reads
+  them saves them first. A crash or a power cut can lose up to the chosen
+  number of seconds of latency readings. Outage records are never delayed. A
+  value at or below the check interval saves nothing: every round is then
+  written by itself), plus the
   **DNS resolution** probe (on by default), the **Connection info** lookups, and
   the **Exit-path target** - the host or IP the exit traceroute heads toward
   (blank = `1.1.1.1`; it must resolve to IPv4, see [How it works](architecture.md#how-it-works)).
@@ -356,6 +362,7 @@ and persist across restarts.
   that big, stop the service and copy the SQLite database file at the `-db` path
   together with `pingularity.key` beside it (a copy taken while it runs misses
   the `pingularity.db-wal` sidecar, which on a young install is *everything*,
+  and the latest latency readings, which are still in memory,
   and without the key the saved iperf3 passwords and signed-in sessions do not
   survive the restore), or stream `/api/export` straight to disk with
   `curl -OJ 'http://127.0.0.1:9000/api/export?config=1&latency=1&speed=1&downtime=1'`

@@ -198,15 +198,21 @@ const shutdownWorkerGrace = 4 * time.Second
 // exit beats the store close it is there to allow - which is the whole point of
 // waiting at all. Paid only when run really is still draining: p.done closes
 // the moment it returns.
+//
+// The probe readings that still wait in memory are written on the way: once
+// when the monitor has stopped and again by the close, for what the first
+// could not write. Each may take store.FinalSaveBudget.
 func stopWait() time.Duration {
-	return shutdownWorkerGrace + web.RestoreDrainBudget() + time.Second
+	return shutdownWorkerGrace + web.RestoreDrainBudget() + 2*store.FinalSaveBudget + time.Second
 }
 
 // drainWorkers waits for the background workers to stop, so run's deferred
 // store.Close does not land under one of them (a final InsertSpeed / Prune /
 // status read on a closed handle). Bounded, so a wedged worker cannot hang
 // shutdown forever - and skipping the graceful close is safe anyway, the WAL is
-// crash-consistent.
+// crash-consistent. What a skipped close does cost is the probe readings not
+// yet saved, up to the save interval of them, which is why run saves them as
+// soon as the monitor has stopped and does not leave it to the close.
 //
 // One worker is allowed to outlast that bound. A restore that has committed the
 // backup's config rows is mid-repair, and that repair is all that stands between
@@ -420,6 +426,16 @@ func (p *program) run(ctx context.Context) {
 	// silence the warning explaining its published port's new 403.
 	setOpts = append(setOpts, settings.WithBornVersion(version), settings.WithDatabaseCreated(p.dbCreated))
 	set, err := settings.New(ctx, p.store, def, setOpts...)
+	// From here on probe readings are saved in batches (store.SaveBuffered).
+	// Wired on every way out of the load: New returns a controller even when
+	// the load failed, and that one answers with the default interval.
+	p.store.SetSaveEveryFn(set.SaveEvery)
+	// A reading that waits was accepted from the monitor, so a save that
+	// fails later can only be reported by the store. Through the logger, so
+	// it reaches the log the dashboard shows.
+	p.store.SetSaveLogFn(func(level slog.Level, msg string, args ...any) {
+		p.log.Log(context.Background(), level, msg, args...)
+	})
 	if errors.Is(err, settings.ErrLegacyReseal) {
 		// Settings loaded and are in effect; only re-encrypting old plaintext
 		// iperf3 passwords failed. Warning "using defaults" here would tell the
@@ -615,7 +631,7 @@ func (p *program) run(ctx context.Context) {
 		"monitoring", set.Monitoring(), "speedtest", set.SpeedtestEnabled(),
 		"speed_engine", set.SpeedEngine(), "speed_interval", set.SpeedInterval(),
 		"thresholds", set.Thresholds().Any(), "auth", set.AuthEnabled(),
-		"access_local_only", localOnly)
+		"access_local_only", localOnly, "save_every", set.SaveEvery())
 
 	// Warn when the control plane is actually reachable from the network without
 	// auth: a non-loopback listen AND the loopback filter off. Every install
@@ -1151,6 +1167,14 @@ func (p *program) run(ctx context.Context) {
 	if err := m.Run(ctx); err != nil && err != context.Canceled {
 		p.log.Error("monitor", "err", err)
 	}
+	// The readings still in memory go to disk now, not when the store closes.
+	// The close comes after the workers have been waited for, which can take
+	// seconds, and a container runtime may kill the process inside that time.
+	// The monitor has waited for its DNS probe, so no reading arrives after
+	// this. A save that fails is reported by the store, and the close tries
+	// again. One that is still waiting behind another save when its time is
+	// up is left to the close, which says what it had to give up.
+	p.store.SaveBuffered(store.SaveStop)
 	p.log.Info("pingularity stopped")
 }
 
@@ -1249,6 +1273,12 @@ func seedKnownCounters() {
 		// The write-ahead log after a large delete: emptied, left because a
 		// reader or a writer was on it, or refused. Read against each other.
 		"db.wal_trim", "db.wal_trim_blocked", "db.wal_trim_failed",
+		// Probe readings saved in batches: rows taken into memory, rows lost
+		// for good, saves that failed and kept their rows, and saves for a
+		// reader that left the rows waiting because the database was busy.
+		// The saves that went through are seeded by reason, below.
+		"db.sample_rows_buffered", "db.sample_rows_dropped",
+		"db.sample_save_failed", "db.sample_save_deferred",
 		"web.login_fail", "web.limiter_trips", "web.metrics_targets_capped",
 		// The /metrics label-collision disclosure and the step-up security
 		// counter (sibling of login_fail); both alert-worthy first events.
@@ -1299,6 +1329,9 @@ func seedKnownCounters() {
 	}
 	for _, stage := range []string{"server_list", "server_fetch", "no_servers", "ping", "na", "download", "upload", "bidir", "other"} {
 		names = append(names, "speed.fail."+stage)
+	}
+	for _, reason := range store.SaveReasons() {
+		names = append(names, "db.sample_saves."+string(reason))
 	}
 	for _, dest := range []string{"discord", "slack", "healthchecks", "ntfy", "generic", "heartbeat"} {
 		names = append(names, "notify."+dest+".ok", "notify."+dest+".fail", "notify."+dest+".blocked", "notify."+dest+".lat_n")
@@ -2599,6 +2632,7 @@ func defaultSettings(cfg config.Config) settings.Values {
 		Speed:          cfg.SpeedtestInterval, Retention: cfg.Retention,
 		SpeedRetention: cfg.SpeedRetention, DowntimeRetention: cfg.DowntimeRetention,
 		Timeout: cfg.Timeout, DownAfter: cfg.DownAfter, UpAfter: cfg.UpAfter,
+		SaveEvery:            30 * time.Second, // probe readings are written in batches; 0 = every round at once
 		SpeedtestEnabled:     cfg.SpeedtestEnabled,
 		SpeedtestOnReconnect: cfg.SpeedtestOnReconnect, IPv6Mode: cfg.IPv6Mode, Monitoring: true,
 		AccessLocalOnly:    !networkAccess, // loopback-only unless the operator explicitly opted into network access

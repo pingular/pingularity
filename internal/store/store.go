@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"net/netip"
 	"os"
@@ -301,6 +302,10 @@ type Store struct {
 	// later Open of the file it just built finds a healthy database and says
 	// no. See RebuiltAfterCorruption for who asks.
 	rebuilt bool
+
+	// held is the probe rounds and DNS readings that wait to be saved (see
+	// SaveBuffered).
+	held sampleBuf
 }
 
 // pragmaConn is the per-connection pragma query appended to every file-backed
@@ -854,6 +859,7 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool, opts 
 		rebuilt:     rebuilt,
 	}
 	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
+	st.held.init()
 	// When the clock could not anchor the future-end pause repair above, arm the
 	// lazy re-judgement: the first write under a plausible clock runs it instead.
 	if nowU < plausibleEpoch {
@@ -2023,8 +2029,13 @@ func (s *Store) ReleaseAccessHold(ctx context.Context) (bool, error) {
 	return n > 0, err
 }
 
-// Close releases the underlying database handle.
-func (s *Store) Close() error { return s.db.Close() }
+// Close writes the probe readings that are still waiting and releases the
+// underlying database handle. The save comes first, before anything else a
+// close may come to do: it needs the handle, and the rows are lost without it.
+func (s *Store) Close() error {
+	s.finalSave()
+	return s.db.Close()
+}
 
 // DB exposes the raw handle for ad-hoc queries (used by tests).
 func (s *Store) DB() *sql.DB { return s.db }
@@ -2045,6 +2056,11 @@ const famExpr = `COALESCE(NULLIF(family,''), CASE WHEN target LIKE '%-v6' THEN '
 
 // InsertSamples records one probe round's results in a single transaction (one
 // commit/fsync instead of one per target).
+//
+// On a store with a save interval the round waits in memory instead, and is
+// written with the rounds around it (see SaveBuffered). The error then says
+// only whether the round was taken. A save that fails later is logged and
+// counted by the store.
 func (s *Store) InsertSamples(ctx context.Context, sms []Sample) error {
 	// A probe round means the process is alive and reading its clock: the moment
 	// that clock turns plausible, run the future-end pause repair Open had to
@@ -2052,6 +2068,9 @@ func (s *Store) InsertSamples(ctx context.Context, sms []Sample) error {
 	s.maybeRepairFuturePauses()
 	if len(sms) == 0 {
 		return nil
+	}
+	if held, err := s.holdRound(ctx, sms); held {
+		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2086,7 +2105,11 @@ func (s *Store) InsertSamples(ctx context.Context, sms []Sample) error {
 
 // InsertDNS records one DNS-resolve-latency sample (one per probe round). ms is
 // the cache-busted lookup time; ok=false stores a NULL latency with success=0.
+// It waits in memory like a probe round on a store with a save interval.
 func (s *Store) InsertDNS(ctx context.Context, ts time.Time, ms float64, ok bool) error {
+	if held, err := s.holdDNS(ctx, ts, ms, ok); held {
+		return err
+	}
 	var lat any
 	if ok {
 		lat = ms
@@ -2095,6 +2118,774 @@ func (s *Store) InsertDNS(ctx context.Context, ts time.Time, ms float64, ok bool
 		ts.Unix(), lat, util.B2I(ok))
 	recordDBErr(err)
 	return err
+}
+
+// Batched saves.
+//
+// Probe rounds and DNS readings wait in memory and are written together, one
+// transaction for every save. A round written alone costs about 4.7 pages of
+// write-ahead log, which at the default cadence is 333 MB of writes a day.
+// Six rounds to a save bring that to 85 MB. On an SD card or eMMC that is the
+// difference that matters.
+//
+// SQL cannot see a waiting row, so whatever reads the two tables, or has to
+// come after the rows in them, saves first: every store function that reads
+// samples or dns, every writer of an event, a pause or a speed row, a
+// cleanup, a clear, an import and Close. Two more things start a save: the
+// oldest waiting row reaching the chosen age, and a full buffer. What is
+// still waiting when the process is killed or the power goes is lost. That
+// is the whole cost, and outage records are never part of it: an event is
+// written at once and takes the waiting rows with it.
+//
+// A store that was given no interval (SetSaveEveryFn) writes every round at
+// once, as it always did. That is every test that opens its own store, and
+// reset-auth.
+
+// MaxSaveEvery is the longest a reading may be left waiting, whatever the
+// setting says. It is the most history a crash or a power cut can cost. It is
+// also as long as a restart after one may take before the monitor books the
+// stretch it cannot account for as unobserved (startupGapMin in
+// internal/monitor).
+const MaxSaveEvery = 120 * time.Second
+
+// FinalSaveBudget is what a save at shutdown may take: one whole wait for the
+// writer (busy_timeout in pragmaConn) and a second to commit. It must stay
+// above that wait, and so must saveTimeout. SQLite does not look at the
+// context while it waits for the writer: under a deadline of 300 ms a write
+// beside a held writer still took 5.06 s to come back, and came back as
+// "context deadline exceeded", which db.busy does not count.
+const FinalSaveBudget = 6 * time.Second
+
+const (
+	// maxHeldRows is how many rows may wait. A round that would go over it
+	// starts a save, and only if that save fails are the oldest rounds
+	// dropped. A save that failed within the last saveRetryEvery counts as
+	// that failure, and the round starts none of its own: a store that
+	// cannot be written would be handed every waiting row again by every
+	// round, and the retry is the timer's. It covers the longest wait at the
+	// fastest cadence: 120 s of rounds a second apart, with 64 targets and a
+	// DNS reading each, is 7,800 rows. 64 is where /metrics stops listing
+	// targets. Full, the buffer holds about 0.6 MB.
+	maxHeldRows = 8192
+	// saveRetryEvery is how long after a failed save the next one is tried.
+	// It is the default probe interval: a store that could not be written
+	// was tried again once a round before, too.
+	saveRetryEvery = 5 * time.Second
+	// saveTimeout bounds one save. It is longer than busy_timeout, so that
+	// SQLite gives up first and the error names what was in the way.
+	saveTimeout = 10 * time.Second
+	// readerSaveWait is as long as a save made for a reader waits: for a
+	// save that is already running, for a free connection, and for the
+	// writer. A request must never stall behind a long write because of a
+	// save. Measured before this bound, a read beside a held writer waited
+	// nothing at all and a write waited the whole 5 s.
+	readerSaveWait = 100 * time.Millisecond
+	// readerSaveQuiet is how long saves for readers stay away after one of
+	// them found the writer taken. One request reads through many store
+	// functions, and each of them would wait readerSaveWait again.
+	readerSaveQuiet = time.Second
+)
+
+// SaveReason says what started a save. It is the last part of the counter a
+// save is booked under, db.sample_saves.<reason>.
+type SaveReason string
+
+const (
+	SaveAge     SaveReason = "age"     // the oldest waiting row reached the save interval, or a failed save is tried again
+	SaveRequest SaveReason = "request" // an HTTP request that may read the rows is about to be served
+	SaveRead    SaveReason = "read"    // a store function is about to read samples or dns
+	SaveOrder   SaveReason = "order"   // a row that has to come after the waiting ones is about to be written, or rows are about to be deleted or merged
+	SaveCap     SaveReason = "cap"     // the buffer is full
+	SaveStop    SaveReason = "stop"    // the monitor has stopped, or the store is closing
+)
+
+// SaveReasons lists every reason a save can have, so the counters can be
+// seeded from the same list they are booked from.
+func SaveReasons() []SaveReason {
+	return []SaveReason{SaveAge, SaveRequest, SaveRead, SaveOrder, SaveCap, SaveStop}
+}
+
+// forReader reports whether a save is made on behalf of a reader. Such a save
+// gives up after readerSaveWait. Every other save keeps the ordinary wait of
+// busy_timeout: nothing is waiting for an answer behind it.
+func (r SaveReason) forReader() bool { return r == SaveRead || r == SaveRequest }
+
+// errSaveWaiting is what a save made for a reader returns when it left the
+// rows waiting: the writer was taken, or a save failed moments ago. The read
+// goes on with what is saved, and the rows are written by the next save that
+// is not made for a reader.
+var errSaveWaiting = errors.New("probe readings are waiting to be saved")
+
+// heldRound is one probe round waiting to be saved.
+type heldRound struct {
+	// at is when the store was handed the round. The save interval counts
+	// from here, on the monotonic clock: the rows' own timestamps are wall
+	// time, which can step, and a test's rows can carry any time at all.
+	at   time.Time
+	rows []Sample
+}
+
+// heldDNS is one DNS reading waiting to be saved.
+type heldDNS struct {
+	at time.Time
+	ts time.Time
+	ms float64
+	ok bool
+}
+
+// txBeginner is satisfied by *sql.DB and by *sql.Conn: a save runs on the
+// pool, or on one connection it took out for itself.
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
+// sampleBuf holds the rows that wait. Rounds are held and dropped whole: a
+// round was all or nothing when it was one transaction, and recovery dating
+// counts a majority of each round's targets, so part of a round could read as
+// a quorum the round never had.
+type sampleBuf struct {
+	everyFn atomic.Pointer[func() time.Duration]
+	logFn   atomic.Pointer[func(level slog.Level, msg string, args ...any)]
+	// waiting counts the rows held plus the rows inside a save that is
+	// running. Zero means a reader has nothing to wait for, and reading it
+	// is all a read pays then.
+	waiting atomic.Int64
+
+	// gate lets one save run at a time, and is held across its transaction.
+	// A channel and not a mutex, because a save made for a reader has to be
+	// able to stop waiting for it. Order: gate, then mu.
+	gate chan struct{}
+
+	mu     sync.Mutex
+	rounds []heldRound
+	dns    []heldDNS
+	rows   int
+	timer  *time.Timer
+	due    time.Time // what the timer is set for. Zero: not set
+	// quietUntil keeps saves made for readers away: for saveRetryEvery after
+	// a save failed, so readers do not hammer a store that cannot be
+	// written, and for readerSaveQuiet after one of them found the writer
+	// taken.
+	quietUntil time.Time
+	failing    bool // the last save failed. Logged once for the whole streak
+	// dropSaid: the log has said that rows are being dropped. While the
+	// buffer is full every round drops one, and one line says so for all of
+	// them until a save goes through. The counter counts every row.
+	dropSaid bool
+	// missed: a reader went on without the waiting rows. What it read may
+	// be memoized, so the save that lands them drops the read caches.
+	missed bool
+	closed bool
+	// writtenOff: Close waited for a save that was still running for as
+	// long as a close may take, and booked the rows that save holds as lost
+	// (finalSave). When the save comes back it puts nothing into the buffer
+	// and counts nothing a second time.
+	writtenOff bool
+
+	// Test seams. They are fields and not package variables, because a
+	// timer goroutine reads them, and a test's cleanup would put a package
+	// variable back while another store's timer is still running. Set before
+	// the first insert and read under mu.
+	write func(ctx context.Context, q txBeginner, rounds []heldRound, dns []heldDNS, brief bool) error
+	after func(d time.Duration, f func()) *time.Timer
+	now   func() time.Time
+}
+
+// init makes a buffer ready. The one place a Store is built calls it.
+func (b *sampleBuf) init() {
+	b.gate = make(chan struct{}, 1)
+	b.write = writeHeld
+	b.after = time.AfterFunc
+	b.now = time.Now
+}
+
+// SetSaveEveryFn gives the store the save interval, asked for again on every
+// insert so a changed setting applies to the next round. The function must
+// not call back into the store. With none set, or with nil, every round is
+// written at once.
+func (s *Store) SetSaveEveryFn(fn func() time.Duration) {
+	if fn == nil {
+		s.held.everyFn.Store(nil)
+		return
+	}
+	s.held.everyFn.Store(&fn)
+}
+
+// SetSaveLogFn gives the store the daemon's logger for what happens to
+// waiting rows. A round that waits is a round the monitor was told is stored,
+// so a failed save can only be reported from here, and it has to reach the
+// log the dashboard shows. With none set the lines go to the standard logger.
+func (s *Store) SetSaveLogFn(fn func(level slog.Level, msg string, args ...any)) {
+	if fn == nil {
+		s.held.logFn.Store(nil)
+		return
+	}
+	s.held.logFn.Store(&fn)
+}
+
+func (s *Store) saveLog(level slog.Level, msg string, args ...any) {
+	if fn := s.held.logFn.Load(); fn != nil {
+		(*fn)(level, msg, args...)
+		return
+	}
+	var kv strings.Builder
+	for i := 0; i+1 < len(args); i += 2 {
+		fmt.Fprintf(&kv, " %v=%v", args[i], args[i+1])
+	}
+	log.Printf("pingularity: %s%s", msg, kv.String())
+}
+
+// saveEvery is the save interval in force: 0 when every round is to be
+// written at once, and never more than MaxSaveEvery.
+func (s *Store) saveEvery() time.Duration {
+	fn := s.held.everyFn.Load()
+	if fn == nil {
+		return 0
+	}
+	d := (*fn)()
+	if d <= 0 {
+		return 0
+	}
+	return min(d, MaxSaveEvery)
+}
+
+// BufferedRows is how many rows are waiting to be saved, those inside a
+// running save included.
+func (s *Store) BufferedRows() int { return int(s.held.waiting.Load()) }
+
+// holdRound keeps a probe round for the next save. held false means the
+// caller writes it itself, now.
+func (s *Store) holdRound(ctx context.Context, sms []Sample) (held bool, err error) {
+	// Asked before any lock of the buffer is taken: the function is the
+	// settings controller's, which has a lock of its own.
+	every := s.saveEvery()
+	if every == 0 && s.held.waiting.Load() == 0 {
+		return false, nil
+	}
+	if len(sms) > maxHeldRows {
+		// More than the buffer holds. What waits goes first, to keep the order.
+		s.SaveBuffered(SaveCap)
+		return false, nil
+	}
+	// A round cancelled before it was written opened no transaction and was
+	// not counted as a database error. It is not held either.
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	r := heldRound{rows: append([]Sample(nil), sms...)}
+	return s.hold(len(sms), every, func(b *sampleBuf, at time.Time) {
+		r.at = at
+		b.rounds = append(b.rounds, r)
+	})
+}
+
+// holdDNS is holdRound for one DNS reading.
+func (s *Store) holdDNS(ctx context.Context, ts time.Time, ms float64, ok bool) (held bool, err error) {
+	every := s.saveEvery()
+	if every == 0 && s.held.waiting.Load() == 0 {
+		return false, nil
+	}
+	// InsertDNS counts every error, a cancelled context's too.
+	if err := ctx.Err(); err != nil {
+		recordDBErr(err)
+		return true, err
+	}
+	return s.hold(1, every, func(b *sampleBuf, at time.Time) {
+		b.dns = append(b.dns, heldDNS{at: at, ts: ts, ms: ms, ok: ok})
+	})
+}
+
+// hold puts n rows into the buffer through put and sets the timer for them.
+func (s *Store) hold(n int, every time.Duration, put func(b *sampleBuf, at time.Time)) (held bool, err error) {
+	b := &s.held
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return false, nil // the caller's own write fails on the closed store, as before
+	}
+	dropped, say := 0, false
+	if b.rows+n > maxHeldRows {
+		// A save that failed moments ago is this round's failed save too.
+		// Trying again here handed a store that cannot be written all the
+		// waiting rows with every round, and twice a round when the DNS
+		// reading met a full buffer as well, on the goroutine that paces the
+		// rounds. The price: if the store healed inside those few seconds,
+		// this round still drops the oldest one to make room.
+		if !b.failing || !b.now().Before(b.quietUntil) {
+			b.mu.Unlock()
+			s.SaveBuffered(SaveCap)
+			b.mu.Lock()
+			if b.closed {
+				b.mu.Unlock()
+				return false, nil
+			}
+		}
+		dropped = b.dropOldest(maxHeldRows - n)
+		say = b.sayDrop(dropped)
+	}
+	put(b, b.now())
+	b.rows += n
+	stats.Set("db.sample_rows_waiting", b.waiting.Add(int64(n)))
+	// While saves fail the timer is the retry's, and a new round must not
+	// pull it forward. With the interval just set to 0 the save below is
+	// this round's.
+	if !b.failing && every > 0 {
+		b.arm(s, b.oldest().Add(every), false)
+	}
+	b.mu.Unlock()
+	stats.Add("db.sample_rows_buffered", int64(n))
+	s.noteDropped(dropped, say)
+	if every == 0 {
+		// The interval was set to 0 while rows were waiting. They go first,
+		// and this round with them.
+		return true, s.SaveBuffered(SaveAge)
+	}
+	return true, nil
+}
+
+// oldest is when the oldest waiting row was handed over. Called with mu held
+// and rows waiting.
+func (b *sampleBuf) oldest() time.Time {
+	switch {
+	case len(b.rounds) == 0:
+		return b.dns[0].at
+	case len(b.dns) == 0 || !b.dns[0].at.Before(b.rounds[0].at):
+		return b.rounds[0].at
+	}
+	return b.dns[0].at
+}
+
+// arm sets the timer for at. An earlier deadline that is already set stands,
+// unless replace says otherwise: a lowered setting applies to the next round,
+// and a raised one lets the deadline that was set run out once. Called with
+// mu held.
+func (b *sampleBuf) arm(s *Store, at time.Time, replace bool) {
+	if !replace && !b.due.IsZero() && !b.due.After(at) {
+		return
+	}
+	b.disarm()
+	b.due = at
+	b.timer = b.after(max(at.Sub(b.now()), 0), func() { s.timedSave(at) })
+}
+
+// disarm stops the timer. Called with mu held.
+func (b *sampleBuf) disarm() {
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	b.due = time.Time{}
+}
+
+// timedSave is what the timer runs. A timer that was replaced after it fired
+// finds another deadline set and does nothing.
+func (s *Store) timedSave(at time.Time) {
+	b := &s.held
+	// A panic on a timer's goroutine would take the daemon down, and its job
+	// is to keep watching the link.
+	defer func() {
+		if r := recover(); r != nil {
+			s.saveLog(slog.LevelError, "saving probe readings panicked; the save is retried", "panic", r)
+			b.mu.Lock()
+			if !b.closed && b.rows > 0 {
+				b.arm(s, b.now().Add(saveRetryEvery), true)
+			}
+			b.mu.Unlock()
+		}
+	}()
+	b.mu.Lock()
+	mine := b.due.Equal(at)
+	if mine {
+		b.due, b.timer = time.Time{}, nil
+	}
+	b.mu.Unlock()
+	if mine {
+		s.SaveBuffered(SaveAge)
+	}
+}
+
+// dropOldest drops the oldest waiting rounds and DNS readings, each of them
+// whole, until no more than keep rows are left, and returns how many rows
+// went. Called with mu held.
+func (b *sampleBuf) dropOldest(keep int) (dropped int) {
+	for b.rows > keep && b.rows > 0 {
+		if len(b.rounds) == 0 || (len(b.dns) > 0 && b.dns[0].at.Before(b.rounds[0].at)) {
+			b.dns = b.dns[1:]
+			b.rows--
+			dropped++
+			continue
+		}
+		n := len(b.rounds[0].rows)
+		b.rounds[0] = heldRound{}
+		b.rounds = b.rounds[1:]
+		b.rows -= n
+		dropped += n
+	}
+	if dropped > 0 {
+		// Dropped rows wait no longer. Left counted, no reader would ever
+		// take the short way out again.
+		stats.Set("db.sample_rows_waiting", b.waiting.Add(-int64(dropped)))
+	}
+	return dropped
+}
+
+// putBack returns the rows a save could not write to the front of the
+// buffer, in the order they had. Rounds that arrived meanwhile stay behind
+// them. Called with mu held.
+func (b *sampleBuf) putBack(rounds []heldRound, dns []heldDNS, n int) (dropped int) {
+	if b.writtenOff {
+		return 0 // booked as lost by the close, and nothing reads a closed buffer
+	}
+	b.rounds = append(rounds, b.rounds...)
+	b.dns = append(dns, b.dns...)
+	b.rows += n
+	return b.dropOldest(maxHeldRows)
+}
+
+// sayDrop reports whether the log is to say that rows were dropped: for the
+// first of them since a save last went through. Called with mu held.
+func (b *sampleBuf) sayDrop(dropped int) bool {
+	if dropped == 0 || b.dropSaid {
+		return false
+	}
+	b.dropSaid = true
+	return true
+}
+
+func (s *Store) noteDropped(n int, say bool) {
+	if n == 0 {
+		return
+	}
+	stats.Add("db.sample_rows_dropped", int64(n))
+	if say {
+		s.saveLog(slog.LevelError, "dropping unsaved probe readings, oldest first: saves have failed for so long that no more can wait in memory", "rows", n)
+	}
+}
+
+// What enter found.
+const (
+	gateTaken    = iota // the save may run, and must leave the gate when done
+	gateKeptAway        // a save for a reader, while such saves are to stay away
+	gateTimedOut        // the save in front ran for longer than this one waits
+)
+
+// enter takes the gate. A save made for a reader waits readerSaveWait for it
+// and no longer, and does not wait at all while such saves are to stay away.
+func (b *sampleBuf) enter(ctx context.Context, brief bool) int {
+	if brief {
+		b.mu.Lock()
+		quiet := b.now().Before(b.quietUntil)
+		if quiet {
+			b.missed = true
+		}
+		b.mu.Unlock()
+		if quiet {
+			return gateKeptAway
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, readerSaveWait)
+		defer cancel()
+	}
+	select {
+	case b.gate <- struct{}{}:
+		return gateTaken
+	case <-ctx.Done():
+		return gateTimedOut
+	}
+}
+
+func (b *sampleBuf) leave() { <-b.gate }
+
+// readerGaveUp books a save made for a reader that left the rows waiting.
+// Called with mu held.
+func (b *sampleBuf) readerGaveUp() {
+	b.quietUntil = b.now().Add(readerSaveQuiet)
+	b.missed = true
+}
+
+// SaveBuffered writes the waiting rows, in one transaction. It is safe on a
+// nil store, and costs one atomic read when nothing waits.
+//
+// A save runs under its own context and never the caller's. The buffer is
+// shared, and one client that hangs up must not cancel a save that others
+// wait for.
+//
+// A save made for a reader (SaveRead, SaveRequest) that cannot start within
+// readerSaveWait leaves the rows waiting and returns an error its caller
+// ignores. The read then serves what is saved. Every other save waits for the
+// writer as any write does.
+//
+// It must never be called with a transaction or a cursor of the caller's
+// open. The in-memory pool has one connection, and a save would wait for the
+// one its caller holds.
+func (s *Store) SaveBuffered(reason SaveReason) error {
+	if s == nil {
+		return nil
+	}
+	b := &s.held
+	if b.waiting.Load() == 0 {
+		return nil
+	}
+	brief := reason.forReader()
+	every := s.saveEvery() // before mu, as in holdRound
+	budget := saveTimeout
+	if reason == SaveStop {
+		budget = FinalSaveBudget
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	switch b.enter(ctx, brief) {
+	case gateKeptAway:
+		return errSaveWaiting
+	case gateTimedOut:
+		b.mu.Lock()
+		if brief {
+			b.readerGaveUp()
+		} else if !b.closed && b.rows > 0 && b.due.IsZero() {
+			// The save in front ran for longer than a save may. The rows it
+			// took are its own to settle. The ones here are tried again.
+			b.arm(s, b.now().Add(saveRetryEvery), true)
+		}
+		b.mu.Unlock()
+		if brief {
+			stats.Inc("db.sample_save_deferred")
+			return errSaveWaiting
+		}
+		return fmt.Errorf("save probe readings: the save in front did not finish: %w", ctx.Err())
+	}
+	defer b.leave()
+
+	b.mu.Lock()
+	if b.rows == 0 {
+		b.mu.Unlock()
+		return nil // the save in front took them
+	}
+	if brief && b.now().Before(b.quietUntil) {
+		// The save in front failed while this one waited for it.
+		b.missed = true
+		b.mu.Unlock()
+		return errSaveWaiting
+	}
+	rounds, dns, n := b.rounds, b.dns, b.rows
+	b.rounds, b.dns, b.rows = nil, nil, 0
+	write := b.write
+	b.mu.Unlock()
+
+	// s.db is read here, at the time of the save, and never kept: a test
+	// swaps the handle (countingStore).
+	err := s.runSave(ctx, write, rounds, dns, brief)
+
+	b.mu.Lock()
+	var dropped int
+	var recovered, missed, first, say bool
+	closed := b.closed
+	// The close did not wait for this save any longer and booked its rows as
+	// lost. They are counted as waiting no more, and putBack leaves them out.
+	writtenOff := b.writtenOff
+	switch {
+	case err == nil:
+		if !writtenOff {
+			stats.Set("db.sample_rows_waiting", b.waiting.Add(-int64(n)))
+		}
+		b.quietUntil = time.Time{}
+		recovered, b.failing = b.failing, false
+		missed, b.missed = b.missed, false
+		b.dropSaid = false
+		b.disarm()
+		if b.rows > 0 && !b.closed {
+			b.arm(s, b.oldest().Add(every), true)
+		}
+	case brief && (IsBusy(err) || errors.Is(err, errNoConnection)):
+		// The writer is taken, or every connection is. Nothing has failed.
+		// The rows keep the deadline they had, and the save that meets it
+		// waits for the writer as long as any write.
+		dropped = b.putBack(rounds, dns, n)
+		say = b.sayDrop(dropped)
+		b.readerGaveUp()
+		if !b.closed && b.due.IsZero() {
+			b.arm(s, b.oldest().Add(every), false)
+		}
+		err = errSaveWaiting
+	default:
+		dropped = b.putBack(rounds, dns, n)
+		say = b.sayDrop(dropped)
+		b.quietUntil = b.now().Add(saveRetryEvery)
+		first, b.failing = !b.failing, true
+		b.missed = b.missed || brief
+		if !b.closed {
+			b.arm(s, b.quietUntil, true)
+		}
+	}
+	b.mu.Unlock()
+
+	// Counters and log lines come last, with no lock held.
+	switch {
+	case err == nil:
+		stats.Inc("db.sample_saves." + string(reason))
+		if writtenOff {
+			// Closing the handle does not stop a transaction that is
+			// running. The log has said these rows are lost, and they are
+			// counted as dropped. The count stays, the log is put right.
+			s.saveLog(slog.LevelInfo, "the probe readings given up at shutdown were saved after all", "rows", n)
+		}
+		if recovered {
+			s.saveLog(slog.LevelInfo, "saved the probe readings that had waited through failed saves", "rows", n)
+		}
+		// A reader can only have missed rows while saves failed or while
+		// the writer was taken. Whatever it memoized then is dropped now
+		// that the rows are in.
+		if recovered || missed {
+			s.invalidateReadCaches()
+		}
+	case err == errSaveWaiting:
+		stats.Inc("db.sample_save_deferred")
+	default:
+		stats.Inc("db.sample_save_failed")
+		// Close says what was lost in its own words (finalSave).
+		if first && !closed {
+			s.saveLog(slog.LevelError, "could not save probe readings; they stay in memory and the save is retried", "rows", n, "err", err)
+		}
+	}
+	s.noteDropped(dropped, say)
+	return err
+}
+
+// errNoConnection is a save made for a reader finding every pooled
+// connection taken for longer than it waits.
+var errNoConnection = errors.New("no free database connection")
+
+// runSave runs one save's transaction. A panic in it comes back as an error,
+// so the rows return to the buffer like those of any failed save.
+func (s *Store) runSave(ctx context.Context, write func(context.Context, txBeginner, []heldRound, []heldDNS, bool) error,
+	rounds []heldRound, dns []heldDNS, brief bool) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("save probe readings: panic: %v", r)
+		}
+	}()
+	if !brief {
+		return write(ctx, s.db, rounds, dns, false)
+	}
+	// A save made for a reader runs on a connection of its own, taken out of
+	// the pool for the one transaction, because the wait for the writer
+	// belongs to the connection. A context cannot shorten it (see
+	// FinalSaveBudget).
+	wait, cancel := context.WithTimeout(ctx, readerSaveWait)
+	conn, err := s.db.Conn(wait)
+	cancel()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return errNoConnection
+		}
+		return err
+	}
+	defer conn.Close()
+	restore, err := lowerBusyTimeout(ctx, conn, readerSaveWait)
+	if err != nil {
+		return err
+	}
+	defer restore()
+	return write(ctx, conn, rounds, dns, true)
+}
+
+// writeHeld writes rounds and DNS readings in one transaction, in the order
+// they were handed over. It only writes. A transaction that reads first and
+// writes after fails with SQLITE_BUSY_SNAPSHOT as soon as another connection
+// commits in between, and busy_timeout does not cover that (see
+// InsertSpeedTS).
+//
+// The two statements and the way a row's values are bound are InsertSamples'
+// and InsertDNS's, and so is what counts as a database error: a transaction
+// that would not open or prepare does not, a row or a commit that failed
+// does. TestBatchedRowsMatchDirectRows holds the two paths together.
+//
+// brief is a save made for a reader. The writer being taken is how such a
+// save is meant to end when a long write is running, so it is not counted as
+// a database error.
+func writeHeld(ctx context.Context, q txBeginner, rounds []heldRound, dns []heldDNS, brief bool) error {
+	record := func(err error) {
+		if !brief || !IsBusy(err) {
+			recordDBErr(err)
+		}
+	}
+	tx, err := q.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// On every way out, a panic's too. A transaction left open keeps its
+	// connection, and a save made for a reader could not hand its own back.
+	// After the commit this does nothing.
+	defer tx.Rollback()
+	if len(rounds) > 0 {
+		stmt, err := tx.PrepareContext(ctx,
+			`INSERT INTO samples (ts, target, latency_ms, success, family) VALUES (?, ?, ?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, r := range rounds {
+			for _, sm := range r.rows {
+				var lat any
+				if sm.Success {
+					lat = sm.LatencyMS
+				}
+				var fam any
+				if sm.Family != "" {
+					fam = sm.Family
+				}
+				if _, err := stmt.ExecContext(ctx, sm.TS.Unix(), sm.Target, lat, util.B2I(sm.Success), fam); err != nil {
+					record(err)
+					return err
+				}
+			}
+		}
+	}
+	for _, d := range dns {
+		var lat any
+		if d.ok {
+			lat = d.ms
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO dns (ts, latency_ms, success) VALUES (?, ?, ?)`,
+			d.ts.Unix(), lat, util.B2I(d.ok)); err != nil {
+			record(err)
+			return err
+		}
+	}
+	err = tx.Commit()
+	record(err)
+	return err
+}
+
+// finalSave is Close's save. Nothing is held after it: what could not be
+// written is dropped and said to be lost, because nothing will try again.
+//
+// That goes for the rows inside a save that is still running when the wait
+// for it is over. The close does not wait longer: Stop gives a shutdown two
+// saves of FinalSaveBudget each (stopWait in main.go) and then lets the
+// process go. Left alone, those rows were lost without a line in the log or
+// a count, and stayed counted as waiting.
+func (s *Store) finalSave() {
+	b := &s.held
+	b.mu.Lock()
+	b.closed = true
+	b.disarm()
+	b.mu.Unlock()
+	err := s.SaveBuffered(SaveStop)
+	b.mu.Lock()
+	lost := b.dropOldest(0)
+	if n := b.waiting.Load(); n > 0 {
+		// The buffer is empty, so what still counts as waiting is inside the
+		// save in front.
+		b.writtenOff = true
+		lost += int(n)
+		b.waiting.Store(0)
+		stats.Set("db.sample_rows_waiting", 0)
+	}
+	b.mu.Unlock()
+	if lost > 0 {
+		stats.Add("db.sample_rows_dropped", int64(lost))
+		s.saveLog(slog.LevelError, "probe readings could not be saved at shutdown and are lost", "rows", lost, "err", err)
+	}
 }
 
 // InsertPause records a monitoring-pause span [start, start+durationS): wall time
@@ -2126,6 +2917,9 @@ func (s *Store) InsertPause(ctx context.Context, start time.Time, durationS int6
 	if !PauseSpanSane(start.Unix(), durationS) {
 		return false, nil
 	}
+	// The rounds before the pause are stored before it. If they cannot be,
+	// the pause is written all the same: it is the uptime denominator.
+	s.SaveBuffered(SaveOrder)
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO pauses (ts, duration_s) VALUES (?, ?)`, start.Unix(), durationS)
 	recordDBErr(err)
@@ -2166,6 +2960,7 @@ func (s *Store) InsertSpeedSpan(ctx context.Context, start time.Time, durationS 
 	if !speedSpanSane(start.Unix(), durationS, time.Now().Unix()) {
 		return false, nil
 	}
+	s.SaveBuffered(SaveOrder) // the rounds taken before the test ended come first
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO speed_spans (ts, duration_s) VALUES (?, ?)`, start.Unix(), durationS)
 	recordDBErr(err)
@@ -2226,6 +3021,7 @@ func (s *Store) SpeedSpans(ctx context.Context, since, until time.Time, mergeS i
 // would re-book the interval the pause span already covers - double-counting it out
 // of the observed denominator.
 func (s *Store) LastObservedTS(ctx context.Context) (int64, bool, error) {
+	s.SaveBuffered(SaveRead)
 	now := time.Now().Unix()
 	var v sql.NullInt64
 	// The events arm counts only the two types this build reads. The answer is
@@ -2281,6 +3077,11 @@ func (s *Store) InsertEvent(ctx context.Context, ts time.Time, typ string, durat
 			dur = durationS
 		}
 	}
+	// The rounds that confirmed the change are stored before the event is, so
+	// an outage record is never on disk ahead of the readings it rests on.
+	// This is also the save a transition makes: every one of them writes an
+	// event. If the rounds cannot be saved the event is written all the same.
+	s.SaveBuffered(SaveOrder)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO events (ts, type, duration_s, detail) VALUES (?, ?, ?, ?)`,
 		ts.Unix(), typ, dur, detail)
@@ -2307,6 +3108,7 @@ const firstSeenKey = "first_seen_ts"
 // outages on the heatmap. Timestamps outside [plausibleEpoch, now] (a wrong
 // boot clock) are ignored and never persisted, so a bad anchor self-heals.
 func (s *Store) monitoringSince(ctx context.Context, nowU int64) (int64, error) {
+	s.SaveBuffered(SaveRead)
 	anchor := nowU
 	var first sql.NullInt64
 	// Only events this build can read anchor the window FROM THE TABLE. This is
@@ -2388,6 +3190,7 @@ func (s *Store) monitoringSince(ctx context.Context, nowU int64) (int64, error) 
 // nothing else would answer "established" and skip the very flows that exist
 // for a fresh install.
 func (s *Store) HasHistory(ctx context.Context) (bool, error) {
+	s.SaveBuffered(SaveRead)
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM samples LIMIT 1)
 		OR EXISTS(SELECT 1 FROM events WHERE type IN ('down','up') LIMIT 1)
@@ -2433,6 +3236,10 @@ const recFrontierSlack = 300
 // UptimeSince calls per status refresh, and without the memo a months-old
 // dangling 'down' would re-aggregate every newer sample on each one.
 func (s *Store) firstQuorumRecovery(ctx context.Context, after, before int64) (int64, bool, error) {
+	// Before the memo is read, not before the scan: a save can drop the memo,
+	// and one that did so between the read of the generation below and the
+	// publish would make this scan's answer look stale for nothing.
+	s.SaveBuffered(SaveRead)
 	s.recMu.Lock()
 	memo := s.recCache[after]
 	gen := s.recGen
@@ -2502,6 +3309,9 @@ func (s *Store) firstQuorumRecovery(ctx context.Context, after, before int64) (i
 // false when the table is empty. Used to bound a dangling outage at the last
 // time monitoring actually observed the link (a pause writes no samples).
 func (s *Store) newestSampleAt(ctx context.Context, nowU int64) (int64, bool, error) {
+	// An open outage ends at the newest sample. Read without the waiting
+	// rounds it would be booked short.
+	s.SaveBuffered(SaveRead)
 	var newest sql.NullInt64
 	if err := s.db.QueryRowContext(ctx, `SELECT MAX(ts) FROM samples`).Scan(&newest); err != nil {
 		return 0, false, err
@@ -3345,6 +4155,7 @@ type TargetLatency struct {
 // ts DESC and show a not-yet-real reading until the clock caught up. The small
 // skew tolerance keeps a slightly-fast importer's just-now rows visible.
 func (s *Store) LatestPerTarget(ctx context.Context, grace time.Duration) ([]TargetLatency, error) {
+	s.SaveBuffered(SaveRead)
 	now := time.Now().Unix()
 	cut := `0`
 	args := []any{}
@@ -4091,7 +4902,9 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 	// same commit, as they did when one statement read both tables. Two plain
 	// pool queries could each see a different one. Everything below runs on the
 	// transaction, never on s.db: the in-memory pool has one connection and this
-	// holds it.
+	// holds it. The waiting rounds are saved before it opens, not by a cache
+	// hit in Series, which reads nothing.
+	s.SaveBuffered(SaveRead)
 	tx, err := s.BeginReadSnapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -4548,6 +5361,9 @@ func (s *Store) InsertSpeedTS(ctx context.Context, sp SpeedSample) (int64, error
 	// The free-second expression: the requested second if nothing occupies it,
 	// else the smallest successor of an occupied second >= the request whose
 	// successor is free (the first gap after the contiguous occupied stretch).
+	//
+	// The rounds taken while the test ran are stored before its result.
+	s.SaveBuffered(SaveOrder)
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO speed (ts, down_mbps, up_mbps, ping_ms, server, server_id,
 			public_ipv4, public_ipv6, isp, isp_location, dns_ip, dns_provider, dns_location,
@@ -4634,6 +5450,7 @@ func (s *Store) InsertSpeedServers(ctx context.Context, rows []SpeedServerRow) e
 	if len(rows) == 0 {
 		return nil
 	}
+	s.SaveBuffered(SaveOrder) // before the transaction opens, never inside it
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		recordDBErr(err)
@@ -5043,6 +5860,7 @@ func (s *Store) ResolvedOutagesSince(ctx context.Context, since int64) (count, d
 
 // TableCounts reports the row count of each data table.
 func (s *Store) TableCounts(ctx context.Context) (map[string]int64, error) {
+	s.SaveBuffered(SaveRead)
 	out := map[string]int64{}
 	// Every table Clear/import/prune can touch, so a test asserting "this dataset
 	// is empty now" cannot pass by looking at a table the operation never had.
@@ -6742,6 +7560,10 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// deleted the very rows it would have quarantined. A no-op fast path (two
 	// atomic loads) when nothing is armed.
 	s.maybeRepairFuturePauses()
+	// A cleanup is a writer, and it dates recoveries from the samples. The
+	// waiting rounds go in first. If they cannot, the cleanup goes on: what
+	// it removes is old, and what waits is new.
+	s.SaveBuffered(SaveOrder)
 	cuts := []struct {
 		table  string
 		before time.Time
@@ -7098,24 +7920,11 @@ func (s *Store) trimWAL(ctx context.Context) (walTrim, error) {
 	case copied < logFrames:
 		return walTrimNotTried, nil // a reader still needs part of the log
 	}
-	var prev int64
-	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&prev); err != nil {
+	restore, err := lowerBusyTimeout(ctx, conn, walTrimWait)
+	if err != nil {
 		return fail(err)
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, walTrimWait.Milliseconds())); err != nil {
-		return fail(err)
-	}
-	// The connection goes back to the pool, so it must leave with the timeout
-	// it came with: a probe write on a connection left at walTrimWait would
-	// give up twenty times sooner than it should. The restore does not run
-	// under the caller's context, which may be over by then. A connection
-	// that cannot be restored is dropped instead, and the pool opens a new
-	// one with the DSN's pragmas.
-	defer func() {
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf(`PRAGMA busy_timeout = %d`, prev)); err != nil {
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
-	}()
+	defer restore()
 	if err := conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &copied); err != nil {
 		return fail(err)
 	}
@@ -7123,6 +7932,31 @@ func (s *Store) trimWAL(ctx context.Context) (walTrim, error) {
 		return walTrimGaveUp, nil
 	}
 	return walTrimDone, nil
+}
+
+// lowerBusyTimeout makes statements on conn wait d for the writer, in place
+// of the timeout the connection came with, and returns the function that puts
+// that one back.
+//
+// The connection goes back to the pool, so it must leave with the timeout
+// it came with: a probe write on a connection left at a quarter second would
+// give up twenty times sooner than it should. The restore does not run
+// under the caller's context, which may be over by then. A connection
+// that cannot be restored is dropped instead, and the pool opens a new
+// one with the DSN's pragmas.
+func lowerBusyTimeout(ctx context.Context, conn *sql.Conn, d time.Duration) (restore func(), err error) {
+	var prev int64
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&prev); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, d.Milliseconds())); err != nil {
+		return nil, err
+	}
+	return func() {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf(`PRAGMA busy_timeout = %d`, prev)); err != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}, nil
 }
 
 // ReusableBytes is the space inside the database file that holds no data:
@@ -7223,6 +8057,14 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 		tables = []string{"events", "pauses", "pauses_quarantine"}
 	default:
 		return 0, fmt.Errorf("unknown data kind %q", kind)
+	}
+	// The readings still waiting belong to what is being cleared. Saved first
+	// they are deleted and counted with the rest. Left waiting they would come
+	// back after the clear. So a clear that cannot save them deletes nothing.
+	if kind == "latency" {
+		if err := s.SaveBuffered(SaveOrder); err != nil {
+			return 0, err
+		}
 	}
 	// One transaction so a multi-table clear ("latency" -> samples + dns) is
 	// all-or-nothing: a cancellation or a failure on the second table must not
@@ -7580,7 +8422,11 @@ func mergeImportedIperfPasswords(incoming, existing string) string {
 // exports at O(1) memory instead of buffering every row. fn is called per row;
 // returning an error stops the scan and propagates it. Denied settings rows (the
 // secrets/state denylist) are skipped, same as ExportTable.
+//
+// The waiting probe readings are saved first. If they cannot be, the export
+// carries what is saved.
 func (s *Store) ExportTableRows(ctx context.Context, table string, fn func(map[string]any) error) error {
+	s.SaveBuffered(SaveRead)
 	return exportRows(ctx, s.db, table, fn)
 }
 
@@ -7590,7 +8436,13 @@ func (s *Store) ExportTableRows(ctx context.Context, table string, fn func(map[s
 // pick up rows newer than the export started (audit: export is not one snapshot).
 // The caller MUST Rollback it when done; it only prevents WAL CHECKPOINT past its
 // mark (a bounded WAL growth for the export's duration), never live writes.
+//
+// The waiting probe readings are saved before the snapshot opens, because
+// nothing read inside it can save them any more. If they cannot be saved the
+// snapshot opens on what is: a disk too full to take them must not stand in
+// the way of the export that rescues the rest.
 func (s *Store) BeginReadSnapshot(ctx context.Context) (*sql.Tx, error) {
+	s.SaveBuffered(SaveRead)
 	return s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 }
 
@@ -7912,6 +8764,12 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 			}
 		}
 	}
+	// An imported row is stored only where no row with its key is. A waiting
+	// reading with that key is not stored yet and would be stored twice, so
+	// what waits goes in first, here and before every later chunk. A restore
+	// that stops part way is what this function works hardest to avoid, so it
+	// goes on when the save fails.
+	s.SaveBuffered(SaveOrder)
 	// An import can replace the iperf3 server list, and exports no longer carry passwords
 	// (see redactIperfPasswords), so we re-attach the ones this host already has. Read them
 	// HERE, before the write transaction opens: a read on s.db while the tx holds the single
@@ -8234,6 +9092,9 @@ func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[s
 			if importChunkHook != nil {
 				importChunkHook()
 			}
+			// Between two chunks no transaction is open, and rounds have
+			// arrived while the last one ran.
+			s.SaveBuffered(SaveOrder)
 			if tx, err = s.db.BeginTx(ctx, nil); err != nil {
 				return committed, err
 			}
