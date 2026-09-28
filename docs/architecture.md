@@ -208,3 +208,7 @@ flowchart TB
   constant probe-write load cheap, a small connection pool lets dashboard reads
   proceed without blocking the writer, and the expensive uptime aggregation is
   cached briefly so the 3-second status poll stays light.
+- **Charts read in time order.** A latency chart reads its window's samples
+  through the time index and adds them up into buckets in Go, rather than asking
+  SQLite to group them. The rows arrive already in order, so a wide chart needs
+  no sort and writes no temp files.

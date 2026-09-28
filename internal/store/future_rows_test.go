@@ -379,11 +379,11 @@ func TestSpeedAvgBytesFutureRowEvictsNoRun(t *testing.T) {
 	}
 }
 
-// seriesQuery bounds the dns aggregate separately from the samples one, and that
+// seriesQuery bounds the dns scan separately from the samples one, and that
 // half is only observable in a bucket wide enough to hold BOTH a present ping row
-// and a future dns row. The dns line is LEFT JOINed onto the ping buckets, so at
-// chart resolutions the future dns row sits in a bucket with no ping row (the
-// samples bound removed its sample) and is dropped by the join - the fixture above
+// and a future dns row. A dns reading only reaches a bucket that has a ping row,
+// so at chart resolutions the future dns row sits in a bucket with no ping row
+// (the samples bound removed its sample) and is dropped - the fixture above
 // therefore says nothing about it. Widen the bucket and the same row is averaged
 // into the PRESENT bucket's value instead: the point's timestamp is right and its
 // DNS reading is a number nothing has measured.

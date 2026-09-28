@@ -111,8 +111,8 @@ func perfEnvFloat(name string, def float64) float64 {
 
 // perfTargets is the shipped default target set (config.DefaultTargets), by
 // address family. A dual-stack box writes twice the sample rows per round and
-// the aggregate groups by family, so the two stacks are different scans rather
-// than one scaled by two.
+// the chart's scan tallies each family on its own, so the two stacks are
+// different scans rather than one scaled by two.
 func perfTargets(stack string) []store.Sample {
 	v4 := []store.Sample{
 		{Target: "cloudflare", Family: "ipv4"},

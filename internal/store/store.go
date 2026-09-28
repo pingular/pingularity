@@ -14,6 +14,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -3430,7 +3431,7 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 	// Floor the start to its bucket boundary and run the aggregate from THERE, so a
 	// cache miss computes exactly the window the key names. The key already floors
 	// the start (below), so two exact starts in the same bucket share one entry -
-	// but the SQL aggregate keyed off the caller's exact start would build a
+	// but an aggregate keyed off the caller's exact start would build a
 	// different leading (partial) bucket for each, serving whichever raced in first.
 	// Aligning the query to the same boundary makes cached and fresh agree; buckets
 	// are ts/bucket-aligned anyway, so this just completes the leading bucket.
@@ -3569,7 +3570,426 @@ func (s *Store) Series(ctx context.Context, since, until time.Time, bucketSec in
 	return pts, nil
 }
 
+// seriesScanHook runs at four points of seriesQuery, with the number of rows
+// read so far: "samples" once the samples statement is open and before its
+// first row is read, "dns" between the two statements, "dnsrows" once the dns
+// statement is open and before its first row is read, and "end" on every way
+// out of a scan that got its read snapshot. A zero width and a snapshot that
+// would not open return before that, with nothing read. Test seam only (nil in
+// production), like importChunkHook: a write or a cancellation landing between
+// the two scans or inside one of them is the interesting case, and nothing
+// else can put one there.
+var seriesScanHook func(stage string, rows int64)
+
+// seriesFamCode is a sample's family the way the fold wants it: 0 for ipv4, 1
+// for ipv6, and the stored value itself for anything else (an import can carry
+// any text). The driver hands a small integer over without allocating; a text
+// value per row costs two allocations.
+const seriesFamCode = `CASE ` + famExpr + ` WHEN 'ipv4' THEN 0 WHEN 'ipv6' THEN 1 ELSE ` + famExpr + ` END`
+
+// seriesSamplesSQL reads one row per sample in ts order: the timestamp, the
+// latency if the row counts toward the lowest line, whether it succeeded, and
+// its family. INDEXED BY is a hard constraint, as in LatestPerTarget: without
+// the index SQLite would sort the window to satisfy ORDER BY, which is the
+// cost this query exists to avoid, so it fails at plan time instead.
+func seriesSamplesSQL(latFilter string) string {
+	return `
+		SELECT ts,
+		       CASE WHEN success = 1` + latFilter + ` THEN latency_ms END,
+		       CASE WHEN success = 1 THEN 1 ELSE 0 END,
+		       ` + seriesFamCode + `
+		FROM samples INDEXED BY idx_samples_ts
+		WHERE ts >= ? AND ts < ?
+		ORDER BY ts`
+}
+
+// seriesDNSSQL reads the successful DNS readings in ts order. The CAST is what
+// AVG did to a value before adding it, so text left in the column by an old
+// import still counts the way it did.
+const seriesDNSSQL = `
+		SELECT ts, CASE WHEN success = 1 THEN CAST(latency_ms AS REAL) END
+		FROM dns INDEXED BY idx_dns_ts
+		WHERE ts >= ? AND ts < ?
+		ORDER BY ts`
+
+// seriesInt takes an INTEGER cell. Anything else is an error. For a sample's ts
+// that is a fraction left behind by an import of an older build, and it fails
+// the read as it did when the bucket made from it went through database/sql.
+// (Not in every last case: see the known difference at seriesSQLOracle.)
+type seriesInt int64
+
+func (c *seriesInt) Scan(src any) error {
+	v, ok := src.(int64)
+	if !ok {
+		return fmt.Errorf("series: %T where an integer belongs", src)
+	}
+	*c = seriesInt(v)
+	return nil
+}
+
+// What a latency cell held. The order is SQLite's: a number sorts below text,
+// and text below a blob.
+const (
+	seriesNull = iota
+	seriesNumber
+	seriesText
+	seriesBlob
+)
+
+// seriesCell takes a latency cell as stored. The column should hold a number or
+// NULL; text and blobs from old imports can still be at rest, and MIN ranked
+// them rather than failing, so they are kept here with their kind.
+type seriesCell struct {
+	kind uint8
+	num  float64
+	raw  []byte // text or blob bytes, reused from row to row
+}
+
+func (c *seriesCell) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		c.kind = seriesNull
+	case float64:
+		c.kind, c.num = seriesNumber, v
+	case int64:
+		c.kind, c.num = seriesNumber, float64(v)
+	case string:
+		c.kind, c.raw = seriesText, append(c.raw[:0], v...)
+	case []byte:
+		c.kind, c.raw = seriesBlob, append(c.raw[:0], v...)
+	default:
+		return fmt.Errorf("series: %T in a latency cell", src)
+	}
+	return nil
+}
+
+// seriesFamCell takes seriesFamCode: 0 or 1, or another family's own value.
+type seriesFamCell struct {
+	code int // 0 ipv4, 1 ipv6, 2 anything else
+	// The other value was stored as a blob. That is a different family from the
+	// same bytes stored as text, as it was to GROUP BY.
+	blob bool
+	raw  []byte
+}
+
+func (c *seriesFamCell) Scan(src any) error {
+	switch v := src.(type) {
+	case int64:
+		if v != 0 && v != 1 {
+			return fmt.Errorf("series: family code %d", v)
+		}
+		c.code = int(v)
+	case string:
+		c.code, c.blob, c.raw = 2, false, append(c.raw[:0], v...)
+	case []byte:
+		c.code, c.blob, c.raw = 2, true, append(c.raw[:0], v...)
+	default:
+		return fmt.Errorf("series: %T in a family cell", src)
+	}
+	return nil
+}
+
+// seriesDNSTime takes a dns row's ts: a whole number, or a fraction left behind
+// by an import of an older build. The fraction is kept as it is, because the
+// row's bucket is worked out differently (fracBucket) and no dns row ever
+// failed the read.
+type seriesDNSTime struct {
+	whole int64
+	frac  float64
+	odd   bool // the ts is in frac
+}
+
+func (c *seriesDNSTime) Scan(src any) error {
+	switch v := src.(type) {
+	case int64:
+		c.whole, c.odd = v, false
+	case float64:
+		c.frac, c.odd = v, true
+	default:
+		return fmt.Errorf("series: %T where a timestamp belongs", src)
+	}
+	return nil
+}
+
+// seriesFamCount is one family's tally inside one bucket.
+type seriesFamCount struct{ n, ok int64 }
+
+// online is the quorum rule: a strict majority of the family's rows succeeded.
+// It is the rule the prober judges a round by (aggregate, internal/prober).
+func (f seriesFamCount) online() bool { return f.ok*2 > f.n }
+
+// seriesMean adds numbers up the way SQLite's AVG does (Kahan-Babuska-Neumaier
+// summation), in the same order, so the mean comes out the same to the last
+// bit. A plain sum does not. There are only additions here, so the compiler has
+// nothing to fuse.
+type seriesMean struct {
+	sum, comp float64
+	n         int64
+}
+
+func (m *seriesMean) add(r float64) {
+	t := m.sum + r
+	if math.Abs(m.sum) > math.Abs(r) {
+		m.comp += (m.sum - t) + r
+	} else {
+		m.comp += (r - t) + m.sum
+	}
+	m.sum = t
+	m.n++
+}
+
+// value is the mean, or false when there is none: nothing was added, or the
+// result is not a number (Inf plus -Inf), which SQLite returns as NULL.
+func (m *seriesMean) value() (float64, bool) {
+	if m.n == 0 {
+		return 0, false
+	}
+	r := m.sum
+	if !math.IsInf(m.comp, 0) && !math.IsNaN(m.comp) {
+		r += m.comp
+	}
+	r /= float64(m.n)
+	return r, !math.IsNaN(r)
+}
+
+// seriesAgg folds ts-ordered rows into SeriesPoints. One per scan; nothing in
+// it is shared, and the points it returns are never reused (Series caches them).
+type seriesAgg struct {
+	width int64
+	out   []SeriesPoint
+	rows  int64 // rows read so far, samples and dns; for the hook
+	hook  func(stage string, rows int64)
+
+	open bool // a bucket is being filled
+	bts  int64
+	fam  [2]seriesFamCount // ipv4, ipv6
+	// Families other than the two, keyed by their bytes: [0] stored as text, [1]
+	// as a blob. A map, not a list: an import may carry any number of them.
+	other [2]map[string]*seriesFamCount
+
+	hasLat bool
+	lat    float64
+	// The smallest text or blob latency of the bucket. It only matters when the
+	// bucket has no number at all, because a number always ranks lower.
+	oddKind uint8
+	odd     []byte
+}
+
+// bucket is the start of ts's bucket, by the same integer arithmetic SQLite
+// used ((ts / width) * width, truncating toward zero), so timestamps below
+// zero land where they did.
+func (a *seriesAgg) bucket(ts int64) int64 { return (ts / a.width) * a.width }
+
+// fracBucket is the bucket of a dns row whose ts is a fraction, and false when
+// the row has none. SQLite ran the same (ts / width) * width on it in floating
+// point, where nothing truncates: the bucket came out as about the ts itself, a
+// value no sample's bucket has, and the row went nowhere. It was counted only
+// where the arithmetic gave the start of a bucket exactly, which in practice
+// takes a ts so close to zero that dividing it leaves nothing. Both are kept
+// as they were. A division and a multiplication give the compiler nothing to
+// fuse, so this rounds as SQLite did.
+func (a *seriesAgg) fracBucket(ts float64) (int64, bool) {
+	w := float64(a.width)
+	r := (ts / w) * w
+	if r != math.Trunc(r) || r < -1<<63 || r >= 1<<63 {
+		return 0, false
+	}
+	b := int64(r)
+	return b, b%a.width == 0
+}
+
+// dnsBucket is the bucket a dns row belongs to, and false when it has none.
+func (a *seriesAgg) dnsBucket(ts *seriesDNSTime) (int64, bool) {
+	if ts.odd {
+		return a.fracBucket(ts.frac)
+	}
+	return a.bucket(ts.whole), true
+}
+
+func (a *seriesAgg) at(stage string) {
+	if a.hook != nil {
+		a.hook(stage, a.rows)
+	}
+}
+
+func (a *seriesAgg) readSamples(ctx context.Context, q rowQuerier, query string, args []any) error {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	a.at("samples")
+	var (
+		ts, ok seriesInt
+		lat    seriesCell
+		fam    seriesFamCell
+	)
+	dest := []any{&ts, &lat, &ok, &fam}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return err
+		}
+		a.rows++
+		if err := a.addSample(int64(ts), &lat, int64(ok), &fam); err != nil {
+			return err
+		}
+	}
+	// A cancelled request surfaces here: database/sql closes the rows when the
+	// context ends, Next returns false, and Err is the context's error.
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return a.closeBucket()
+}
+
+func (a *seriesAgg) addSample(ts int64, lat *seriesCell, ok int64, fam *seriesFamCell) error {
+	if bts := a.bucket(ts); !a.open || bts != a.bts {
+		if err := a.closeBucket(); err != nil {
+			return err
+		}
+		a.open, a.bts = true, bts
+	}
+	f := &a.fam[0]
+	switch {
+	case fam.code < 2:
+		f = &a.fam[fam.code]
+	default:
+		k := 0
+		if fam.blob {
+			k = 1
+		}
+		if f = a.other[k][string(fam.raw)]; f == nil {
+			if a.other[k] == nil {
+				a.other[k] = map[string]*seriesFamCount{}
+			}
+			f = &seriesFamCount{}
+			a.other[k][string(fam.raw)] = f
+		}
+	}
+	f.n++
+	f.ok += ok
+	switch lat.kind {
+	case seriesNumber:
+		if !a.hasLat || lat.num < a.lat {
+			a.hasLat, a.lat = true, lat.num
+		}
+	case seriesText, seriesBlob:
+		if a.oddKind == seriesNull || lat.kind < a.oddKind ||
+			(lat.kind == a.oddKind && bytes.Compare(lat.raw, a.odd) < 0) {
+			a.oddKind, a.odd = lat.kind, append(a.odd[:0], lat.raw...)
+		}
+	}
+	return nil
+}
+
+// closeBucket turns the bucket being filled into a point.
+func (a *seriesAgg) closeBucket() error {
+	if !a.open {
+		return nil
+	}
+	p := SeriesPoint{TS: a.bts}
+	switch {
+	case a.hasLat:
+		v := a.lat
+		p.LatencyMS = &v
+	case a.oddKind != seriesNull:
+		// Only text or blobs succeeded here. The old query handed the smallest one
+		// to database/sql, which parsed it or failed the whole read. Same here.
+		v, err := strconv.ParseFloat(string(a.odd), 64)
+		if err != nil {
+			return fmt.Errorf("series: latency in bucket %d is not a number: %w", a.bts, err)
+		}
+		p.LatencyMS = &v
+	}
+	p.Online = a.fam[0].online() || a.fam[1].online()
+	for k := range a.other {
+		for _, f := range a.other[k] {
+			if f.online() {
+				p.Online = true
+			}
+		}
+		// Forget this bucket's families. Dropped, not cleared: clearing a map costs
+		// the size it once grew to, at every bucket after.
+		if len(a.other[k]) > 0 {
+			a.other[k] = nil
+		}
+	}
+	a.out = append(a.out, p)
+	a.open = false
+	a.fam = [2]seriesFamCount{}
+	a.hasLat, a.oddKind = false, seriesNull
+	return nil
+}
+
+// readDNS gives each point the mean of its bucket's DNS readings. A reading in
+// a bucket without samples has no point to go to and is dropped, as the LEFT
+// JOIN dropped it.
+func (a *seriesAgg) readDNS(ctx context.Context, q rowQuerier, sinceU, upperU int64) error {
+	rows, err := q.QueryContext(ctx, seriesDNSSQL, sinceU, upperU)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	a.at("dnsrows")
+	var (
+		ts   seriesDNSTime
+		lat  seriesCell
+		open bool
+		bts  int64
+		mean seriesMean
+		i    int // the first point not yet passed; both lists are in ts order
+	)
+	put := func() {
+		if !open {
+			return
+		}
+		for i < len(a.out) && a.out[i].TS < bts {
+			i++
+		}
+		if i < len(a.out) && a.out[i].TS == bts {
+			if v, ok := mean.value(); ok {
+				a.out[i].DNSms = &v
+			}
+		}
+	}
+	dest := []any{&ts, &lat}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return err
+		}
+		a.rows++
+		b, ok := a.dnsBucket(&ts)
+		if !ok {
+			continue
+		}
+		if !open || b != bts {
+			put()
+			open, bts, mean = true, b, seriesMean{}
+		}
+		if lat.kind == seriesNumber {
+			mean.add(lat.num)
+		}
+	}
+	// As in readSamples. Without this a scan that was cut short would end as
+	// a chart with part of its DNS line, or none, and be kept as one.
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	put()
+	return nil
+}
+
 // seriesQuery runs the actual Series aggregate (see Series for semantics).
+//
+// It reads the window's rows in time order and folds them into buckets here,
+// in Go. Asking SQLite for the buckets (GROUP BY bucket, family) made it sort
+// every row of the window first, although the ts index already hands them over
+// in order. That sort was over half the time of a wide scan, and from about
+// 100,000 rows up it spilled into temp files on every chart redraw. The two
+// statements below walk their ts index and nothing else, so nothing is sorted.
+//
+// The points must not change by a bit. The statement this replaced is kept as
+// seriesSQLOracle in series_stream_test.go, and the tests there compare the two.
 func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketSec int, excludeTargets []string) ([]SeriesPoint, error) {
 	// Counted here, not at the two call sites (the sub-minute bypass and the cache
 	// miss in Series above), so "a scan really ran" cannot drift from the code that
@@ -3583,12 +4003,18 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 	stats.Inc("series.query")
 	queryStart := time.Now()
 	defer func() { stats.Observe("series.query.seconds", time.Since(queryStart).Seconds()) }()
+	// The fold divides by the width. Series never passes less than 1; this is for
+	// a direct caller, which gets an error where the division would panic.
+	if bucketSec == 0 {
+		return nil, errors.New("series: bucket width is zero")
+	}
 	// excludeTargets drops targets from the latency MIN (the "lowest" line) only;
 	// online/outage detection below still counts every target, since connectivity
 	// is global truth, not a per-user display filter. Placeholders keep it
-	// injection-safe.
+	// injection-safe. The test stays in SQL: doing it here would need every row's
+	// target as a Go string.
 	latFilter := ""
-	args := []any{bucketSec, bucketSec}
+	var args []any
 	for _, t := range excludeTargets {
 		latFilter += "?,"
 		args = append(args, t)
@@ -3596,66 +4022,45 @@ func (s *Store) seriesQuery(ctx context.Context, since, until time.Time, bucketS
 	if latFilter != "" {
 		latFilter = " AND target NOT IN (" + latFilter[:len(latFilter)-1] + ")"
 	}
-	// An absolute window bounds BOTH aggregates below. Bounding only the samples
-	// one would leave the DNS line on a different window than the latency line it
-	// is drawn beside - wrong data rather than a visible break.
+	// An absolute window bounds BOTH scans below. Bounding only the samples one
+	// would leave the DNS line on a different window than the latency line it is
+	// drawn beside - wrong data rather than a visible break.
 	//
 	// An open-ended window still ends: at the present (currentHorizon), not at
 	// whatever the newest row on disk claims. Left unbounded, a sample stamped
-	// ahead of the clock draws a latency point - and, through fam_online, an
+	// ahead of the clock draws a latency point - and, through the quorum, an
 	// outage band - in a bucket the wall clock has not reached, and it stays there
 	// until it does.
 	upperTS := currentHorizon(time.Now().Unix())
 	if !until.IsZero() {
 		upperTS = until.Unix()
 	}
-	const upper = " AND ts < ?"
 	args = append(args, since.Unix(), upperTS)
-	// The DNS line rides the same buckets via a LEFT JOIN on a parallel aggregate
-	// of the dns table (mean resolve time per bucket), so the chart plots ping +
-	// DNS on one axis.
-	args = append(args, bucketSec, bucketSec, since.Unix(), upperTS)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT ping.bts, MIN(ping.lat) AS lat, MAX(ping.fam_online) AS online, d.dns
-		FROM (
-			SELECT (ts / ?) * ? AS bts,
-			       `+famExpr+` AS fam,
-			       MIN(CASE WHEN success = 1`+latFilter+` THEN latency_ms END) AS lat,
-			       CASE WHEN SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 2 > COUNT(*) THEN 1 ELSE 0 END AS fam_online
-			FROM samples
-			WHERE ts >= ?`+upper+`
-			GROUP BY bts, fam
-		) ping
-		LEFT JOIN (
-			SELECT (ts / ?) * ? AS bts, AVG(CASE WHEN success = 1 THEN latency_ms END) AS dns
-			FROM dns WHERE ts >= ?`+upper+` GROUP BY bts
-		) d ON d.bts = ping.bts
-		GROUP BY ping.bts
-		ORDER BY ping.bts`, args...)
+	// One read snapshot for both scans, so the two lines of a chart come from the
+	// same commit, as they did when one statement read both tables. Two plain
+	// pool queries could each see a different one. Everything below runs on the
+	// transaction, never on s.db: the in-memory pool has one connection and this
+	// holds it.
+	tx, err := s.BeginReadSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []SeriesPoint
-	for rows.Next() {
-		var p SeriesPoint
-		var lat, dns sql.NullFloat64
-		var online int
-		if err := rows.Scan(&p.TS, &lat, &online, &dns); err != nil {
-			return nil, err
-		}
-		if lat.Valid {
-			v := lat.Float64
-			p.LatencyMS = &v
-		}
-		if dns.Valid {
-			v := dns.Float64
-			p.DNSms = &v
-		}
-		p.Online = online == 1
-		out = append(out, p)
+	defer tx.Rollback()
+	agg := seriesAgg{width: int64(bucketSec), hook: seriesScanHook}
+	defer agg.at("end")
+	if err := agg.readSamples(ctx, tx, seriesSamplesSQL(latFilter), args); err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	// A bucket exists only where a sample does, so with none there is nothing for
+	// a DNS reading to attach to. nil, not an empty slice, as before.
+	if len(agg.out) == 0 {
+		return nil, nil
+	}
+	agg.at("dns")
+	if err := agg.readDNS(ctx, tx, since.Unix(), upperTS); err != nil {
+		return nil, err
+	}
+	return agg.out, nil
 }
 
 // SpeedSample is one completed speedtest plus the connection context it ran in.

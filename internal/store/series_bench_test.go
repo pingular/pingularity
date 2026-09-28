@@ -28,7 +28,7 @@ type benchTarget struct{ name, family string }
 
 // benchStack is one address-family shape of the same install: a dual-stack box
 // writes twice the sample rows per round of an IPv4-only one, and the aggregate
-// groups by family (famExpr, store.go:1161), so the two are genuinely different
+// tallies each family on its own (famExpr), so the two are genuinely different
 // scans rather than one scaled by two.
 type benchStack struct {
 	name    string
@@ -54,6 +54,15 @@ func seedSeriesDB(tb testing.TB, stack benchStack, span time.Duration, end time.
 		tb.Fatalf("open: %v", err)
 	}
 	tb.Cleanup(func() { st.Close() })
+	seedSeriesInto(tb, st, stack, span, end, intervalSec)
+	return st
+}
+
+// seedSeriesInto is seedSeriesDB's writing half, for a store the caller opened:
+// the comparisons against the old statement (series_stream_test.go) also run on
+// the one-connection in-memory store, over the same rows.
+func seedSeriesInto(tb testing.TB, st *Store, stack benchStack, span time.Duration, end time.Time, intervalSec int) {
+	tb.Helper()
 	tx, err := st.db.Begin()
 	if err != nil {
 		tb.Fatalf("begin: %v", err)
@@ -104,7 +113,6 @@ func seedSeriesDB(tb testing.TB, stack benchStack, span time.Duration, end time.
 		tb.Fatal("seeded no samples")
 	}
 	tb.Logf("%s: %d sample rows over %v at %ds rounds", stack.name, rows, span, intervalSec)
-	return st
 }
 
 func BenchmarkSeriesQuery(b *testing.B) {

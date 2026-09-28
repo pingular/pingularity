@@ -48,15 +48,15 @@ func TestSeriesRangeBucketsFromTheSpanNotMins(t *testing.T) {
 	}
 }
 
-// The window bounds BOTH aggregates. The DNS line rides a separate subquery
-// LEFT JOINed on the bucket, so an out-of-window DNS row only reaches the output
-// when it shares a BUCKET with in-window ping data. Buckets are epoch-aligned,
+// The window bounds BOTH scans. The DNS line comes from a scan of its own and
+// is matched to the ping buckets, so an out-of-window DNS row only reaches the
+// output when it shares a BUCKET with in-window ping data. Buckets are epoch-aligned,
 // so that happens exactly when the window end falls MID-bucket: the straddling
 // bucket holds in-window ping rows and out-of-window DNS rows at once.
 // Both earlier attempts at this test were worthless - one put the stray row ten
 // hours out, the other used a bucket-aligned end - and the suite passed with the
 // DNS bound deleted. This one is checked against that: remove ` AND ts < ?` from
-// the dns subquery and it must fail.
+// the dns statement (seriesDNSSQL) and it must fail.
 func TestSeriesRangeBoundsTheDNSAggregateToo(t *testing.T) {
 	s := newTestServer(t)
 	const bucketSec = 60
@@ -94,7 +94,7 @@ func TestSeriesRangeBoundsTheDNSAggregateToo(t *testing.T) {
 		}
 		if p.DNSms != nil && *p.DNSms > 100 {
 			t.Errorf("bucket %d carries DNS %.0f: the DNS row from past the window end leaked "+
-				"in, so the upper bound is missing from the dns aggregate", p.TS, *p.DNSms)
+				"in, so the upper bound is missing from the dns scan", p.TS, *p.DNSms)
 		}
 	}
 	if !seenStraddle {
