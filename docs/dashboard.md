@@ -332,7 +332,9 @@ and persist across restarts.
   strip under each list shows the merged coverage. Manual "Run now" always works.
 - **Data** → retention: three independent windows - **latency** samples (default
   **30** days), **speed** history (default **365** days), and **downtime**/outage
-  history (the heatmap, default **365** days); `0` = keep forever - plus
+  history (the heatmap, default **365** days); `0` = keep forever; a lowered
+  window applies at the next hourly cleanup, which works through a large
+  backlog in small steps and can take a few minutes - plus
   per-kind "delete data" buttons, each clearing everything its category exports:
   **latency** takes the DNS-resolution series with the ping samples, **speed**
   takes the server-selection reports with the runs, and **downtime** takes the

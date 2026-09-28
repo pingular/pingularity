@@ -212,3 +212,12 @@ flowchart TB
   through the time index and adds them up into buckets in Go, rather than asking
   SQLite to group them. The rows arrive already in order, so a wide chart needs
   no sort and writes no temp files.
+- **Cleanup works in small steps.** The hourly retention cleanup deletes old
+  rows a chunk at a time and leaves the database alone for a moment after each
+  full chunk, so probe writes get their turn in between. A large cleanup (after
+  lowering retention, a long power-off or a restore of old rows) takes longer
+  this way, up to a few minutes, and cannot block probe writes while it runs.
+  At the default cadence an hour of rows is less than one chunk, so the usual
+  cleanup never waits. Outages are removed whole: a chunk never ends between a
+  `down` and its `up`. A cleanup stopped by a shutdown keeps what it has
+  removed, and the next one removes the rest.

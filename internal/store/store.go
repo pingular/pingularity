@@ -6543,9 +6543,6 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	return nil
 }
 
-// Prune deletes old rows - and future-stamped ones beyond pruneFutureSlack.
-// Each table has its own cutoff so latency samples, speed history, and outage
-// events can be retained for different windows. Returns total rows removed.
 // pruneClock reads the wall clock and the store's monotonic uptime as one pair.
 // A single seam so a test can make the two disagree, which is the whole point:
 // no wall reading can be checked against itself.
@@ -6644,6 +6641,15 @@ func (s *Store) repairReading(fallback func() int64) (int64, bool) {
 	return fallback(), true
 }
 
+// Prune deletes old rows - and future-stamped ones beyond pruneFutureSlack.
+// Each table has its own cutoff so latency samples, speed history, and outage
+// events can be retained for different windows. Returns total rows removed.
+//
+// The deletes run in chunks of at most pruneChunkRows rows, with a wait of
+// pruneChunkPause after every full one, so probe writes get the writer in
+// between however big the backlog is. Every chunk commits on its own. A pass
+// that fails or is stopped part way returns the rows it did remove, and the
+// next pass removes the rest by the same rule.
 func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBefore time.Time) (int64, error) {
 	start, uptime := pruneClock(s)
 	// Refuse to prune while the wall clock is implausibly early: an RTC-less device
@@ -6697,43 +6703,58 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 		recordDBErr(err)
 		return 0, err
 	}
-	var total int64
+	sw := &pruneSweep{budget: pruneChunkRows}
+	// From the first DELETE on, rows may be gone whatever this call goes on to
+	// return: every chunk commits on its own. So a failure or a shutdown after
+	// that point drops the read caches too, the way a chunked import does. A
+	// reader in the middle of a pass can memoize an answer from a half-pruned
+	// table, and nothing else would ever drop it.
+	fail := func(err error) (int64, error) {
+		s.invalidateReadCaches()
+		return sw.total, err
+	}
+	// Two arms per table, the cutoff and the future horizon, not one statement
+	// with an OR: with the OR the planner walks the whole ts index to honour
+	// the ORDER BY, and the row limit needs that order.
 	for _, c := range cuts {
-		res, err := s.db.ExecContext(ctx, `DELETE FROM `+c.table+` WHERE ts < ? OR ts > ?`,
-			c.before.Unix(), horizon)
-		if err != nil {
-			recordDBErr(err)
-			return total, err
+		for _, arm := range [...]struct {
+			cmp   string
+			bound int64
+		}{{"<", c.before.Unix()}, {">", horizon}} {
+			if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM `+c.table+` WHERE rowid IN (
+				SELECT rowid FROM `+c.table+` WHERE ts `+arm.cmp+` ? ORDER BY ts, rowid LIMIT ?)`, arm.bound); err != nil {
+				return fail(err)
+			}
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			recordDBErr(err)
-		}
-		total += n
 	}
 	// The selection reports ride the speed retention (their run_ts IS speed.ts;
 	// no FK anywhere, so the cascade is manual). Keyed on its own column with
 	// both arms of the same cut - cutoff and future horizon - rather than a
 	// join to speed: a crash between the two DELETEs leaves only bounded
-	// orphans that the next hourly pass removes by the same rule.
-	if res, err := s.db.ExecContext(ctx, `DELETE FROM speed_servers WHERE run_ts < ? OR run_ts > ?`,
-		speedBefore.Unix(), horizon); err != nil {
-		recordDBErr(err)
-		return total, err
-	} else if n, err := res.RowsAffected(); err == nil {
-		total += n
+	// orphans that the next hourly pass removes by the same rule. A pass
+	// stopped between two chunks leaves the same bounded orphans.
+	for _, arm := range [...]struct {
+		cmp   string
+		bound int64
+	}{{"<", speedBefore.Unix()}, {">", horizon}} {
+		if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM speed_servers WHERE rowid IN (
+			SELECT rowid FROM speed_servers WHERE run_ts `+arm.cmp+` ? ORDER BY run_ts, rowid LIMIT ?)`, arm.bound); err != nil {
+			return fail(err)
+		}
 	}
 	// The speedtest times ride the LATENCY retention: the latency chart's hover
 	// note is their only reader, and it has no point to hover once the samples
 	// they cover are gone. Like a pause they have length, so a span goes only
 	// once its END is past the cutoff; one that runs into the kept window stays
 	// until it does. The future arm is the same horizon every table gets.
-	if res, err := s.db.ExecContext(ctx, `DELETE FROM speed_spans WHERE ts > ? OR (ts < ? AND ts + duration_s < ?)`,
-		horizon, samplesBefore.Unix(), samplesBefore.Unix()); err != nil {
-		recordDBErr(err)
-		return total, err
-	} else if n, err := res.RowsAffected(); err == nil {
-		total += n
+	if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM speed_spans WHERE rowid IN (
+		SELECT rowid FROM speed_spans WHERE ts < ? AND ts + duration_s < ? ORDER BY ts, rowid LIMIT ?)`,
+		samplesBefore.Unix(), samplesBefore.Unix()); err != nil {
+		return fail(err)
+	}
+	if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM speed_spans WHERE rowid IN (
+		SELECT rowid FROM speed_spans WHERE ts > ? ORDER BY ts, rowid LIMIT ?)`, horizon); err != nil {
+		return fail(err)
 	}
 	// Events (outage transitions) prune as WHOLE outages: a 'down' older than the
 	// cutoff whose paired 'up' is at/after it straddles the boundary, so keep it -
@@ -6741,20 +6762,41 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// phantom downtime the uptime math then miscounts (audit: whole-outage pruning).
 	// Everything else < cutoff (complete past outages) and any future-stamped event
 	// still goes. A dangling 'down' (no 'up' yet) is kept, like an in-progress outage.
+	//
+	// In chunks the same rule has to hold after EVERY chunk, not only after the
+	// last: a pass can be stopped between two, and the wait between two is long
+	// enough for a reader. So a chunk is not cut at a row count. It ends on a
+	// recovery: b is the ts of the Nth 'up' under the cutoff, oldest first, and
+	// the chunk takes every row the rule lets go up to and including it. A
+	// 'down' that may go has its 'up' after it and under the cutoff, so it goes
+	// no later than the chunk that takes that 'up'. Cut by rows instead, the
+	// 'down' could go alone, and the 'up' left behind reads as an outage that
+	// started at ts - duration_s: later and shorter than the real one whenever a
+	// pause sat inside it.
+	//
+	// The limit counts recoveries, so a chunk can remove about twice as many
+	// rows as it names, a 'down' for every 'up'. These are small rows, two for
+	// an outage. With fewer than N recoveries left b is the cutoff itself and
+	// the statement is the unchunked one. It reads every row under the cutoff
+	// each time, which is fine for a table this size and would not be for
+	// samples.
 	eventsCut := eventsBefore.Unix()
-	res, err := s.db.ExecContext(ctx, `
+	if err := s.pruneChunked(ctx, sw, nil, `
+		WITH b(ts) AS (SELECT COALESCE(
+			(SELECT ts FROM events WHERE type = 'up' AND ts < ?1 ORDER BY ts, rowid LIMIT 1 OFFSET ?2 - 1), ?1))
 		DELETE FROM events
-		WHERE ts > ?
-		   OR (ts < ? AND NOT (
-		         type = 'down'
-		         AND (SELECT MIN(u.ts) FROM events u WHERE u.type = 'up' AND u.ts > events.ts) >= ?))`,
-		horizon, eventsCut, eventsCut)
-	if err != nil {
-		recordDBErr(err)
-		return total, err
+		WHERE ts < ?1
+		  AND NOT (type = 'down'
+		           AND (SELECT MIN(u.ts) FROM events u WHERE u.type = 'up' AND u.ts > events.ts) >= ?1)
+		  AND ts <= (SELECT ts FROM b)`, eventsCut); err != nil {
+		return fail(err)
 	}
-	if n, e := res.RowsAffected(); e == nil {
-		total += n
+	// The future arm is cut by rows like every other table's. Nothing that
+	// reads the present looks past currentHorizon, and these rows are further
+	// out than that, so no reader can tell where a chunk of them ended.
+	if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM events WHERE rowid IN (
+		SELECT rowid FROM events WHERE ts > ? ORDER BY ts, rowid LIMIT ?)`, horizon); err != nil {
+		return fail(err)
 	}
 	// Pause spans share the outage retention (they are the uptime DENOMINATOR), and
 	// like an outage they have LENGTH - so they prune whole, on the same rule the
@@ -6784,20 +6826,27 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// quarantined for a later clock correction - so leave them and let the next
 	// prune (hourly) retry the repair first. The retention-floor half (rows whose
 	// END predates the window) is always safe to sweep.
-	var pauseDel string
-	if s.pauseRepairArmed() {
-		stats.Inc("db.prune_pauses_future_deferred")
-		pauseDel = `DELETE FROM pauses WHERE ts + duration_s < ?`
-		res, err = s.db.ExecContext(ctx, pauseDel, eventsCut)
-	} else {
-		res, err = s.db.ExecContext(ctx, `DELETE FROM pauses WHERE ts > ? OR ts + duration_s < ?`, horizon, eventsCut)
+	if err := s.pruneChunked(ctx, sw, nil, `DELETE FROM pauses WHERE rowid IN (
+		SELECT rowid FROM pauses WHERE ts + duration_s < ? ORDER BY rowid LIMIT ?)`, eventsCut); err != nil {
+		return fail(err)
 	}
-	if err != nil {
-		recordDBErr(err)
-		return total, err
+	// Asked before every chunk, not once: a restore landing between two chunks
+	// arms a new judgement, and the rows it would hold aside are the ones this
+	// arm deletes.
+	deferred := false
+	healed := func() bool {
+		if !s.pauseRepairArmed() {
+			return true
+		}
+		if !deferred {
+			deferred = true
+			stats.Inc("db.prune_pauses_future_deferred")
+		}
+		return false
 	}
-	if n, e := res.RowsAffected(); e == nil {
-		total += n
+	if err := s.pruneChunked(ctx, sw, healed, `DELETE FROM pauses WHERE rowid IN (
+		SELECT rowid FROM pauses WHERE ts > ? ORDER BY ts, rowid LIMIT ?)`, horizon); err != nil {
+		return fail(err)
 	}
 	// Pruning deleted rows (and resolveDanglingDowns may have written a synthetic
 	// 'up'), so drop the memoized quorum scans and cached chart aggregates. A
@@ -6805,8 +6854,118 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// bucketSec/4 (~88 min on the 1-year bucket).
 	s.invalidateReadCaches()
 	stats.Inc("db.prune_count")
+	// The whole pass, the waits between chunks included: a big cleanup reads
+	// as the minutes it took.
 	stats.AddF("db.prune_ms_sum", util.DurMS(time.Since(start)))
-	return total, nil
+	return sw.total, nil
+}
+
+// pruneChunkRows bounds how many rows Prune deletes between two waits. SQLite
+// has a single writer, and one DELETE over a big backlog (retention lowered, a
+// box that was off for weeks, a restore of old rows) held it for the whole
+// backlog: 2.1 s for 1.8M rows on a fast laptop, and a probe write beside it
+// waited those 2.1 s, against the 5 s it waits before its round is logged and
+// dropped. A full chunk of 20000 sample rows holds the writer for about 50 ms
+// on that laptop, a hundredth of those 5 s. The same idea as importTxRows,
+// sized for deletes. An hour of probe rounds at the default cadence is about a
+// quarter of this, so the hourly pass of a settled install never fills a chunk
+// and never waits. A variable so a test can make a chunk small enough to cut
+// through an outage.
+var pruneChunkRows int64 = 20000
+
+// pruneChunkPause is how long Prune leaves the writer alone after a full
+// chunk. Letting go of the lock is not enough: a writer that found it taken
+// sleeps before it looks again, in steps that grow to 100 ms (the busy handler
+// of the bundled SQLite, modernc.org/sqlite v1.52.0), so chunks run back to
+// back keep winning the lock from a writer that is asleep each time it comes
+// free. One and a half of the longest step means every waiting writer looks at
+// least once while the lock is free.
+var pruneChunkPause = 150 * time.Millisecond
+
+// pruneChunkHook runs after a chunk has committed and before the wait that
+// follows a full one. Test seam only (nil in production), like importChunkHook.
+// held is how long the statement's call took. That is more than the time it
+// held the writer: it includes any time the statement waited for the writer
+// itself, and the checkpoint SQLite can run once the commit is done.
+var pruneChunkHook func(q string, rows int64, held time.Duration, full bool)
+
+// pruneSweep is one Prune pass's running state.
+type pruneSweep struct {
+	total  int64 // rows removed so far, every table
+	budget int64 // rows the pass may still delete before it must wait
+}
+
+// pruneChunked runs one DELETE until it has nothing left to delete. q removes
+// at most as many rows as its LAST parameter says (the events rule counts
+// recoveries there, see Prune). Each chunk is one autocommit statement, so it
+// is atomic, it never upgrades a read snapshot, and no cursor is open when the
+// next one starts. allowed, when set, is asked before every chunk and ends the
+// sweep quietly when it says no.
+//
+// The budget is the pass's, not the statement's: a chunk gets what the tables
+// before it left, so a run of nearly full tables cannot add up to one long
+// hold with no wait in it.
+//
+// A chunk that loses the writer for the whole busy timeout ends the pass with
+// that error, like any other failure. A restore commits its batches back to
+// back, so it can happen beside one. The rows wait for the next pass.
+//
+// A cancelled context stops the pass inside a wait at once, and interrupts a
+// statement that is running. A statement still waiting for the writer is not
+// interruptible: it sits out the rest of its wait first, as it always has.
+func (s *Store) pruneChunked(ctx context.Context, sw *pruneSweep, allowed func() bool, q string, args ...any) error {
+	bound := append(args[:len(args):len(args)], int64(0))
+	for {
+		if allowed != nil && !allowed() {
+			return nil
+		}
+		bound[len(bound)-1] = sw.budget
+		began := time.Now()
+		res, err := s.db.ExecContext(ctx, q, bound...)
+		if err != nil {
+			recordDBErr(err)
+			return err
+		}
+		n, _ := res.RowsAffected() // the driver never fails this
+		sw.total += n
+		full := n >= sw.budget
+		sw.budget -= n
+		if pruneChunkHook != nil {
+			pruneChunkHook(q, n, time.Since(began), full)
+		}
+		if !full {
+			return nil
+		}
+		sw.budget = pruneChunkRows
+		if err := pruneWait(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// pruneWait leaves the writer free for pruneChunkPause, or returns at once
+// with the context's error when the daemon is shutting down.
+func pruneWait(ctx context.Context) error {
+	t := time.NewTimer(pruneChunkPause)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// IsBusy reports whether err is SQLite giving up on the writer: something else
+// held it for longer than the busy timeout. It is the test db.busy counts by,
+// so a caller that reports the case in its own words agrees with /metrics
+// about which errors those are.
+func IsBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
 }
 
 // recordDBErr feeds the db.* health counters (surfaced on /metrics), splitting
@@ -6819,7 +6978,7 @@ func recordDBErr(err error) {
 	stats.Inc("db.err")
 	msg := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(msg, "busy") || strings.Contains(msg, "locked"):
+	case IsBusy(err):
 		stats.Inc("db.busy")
 	case strings.Contains(msg, "malformed") || strings.Contains(msg, "not a database") || strings.Contains(msg, "corrupt"):
 		// Tested before the disk arm: the corruption message "database disk image

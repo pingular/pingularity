@@ -1579,7 +1579,22 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		}
 		n, err := p.store.Prune(ctx, cutoff(set.Retention()), cutoff(set.SpeedRetention()), cutoff(set.DowntimeRetention()))
 		if err != nil {
-			p.log.Error("prune", "err", err)
+			switch {
+			case ctx.Err() != nil:
+				// Stopped for shutdown. A big cleanup lasts long enough for
+				// that to land inside it, and it is a stop, not a failure:
+				// every chunk already committed stays deleted and the next
+				// pass removes the rest by the same rule.
+				p.log.Info("prune stopped for shutdown; the next pass finishes it", "rows", n)
+			case store.IsBusy(err):
+				// Something else held the database for the whole busy
+				// timeout. A restore can, since it commits its batches back
+				// to back. Nothing is wrong with the data and nothing is
+				// lost, so it is a warning, and the rows go at the next pass.
+				p.log.Warn("prune gave way to another writer; the next pass finishes it", "rows", n, "err", err)
+			default:
+				p.log.Error("prune", "err", err)
+			}
 			return
 		}
 		if n > 0 {

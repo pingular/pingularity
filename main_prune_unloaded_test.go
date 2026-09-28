@@ -133,8 +133,8 @@ func unloadedController(t *testing.T, f *prunerStore) *settings.Controller {
 
 // prunePasses counts the passes Prune has completed. Incrementing it is the
 // last thing Prune does before returning, so a wait on it is a wait for the
-// whole sweep - Prune deletes from each table in its own statement, and a
-// pruner cancelled between two of them reports a cancellation, not a prune.
+// whole sweep - Prune deletes from each table in its own chunked statements,
+// and a pruner cancelled between two of them reports a cancellation, not a prune.
 func prunePasses() int64 { return stats.Lifetime().Counters["db.prune_count"] }
 
 // waitFor polls cond until it holds or d has passed, and reports which.

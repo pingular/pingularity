@@ -216,7 +216,8 @@ self-describing):
   `_sum`/`_count` summary in seconds, so `rate(_sum)/rate(_count)` is "the webhook
   got slow"),
   `pingularity_database_errors_total{reason}`, `pingularity_database_prunes_total`,
-  `pingularity_database_prune_duration_seconds_total`,
+  `pingularity_database_prune_duration_seconds_total` (whole cleanup passes: a
+  big cleanup deletes in chunks, and its time includes the pauses between them),
   `pingularity_speed_run_duration_seconds` (a `_sum`/`_count` summary),
   `pingularity_probe_blips_total` (failure streaks that ended before Down after;
   failed rounds taken during a speedtest don't count toward one),
