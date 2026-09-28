@@ -278,6 +278,109 @@ func TestMetricsDBSizeAndSpeedTimestamp(t *testing.T) {
 	}
 }
 
+// The space deleting frees stays inside the file. File-backed on purpose: the
+// web package has no file-backed CI leg, and the size gauge beside this one is
+// only there for a real file.
+func TestMetricsReusableBytes(t *testing.T) {
+	stats.ResetForTest()
+	path := t.TempDir() + "/db.sqlite"
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	set, err := settings.New(context.Background(), st, settings.Values{
+		Latency: 5 * time.Second, Speed: time.Hour, Timeout: 2 * time.Second, DownAfter: 2, UpAfter: 1,
+	})
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	s := New(st, func() LiveStatus { return LiveStatus{Online: true} }, nil, set, nil, "t", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.DBPath = path
+
+	ctx := context.Background()
+	at := time.Now().Add(-time.Hour)
+	for i := 0; i < 400; i++ {
+		var sms []store.Sample
+		for j := 0; j < 50; j++ {
+			sms = append(sms, store.Sample{TS: at.Add(time.Duration(i) * time.Second), Target: fmt.Sprintf("t%d", j), Family: "ipv4", LatencyMS: 12.5, Success: true})
+		}
+		if err := st.InsertSamples(ctx, sms); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	body := scrape(t, s)
+	if v, ok := gaugeValue(body, "pingularity_db_reusable_bytes"); !ok || v != 0 {
+		t.Errorf("pingularity_db_reusable_bytes = %v, present %v on a file nothing was deleted from; want 0", v, ok)
+	}
+	before, ok := gaugeValue(body, "pingularity_db_bytes")
+	if !ok {
+		t.Fatal("db size gauge missing for a file-backed store")
+	}
+	if _, err := st.Clear(ctx, "latency"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	body = scrape(t, s)
+	free, ok := gaugeValue(body, "pingularity_db_reusable_bytes")
+	size, _ := gaugeValue(body, "pingularity_db_bytes")
+	want, err := st.ReusableBytes(ctx)
+	if err != nil {
+		t.Fatalf("ReusableBytes: %v", err)
+	}
+	if !ok || free <= 0 || free != float64(want) {
+		t.Errorf("pingularity_db_reusable_bytes = %v, present %v after a clear; want the store's %d", free, ok, want)
+	}
+	if size < before {
+		t.Errorf("pingularity_db_bytes fell from %v to %v over a clear: the file does not shrink, and the docs say so", before, size)
+	}
+	if free > size {
+		t.Errorf("reusable %v is more than the whole database %v", free, size)
+	}
+	if !strings.Contains(body, `pingularity_metrics_collector_success{collector="db_reusable"} 1`) {
+		t.Error("the ReusableBytes store read has no collector accounting - its failure would be invisible")
+	}
+	st.Close()
+	body = scrape(t, s)
+	if _, ok := gaugeValue(body, "pingularity_db_reusable_bytes"); ok {
+		t.Error("pingularity_db_reusable_bytes is still exported after its read failed: a stale or zero figure would read as no free space")
+	}
+	if !strings.Contains(body, `pingularity_metrics_collector_success{collector="db_reusable"} 0`) {
+		t.Error("a failed ReusableBytes read must show as collector_success 0")
+	}
+	if !strings.Contains(body, `pingularity_metrics_collector_errors_total{collector="db_reusable"} 1`) {
+		t.Error("a failed ReusableBytes read must count in collector_errors_total")
+	}
+}
+
+// The trim outcomes have no named family. They reach a scrape through the
+// generic one, and must not be mistaken for database errors: a blocked trim is
+// a busy dashboard, not a fault.
+func TestMetricsExportsTheTrimOutcomes(t *testing.T) {
+	stats.ResetForTest()
+	stats.Inc("db.wal_trim")
+	stats.Add("db.wal_trim_blocked", 2)
+	stats.Add("db.wal_trim_failed", 3)
+	stats.Seed("db.err") // as the daemon does, so the error family is there to be read
+	body := scrape(t, newMetricsServer(t))
+	for _, want := range []string{
+		`pingularity_stat_total{stat="db.wal_trim"} 1`,
+		`pingularity_stat_total{stat="db.wal_trim_blocked"} 2`,
+		`pingularity_stat_total{stat="db.wal_trim_failed"} 3`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	if !strings.Contains(body, `pingularity_database_errors_total{reason="err"} 0`) {
+		t.Error("the database error family is missing or moved: a trim outcome is not an error")
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "pingularity_database_errors_total{") && strings.Contains(line, "wal_trim") {
+			t.Errorf("a trim outcome is exported as a database error: %s", line)
+		}
+	}
+}
+
 // Each metric family's samples must form one contiguous block (all family_up
 // lines together, then all family_latency lines, ...): the exposition format
 // requires it, and strict parsers reject interleaving. Checked generically

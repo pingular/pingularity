@@ -1246,6 +1246,9 @@ func seedKnownCounters() {
 		"notify.outage_dropped",
 		"db.err", "db.busy", "db.io_err", "db.disk_full", "db.corrupt", "db.prune_count",
 		"db.prune_skipped_clock",
+		// The write-ahead log after a large delete: emptied, left because a
+		// reader or a writer was on it, or refused. Read against each other.
+		"db.wal_trim", "db.wal_trim_blocked", "db.wal_trim_failed",
 		"web.login_fail", "web.limiter_trips", "web.metrics_targets_capped",
 		// The /metrics label-collision disclosure and the step-up security
 		// counter (sibling of login_fail); both alert-worthy first events.

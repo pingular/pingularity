@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -307,7 +308,57 @@ type Store struct {
 // path and lets status/chart reads run without blocking the writer, and
 // busy_timeout makes a rare write-write collision retry instead of failing. The
 // params apply to every pooled connection (modernc/sqlite).
-const pragmaConn = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+//
+// journal_size_limit is walSizeLimit, written out because a constant string
+// cannot be built from a number. SQLite never shrinks the -wal file by itself:
+// it writes it again from the start after a checkpoint, so a log that grew
+// once kept that size until the daemon stopped (78 to 87 MB after a cleanup of
+// 15 days of rows). With the limit, the first commit after the log restarts
+// cuts the file back to the limit. That commit is usually a probe round's, and
+// the cut is one truncate call inside it. The limit does not keep the log from
+// growing past it while a reader holds the log. It is a property of the
+// connection, not of the file, which is why it rides the DSN.
+const pragmaConn = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(8388608)&_pragma=synchronous(NORMAL)"
+
+// walSizeLimit is the journal_size_limit in pragmaConn, in bytes (8 MiB). It
+// is twice what the log needs in ordinary running: SQLite checkpoints at 1000
+// pages, which is 4,120,032 bytes of log at the 4096-byte page size, and a
+// running install measured 4,124,152 to 4,136,512. A limit at or below that
+// size would cut the file on every cycle, about 81 times a day, and make
+// SQLite grow it again each time. At twice the size ordinary running never
+// reaches it.
+const walSizeLimit = 8 << 20
+
+// walTrimRows is how many deleted rows make a cleanup or a clear worth
+// emptying the log afterwards. A cleanup writes about 40 bytes of log for
+// every row it deletes (38 to 43 measured). It deletes in chunks and the log
+// restarts between them, so left alone it leaves the log at its ordinary 4 MB
+// however many rows it took. A reader that holds its place across the cleanup
+// (an export, a wide chart) keeps the log from restarting, and the log then
+// keeps every chunk: at this many rows that comes to walSizeLimit. So this is
+// the smallest cleanup that can leave more log behind than the limit allows.
+// The hourly cleanup of a running install removes 5,040 rows, and 25,200 at
+// the fastest probe interval, and must never reach it: emptying a log that is
+// about to be refilled is work for nothing. A variable so a test can lower
+// it: a fixture of this many rows is slow under the race detector.
+var walTrimRows int64 = 200_000
+
+// walTrimWait bounds the two waits a trim can make: for a free pooled
+// connection, and inside SQLite for the writer and for readers still on the
+// log. The second wait holds the writer, so this is the longest a trim can
+// keep a probe round's write waiting. A probe write gives up after 5 s.
+const walTrimWait = 250 * time.Millisecond
+
+// walTrim is what a trim did.
+type walTrim int
+
+const (
+	walTrimSkipped  walTrim = iota // nothing to do: no log (an in-memory database), or the caller is stopping
+	walTrimDone                    // the log is empty
+	walTrimNotTried                // stopped before TRUNCATE, so the writer was never taken: no free connection, another checkpoint running, or a reader that still needs part of the log
+	walTrimGaveUp                  // TRUNCATE ran and something was still on the log, or writing, after walTrimWait
+	walTrimFailed                  // the connection or SQLite refused
+)
 
 // buildDSN turns a filesystem path into a modernc/sqlite DSN. A path containing
 // a character the driver parses as DSN syntax ('?', '#', or '%') must not be
@@ -6650,6 +6701,9 @@ func (s *Store) repairReading(fallback func() int64) (int64, bool) {
 // between however big the backlog is. Every chunk commits on its own. A pass
 // that fails or is stopped part way returns the rows it did remove, and the
 // next pass removes the rest by the same rule.
+//
+// A pass that removed walTrimRows or more ends by emptying the write-ahead
+// log (trimWALAfter). Whatever comes of that, the pass has succeeded.
 func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBefore time.Time) (int64, error) {
 	start, uptime := pruneClock(s)
 	// Refuse to prune while the wall clock is implausibly early: an RTC-less device
@@ -6857,6 +6911,13 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// The whole pass, the waits between chunks included: a big cleanup reads
 	// as the minutes it took.
 	stats.AddF("db.prune_ms_sum", util.DurMS(time.Since(start)))
+	// Last, and outside the cleanup's own time: the rows are gone whatever
+	// happens to the log. The count is the whole pass's, every chunk of every
+	// table. A pass that failed or was stopped returned above and leaves the
+	// log to the size limit. The wait first is the one every full chunk gets:
+	// a probe write that found the writer taken by the last chunk gets its
+	// look at it before the trim can take it.
+	s.trimWALAfter(ctx, sw.total, pruneWait)
 	return sw.total, nil
 }
 
@@ -6956,6 +7017,126 @@ func pruneWait(ctx context.Context) error {
 	}
 }
 
+// trimWALAfter empties the write-ahead log after a delete of walTrimRows or
+// more. first, when set, runs before the trim and calls it off by returning an
+// error. It reports nothing to its caller on purpose: the delete has
+// committed, and a log that could not be emptied is still cut back to
+// walSizeLimit once it restarts.
+func (s *Store) trimWALAfter(ctx context.Context, rows int64, first func(context.Context) error) {
+	if rows < walTrimRows {
+		return
+	}
+	if first != nil && first(ctx) != nil {
+		return // the caller is stopping
+	}
+	switch got, err := s.trimWAL(ctx); got {
+	case walTrimDone:
+		stats.Inc("db.wal_trim")
+	case walTrimNotTried, walTrimGaveUp:
+		stats.Inc("db.wal_trim_blocked")
+	case walTrimFailed:
+		stats.Inc("db.wal_trim_failed")
+		recordDBErr(err)
+		log.Printf("pingularity: could not empty the write-ahead log after a large delete (it is cut back to %d MiB once it restarts): %v", walSizeLimit>>20, err)
+	}
+}
+
+// trimWAL copies the log back into the database and cuts the -wal file to
+// nothing (wal_checkpoint(TRUNCATE)). It runs on the caller's goroutine, which
+// is the pruner's or a request's, never the monitor's.
+//
+// Two passes, because TRUNCATE copies while it holds the writer. The PASSIVE
+// pass takes no writer lock and never waits, so whatever is left to copy is
+// copied there. TRUNCATE runs only if that pass finished the log, and then has
+// a few frames at most to copy. If a reader still needs the log, the PASSIVE
+// pass cannot finish and the trim stops there without ever taking the writer.
+//
+// TRUNCATE can still meet a reader that is on the end of the log, or a writer
+// in the middle of a transaction. It waits for them, and once it has the
+// writer it holds it while it waits for the reader, so the connection's busy
+// timeout is lowered to walTrimWait for that one statement and put back
+// afterwards.
+//
+// A blocked trim is the usual outcome while a dashboard is open on a wide
+// chart or an export is running. Nothing retries it: the size limit cuts the
+// log back once the reader has left and the log restarts.
+func (s *Store) trimWAL(ctx context.Context) (walTrim, error) {
+	if ctx.Err() != nil {
+		return walTrimSkipped, nil
+	}
+	fail := func(err error) (walTrim, error) {
+		if ctx.Err() != nil {
+			return walTrimSkipped, nil // stopping, not failing
+		}
+		return walTrimFailed, err
+	}
+	wait, cancel := context.WithTimeout(ctx, walTrimWait)
+	conn, err := s.db.Conn(wait)
+	cancel()
+	if err != nil {
+		// Only running out of time is "every pooled connection is busy".
+		// Anything else (a closed store, a file that cannot be opened) is a
+		// fault and must not read as a reader being in the way.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return walTrimNotTried, nil
+		}
+		return fail(err)
+	}
+	defer conn.Close()
+	var busy, logFrames, copied int64
+	if err := conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logFrames, &copied); err != nil {
+		return fail(err)
+	}
+	// The order matters. When another connection holds the checkpoint lock
+	// the reply is busy 1, log -1, copied -1. Asking for a missing log first
+	// would read that reply as "no log".
+	switch {
+	case busy != 0:
+		return walTrimNotTried, nil // another connection is checkpointing
+	case logFrames < 0:
+		return walTrimSkipped, nil // no log: an in-memory database
+	case copied < logFrames:
+		return walTrimNotTried, nil // a reader still needs part of the log
+	}
+	var prev int64
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&prev); err != nil {
+		return fail(err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, walTrimWait.Milliseconds())); err != nil {
+		return fail(err)
+	}
+	// The connection goes back to the pool, so it must leave with the timeout
+	// it came with: a probe write on a connection left at walTrimWait would
+	// give up twenty times sooner than it should. The restore does not run
+	// under the caller's context, which may be over by then. A connection
+	// that cannot be restored is dropped instead, and the pool opens a new
+	// one with the DSN's pragmas.
+	defer func() {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf(`PRAGMA busy_timeout = %d`, prev)); err != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+	if err := conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &copied); err != nil {
+		return fail(err)
+	}
+	if busy != 0 {
+		return walTrimGaveUp, nil
+	}
+	return walTrimDone, nil
+}
+
+// ReusableBytes is the space inside the database file that holds no data:
+// whole free pages, in bytes. Deleting rows never shrinks the file. The pages
+// they filled go on a free list, and new rows use them before the file grows.
+// A page that is only partly empty is not counted, so the figure is a floor.
+// One statement, so both numbers come from one snapshot.
+func (s *Store) ReusableBytes(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT freelist_count * page_size FROM pragma_freelist_count(), pragma_page_size()`).Scan(&n)
+	return n, err
+}
+
 // IsBusy reports whether err is SQLite giving up on the writer: something else
 // held it for longer than the busy timeout. It is the test db.busy counts by,
 // so a caller that reports the case in its own words agrees with /metrics
@@ -7016,6 +7197,10 @@ func (s *Store) invalidateReadCaches() {
 // too - otherwise orphaned DNS rows keep feeding the chart after a clear. The
 // speedtest times go with it for the same reason: that chart's hover note is
 // their only reader, and a chart with no data has no point to hover.
+//
+// The database file keeps its size. The rows' pages go on the free list
+// (ReusableBytes) and new rows fill them. A clear of walTrimRows or more ends
+// by emptying the write-ahead log, which cannot fail the clear.
 func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 	var tables []string
 	switch kind {
@@ -7064,6 +7249,12 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 		return 0, err
 	}
 	s.invalidateReadCaches()
+	// Here by decision more than by need. Emptying a whole table frees its
+	// pages without logging its rows (0.55 bytes of log a row measured,
+	// against 43 for a cleanup), so what this empties is the log as it stood
+	// before the clear. No wait first: it would be most of what a Delete now
+	// takes.
+	s.trimWALAfter(ctx, total, nil)
 	return total, nil
 }
 

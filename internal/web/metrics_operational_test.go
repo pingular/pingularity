@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,46 @@ func TestMetricsSingleRegistrySnapshotPerScrape(t *testing.T) {
 	}
 	if n := strings.Count(string(src), "stats.Lifetime("); n != 1 {
 		t.Errorf("web.go calls stats.Lifetime() %d times; one scrape must observe one snapshot", n)
+	}
+}
+
+// EVERY COLLECTOR COUNTS TOWARDS metrics_data_valid. The collector list and
+// the expression behind the gauge are written out apart, and a read added to
+// one and not the other is a failure the gauge sleeps through. Closing the
+// store cannot show that: every read fails at once, and any one term turns the
+// gauge to 0. Pinned structurally: one term for each collector, the same
+// expression, and the same expression booked through collResult.
+func TestMetricsDataValidCountsEveryCollector(t *testing.T) {
+	b, err := os.ReadFile("web.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	list := regexp.MustCompile(`(?m)^\s*colls := \[\]coll\{(.*)\}$`).FindStringSubmatch(src)
+	valid := regexp.MustCompile(`(?m)^\s*dataValid := (.*)$`).FindStringSubmatch(src)
+	if list == nil || valid == nil {
+		t.Fatal("web.go no longer holds the collector list and the dataValid expression on a line each - this test now reads nothing")
+	}
+	entries := regexp.MustCompile(`\{"([a-z_]+)", ([^,{}]+), [A-Za-z]+\}`).FindAllStringSubmatch(list[1], -1)
+	if len(entries) < 5 {
+		t.Fatalf("found %d collectors in the list, want targets, aggregates, speed, uptime_floor and db_reusable at least", len(entries))
+	}
+	terms := map[string]bool{}
+	for _, term := range strings.Split(valid[1], " && ") {
+		terms[strings.TrimSpace(term)] = true
+	}
+	for _, e := range entries {
+		name, ok := e[1], e[2]
+		if !terms[ok] {
+			t.Errorf("collector %q reports %q and metrics_data_valid does not ask for it: its failure is a 200 that reads as whole", name, ok)
+		}
+		if !strings.Contains(src, `s.collResult("`+name+`", `+ok+`)`) {
+			t.Errorf("collector %q has no s.collResult(%q, %s): its errors and its last success are never booked", name, name, ok)
+		}
+		delete(terms, ok)
+	}
+	for term := range terms {
+		t.Errorf("metrics_data_valid asks for %q, which no collector in the list reports: a scrape cannot say which read failed", term)
 	}
 }
 

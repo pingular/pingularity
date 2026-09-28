@@ -334,7 +334,9 @@ and persist across restarts.
   **30** days), **speed** history (default **365** days), and **downtime**/outage
   history (the heatmap, default **365** days); `0` = keep forever; a lowered
   window applies at the next hourly cleanup, which works through a large
-  backlog in small steps and can take a few minutes - plus
+  backlog in small steps and can take a few minutes. A shorter window or a
+  delete does not make the database file smaller: the freed space stays in
+  the file and new data fills it first. Plus
   per-kind "delete data" buttons, each clearing everything its category exports:
   **latency** takes the DNS-resolution series with the ping samples, **speed**
   takes the server-selection reports with the runs, and **downtime** takes the

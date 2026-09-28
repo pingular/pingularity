@@ -5198,6 +5198,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	s.collResult("uptime_floor", ferr == nil)
 
+	// The free space inside the database file is a store read too, and gets the
+	// same accounting.
+	rStart := time.Now()
+	reusable, rerr := s.store.ReusableBytes(ctx)
+	reusableDur := time.Since(rStart)
+	if rerr != nil {
+		s.log.Warn("metrics read failed; reusable database space omitted from this scrape", "op", "db_reusable", "err", rerr)
+	}
+	s.collResult("db_reusable", rerr == nil)
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	fmt.Fprintln(w, "# HELP pingularity_build_info Build metadata; constant 1, version and Go toolchain in the labels.")
 	fmt.Fprintln(w, "# TYPE pingularity_build_info gauge")
@@ -5567,11 +5577,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE pingularity_memory_heap_bytes gauge")
 	fmt.Fprintf(w, "pingularity_memory_heap_bytes %d\n", ms.HeapAlloc)
 	// Standard-ish Go runtime signals, hand-emitted (no client_golang dependency):
-	// resident/sys memory, GC count, and the scheduler shape - enough to spot a leak
-	// or GC thrash on a long-running daemon.
+	// what the Go runtime took from the OS, GC count, and the scheduler shape -
+	// enough to spot a leak or GC thrash on a long-running daemon.
 	fmt.Fprintln(w, "# HELP pingularity_memory_sys_bytes Total bytes of memory obtained from the OS.")
 	fmt.Fprintln(w, "# TYPE pingularity_memory_sys_bytes gauge")
 	fmt.Fprintf(w, "pingularity_memory_sys_bytes %d\n", ms.Sys)
+	// The two gauges above are the Go runtime's own view. SQLite allocates
+	// outside it (its page cache above all), so a process measured at 57 MB
+	// showed a heap of 3 MB. Resident memory is the figure a container's
+	// memory limit is judged against.
+	if rss, ok := residentBytes(); ok {
+		fmt.Fprintln(w, "# HELP pingularity_memory_resident_bytes Memory the process holds in RAM, SQLite's included (Linux).")
+		fmt.Fprintln(w, "# TYPE pingularity_memory_resident_bytes gauge")
+		fmt.Fprintf(w, "pingularity_memory_resident_bytes %d\n", rss)
+	}
 	fmt.Fprintln(w, "# HELP pingularity_gc_cycles_total Completed GC cycles since start.")
 	fmt.Fprintln(w, "# TYPE pingularity_gc_cycles_total counter")
 	fmt.Fprintf(w, "pingularity_gc_cycles_total %d\n", ms.NumGC)
@@ -5585,7 +5604,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// On-disk database footprint (main file + WAL/SHM sidecars) - a retention
-	// misconfiguration shows up here long before the disk fills.
+	// misconfiguration shows up here long before the disk fills. The main file
+	// never shrinks: deleting rows frees pages inside it, which the reusable
+	// gauge below counts, and the file keeps its size.
 	if s.DBPath != "" && s.DBPath != ":memory:" {
 		var total int64
 		seen := false
@@ -5607,6 +5628,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintln(w, "# TYPE pingularity_disk_free_bytes gauge")
 			fmt.Fprintf(w, "pingularity_disk_free_bytes %d\n", free)
 		}
+	}
+	// Absent when its read failed: a 0 would read as a file with no free space.
+	if rerr == nil {
+		fmt.Fprintln(w, "# HELP pingularity_db_reusable_bytes Free space inside the database file, reused by new data before the file grows.")
+		fmt.Fprintln(w, "# TYPE pingularity_db_reusable_bytes gauge")
+		fmt.Fprintf(w, "pingularity_db_reusable_bytes %d\n", reusable)
 	}
 
 	// Update-check state: the same facts the dashboard badge shows, so "an
@@ -5636,7 +5663,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		ok   bool
 		dur  time.Duration
 	}
-	colls := []coll{{"targets", terr == nil, targetsDur}, {"aggregates", aggValid, aggDur}, {"speed", serr == nil, speedDur}, {"uptime_floor", ferr == nil, floorDur}}
+	colls := []coll{{"targets", terr == nil, targetsDur}, {"aggregates", aggValid, aggDur}, {"speed", serr == nil, speedDur}, {"uptime_floor", ferr == nil, floorDur}, {"db_reusable", rerr == nil, reusableDur}}
 	s.collMu.Lock()
 	errsCopy, okCopy := map[string]int64{}, map[string]int64{}
 	for k, v := range s.collErrs {
@@ -5668,7 +5695,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "pingularity_metrics_collector_last_success_timestamp_seconds{collector=\"%s\"} %d\n", c.name, ts)
 		}
 	}
-	dataValid := terr == nil && aggValid && serr == nil && ferr == nil
+	dataValid := terr == nil && aggValid && serr == nil && ferr == nil && rerr == nil
 	fmt.Fprintln(w, "# HELP pingularity_metrics_data_valid 1 when every store read on this scrape succeeded; 0 when any failed (series may be missing or stale despite the 200).")
 	fmt.Fprintln(w, "# TYPE pingularity_metrics_data_valid gauge")
 	fmt.Fprintf(w, "pingularity_metrics_data_valid %d\n", util.B2I(dataValid))

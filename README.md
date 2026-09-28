@@ -497,6 +497,12 @@ copy the database file by hand instead, with the service stopped - a copy
 taken while it runs misses the recent rows in the `-wal` sidecar - and copy
 the key file with it.
 
+**Disk space.** The database file grows until it holds what your retention
+windows keep, then stops. It does not get smaller. Lowering a window or using
+**Delete now** frees space inside the file, and new data fills it before the
+file grows again. The `-wal` file beside it stays at a few MB. A large cleanup
+or an export can make it grow for a while, and it is cut back afterwards.
+
 **Forgot the password?** Run `pingularity reset-auth` on the host to clear it
 and disable auth, then reload or restart the service, which caches settings in
 memory. In Docker, run it from a one-off container sharing the volume to clear

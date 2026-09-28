@@ -11637,6 +11637,13 @@ test('the status poll keeps the speedtest times current', () => {
   assert.match(extract('async function refreshStatus'), /if\(noteSpeedActivity\(s\) && latSpansStale\) refreshLatSpans\(\);/);
 });
 
+test('the Data card says the file does not shrink', () => {
+  const card = html.slice(html.indexOf('<h3>Stored data</h3>'), html.indexOf('<h3>Backup &amp; restore</h3>'));
+  assert.match(card, /<p class="card-foot muted">Deleting data or shortening a window does not make the database file smaller\. The freed space stays in the file, and new data fills it before the file grows again\.<\/p>/);
+  assert.match(card, /<p class="card-foot muted">How long each dataset is kept/, 'the retention note stays beside it');
+  assert.doesNotMatch(card, /\u2014/, 'no em-dashes in new text');
+});
+
 test('the tips say what a test does to the checks, and describe no stripes', () => {
   const chartTip = html.slice(html.indexOf('data-tip="What\'s on this chart:'), html.indexOf('<span class="win-dd" id="latencyWindow"'));
   assert.match(chartTip, /• Shaded bands - rounds where the link failed its checks\. Failed checks during a speedtest start an outage only if they last over 2 minutes or outlast the test\.\n/);

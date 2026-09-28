@@ -171,8 +171,21 @@ self-describing):
   form; `pingularity_runtime_seconds` kept for compatibility)
 - `pingularity_goroutines` / `pingularity_memory_heap_bytes` / `_memory_sys_bytes` /
   `pingularity_gc_cycles_total` / `pingularity_gomaxprocs` / `pingularity_open_fds`
-  (Unix) - process self-health: leak and GC trends, and an FD-leak early warning
-- `pingularity_db_bytes` - on-disk database size incl. WAL/SHM (watch your retention)
+  (Unix) - process self-health: leak and GC trends, and an FD-leak early warning.
+  The two memory gauges are the Go runtime's own figures. They leave out the
+  memory SQLite takes for itself, such as its page cache
+- `pingularity_memory_resident_bytes` (Linux) - the memory the process holds in
+  RAM, SQLite's included. This is the one to compare with a container or NAS
+  memory limit. Absent on other systems
+- `pingularity_db_bytes` - on-disk database size incl. WAL/SHM. Watch it for
+  growth. The main file does not get smaller when data is deleted: lowering
+  retention or clearing data frees space inside the file, new data fills that
+  space first, and the file keeps its size
+- `pingularity_db_reusable_bytes` - that free space inside the file. Only whole
+  free pages are counted, so
+  `pingularity_db_bytes - pingularity_db_reusable_bytes` is about what the
+  stored data takes, the write-ahead log included. Absent on a scrape where
+  its read failed
 - `pingularity_disk_free_bytes` - free space on the filesystem holding the
   database, where the platform supports it - an early disk-full warning long
   before writes start failing
@@ -202,9 +215,11 @@ self-describing):
   `200` with missing/stale series is directly alertable). Paired with
   `pingularity_metrics_collector_success{collector}` / `_errors_total{collector}` /
   `_duration_seconds{collector}` / `_last_success_timestamp_seconds{collector}` for
-  the `targets` / `aggregates` / `speed` / `uptime_floor` reads (`aggregates`
-  tracks the LAST refresh attempt, so a store that fails after the cache once
-  warmed still reads 0)
+  the `targets` / `aggregates` / `speed` / `uptime_floor` / `db_reusable` reads
+  (`aggregates` tracks the LAST refresh attempt, so a store that fails after the
+  cache once warmed still reads 0; `db_reusable` is the read behind
+  `pingularity_db_reusable_bytes`, and counts towards `metrics_data_valid`
+  like the others)
 - **Well-named families** (Prometheus-conventional, one quantity + labels each,
   emitted alongside the generic `stat_total` below): `pingularity_probe_rounds_total`,
   `pingularity_probe_failures_total{reason}`, `pingularity_dns_attempts_total`,
@@ -284,7 +299,12 @@ self-describing):
   be measured and the incumbent was measured instead; `speed.head_failed` -
   runs where the server the run led with could not be measured and the next
   ranked one was measured instead), webhook delivery (`.ok` / `.fail` / `.blocked` per
-  destination), DB health (`db.*`), import/restore repairs (`import.*` - rows a
+  destination), DB health (`db.*`, including `db.wal_trim`,
+  `db.wal_trim_blocked` and `db.wal_trim_failed`: the write-ahead log emptied
+  after a large delete, left alone because a chart, an export or another
+  writer was using it, or refused. A blocked one is normal while a dashboard
+  is open, and the log is then cut back to 8 MiB once it restarts),
+  import/restore repairs (`import.*` - rows a
 restore refused rather than silently dropped), the /metrics self-disclosures
 (`web.metrics_targets_capped`, `web.metrics_label_collisions` - the operator's
 sign that the target-series view was truncated or a normalized label collided),

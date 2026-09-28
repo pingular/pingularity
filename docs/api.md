@@ -239,7 +239,8 @@ and `-d '{…}'` where a body is listed below.
   arrived since - `since` is ignored unless `epoch` matches, because a restart
   reseeds the buffer and re-uses the same sequence numbers for different lines
 - `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
-  (`latency` also clears the speedtest times `/api/speed/spans` answers)
+  (`latency` also clears the speedtest times `/api/speed/spans` answers). The
+  database file keeps its size; the freed space is reused
 - `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
   export / import config + history. Pick at least one of those four categories (any
   non-empty value selects one); with none at all the export is a `400`.

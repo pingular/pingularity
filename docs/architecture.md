@@ -221,3 +221,12 @@ flowchart TB
   cleanup never waits. Outages are removed whole: a chunk never ends between a
   `down` and its `up`. A cleanup stopped by a shutdown keeps what it has
   removed, and the next one removes the rest.
+- **Disk space is reused, not given back.** The main file is never compacted:
+  deleted rows leave free pages, and new rows fill them before the file grows.
+  The write-ahead log beside it stays near 4 MB in ordinary running. A reader
+  that holds its place (an export, a wide chart) can make it grow while a big
+  cleanup runs. Every connection carries a size limit of 8 MiB, so the log is
+  cut back to that once it restarts, inside whichever commit restarts it,
+  which is usually a probe round's. After a cleanup or a delete of 200,000
+  rows or more the log is also emptied, when no reader or writer is using it.
+  That step never fails the cleanup or the delete.
