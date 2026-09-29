@@ -262,12 +262,17 @@ type Store struct {
 	seriesMu    sync.Mutex
 	seriesCache map[seriesKey]*seriesEntry
 
-	// opened carries a MONOTONIC reading from store open; clockBase/clockBaseUp
-	// are the wall/monotonic pair destructive pruning judges the clock against,
-	// and clockSettleUp parks pruning until that much uptime has passed. See
-	// clockStepped - the only thing that reads or writes them.
+	// opened carries the wall and MONOTONIC readings from store open, and
+	// openedBoot the boot clock read with them (openedBootOK false when there
+	// was none); the three are set once, in openAtClock, and only read after,
+	// so they need no lock. sinceOpen turns them into the store's uptime.
+	// clockBase/clockBaseUp are the wall/uptime pair destructive pruning judges
+	// the clock against, and clockSettleUp parks pruning until that much uptime
+	// has passed. See clockStepped - the only thing that reads or writes them.
 	clockMu       sync.Mutex
 	opened        time.Time
+	openedBoot    time.Duration
+	openedBootOK  bool
 	clockBase     time.Time
 	clockBaseUp   time.Duration
 	clockSettleUp time.Duration
@@ -277,12 +282,14 @@ type Store struct {
 	// armed earlier (an implausible Open's) - the same reading that parked
 	// destructive pruning must not judge history either.
 	pauseStepSeen bool
-	// pauseVetted (under clockMu): the reading that survived the most recent
-	// settle window; zero until a step has settled. Once present, every
-	// deferred repair judges in THIS frame, advanced by monotonic elapsed
-	// time - never a fresh wall reading, which a step after arming (but
-	// before the consuming write) could have made untrustworthy again.
-	pauseVetted time.Time
+	// pauseVetted (under clockMu): the wall reading that survived the most
+	// recent settle window, and pauseVettedUp the uptime read with it; zero
+	// until a step has settled. Once present, every deferred repair judges in
+	// THIS frame, advanced by the uptime since (see repairReading) - never a
+	// fresh wall reading, which a step after arming (but before the consuming
+	// write) could have made untrustworthy again.
+	pauseVetted   time.Time
+	pauseVettedUp time.Duration
 
 	// pauseRepairArm/pauseRepairDone are the deferred pause re-judgement
 	// trigger, as a GENERATION pair rather than a boolean: arm != done means a
@@ -498,11 +505,19 @@ func looseDataDirWarning(dir string) string {
 	return fmt.Sprintf("pingularity: data directory %s is group/world-accessible and was not created by pingularity; leaving its permissions unchanged (the database file itself is owner-only). Consider a dedicated -db directory.", dir)
 }
 
-// openAtClock is the full seam: the judging clock AND the wall/monotonic
-// reading the step detector baselines on, as one pair. existing is
-// OpenExisting's contract: the file must already be a database, and a
-// database that will not open is never set aside.
+// openAtClock is the full seam: the judging clock AND the wall reading the step
+// detector baselines on (opened), as one pair. The detector measures time
+// passing by the boot clock, read first thing below; opened's monotonic half is
+// only its fallback, for a machine whose boot clock cannot be read (see
+// sinceOpen). existing is OpenExisting's contract: the file must already be a
+// database, and a database that will not open is never set aside.
 func openAtClock(path string, nowU int64, opened time.Time, existing bool, opts ...OpenOption) (*Store, error) {
+	// The boot clock is read first, before anything below can take time, so it
+	// pairs with opened, which the caller read an instant ago. Read after a slow
+	// Open - a migration, a rebuild - it would start the uptime late by that
+	// long, and the first cleanup would see the wall clock that much ahead: a
+	// step, once an Open takes longer than pruneClockStepSlack.
+	openedBoot, openedBootOK := bootClockFn()
 	var oo openOpts
 	for _, opt := range opts {
 		opt(&oo)
@@ -852,11 +867,13 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool, opts 
 		}
 	}
 	st := &Store{
-		db:          db,
-		recCache:    map[int64]recScan{},
-		seriesCache: map[seriesKey]*seriesEntry{},
-		opened:      opened, // the top-of-Open reading; carries a monotonic reading for clockStepped
-		rebuilt:     rebuilt,
+		db:           db,
+		recCache:     map[int64]recScan{},
+		seriesCache:  map[seriesKey]*seriesEntry{},
+		opened:       opened, // the top-of-Open reading: the wall baseline, and sinceOpen's fallback
+		openedBoot:   openedBoot,
+		openedBootOK: openedBootOK,
+		rebuilt:      rebuilt,
 	}
 	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
 	st.held.init()
@@ -7412,22 +7429,98 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	return nil
 }
 
-// pruneClock reads the wall clock and the store's monotonic uptime as one pair.
-// A single seam so a test can make the two disagree, which is the whole point:
-// no wall reading can be checked against itself.
+// pruneClock reads the wall clock and the store's uptime (sinceOpen) as one
+// pair. A single seam so a test can make the two disagree, which is the whole
+// point: no wall reading can be checked against itself. The deferred pause
+// repair takes its uptime from here too (repairReading), so the frame it
+// judges in and the guard that vets it read the same clock.
 var pruneClock = func(s *Store) (time.Time, time.Duration) {
-	return time.Now(), time.Since(s.opened)
+	return time.Now(), s.sinceOpen()
 }
 
-// pruneClockStepSlack is how far the wall clock may run ahead of monotonic time
-// before destructive pruning parks itself, and pruneClockSettle is how much
-// steady uptime it then wants before believing the clock again.
+// bootClockFn is bootClock, a var so a test can stand in for a machine that
+// slept: the boot clock moving on while Go's monotonic clock stands still is
+// the whole subject, and no test can put a real computer to sleep.
+var bootClockFn = bootClock
+
+// sinceOpen is the store's uptime as the clock guard reads it: how long since
+// Open, by a clock that nothing can set and that keeps counting while the
+// machine sleeps (bootClock: CLOCK_BOOTTIME on Linux, CLOCK_MONOTONIC on macOS).
+//
+// It used to be time.Since(s.opened), Go's monotonic clock, and on macOS and
+// Linux that clock stands still while the machine sleeps (mach_absolute_time
+// and CLOCK_MONOTONIC; `go doc time` warns of it). The wall clock does not: a
+// wake puts the time asleep back into it. So clockStepped read a lid closed
+// for the night as the wall clock jumping ahead by the night. Any sleep longer
+// than pruneClockStepSlack - or several shorter ones adding up, because the
+// baseline moves only when a step is found - parked cleanup until another
+// pruneClockSettle of AWAKE time had passed, counted db.prune_skipped_clock at
+// every hourly try, parked the deferred pause repair, and then re-judged the
+// pauses for a step that never happened. The next sleep started the wait over,
+// so a laptop that never stayed awake six hours at a stretch did not clean up
+// again until the daemon restarted. The monitor notes the same blind spot: "a
+// step and a suspend leave identical evidence" - on Go's clock they do. On
+// this one they do not: a wake moves the wall clock and the boot clock by the
+// same amount, and setting the clock moves the wall clock alone.
+//
+// So a real step still shows: NTP stepping the clock, a VM resumed from a
+// snapshot on its old time until the guest agent sets it, a hypervisor's
+// time-sync glitch, a bad RTC corrected after boot. Each sets the wall clock
+// and leaves the boot clock where it was. What this cannot see is a wake that
+// reports the wrong length of sleep, which moves both. The kernel takes that
+// length from the hardware clock that keeps time through the sleep, and the
+// monitor books the same length as unobserved time.
+//
+// Windows needs none of it: Go's clock there counts sleep already (see
+// bootclock_other.go). If the boot clock cannot be read at Open, the store
+// uses Go's clock throughout, as the guard did before. If it was read at Open
+// and a later reading fails, that one reading uses Go's clock, which lacks the
+// sleep since Open: for that reading the guard is as blind to sleep as it used
+// to be, and can take a sleep for a step, or miss a backward step about as
+// long as the sleep. The ways these calls are known to fail - a kernel without
+// the clock, a sandbox that refuses the call - fail every time, not now and
+// then, and land in the first case.
+//
+// Inside a virtual machine the boot clock is the guest's, and the guest does
+// not sleep when its host does: its clocks, this one among them, just stop
+// while the host sleeps, and at wake its time sync sets the wall clock forward
+// by the time lost. To this guard that is a step, and it is one: the clock was
+// set. So pingularity under Docker Desktop, WSL2 or Lima on a laptop still
+// parks cleanup after each sleep of the laptop, for pruneClockSettle of the
+// laptop's awake time, and counts db.prune_skipped_clock for it, as every
+// sleep did before. Running directly on the laptop is what avoids it.
+func (s *Store) sinceOpen() time.Duration {
+	if s.openedBootOK {
+		if now, ok := bootClockFn(); ok {
+			return now - s.openedBoot
+		}
+	}
+	return time.Since(s.opened)
+}
+
+// pruneClockStepSlack is how far the wall clock may run ahead of the store's
+// uptime before destructive pruning parks itself, and pruneClockSettle is how
+// much steady uptime it then wants before believing the clock again.
 //
 // The slack is sized to swallow ordinary hygiene - NTP slew, a leap second, the
 // scheduling gap between reading the clock and running the DELETE - while being
 // two orders of magnitude below the smallest default retention window (30d), so
 // a step big enough to shorten a window is always caught. The settle window is
 // long enough to cover several hourly attempts, giving time sync room to land.
+//
+// The settle window is measured by the same uptime, so it counts the time the
+// machine sleeps. On Windows it always did. On macOS and Linux it counted
+// awake time alone until the uptime moved to the boot clock (sinceOpen), and
+// counting sleep there too is on purpose: a step found before a night's sleep
+// is believed at the first pass after the wake, not after six more awake hours.
+// What that gives up is awake time in which time sync could take a bogus step
+// back, and it still gets an hour of that after every step. A step is found BY
+// a cleanup pass, and the next pass comes only after another hour awake,
+// because the pruner's ticker runs on Go's clock, which stands still while the
+// machine sleeps (runPruner in main.go). Time sync runs again as the network
+// comes back at wake and normally lands well inside that hour. A correction it
+// makes is a step like any other and starts the wait over; a step still in
+// place at that pass is believed, as it would be on Windows.
 //
 // Neither can save a clock that boots fast and is NEVER corrected: nothing on
 // the machine can tell that apart from a correct one, and refusing forever would
@@ -7438,11 +7531,17 @@ const (
 	pruneClockSettle    = 6 * time.Hour
 )
 
-// clockStepped reports whether the wall clock has jumped relative to monotonic
-// time, and parks destructive pruning when it has. Reading now against the
-// baseline captured at open (or at the last step) is what makes a jump visible:
-// monotonic time cannot be stepped, so wall progress exceeding uptime progress
-// is the clock moving under us rather than time passing.
+// clockStepped reports whether the wall clock has jumped relative to the
+// store's uptime, and parks destructive pruning when it has. Reading now
+// against the baseline captured at open (or at the last step) is what makes a
+// jump visible: the uptime cannot be stepped and counts sleep (sinceOpen), so
+// wall progress exceeding uptime progress is the clock moving under us rather
+// than time passing, awake or asleep.
+//
+// Once it has found a step it keeps pruning parked until the uptime is
+// pruneClockSettle past it. That wait is on the same clock, so it counts sleep
+// too: a change from Go's clock, on which macOS and Linux counted awake hours
+// alone. pruneClockSettle says why that is acceptable.
 //
 // A detected step RE-BASELINES rather than latching. Otherwise the honest case
 // poisons itself: an RTC-less board boots near 1970, the floor guard above skips
@@ -7485,7 +7584,8 @@ func (s *Store) clockStepped(now time.Time, uptime time.Duration) bool {
 	// guarded against.
 	if s.pauseStepSeen {
 		s.pauseStepSeen = false
-		s.pauseVetted = now // the reading the settle window vouched for
+		// The reading the settle window vouched for, and the uptime read with it.
+		s.pauseVetted, s.pauseVettedUp = now.Round(0), uptime
 		s.pauseRepairArm.Add(1)
 	}
 	return false
@@ -7494,10 +7594,23 @@ func (s *Store) clockStepped(now time.Time, uptime time.Duration) bool {
 // repairReading picks the clock the deferred pause repair may judge with, or
 // reports that no reading is currently trustworthy (a detected step is still
 // settling - every generation parks, not only the one that step would arm).
-// Once any step has settled, its vetted reading - advanced by monotonic
-// elapsed time, which no later wall step can bend - is the judging frame, and
-// the caller-supplied reading is ignored; before any step, the fallback (the
+// Once any step has settled, its vetted reading - advanced by the uptime since,
+// which no later wall step can bend - is the judging frame, and the
+// caller-supplied reading is ignored; before any step, the fallback (the
 // caller's clock, plausibility-gated by the caller) is all there is.
+//
+// The frame used to advance by time.Since(pauseVetted): Go's monotonic clock,
+// which stands still while macOS and Linux sleep, so every hour asleep left the
+// frame an hour further behind the real time. Once it was more than
+// pauseRepairFutureSkew (48 hours) behind, a repair - armed by a restore that
+// brought held rows, or retried after one that failed - took the newest
+// genuine pauses for rows from the future and held them aside, the pause that
+// recorded the sleep among them, so that stretch counted as watched. A repair
+// in the first hour after a long weekend with the lid shut could do it. And
+// with sleep no longer mistaken for a step (sinceOpen), no settle re-vets the
+// frame after a sleep any more, so the lag would have added up over every
+// night since the last real step. The uptime counts the sleep, so the frame
+// keeps pace with the wall clock without trusting it.
 func (s *Store) repairReading(fallback func() int64) (int64, bool) {
 	s.clockMu.Lock()
 	defer s.clockMu.Unlock()
@@ -7505,7 +7618,8 @@ func (s *Store) repairReading(fallback func() int64) (int64, bool) {
 		return 0, false
 	}
 	if !s.pauseVetted.IsZero() {
-		return s.pauseVetted.Add(time.Since(s.pauseVetted)).Unix(), true
+		_, uptime := pruneClock(s)
+		return s.pauseVetted.Add(uptime - s.pauseVettedUp).Unix(), true
 	}
 	return fallback(), true
 }

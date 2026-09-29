@@ -303,8 +303,21 @@ self-describing):
   `db.wal_trim_blocked` and `db.wal_trim_failed`: the write-ahead log emptied
   after a large delete, left alone because a chart, an export or another
   writer was using it, or refused. A blocked one is normal while a dashboard
-  is open, and the log is then cut back to 8 MiB once it restarts. Latency
-  readings are saved in batches, and `db.sample_*` follows them:
+  is open, and the log is then cut back to 8 MiB once it restarts.
+  `db.prune_skipped_clock` counts cleanups skipped because the clock could
+  not be trusted: it read earlier than 2023, or it had jumped by more than 15
+  minutes in the six hours before. Each hourly try in those six hours counts,
+  so one jump adds about six, or fewer if the computer sleeps through part of
+  them. A jump is measured against a clock that nothing can set and that
+  keeps counting while the computer sleeps, so when pingularity runs directly
+  on a computer, sleep is not one. Inside a virtual machine on a laptop
+  (Docker Desktop, WSL2, Lima) it still is: the virtual machine's clocks stop
+  while the laptop sleeps, and its time sync sets the clock forward at wake.
+  A count that keeps climbing means the clock still reads earlier than 2023,
+  since every hourly try counts until time sync sets it, or that something
+  keeps setting the clock, such as a laptop that sleeps with pingularity in
+  one of those virtual machines.
+  Latency readings are saved in batches, and `db.sample_*` follows them:
   `db.sample_saves.<reason>` counts the saves by what started each (`age` the
   save interval, `request` a dashboard, API or `/metrics` request, `read` a
   read inside the daemon, `order` an outage event, pause, speedtest result,

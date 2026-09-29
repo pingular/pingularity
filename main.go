@@ -1269,6 +1269,15 @@ func seedKnownCounters() {
 		"monitor.unobserved_gap_retries", "monitor.unobserved_gap_refused",
 		"notify.outage_dropped",
 		"db.err", "db.busy", "db.io_err", "db.disk_full", "db.corrupt", "db.prune_count",
+		// A cleanup skipped because the clock could not be trusted: it read
+		// earlier than 2023, or it had jumped by more than 15 minutes within
+		// the six hours before. A computer that sleeps is not a jump (the store
+		// measures against a clock that counts sleep), so a count that keeps
+		// climbing means the clock still reads earlier than 2023, or something
+		// keeps setting it. Inside a VM on a laptop (Docker Desktop, WSL2,
+		// Lima) the laptop sleeping still reads as a jump: the VM's clocks, the
+		// boot clock among them, stop while the laptop sleeps, and its time
+		// sync sets the clock forward at wake.
 		"db.prune_skipped_clock",
 		// The write-ahead log after a large delete: emptied, left because a
 		// reader or a writer was on it, or refused. Read against each other.
@@ -1638,11 +1647,13 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		}
 	}
 	// Deliberately NOT pruned here. Prune's own guard catches a clock that STEPS
-	// while we are running, by checking it against monotonic time - but a machine
-	// whose clock is already wrong at boot never steps, so there is nothing for
-	// that guard to see. Pruning is the one irreversible thing this process does
-	// on a schedule, and at t=0 it would run on the least trustworthy reading the
-	// process will ever hold: before NTP, on hardware that may have no RTC at all.
+	// while we are running, by checking it against a clock nothing can set (the
+	// boot clock, which counts sleep: see sinceOpen in internal/store) - but a
+	// machine whose clock is already wrong at boot never steps, so there is
+	// nothing for that guard to see. Pruning is the one irreversible thing this
+	// process does on a schedule, and at t=0 it would run on the least
+	// trustworthy reading the process will ever hold: before NTP, on hardware
+	// that may have no RTC at all.
 	//
 	// So the first pass waits. Nothing is lost by it - the cleanup is idempotent
 	// and the ticker below repeats forever - and the wait is what turns "boots

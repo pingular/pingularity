@@ -254,6 +254,20 @@ flowchart TB
   cleanup never waits. Outages are removed whole: a chunk never ends between a
   `down` and its `up`. A cleanup stopped by a shutdown keeps what it has
   removed, and the next one removes the rest.
+- **Cleanup waits for a clock it can trust.** Every retention cutoff comes
+  from the clock, so a clock set wrong would delete history that should stay.
+  Cleanup is skipped while the clock reads earlier than 2023 (a board with no
+  clock battery, before time sync), and for six hours after the clock jumps by
+  more than 15 minutes. A jump is measured against the boot clock
+  (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on macOS), which nothing can
+  set and which keeps counting while the computer sleeps, so a laptop that
+  sleeps is not taken for a clock that jumped when pingularity runs directly
+  on the laptop. On Windows Go's own clock counts sleep already. The six hours
+  count time asleep too, as they always did on Windows. Inside a virtual
+  machine on a laptop (Docker Desktop, WSL2, Lima) a sleep still reads as a
+  jump: the virtual machine's clocks stop while the laptop sleeps, the boot
+  clock with them, and its time sync sets the clock forward at wake.
+  `db.prune_skipped_clock` on `/metrics` counts the skipped passes.
 - **Disk space is reused, not given back.** The main file is never compacted:
   deleted rows leave free pages, and new rows fill them before the file grows.
   The write-ahead log beside it stays near 4 MB in ordinary running. A reader
