@@ -358,7 +358,12 @@ and persist across restarts.
   restored backup's history has no such notes. And **Export** / **Import** on the same tab: pick any of
   config / latency / speed / downtime, export them to a JSON file, and import one
   back - time-series data is **merged** (existing/newer local rows are kept, only
-  missing rows are added) while **config is overwritten** and reloaded live.
+  missing rows are added) while **config is overwritten** and reloaded live,
+  with one exception: a restore **never shortens a retention window**. Where
+  the backup keeps a kind of history for less time than this install does,
+  this install's window stays, and the import says which windows it kept and
+  what the backup asked for, so you can lower them yourself on this tab. A
+  longer window in the backup, or `0` (keep forever), is taken as usual.
   Both ends stream on the wire, but the *browser* download assembles the whole
   file before it saves, with no progress shown while it does and no size warning
   first - the export is sent as a stream, so its size is not known in advance to
@@ -372,10 +377,31 @@ and persist across restarts.
   survive the restore), or stream `/api/export` straight to disk with
   `curl -OJ 'http://127.0.0.1:9000/api/export?config=1&latency=1&speed=1&downtime=1'`
   (name at least one category or it is a `400`; add `-u user:pass` when a login is
-  set). The import warns you when it matters: restored rows older than
-  your current retention windows will be pruned within the hour (raise
-  retention first to keep them), and a config restore that carried "login on"
-  without a password leaves login off until you set one.
+  set). The import warns you when it matters: it says how many restored rows
+  are older than your retention windows, which the next cleanup deletes - it
+  runs every hour, so that can be seconds away. It counts only rows the
+  cleanup really deletes: an outage whose recovery is inside the window, an
+  outage still open, and a pause that runs into the window are kept, and so
+  are not counted. The cleanup deletes an outage whole, though, so a restored
+  recovery that ends one of this install's own old outages before the window
+  takes that outage's record with it, and the import counts those records
+  too. To keep the old rows, raise the window before you restore (the restore
+  will not lower it again), or raise it afterwards and import the file again:
+  rows still there are skipped, and any the cleanup already deleted come
+  back, except this install's own outage records, which come back only if the
+  backup holds them - for those, raise the window before the next cleanup. A
+  restore that fails part way gives the same count for the rows it did add.
+  If the hourly cleanup runs beside a restore and could have deleted rows of a
+  kind the restore brought, older than the window it cut at, the import says
+  so, with how many rows of that kind the cleanup deleted, since restored rows
+  may be among them. Where outages are among them, this install's own outage
+  records may be as well, and importing again brings those back only if the
+  backup holds them. The import speaks for what the cleanup deleted from the
+  start of the import until its reply. A cleanup keeps the windows it started
+  with to its end, so one that began before you raised a window can still
+  delete rows the new window keeps, and what it deletes after the reply is not
+  in it. And a config restore that carried "login on" without a password
+  leaves login off until you set one.
 - **Alerts** → *Thresholds* (min download/upload, max ping/jitter/packet-loss, and
   max bufferbloat per direction; each run is marked healthy/unhealthy against the
   values in effect when it ran) with a **Breaches in a row** count (1-10) that

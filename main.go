@@ -1600,12 +1600,8 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 // loaded, since the windows would then be nobody's choice.
 func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 	// cutoff returns the prune-before time for a window (epoch = keep forever).
-	cutoff := func(d time.Duration) time.Time {
-		if d <= 0 {
-			return time.Unix(0, 0)
-		}
-		return time.Now().Add(-d)
-	}
+	// A restore counts what this pass will remove with the same function.
+	cutoff := func(d time.Duration) time.Time { return settings.PruneCutoff(time.Now(), d) }
 	prune := func() {
 		// The windows come from the controller, and one whose boot read failed
 		// answers with the compiled-in defaults, not the operator's stored

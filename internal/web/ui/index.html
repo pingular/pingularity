@@ -2397,7 +2397,7 @@ Delete now clears them all.">i</span></span>
             <label class="filebtn" id="importFileBtn" role="button" tabindex="0"><span class="flabel" id="importFileName">Choose file…</span><input type="file" id="importFile" accept="application/json,.json"></label>
           </div>
         </div>
-        <span class="muted card-foot">Imports selected categories from the file, data is merged, existing rows kept, config overwrites your settings.</span>
+        <span class="muted card-foot">Imports selected categories from the file, data is merged, existing rows kept, config overwrites your settings - except that it never shortens how long data is kept. Restored rows older than a retention window are deleted at the next cleanup, which runs every hour; the import says how many.</span>
         <span class="muted card-foot" role="status" id="importMsg"></span>
       </section>
       </div><!-- /retention (Data) pane: stored-data + backup cards -->
@@ -10462,7 +10462,7 @@ $('importBtn').addEventListener('click', async ()=>{
   if(!c.length){ msg.textContent='Select at least one category.'; return; }
   if(!f){ msg.textContent='Choose an export file first.'; return; }
   // Config is the only category that REPLACES rather than merges - confirm it.
-  if(c.includes('config') && !confirm('Importing config will overwrite your current settings. Continue?')) return;
+  if(c.includes('config') && !confirm('Importing config will overwrite your current settings (a retention window is only ever lengthened, never shortened). Continue?')) return;
   msg.textContent='Importing…';
   // A big restore takes minutes, and a second click would send the whole file again
   // into a half-applied import. The button comes back in the finally below, whatever

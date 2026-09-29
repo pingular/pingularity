@@ -639,6 +639,16 @@ consequences worth knowing before you need them:
   restore never opens a dashboard to the network, and closes one only in the
   fail-closed case above - a backup with login on, restored where no password
   exists. Set it in the Access tab on the destination.
+- **Restoring a backup with shorter retention?** A backup carries its
+  install's retention windows, but a restore never shortens one: where the
+  backup keeps a kind of history for less time than this machine does, this
+  machine's window stays, so the next cleanup cannot delete history the
+  machine already had. The import names each window it kept and what the
+  backup asked for; lower it on the Data tab if the backup's was what you
+  wanted. A longer window, or keep forever, is restored as usual. Restored
+  rows that are already older than a window are deleted at the next cleanup,
+  which runs every hour, and the import says how many; raise the window and
+  import the file again to keep them.
 - **Restoring on an *older* version?** It will refuse the file rather than
   restore half of it. A backup is stamped with the oldest version that can read
   it, and that stamp is worked out from what the file actually contains - so a

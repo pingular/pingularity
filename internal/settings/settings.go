@@ -1336,6 +1336,74 @@ func (c *Controller) IperfPairAbsent(rows map[string]string) (direction string, 
 	return there.IperfDirection, there.IperfRetries, noDirection, noRetries
 }
 
+// RetentionCategory names the history a retention setting keeps - "latency",
+// "speed" or "downtime", the names a backup's categories and the Data tab use -
+// or "" for a key that is not one of the three windows.
+func RetentionCategory(key string) string {
+	switch key {
+	case keyRetention:
+		return "latency"
+	case keySpeedRet:
+		return "speed"
+	case keyDowntimeRet:
+		return "downtime"
+	}
+	return ""
+}
+
+// RestoredRetention weighs one restored row for a retention window
+// (RetentionCategory) against the window this install keeps now. asked is the
+// window the row would put in force, read the way a load reads it - onto this
+// controller's defaults, then normalize - so a value a load clamps, or refuses
+// and replaces with the default, counts as what the daemon would then run
+// rather than as what the file says. here is the window in force. keeps
+// reports whether asked keeps history at least as long as here (KeepsAtLeast).
+//
+// A restore never shortens a window, and this is the question it asks of each
+// such row before it lands. A backup carries its install's retention with the
+// rest of its settings, and a shorter one went live at the reload that ends a
+// restore: the next hourly cleanup then deleted this install's own history
+// down to the backup's window, with nothing in the reply to say so. The same
+// held for a value a load cannot read, which falls back to the default.
+func (c *Controller) RestoredRetention(key, text string) (asked, here time.Duration, keeps bool) {
+	there, live := normalize(overlay(c.defaults, map[string]string{key: text})), c.get()
+	switch key {
+	case keyRetention:
+		asked, here = there.Retention, live.Retention
+	case keySpeedRet:
+		asked, here = there.SpeedRetention, live.SpeedRetention
+	case keyDowntimeRet:
+		asked, here = there.DowntimeRetention, live.DowntimeRetention
+	default:
+		return 0, 0, true
+	}
+	return asked, here, KeepsAtLeast(asked, here)
+}
+
+// KeepsAtLeast reports whether retention window a keeps history at least as
+// long as b. 0 keeps it forever, so it is at least as long as anything, and
+// nothing but another 0 is at least as long as it.
+func KeepsAtLeast(a, b time.Duration) bool {
+	switch {
+	case a <= 0:
+		return true
+	case b <= 0:
+		return false
+	}
+	return a >= b
+}
+
+// PruneCutoff is the time before which a retention window's cleanup removes
+// rows, at now: the epoch for a window of 0 (keep forever), which is before
+// every row. The pruner hands it to the cleanup, and a restore counts what that
+// cleanup will remove with it, so the two cannot read a window differently.
+func PruneCutoff(now time.Time, window time.Duration) time.Time {
+	if window <= 0 {
+		return time.Unix(0, 0)
+	}
+	return now.Add(-window)
+}
+
 // recordMigrations writes back what the legacy reads in overlay and loadSchedule
 // just seeded, so each legacy source is consulted once. m is the AllSettings
 // snapshot the load read, v the normalized result now in effect. Without this

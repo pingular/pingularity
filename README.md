@@ -486,16 +486,21 @@ the same file, so a copy of the database on its own cannot mint a login. Back th
 **Backups.** The Data tab's **Export** writes a JSON file with any mix of
 settings, latency history, speed runs and outages; **Import** restores it -
 history is merged (nothing you already have is overwritten), settings are
-replaced and applied live. It never contains passwords, but it does carry your
-webhook and heartbeat URLs, which are as good as passwords for those services,
-so treat the file as a secret. Restoring onto a machine with no password
-leaves login off and closes network access until you set one; restoring onto
-another machine keeps that machine's own "monitoring since" date, so its
-uptime never claims time it didn't watch; an older release refuses a backup it
-can't fully read rather than restoring half of it. For a very large backup,
-copy the database file by hand instead, with the service stopped - a copy
-taken while it runs misses the recent rows in the `-wal` sidecar, and the
-latest readings, which are still in memory - and copy the key file with it.
+replaced and applied live - except that a restore never shortens how long
+history is kept: where the backup's retention window is shorter, yours stays,
+and the import says so. It also says how many restored rows are older than
+your windows, which the next hourly cleanup deletes; to keep them, raise the
+window and import the file again. A backup never contains passwords, but it
+does carry your webhook and heartbeat URLs, which are as good as passwords for
+those services, so treat the file as a secret. Restoring onto a machine with
+no password leaves login off and closes network access until you set one;
+restoring onto another machine keeps that machine's own "monitoring since"
+date, so its uptime never claims time it didn't watch; an older release
+refuses a backup it can't fully read rather than restoring half of it. For a
+very large backup, copy the database file by hand instead, with the service
+stopped - a copy taken while it runs misses the recent rows in the `-wal`
+sidecar, and the latest readings, which are still in memory - and copy the key
+file with it.
 
 **Disk space.** The database file grows until it holds what your retention
 windows keep, then stops. It does not get smaller. Lowering a window or using

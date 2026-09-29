@@ -1157,16 +1157,14 @@ func TestHandleUpdate(t *testing.T) {
 	}
 }
 
-// Rows older than the live retention window import fine but will be pruned
-// within the hour; the response must warn so the vanishing doesn't read as a
+// Rows older than the live retention window import fine but are deleted at the
+// next cleanup; the response must warn so the vanishing doesn't read as a
 // broken restore.
 func TestImportWarnsWhenRowsPredateRetention(t *testing.T) {
 	s := newTestServer(t)
-	// First set a 30-day latency retention via a config import.
-	cfg := `{"pingularity_export":1,"config":[{"key":"retention_s","value":"2592000"}]}`
-	if w := do(t, s.Handler(), "POST", "/api/import?config=1", cfg); w.Code != http.StatusOK {
-		t.Fatalf("config import: got %d: %s", w.Code, w.Body)
-	}
+	// First set a 30-day latency retention. Not through a config import: this
+	// server keeps everything, and a restore never shortens a window.
+	setRetention(t, s, 30*24*time.Hour, 0, 0)
 	// Then restore samples stamped far in the past.
 	old := `{"pingularity_export":1,"latency":[{"ts":1000,"target":"cf","latency_ms":10,"success":1,"family":"ipv4"}]}`
 	w := do(t, s.Handler(), "POST", "/api/import?latency=1", old)

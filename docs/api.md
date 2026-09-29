@@ -255,12 +255,19 @@ and `-d '{…}'` where a body is listed below.
   (413), 8 MiB per batch held in memory. In a file from Pingularity's own
   exporter, config is applied last, so a data failure can't half-change your
   settings; a hand-built or third-party file is applied in *its* key order, so put
-  `config` last yourself. A restore that arrives once the daemon has begun shutting
-  down is refused with `503` rather than half-applied; one already in flight holds
-  the shutdown open until the login/access repairs that follow it have finished).
-  The speedtest times behind the latency chart's hover note are not exported:
-  they only feed that note, and a restore simply has no notes for the history
-  it brings
+  `config` last yourself. Config replaces the settings, except that a retention
+  window (`retention_s`, `speed_retention_s`, `downtime_retention_s`) is never
+  shortened: a backup's shorter window is left out, and a longer one or `0` lands.
+  The reply's `warnings` (on success and on a partial failure alike) name the
+  windows kept, count the restored rows already past a window, which the next
+  cleanup (hourly) deletes, with any outage records the install already had that a
+  restored recovery now ends before the window (the cleanup deletes outages
+  whole), and say so when a cleanup that ran during the restore could have deleted
+  restored rows. A restore that arrives once the daemon has begun shutting down is
+  refused with `503` rather than half-applied; one already in flight holds the
+  shutdown open until the login/access repairs that follow it have finished). The
+  speedtest times behind the latency chart's hover note are not exported: they
+  only feed that note, and a restore simply has no notes for the history it brings
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 - `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
 

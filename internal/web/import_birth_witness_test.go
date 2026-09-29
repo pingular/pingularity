@@ -57,9 +57,11 @@ func TestImportVoidsAPendingBirthStamp(t *testing.T) {
 
 	// Restore a MARKERLESS backup - what an export from a pre-marker install
 	// looks like. Its config rows are settings writes, which is exactly what
-	// would otherwise complete the pending stamp.
+	// would otherwise complete the pending stamp. (A row that lands: a
+	// retention window shorter than this install's keep-forever would be left
+	// out, and a restore with nothing to write is not the case here.)
 	s := newTestServerWith(t, st, set)
-	backup := `{"pingularity_export":1,"config":[{"key":"retention_s","value":"3600"}]}`
+	backup := `{"pingularity_export":1,"config":[{"key":"latency_interval_s","value":"10"}]}`
 	if rr := importBackup(t, s, "config=1", backup); rr.Code != 200 {
 		t.Fatalf("import: HTTP %d: %s", rr.Code, rr.Body.String())
 	}
