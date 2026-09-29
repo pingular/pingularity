@@ -1536,6 +1536,16 @@
        Backup & restore the remainder (room for the chips + buttons). */
     .tabpane[data-tab="retention"].active{display:grid;grid-template-columns:fit-content(320px) 1fr;column-gap:48px;align-items:start;}
     .tabpane[data-tab="retention"] .data-card+.data-card{margin-top:0;padding-top:0;border-top:none;padding-left:48px;height:100%;box-sizing:border-box;}
+    /* A retention box widened for a long figure (0.04167, 41.66667 - see
+       syncDayBox) makes the card wider, a few pixels past the cap, rather than
+       squeezing the Delete buttons onto two lines or under the box. The box's
+       own overflow:hidden would otherwise let the table count it as zero wide.
+       At the stock width the table fits under the cap and neither rule moves
+       anything. Below this width the cards stack at full width, which leaves a
+       long figure room to spare down to phone widths; on a phone its Delete
+       button moves to the line under the box instead (.drow.long, below). */
+    .dtable .ctl:has(>input[type=number]){min-width:max-content;}
+    .dtable .btn.danger{white-space:nowrap;}
   }
   .data-card-h{margin:2px 0 10px;}
   .data-card-h h3{grid-column:auto;margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);}
@@ -1549,6 +1559,49 @@
      one bordered box, borderless input, muted unit inside. They sit left in their grid
      column rather than hugging the drawer's right rail. */
   .dtable .ctl:has(>input[type=number]){justify-self:start;}
+  /* The exact length under a box that is not a whole number of days ("= 1h"
+     under 0.04167). It is the row's fourth child, so it drops to a line of its
+     own and spans the box and button columns; hidden, it is no grid item at
+     all and the table keeps its three rows. */
+  .dtable .dexact{grid-column:2/-1;margin-top:-6px;font-size:11.5px;color:var(--muted);}
+  /* Narrow screens: a row whose box is widened for a long figure (.long, set
+     by syncDayBox) takes two lines where subgrid is supported, three without
+     it - the box on the first, free to grow into the button's column, and the
+     Delete button on the second, beside the exact line (above it without
+     subgrid). One line has no room for them. At a 320px screen the table is 272px
+     wide; a stock box leaves its button 9px, but 3649.99999 makes the box
+     141px, 153px in a touch screen's 16px text, and it ran 37px (49px) under
+     the button. Even 0.04167 ran 10px (19px) under it, and in touch text the
+     longest figure still did at 360px. Nothing else in the row can give that
+     back: the name column is as wide as the longest name, and hiding the unit
+     and narrowing the gaps to 10px still left the longest figure touching the
+     button in touch text at 320px. So the button moves, from 600px down, where
+     the settings tabs and the header change to their phone layouts too. The
+     first two rules move it: the box takes the button's column as well, and
+     the button, kept to that column, drops to the line below. That is as far
+     as plain grid items go, because the button comes before the exact line in
+     the markup: the button could only land on a line above the exact line, or
+     beside it on the left, under the dataset's name. So where subgrid is
+     supported the row becomes a grid of its own on the table's three columns,
+     and the button and the exact line both sit at the top of its second line,
+     so the exact line stays right under its box however tall the button is.
+     Without subgrid the exact line comes on a third line, under the button.
+     The first two rules stay outside the @supports because :has(), which
+     draws these boxes, came before subgrid - Safari 15.4 against 16, Chrome
+     105 against 117 - and iOS 15 is as far as the 320px first iPhone SE goes.
+     There the row used to keep its one line, and the box ran under the button
+     by the figures above. The figures the page writes for whole days are four
+     characters at most (3650) and never widen a box, so those rows never
+     change. */
+  @media (max-width:600px){
+    .dtable .drow.long>.ctl{grid-column:2/-1;}
+    .dtable .drow.long>.btn.danger{grid-column:3;}
+    @supports (grid-template-columns:subgrid){
+      .dtable .drow.long{display:grid;grid-column:1/-1;grid-template-columns:subgrid;row-gap:inherit;align-items:center;}
+      .dtable .drow.long>.dexact{grid-area:2/2;align-self:start;}
+      .dtable .drow.long>.btn.danger{grid-area:2/3;align-self:start;}
+    }
+  }
   .btn.danger.sm{padding:6px 12px;font-size:12px;}
   /* Backup & restore: label · selectable categories · action. */
   /* Top-aligned, not centred: the Import row's action column is two controls tall, and
@@ -2290,23 +2343,26 @@
             <span class="dname" id="dnameLatency">Latency
               <span class="info" tabindex="0" data-tip="Connectivity, latency and DNS-lookup samples - the data that grows fastest - and the record of when speedtests ran, used for the latency chart's 'During a speedtest' hover note.
 Delete now clears them all.">i</span></span>
-            <span class="ctl"><input type="number" id="setRetention" step="1" min="0" required aria-labelledby="dnameLatency"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setRetention" step="any" min="0" max="3650" required aria-labelledby="dnameLatency" aria-describedby="setRetentionExact"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delLatency" type="button">Delete now</button>
+            <span class="dexact" id="setRetentionExact" hidden></span>
           </div>
           <div class="drow">
             <span class="dname" id="dnameSpeed">Speed
               <span class="info" tabindex="0" data-tip="Speedtest history. Tests are infrequent, so a long window is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setSpeedRet" step="1" min="0" required aria-labelledby="dnameSpeed"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setSpeedRet" step="any" min="0" max="3650" required aria-labelledby="dnameSpeed" aria-describedby="setSpeedRetExact"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delSpeed" type="button">Delete now</button>
+            <span class="dexact" id="setSpeedRetExact" hidden></span>
           </div>
           <div class="drow">
             <span class="dname" id="dnameDowntime">Downtime
               <span class="info" tabindex="0" data-tip="Outage history - it feeds the downtime heatmap, the outages list and the uptime figure. Outages are tiny, so a long window like 365 is cheap.">i</span></span>
-            <span class="ctl"><input type="number" id="setDowntime" step="1" min="0" required aria-labelledby="dnameDowntime"><span class="unit">days</span></span>
+            <span class="ctl"><input type="number" id="setDowntime" step="any" min="0" max="3650" required aria-labelledby="dnameDowntime" aria-describedby="setDowntimeExact"><span class="unit">days</span></span>
             <button class="btn danger sm" id="delDowntime" type="button">Delete now</button>
+            <span class="dexact" id="setDowntimeExact" hidden></span>
           </div>
         </div>
-        <p class="card-foot muted">How long each dataset is kept before old rows are pruned. <b>0 = keep forever.</b> Each box needs a number - to keep everything, type 0 rather than clearing it.</p>
+        <p class="card-foot muted">How long each dataset is kept before old rows are pruned, in days: 0.5 is 12 hours, and 3650 (10 years) is the most. <b>0 = keep forever.</b> Each box needs a number - to keep everything, type 0 rather than clearing it.</p>
         <p class="card-foot muted">Deleting data or shortening a window does not make the database file smaller. The freed space stays in the file, and new data fills it before the file grows again.</p>
       </section>
       <section class="data-card">
@@ -9237,7 +9293,7 @@ $('serverAuto').addEventListener('click', fpAutoList);
 // form load (applySettings), save (settingsBody), AND Reset to defaults, so the
 // three can never drift out of sync (a new setting is one line here).
 // kinds: bool=checkbox · int/float=number · val=raw value · text=trimmed string
-// · min=seconds↔minutes · day=seconds↔days
+// · min=seconds↔whole minutes · day=seconds↔days, fractions included
 const FIELDS=[
   ['setLatEnabled','latency_enabled','bool'],
   ['setDNSProbe','dns_probe_enabled','bool'],
@@ -9295,10 +9351,16 @@ const FIELDS=[
   ['setHeartbeat','heartbeat_url','text'],
   ['setDigestFreq','digest_freq','val'],
 ];
-// min/day fields display whole units but the API speaks seconds, so remember
-// the exact loaded value per field: an unedited field round-trips it verbatim
-// on Save instead of re-quantizing (a CLI-set "-retain 6h" renders as 0 days,
-// and blindly sending 0 back would mean "keep forever").
+// min/day fields show a unit the API does not speak - it speaks seconds - so
+// remember the exact loaded value per field: an unedited field round-trips it
+// verbatim on Save instead of re-quantizing. 'min' shows whole minutes, so a
+// 90s interval reads 2 and still saves as 90s. 'day' showed whole days the
+// same way, and there the rounding was not harmless: a CLI-set "-retain 6h"
+// read 0 days on a card that says 0 means keep forever, and a 0 typed over it
+// matched the 0 on screen, so Save sent the 6h back and forever was never
+// set. A 'day' box now shows its window exactly instead (see daysShown), so
+// only forever itself reads as 0, and the round trip is a second guarantee
+// for that kind rather than the only one.
 const secOrig={};
 // What each field was LOADED with, keyed by input id and already in the shape
 // the API speaks - filled by every path that fills the form: a settings GET, a
@@ -9310,20 +9372,72 @@ const fieldOrig={};
 function setField(id,kind,v,fb){ switch(kind){
   case 'bool': $(id).checked=!!v; break;
   case 'min': secOrig[id]={raw:v||0, shown:Math.round((v||0)/60)}; $(id).value=secOrig[id].shown; break;
-  case 'day': secOrig[id]={raw:v||0, shown:Math.round((v||0)/86400)}; $(id).value=secOrig[id].shown; break;
+  case 'day': secOrig[id]={raw:v||0, shown:daysShown(v||0)}; $(id).value=secOrig[id].shown; break;
   case 'float': $(id).value=v||0; break;
   case 'text': $(id).value=v||''; break;
   default: { const el=$(id); el.value=v; if(el.tagName==='SELECT'&&el.selectedIndex<0&&el.options.length) el.selectedIndex=0; } }
-  fieldOrig[id]=getField(id,kind,fb); }
-// intOf reads a number input as a whole number, or NaN when it holds nothing
-// usable. Number, not parseInt: "1e3" is valid floating-point syntax that a
-// number input accepts and checkValidity passes (1000 being a whole number in
-// range), while parseInt reads it as its MANTISSA - an iperf window typed as
-// 1e3 KB saved as 1 KB, a retention of 1e2 days as 1 day = prune almost
-// everything. One definition for every whole-number field kind below, because
+  fieldOrig[id]=getField(id,kind,fb);
+  if(kind==='day') syncDayBox(id); }
+// daysShown is what a 'day' box shows for a stored window: days, with the
+// fewest decimals - five at most - that give the stored seconds back exactly.
+// A whole number of days reads as it always has (30, 365). The rest come from
+// a -retain* flag, a POST in seconds or a restored config, and rounding them
+// to whole days is what showed 6h as 0, which the card says is keep forever,
+// and 36h as 2; they read 0.25 and 1.5 now, and 1h reads 0.04167. Five places
+// always do it: a hundred-thousandth of a day is 0.864s, under a second, so no
+// two whole seconds share a five-place figure. And a figure that gives back a
+// window of a second or more cannot itself be 0, so only forever shows as 0.
+function daysShown(sec){ const d=sec/86400;
+  for(let k=0;k<5;k++){ const x=Number(d.toFixed(k)); if(Math.round(x*86400)===sec) return x; }
+  return Number(d.toFixed(5)); }
+// fmtExact spells whole seconds out in every unit they fill, largest first,
+// leaving out the empty ones: 129600 is "1d 12h", 3600 "1h", 90061 "1d 1h 1m
+// 1s". fmtDur keeps two units and rolls days up into months, which is right
+// for a pill and wrong under a box that counts days: 30.5 days would read
+// "1mo 0d" there, the half day gone. This one has to agree with the box to the
+// second, so it drops nothing and stops at days.
+function fmtExact(sec){ let s=Math.max(0,Math.round(sec||0)); const out=[];
+  for(const [u,n] of [['d',86400],['h',3600],['m',60],['s',1]]) if(s>=n){ out.push(Math.floor(s/n)+u); s%=n; }
+  return out.join(' ')||'0s'; }
+// syncDayBox keeps a 'day' box honest about what it holds. It writes the exact
+// length under the box ("= 1h" under 0.04167) while what Save would post is not
+// a whole number of days, and clears it otherwise - forever and whole days need
+// no gloss. It reads through getField, so it describes the value that would be
+// SAVED: the stored seconds while the box is untouched, the typed figure once
+// it is edited, never a rounding of its own. A figure the box itself refuses
+// (below 0, above 3650) gets no line either: Save stops on that box with its
+// own message, so there is no length to describe. The text goes when the line
+// hides, not just the line: the box names it in aria-describedby, and a hidden
+// element a description points at directly is still read out. And it widens a
+// box whose figure is longer than the five characters the box is drawn for, a
+// character's width (1ch) at a time: 0.04167 in the stock box showed as
+// 0.0416, the last digit cut off. Anything shorter goes back to the
+// stylesheet's width, and nothing grows past the longest figure the page
+// writes itself (3649.99999, ten characters) - longer is typing, and the box
+// scrolls under the caret like any other. A widened box marks its row .long,
+// and on a phone that row puts its Delete button on the line under the box: a
+// stock box leaves the button room on a 320px screen, a widened one does not
+// (see .drow.long in the stylesheet).
+function syncDayBox(id){ const box=$(id), note=$(id+'Exact');
+  const len=Math.min(10, String(box.value==null?'':box.value).length);
+  box.style.width = len>5 ? 'calc('+len+'ch + 13px)' : '';
+  const row = box.closest ? box.closest('.drow') : null;
+  if(row) row.classList.toggle('long', len>5);
+  if(!note) return;
+  const s=getField(id,'day'), ok=!box.validity || box.validity.valid;
+  const t=(ok && s>0 && s%86400) ? '= '+fmtExact(s) : '';
+  note.textContent=t; note.hidden=!t; }
+// numOf reads a number input as a number, or NaN when it holds nothing usable.
+// Number, not parseInt: "1e3" is valid floating-point syntax that a number
+// input accepts and checkValidity passes (1000 being a whole number in range),
+// while parseInt reads it as its MANTISSA - an iperf window typed as 1e3 KB
+// saved as 1 KB, a retention of 1e2 days as 1 day = prune almost everything.
+// intOf is the same read for the whole-number kinds. One definition under
+// every number kind that reads a box as typed ('int', 'min', 'day'), because
 // three copies of a rule this subtle is how they drift apart.
-function intOf(v){ const s=String(v==null?'':v).trim(), n=Number(s);
-  return s===''||!Number.isFinite(n)?NaN:Math.trunc(n); }
+function numOf(v){ const s=String(v==null?'':v).trim(), n=Number(s);
+  return s===''||!Number.isFinite(n)?NaN:n; }
+function intOf(v){ return Math.trunc(numOf(v)); }
 function getField(id,kind,fb){ switch(kind){
   case 'bool': return $(id).checked;
   // 0 is a legal value (e.g. Retries "0 = no retry") - only an unparsable
@@ -9332,9 +9446,14 @@ function getField(id,kind,fb){ switch(kind){
   case 'min': { const o=secOrig[id], n=intOf($(id).value);
     if(o && n===o.shown) return o.raw;
     return (n||fb||0)*60; }
-  case 'day': { const o=secOrig[id], n=intOf($(id).value);
+  // Days as typed, fractions and all (0.5 is 12 hours), to the nearest second.
+  // Never below one second, though: 0 is keep forever, and a box holding a
+  // number above 0 must not round its way there. An empty box still reads as
+  // 0, which is why the three boxes are `required` (see invalidNumberField).
+  case 'day': { const o=secOrig[id], n=numOf($(id).value);
+    if(Number.isNaN(n)) return 0;
     if(o && n===o.shown) return o.raw;
-    return (n||0)*86400; }
+    const s=Math.round(n*86400); return n>0 ? Math.max(1,s) : s; }
   case 'float': return parseFloat($(id).value)||0;
   case 'text': return $(id).value.trim();
   default: return $(id).value; } }
@@ -10840,6 +10959,10 @@ async function deleteData(type){
 $('delLatency').addEventListener('click', ()=>deleteData('latency'));
 $('delSpeed').addEventListener('click', ()=>deleteData('speed'));
 $('delDowntime').addEventListener('click', ()=>deleteData('downtime'));
+// A retention box follows the typing (see syncDayBox), so the line under it
+// always says what Save would keep - 1.5 gains "= 1d 12h" as it is typed, and
+// 2 loses it again - and a long figure is never cut off in the box.
+FIELDS.forEach(([id,,kind])=>{ if(kind==='day') $(id).addEventListener('input', ()=>syncDayBox(id)); });
 
 // Reset: load the factory defaults into the form (not saved until Save is clicked).
 $('resetSettings').addEventListener('click', () => {

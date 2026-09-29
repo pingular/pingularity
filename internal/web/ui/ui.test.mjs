@@ -462,16 +462,19 @@ test('seriesGapSec: 3x the median point spacing; Infinity when unknowable', () =
 });
 
 // --- settings form field mapping ---
-// Stub $ with a per-id object store so set/getField run without a DOM.
+// Stub $ with a per-id object store so set/getField run without a DOM. A box
+// comes with a style, because a 'day' box is sized to its figure as it is filled
+// (syncDayBox), and the line under it is one more object in the same store.
 const els = {};
 const SF = new Function('$', extract('const secOrig') + '\n' + extract('const fieldOrig') + '\n' +
-  extract('function setField') + '\n' +
-  extract('function intOf') + '\n' + extract('function getField') +
-  '\nreturn { setField, getField, fieldOrig };')(id => els[id] || (els[id] = {}));
+  extract('function setField') + '\n' + extract('function daysShown') + '\n' +
+  extract('function fmtExact') + '\n' + extract('function syncDayBox') + '\n' +
+  extract('function numOf') + '\n' + extract('function intOf') + '\n' + extract('function getField') +
+  '\nreturn { setField, getField, fieldOrig, daysShown, fmtExact, syncDayBox };')(id => els[id] || (els[id] = { style: {} }));
 
 test('set/getField: an unedited min/day field round-trips its exact seconds', () => {
-  SF.setField('ret', 'day', 21600);               // CLI-set 6h renders as 0 days
-  assert.equal(els.ret.value, 0);
+  SF.setField('ret', 'day', 21600);               // CLI-set 6h shows as a quarter day, not 0
+  assert.equal(els.ret.value, 0.25);
   assert.equal(SF.getField('ret', 'day'), 21600); // unedited -> exact value back, not 0 = forever
   els.ret.value = '2';                            // edited -> whole days as typed
   assert.equal(SF.getField('ret', 'day'), 2 * 86400);
@@ -8609,7 +8612,7 @@ function driveEstimate({ avgDown = 0, avgUp = 0, avgServers = 1, box = '1', mins
     + `function collectWindows(){ return ${JSON.stringify(windows || [])}; }\n`
     + extract('function covGrid') + '\n'
     + extract('function schedRunsPerDay') + '\n'
-    + extract('function intOf') + '\n'
+    + extract('function numOf') + '\n' + extract('function intOf') + '\n'
     + extract('function updateSpeedEstimate') + '\n'
     + 'return updateSpeedEstimate;';
   const run = new Function('$', src)(id => els[id]);
@@ -8730,9 +8733,10 @@ test('Save refuses a number the browser already knows is out of range', () => {
 
 // A retention box the user emptied saved as 0, and 0 means KEEP FOREVER - the
 // Data card says so in bold. getField's 'day' kind has no shipping-default
-// fallback the way 'int' and 'min' do (intOf('') is NaN, and (NaN||0)*86400 is
-// 0), so clearing "365" turned a year into forever with the drawer closing on
-// success and nothing said. The same silence the negative case was closed for.
+// fallback the way 'int' and 'min' do (numOf('') is NaN, and the 'day' reader
+// answers an unreadable box with 0), so clearing "365" turned a year into
+// forever with the drawer closing on success and nothing said. The same
+// silence the negative case was closed for.
 // The three boxes are `required` now, which is what makes the browser call an
 // empty one invalid so the gate above can stop on it.
 test('an emptied retention box is refused rather than saved as keep-forever', () => {
@@ -8834,7 +8838,7 @@ test('a schedule with no active days sends the reader to the rows it is refusing
 function driveDeps() {
   const nodes = {};
   const $ = id => nodes[id] || (nodes[id] = { value: '', checked: false, disabled: false, tagName: 'INPUT',
-    min: '', max: '',
+    min: '', max: '', style: {},
     get validity() { const n = Number(this.value);
       return { valid: !(this.value !== '' && Number.isFinite(n)
         && ((this.min !== '' && n < Number(this.min)) || (this.max !== '' && n > Number(this.max)))) }; },
@@ -8845,7 +8849,9 @@ function driveDeps() {
   const src = 'let schedServerSkewMs=null;\n'
     + script.match(/const FIELDS=\[[\s\S]*?\n\];/)[0] + '\n'
     + extract('const secOrig') + '\n' + extract('const fieldOrig') + '\n'
-    + extract('function setField') + '\n' + extract('function intOf') + '\n'
+    + extract('function setField') + '\n' + extract('function daysShown') + '\n'
+    + extract('function fmtExact') + '\n' + extract('function syncDayBox') + '\n'
+    + extract('function numOf') + '\n' + extract('function intOf') + '\n'
     + extract('function getField') + '\n' + extract('function setFields') + '\n'
     + extract('function settingsBody') + '\n'
     + 'return { setFields, settingsBody };';
@@ -11718,4 +11724,221 @@ test('the Save to disk every tip says what a crash costs and what it never costs
   assert.match(tip, /• 0 = write every round at once\./);
   assert.match(tip, /• Capped at 120 sec\./);
   assert.doesNotMatch(tip, /—/, 'no em-dashes in new text');
+});
+
+// --- the Data tab's Keep for boxes --------------------------------------------
+// The three boxes count days and the daemon keeps seconds. They used to round
+// the stored seconds to whole days, so a window under 12 hours - from a
+// -retain* flag, a POST in seconds or a restored config - showed as 0, the
+// figure the card says means keep forever, and a 36h window showed as 2. And
+// the reader handed back the stored seconds whenever the typed number matched
+// the one on screen, so typing 0 over that 0 saved the old window instead of
+// forever: 3600s showed 0, a typed 0 sent 3600, and only a typed 1 got through.
+test('a retention window is shown as it is, and a typed 0 always means keep forever', () => {
+  // [stored seconds, what the box shows, the line under it]
+  const cases = [
+    [0, 0, ''],
+    [3600, 0.04167, '= 1h'],
+    [43200, 0.5, '= 12h'],
+    [86400, 1, ''],
+    [129600, 1.5, '= 1d 12h'],
+    [2592000, 30, ''],
+    [315360000, 3650, ''],
+  ];
+  // What Save sends first - the reported half of it - then what the page shows.
+  for (const [sec, shown] of cases) {
+    const id = 'keep' + sec;
+    SF.setField(id, 'day', sec);
+    assert.equal(SF.getField(id, 'day'), sec, `${sec}s: an untouched box saves exactly what is stored`);
+    els[id].value = '0';
+    assert.equal(SF.getField(id, 'day'), 0, `${sec}s: a typed 0 is keep forever`);
+    els[id].value = '1';
+    assert.equal(SF.getField(id, 'day'), 86400, `${sec}s: a typed 1 is one day`);
+    SF.setField(id, 'day', sec);
+    assert.equal(els[id].value, shown, `${sec}s shows as ${shown}`);
+  }
+  for (const [sec, , line] of cases) {
+    const note = els['keep' + sec + 'Exact'] || {};
+    assert.equal(note.textContent, line, `${sec}s: the line under the box`);
+    assert.equal(note.hidden, line === '', `${sec}s: the line shows only with something to say`);
+  }
+});
+
+// The same through the whole form: what Save posts is settingsBody, read off
+// every FIELDS entry, and that is also what the unsaved-changes check compares.
+test('Save posts the stored seconds for an untouched Keep for box, and 0 for a typed 0', () => {
+  const D = driveDeps();
+  D.setFields({ retention_seconds: 3600, speed_retention_seconds: 129600, downtime_retention_seconds: 0 });
+  let b = D.settingsBody();
+  assert.equal(b.retention_seconds, 3600);
+  assert.equal(b.speed_retention_seconds, 129600);
+  assert.equal(b.downtime_retention_seconds, 0);
+  const shown = ['setRetention', 'setSpeedRet', 'setDowntime'].map(id => String(D.$(id).value));
+  D.$('setRetention').value = '0';
+  b = D.settingsBody();
+  assert.equal(b.retention_seconds, 0, 'forever, as the card says - the 3600 used to go back instead');
+  assert.equal(b.speed_retention_seconds, 129600, 'and the untouched box beside it is left alone');
+  assert.deepEqual(shown, ['0.04167', '1.5', '0'], 'and the boxes showed the hour, the day and a half, and forever');
+});
+
+// Five decimals are enough for any whole number of seconds (a hundred-thousandth
+// of a day is 0.864s), so the figure in the box IS the stored window: typing it
+// back means the same thing, and no two windows share a figure. That is the
+// property the old display lacked - 0 stood for everything under 12 hours and
+// for forever at once.
+test('every whole second survives the Keep for box, and only forever reads as 0', () => {
+  const check = s => {
+    const shown = String(SF.daysShown(s)), back = Math.round(Number(shown) * 86400);
+    if (back !== s) assert.fail(`${s}s shows as ${shown}, which saves as ${back}s`);
+    if (s > 0 && Number(shown) === 0) assert.fail(`${s}s shows as 0, which the card says is keep forever`);
+    if (!/^\d+(\.\d{1,5})?$/.test(shown)) assert.fail(`${s}s shows as "${shown}": five decimals at most, no exponent`);
+  };
+  for (let s = 0; s <= 2 * 86400; s++) check(s);                   // every second of the first two days
+  for (let s = 0; s <= 315360000; s += 9973) check(s);             // across the whole ten years
+  for (let s = 315360000 - 86400; s <= 315360000; s++) check(s);   // and every second of the last day
+  // The fewest decimals that do it, so a plain window reads plainly.
+  assert.equal(SF.daysShown(21600), 0.25);
+  assert.equal(SF.daysShown(10800), 0.125);
+  assert.equal(SF.daysShown(365 * 86400 + 21600), 365.25);
+  assert.equal(SF.daysShown(1), 0.00001);
+});
+
+test('a typed fraction of a day saves to the second, and a number above 0 never rounds to forever', () => {
+  SF.setField('frac', 'day', 30 * 86400);
+  const typed = v => { els.frac.value = v; return SF.getField('frac', 'day'); };
+  assert.equal(typed('0.5'), 43200);
+  assert.equal(typed('1.5'), 129600);
+  assert.equal(typed('0.04167'), 3600, 'the five-place figure for an hour is an hour');
+  assert.equal(typed('0.0417'), 3603, 'a coarser one is what it says, to the second - and the line under the box shows it');
+  assert.equal(typed('1e2'), 100 * 86400, 'scientific notation is a value, not its mantissa');
+  assert.equal(typed('0.000001'), 1,
+    'a tenth of a second is kept as one second: 0 is keep forever, and nobody typed 0');
+  assert.equal(typed('0'), 0);
+  assert.equal(typed('30'), 30 * 86400, 'the figure on screen, typed again');
+  assert.equal(typed(''), 0, 'still 0 - which is why an empty box is refused before Save reads it');
+});
+
+test('the line under a retention box says the exact length Save would keep, as it is typed', () => {
+  SF.setField('live', 'day', 3600);
+  const note = els.liveExact;
+  assert.equal(note.textContent, '= 1h');
+  const type = v => { els.live.value = v; SF.syncDayBox('live'); return note.hidden ? '' : note.textContent; };
+  assert.equal(type('1.5'), '= 1d 12h');
+  assert.equal(type('2'), '', 'whole days need no gloss');
+  assert.equal(note.textContent, '', 'and the text goes with the line: the box names it as its description');
+  assert.equal(type('0'), '', 'nor does forever');
+  assert.equal(type('0.04167'), '= 1h', 'back to the figure it loaded with, and so to the stored hour');
+  assert.equal(type('0.0417'), '= 1h 3s', 'a figure that is not quite an hour says so');
+  assert.equal(type('-1'), '', 'a negative window is the box’s to refuse, not the line’s to describe');
+  // Past the max the browser calls the box invalid (rangeOverflow) and Save
+  // stops on it with its own message; the stub box judges nothing until told.
+  els.live.validity = { valid: false };
+  assert.equal(type('3650.5'), '', 'nor is a window above the ten years the box stops at');
+  delete els.live.validity;
+  assert.equal(type('3650.5'), '= 3650d 12h', 'the same figure described, once the box accepts it');
+  // fmtExact drops nothing and stops at days, to agree with a box that counts
+  // them: fmtDur keeps two units and would call 30.5 days "1mo 0d".
+  for (const [s, want] of [[0, '0s'], [1, '1s'], [60, '1m'], [3600, '1h'], [90061, '1d 1h 1m 1s'],
+    [129600, '1d 12h'], [2635200, '30d 12h'], [315359999, '3649d 23h 59m 59s']])
+    assert.equal(SF.fmtExact(s), want, `fmtExact(${s})`);
+});
+
+// The stock box holds five characters; 0.04167 showed as 0.0416 in it, the
+// last digit cut off.
+test('a retention box grows to show a long figure whole, and the card makes room for it', () => {
+  SF.setField('wide', 'day', 3600);
+  assert.equal(els.wide.style.width, 'calc(7ch + 13px)', '0.04167');
+  SF.setField('wide', 'day', 315359999);
+  assert.equal(els.wide.style.width, 'calc(10ch + 13px)', '3649.99999');
+  SF.setField('wide', 'day', 365 * 86400);
+  assert.equal(els.wide.style.width, '', 'back to the stylesheet’s width');
+  els.wide.value = '1.00000000000001'; SF.syncDayBox('wide');
+  assert.equal(els.wide.style.width, 'calc(10ch + 13px)', 'no wider than the longest figure the page writes itself');
+  // On wide screens the Stored data card is capped at 320px and the stock table
+  // fills it; a wider box has to widen the card, not overlap the Delete buttons.
+  // The box clips its own overflow, which would otherwise let the table count
+  // it as zero wide.
+  const wide = html.slice(html.indexOf('@media(min-width:980px){'));
+  const block = wide.slice(0, wide.indexOf('\n  }'));
+  assert.match(block, /fit-content\(320px\)/, 'the block that caps the card');
+  assert.match(block, /\.dtable \.ctl:has\(>input\[type=number\]\)\{min-width:max-content;\}/);
+  assert.match(block, /\.dtable \.btn\.danger\{white-space:nowrap;\}/);
+});
+
+// A phone has no room for a widened box and its Delete button on one line. At a
+// 320px screen 3649.99999 ran 37px under the button, 49px in a touch screen's
+// 16px text, where a stock box leaves it 9px, and in touch text it still did at
+// 360px. So a widened box marks its row, and from 600px down the marked row puts
+// the button on the line under the box, beside the exact line where subgrid is
+// supported and above it where it is not. How that lays
+// out was measured in Chromium; this holds the two halves together - the mark,
+// and the rules it switches on. The two rules that move the button sit outside
+// the @supports for subgrid: an engine with :has() and no subgrid (Safari 15.4
+// to 15.8, Chrome 105 to 116) draws the widened box all the same, and while
+// every rule was behind that @supports it kept the one-line row: with the
+// subgrid rules turned off, Chromium ran 3649.99999 under the button by the
+// same 37px (49px) at 320px.
+test('on a phone a widened retention box moves its Delete button to the line under it', () => {
+  const on = new Set();
+  const row = { classList: { toggle: (c, yes) => { if (yes) on.add(c); else on.delete(c); } } };
+  els.phone = { style: {}, closest: sel => (sel === '.drow' ? row : null) };
+  SF.setField('phone', 'day', 3600);
+  assert.ok(on.has('long'), '0.04167 widens its box, and marks the row');
+  SF.setField('phone', 'day', 315359999);
+  assert.ok(on.has('long'), '3649.99999');
+  SF.setField('phone', 'day', 43200);
+  assert.ok(!on.has('long'), '0.5 fits the stock box, and its row keeps one line');
+  SF.setField('phone', 'day', 315360000);
+  assert.ok(!on.has('long'), 'a whole number of days never marks a row: 3650 is four characters');
+  els.phone.value = '0.0416'; SF.syncDayBox('phone');
+  assert.ok(on.has('long'), 'the mark follows the typing');
+  els.phone.value = '0.041'; SF.syncDayBox('phone');
+  assert.ok(!on.has('long'), 'both ways');
+  // Each real box sits in the row the mark goes on.
+  for (const id of ['setRetention', 'setSpeedRet', 'setDowntime']) {
+    const at = html.indexOf('<input type="number" id="' + id + '"');
+    const rowAt = html.lastIndexOf('<div class="drow">', at);
+    assert.ok(rowAt > 0 && !html.slice(rowAt, at).includes('</div>'), id + ' is inside a .drow');
+  }
+  const at = html.lastIndexOf('@media (max-width:600px){', html.indexOf('.dtable .drow.long{display:grid;'));
+  assert.ok(at > 0, 'a phone-width block for the marked row');
+  const block = html.slice(at, html.indexOf('\n  }', at));
+  const sub = block.indexOf('@supports (grid-template-columns:subgrid){');
+  assert.ok(sub > 0, 'with the subgrid rules in it');
+  // What every engine gets: the rules ahead of any @supports.
+  const every = block.slice(0, sub);
+  assert.doesNotMatch(every, /@supports/, 'nothing ahead of the subgrid rules waits on a feature');
+  assert.match(every, /\.dtable \.drow\.long>\.ctl\{grid-column:2\/-1;\}/,
+    'the box gets the button’s column as well, subgrid or not');
+  assert.match(every, /\.dtable \.drow\.long>\.btn\.danger\{grid-column:3;\}/,
+    'and the button keeps to its own, so it drops to the line under the box, subgrid or not');
+  const subgrid = block.slice(sub);
+  assert.match(subgrid, /\.dtable \.drow\.long\{display:grid;grid-column:1\/-1;grid-template-columns:subgrid;/,
+    'with subgrid the row lays out on the table’s own three columns');
+  assert.match(subgrid, /\.dtable \.drow\.long>\.dexact\{grid-area:2\/2;/, 'the exact line stays under the box');
+  assert.match(subgrid, /\.dtable \.drow\.long>\.btn\.danger\{grid-area:2\/3;/, 'and the button moves down beside it');
+});
+
+test('the Keep for boxes take fractions, stop at the daemon’s ten years, and name their exact line', () => {
+  for (const id of ['setRetention', 'setSpeedRet', 'setDowntime']) {
+    const tag = (html.match(new RegExp('<input type="number" id="' + id + '"[^>]*>')) || [''])[0];
+    assert.ok(tag, id);
+    // A step of 1 would make the browser call an untouched 0.04167 a
+    // stepMismatch, and the save gate would refuse the whole drawer over it.
+    assert.match(tag, /\sstep="any"[\s>]/, id + ': a stored window that is not whole days must pass the box’s own step');
+    assert.match(tag, /\smin="0"[\s>]/, id);
+    // settings.MaxDuration, ten years of 365 days; the Go side holds the two
+    // together (TestRetentionBoxesStopWhereTheDaemonClamps).
+    assert.match(tag, /\smax="3650"[\s>]/, id + ': refused at Save, not cut by the daemon without a word');
+    assert.match(tag, new RegExp('\\saria-describedby="' + id + 'Exact"[\\s>]'), id);
+    assert.ok(html.includes('<span class="dexact" id="' + id + 'Exact" hidden></span>'),
+      id + ': its exact line is there, hidden until it has something to say');
+  }
+  assert.match(script, /FIELDS\.forEach\(\(\[id,,kind\]\)=>\{ if\(kind==='day'\) \$\(id\)\.addEventListener\('input', \(\)=>syncDayBox\(id\)\); \}\);/,
+    'the line follows the typing');
+  const foot = html.slice(html.indexOf('<p class="card-foot muted">How long each dataset is kept'));
+  assert.match(foot.slice(0, foot.indexOf('</p>')),
+    /pruned, in days: 0\.5 is 12 hours, and 3650 \(10 years\) is the most\. <b>0 = keep forever\.<\/b>/,
+    'the card says what the boxes take');
+  assert.doesNotMatch(foot.slice(0, foot.indexOf('</p>')), /—/, 'no em-dashes in new text');
 });

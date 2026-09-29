@@ -338,7 +338,12 @@ and persist across restarts.
   strip under each list shows the merged coverage. Manual "Run now" always works.
 - **Data** → retention: three independent windows - **latency** samples (default
   **30** days), **speed** history (default **365** days), and **downtime**/outage
-  history (the heatmap, default **365** days); `0` = keep forever; a lowered
+  history (the heatmap, default **365** days); `0` = keep forever. The boxes
+  count days and take fractions (`0.5` is 12 hours), up to `3650` (10 years).
+  A window that is not a whole number of days - set with `-retain 36h`, say,
+  or sent to the API in seconds - shows as its exact figure (`1.5`) with the
+  length under the box (`= 1d 12h`), so a short window never reads as `0`,
+  and a box you leave alone saves exactly the window it showed. A lowered
   window applies at the next hourly cleanup, which works through a large
   backlog in small steps and can take a few minutes. A shorter window or a
   delete does not make the database file smaller: the freed space stays in
