@@ -22,13 +22,16 @@ import (
 // of rows aside, so the product is reached without any crafted file.
 
 // seedPauseTables restores P live pauses and Q held rows through the import
-// door, the way a backup does - it is the import that arms the re-judgement,
-// so the next write runs the repair exactly as it would after a restore. Held
-// rows end in 2099: no plausible clock exonerates them, so they stay for the
-// repair to walk on every Open.
+// door, the way a backup does, under the hold on the outage record the
+// downtime category goes in under - it is the import that arms the
+// re-judgement, so the next write runs the repair exactly as it would after a
+// restore. Held rows end in 2099: no plausible clock exonerates them, so they
+// stay for the repair to walk on every Open.
 func seedPauseTables(t *testing.T, s *Store, P, Q int) (importPauses, importHeld time.Duration) {
 	t.Helper()
 	ctx := context.Background()
+	hold := s.HoldOutageRecord()
+	defer hold.Release()
 	now := time.Now().Unix()
 	live := make([]map[string]any, 0, P)
 	base := now - int64(P+10)*300
@@ -36,7 +39,7 @@ func seedPauseTables(t *testing.T, s *Store, P, Q int) (importPauses, importHeld
 		live = append(live, map[string]any{"ts": base + int64(i)*300, "duration_s": int64(299)})
 	}
 	start := time.Now()
-	if n, err := s.ImportTableBatch(ctx, "pauses", live, map[int64]int{}); err != nil || n != P {
+	if n, err := hold.ImportTableBatch(ctx, "pauses", live, map[int64]int{}); err != nil || n != P {
 		t.Fatalf("import pauses = %d, %v; want %d, nil", n, err, P)
 	}
 	importPauses = time.Since(start)
@@ -46,7 +49,7 @@ func seedPauseTables(t *testing.T, s *Store, P, Q int) (importPauses, importHeld
 		held = append(held, map[string]any{"ts": future + int64(i)*300, "duration_s": int64(3600)})
 	}
 	start = time.Now()
-	if n, err := s.ImportTableBatch(ctx, "pauses_quarantine", held, map[int64]int{}); err != nil || n != Q {
+	if n, err := hold.ImportTableBatch(ctx, "pauses_quarantine", held, map[int64]int{}); err != nil || n != Q {
 		t.Fatalf("import pauses_quarantine = %d, %v; want %d, nil", n, err, Q)
 	}
 	importHeld = time.Since(start)

@@ -54,7 +54,7 @@ func oraclePrune(t *testing.T, s *Store, start, samplesBefore, speedBefore, even
 	ctx := context.Background()
 	s.maybeRepairFuturePauses()
 	horizon := start.Add(pruneFutureSlack).Unix()
-	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix()); err != nil {
+	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix(), nil); err != nil {
 		t.Fatal(err)
 	}
 	var total int64

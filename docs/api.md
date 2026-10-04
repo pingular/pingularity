@@ -242,7 +242,14 @@ and `-d '{…}'` where a body is listed below.
   arrived since - `since` is ignored unless `epoch` matches, because a restart
   reseeds the buffer and re-uses the same sequence numbers for different lines
 - `POST /api/data/delete` - `{type: latency|speed|downtime}` clear that data
-  (`latency` also clears the speedtest times `/api/speed/spans` answers). The
+  (`latency` also clears the speedtest times `/api/speed/spans` answers). A
+  `latency` delete first writes the closing `up` of any outage whose end only
+  the samples show (a restart in the middle of an outage leaves one), at the
+  second they show, so the outage keeps its length; an outage the running
+  monitor has open is left to it. `deleted` counts the rows removed, not that
+  event, and a failure to write it deletes nothing (`500`). A `latency` or
+  `downtime` delete sent while a restore is bringing in outage history waits
+  until the restore has it all in (see `POST /api/import`). The
   database file keeps its size; the freed space is reused
 - `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
   export / import config + history. Pick at least one of those four categories (any
@@ -263,9 +270,14 @@ and `-d '{…}'` where a body is listed below.
   cleanup (hourly) deletes, with any outage records the install already had that a
   restored recovery now ends before the window (the cleanup deletes outages
   whole), and say so when a cleanup that ran during the restore could have deleted
-  restored rows. A restore that arrives once the daemon has begun shutting down is
-  refused with `503` rather than half-applied; one already in flight holds the
-  shutdown open until the login/access repairs that follow it have finished). The
+  restored rows. The downtime category (`downtime`, `pauses`, `pauses_quarantine`,
+  one after another as the exporter writes them) goes in as one change to the
+  outage history, however many batches it takes: a `latency` or `downtime` data
+  delete, an outage delete and the hourly cleanup that come while it streams
+  wait for the rest of it. A restore that arrives once the daemon has begun
+  shutting down is refused with `503` rather than half-applied; one already in
+  flight holds the shutdown open until the login/access repairs that follow it
+  have finished). The
   speedtest times behind the latency chart's hover note are not exported: they
   only feed that note, and a restore simply has no notes for the history it brings
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook

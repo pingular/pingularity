@@ -417,7 +417,7 @@ func TestImportRejectsFractionalInt(t *testing.T) {
 	st := open(t)
 	ctx := context.Background()
 	// Fractional ts -> skipped.
-	n, err := st.ImportTableBatch(ctx, "events", []map[string]any{{"ts": 1784765000.5, "type": "down"}}, nil)
+	n, err := st.ImportTable(ctx, "events", []map[string]any{{"ts": 1784765000.5, "type": "down"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +425,7 @@ func TestImportRejectsFractionalInt(t *testing.T) {
 		t.Fatalf("fractional ts imported %d rows, want 0 (rejected)", n)
 	}
 	// A whole-number ts (even as float64, like JSON) is accepted and stored as INTEGER.
-	n, err = st.ImportTableBatch(ctx, "events", []map[string]any{{"ts": float64(1784765000), "type": "down"}}, nil)
+	n, err = st.ImportTable(ctx, "events", []map[string]any{{"ts": float64(1784765000), "type": "down"}})
 	if err != nil {
 		t.Fatal(err)
 	}

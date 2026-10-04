@@ -43,7 +43,7 @@ func TestPruneDueCountsWhatPruneRemovesByAge(t *testing.T) {
 		// The one repair Prune makes that PruneDue leaves out, closing an outage
 		// from the samples about to go (see PruneDue). Made first, so what follows
 		// compares the rules alone; Prune's own call then finds nothing to close.
-		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix()); err != nil {
+		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix(), nil); err != nil {
 			t.Fatal(err)
 		}
 		since := map[string]int64{}
@@ -173,7 +173,7 @@ func TestAWatchCountsWhatPruneRemovesFromEachTable(t *testing.T) {
 		sb, pb, eb := now.Add(-30*24*time.Hour), now.Add(-60*24*time.Hour), now.Add(-90*24*time.Hour)
 		// The synthetic recoveries Prune can write first, written now, so that
 		// what a table loses is what Prune deleted from it.
-		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix()); err != nil {
+		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix(), nil); err != nil {
 			t.Fatal(err)
 		}
 		before, watch := map[string]int64{}, s.WatchPrunes()

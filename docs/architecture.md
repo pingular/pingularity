@@ -268,6 +268,34 @@ flowchart TB
   jump: the virtual machine's clocks stop while the laptop sleeps, the boot
   clock with them, and its time sync sets the clock forward at wake.
   `db.prune_skipped_clock` on `/metrics` counts the skipped passes.
+- **An outage keeps its end when its samples go.** A restart in the middle of
+  an outage leaves its `down` with no `up`: the process that wrote it stopped,
+  and the next one starts out assuming the link is up. Only the latency
+  samples then show when the link came back. Before the hourly cleanup removes
+  those samples, and before **Delete now** removes all of them, the outage is
+  given an `up` at that second with its observed length. The uptime figures,
+  the heatmap and the digest read the same afterwards, and the outage list
+  shows the recorded end. The cleanup only reaches samples older than the
+  retention window, 30 days by default. **Delete now** reaches the present, so
+  it leaves alone every outage the running monitor opened: the monitor may
+  still be counting the `up-after` good rounds it needs, or waiting to write
+  its `up`, and it records the end itself. If the `up` cannot be written, the
+  delete deletes nothing. Such a close decides what to write from what it read
+  first, so it takes turns with every other change to the outages but the
+  monitor's: another close, the delete of one outage, the downtime **Delete
+  now**, the cleanup's sweep of old outages and a restore's outage history. Run
+  in between, one of those could leave an outage with two ends, or an end with
+  no outage. A restore takes one turn for its whole downtime category, the
+  outages and the paused time after them, however many batches of 5,000 rows
+  they come in. Taken batch by batch, a close between two batches gave an
+  outage whose `up` was still to come a second end, and one between the
+  outages and the paused time counted as downtime the time a restarted process
+  was not running, which a close takes out of the length it writes only once
+  the paused time is in. So a close, an outage delete or a cleanup that comes
+  while a restore is sending its outage history waits for the rest of it:
+  about a quarter of a second for 20,000 outage rows on a laptop, plus the time
+  the upload itself takes. The monitor's own writes never wait for a close or
+  a restore.
 - **Disk space is reused, not given back.** The main file is never compacted:
   deleted rows leave free pages, and new rows fill them before the file grows.
   The write-ahead log beside it stays near 4 MB in ordinary running. A reader

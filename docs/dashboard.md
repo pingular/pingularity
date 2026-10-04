@@ -355,7 +355,17 @@ and persist across restarts.
   observation coverage. **Latency** also takes the record of when speedtests
   ran, which the latency chart's "During a speedtest" hover note reads and
   which rides its retention too; it is the one thing no export carries, so a
-  restored backup's history has no such notes. And **Export** / **Import** on the same tab: pick any of
+  restored backup's history has no such notes. Deleting **latency** keeps
+  the length of each outage that has ended. A restart in the middle of an
+  outage leaves it with no recorded end, and only the latency samples show
+  when the link came back, so the delete records that end first, as the
+  hourly cleanup does before it removes old samples. The uptime figures, the
+  heatmap and the digest read the same afterwards, and **Recent outages**
+  shows the recorded end. An outage still in progress is left to the
+  monitor, which records its end itself. If that end cannot be
+  written, nothing is deleted: the page reports an error and the log says
+  why. Pressed while an import is bringing in outage history, it waits until
+  the import has all of it in. And **Export** / **Import** on the same tab: pick any of
   config / latency / speed / downtime, export them to a JSON file, and import one
   back - time-series data is **merged** (existing/newer local rows are kept, only
   missing rows are added) while **config is overwritten** and reloaded live,

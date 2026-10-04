@@ -2338,7 +2338,7 @@ func TestEverySamplesStatementSavesFirst(t *testing.T) {
 	}
 	// The scan found the real readers and did not pass on an empty match.
 	for _, must := range []string{"LastObservedTS", "monitoringSince", "HasHistory", "firstQuorumRecovery",
-		"newestSampleAt", "LatestPerTarget", "seriesQuery", "TableCounts", "Prune", "Clear", "ImportTableBatch"} {
+		"newestSampleAt", "LatestPerTarget", "seriesQuery", "TableCounts", "Prune", "Clear", "importTableBatch"} {
 		if !seen[must] {
 			t.Errorf("the source scan did not find %s - it is no longer checking anything", must)
 		}

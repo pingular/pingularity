@@ -321,6 +321,63 @@ type Store struct {
 	// held is the probe rounds and DNS readings that wait to be saved (see
 	// SaveBuffered).
 	held sampleBuf
+
+	// outageMu is held for the whole of every change to the outage record
+	// (events) that does not come from the running monitor: the close of the
+	// outages whose end only the samples show (resolveDanglingDowns, which a
+	// cleanup and a latency Delete now both run), the delete of one outage
+	// (DeleteOutage), the downtime Delete now (Clear), a cleanup's sweep of
+	// old outages (Prune) and a restore's outage history (HoldOutageRecord,
+	// which every import of the downtime category's tables goes through). The
+	// close reads which outages have no end, searches the samples for each,
+	// and only then writes the ends it found. With nothing to keep the others
+	// out, two closes at once each wrote an end for the same outage, and the
+	// readers count the second one as an outage of its own; and a delete that
+	// landed between a close's read and its write left an end with no outage.
+	// Under the lock each of these finds the record as the one before it left
+	// it. A restore that streams a backup holds it for the whole of its
+	// downtime category, every batch of the outages and the paused time after
+	// them, not batch by batch: a close in a gap between two batches found
+	// half an outage, or an outage without the pauses it reads
+	// (HoldOutageRecord).
+	//
+	// The monitor's own writes never take it: InsertEvent from a probe round
+	// or from the monitor's retry buffer. A probe round must not wait out a
+	// close, only, as beside any other writer, the one statement in progress.
+	// The close keeps away from the monitor's outages by liveDownFloor
+	// instead. Open's repairs run before anything else can reach the store.
+	//
+	// It is taken with no other lock of this package held and no transaction
+	// or cursor of the holder's open. (A restore can take it with the web
+	// layer's importMu held, when the file carries its config ahead of its
+	// outages. It lets go before it moves on to another category, and nothing
+	// that holds outageMu takes importMu.) Under it the holder saves the
+	// waiting rows (the save gate, then held.mu, and the daemon's save
+	// interval and save log functions, which lock only their own state), reads
+	// and drops the read caches (recMu, seriesMu), adds what a cleanup's chunk
+	// deleted to the watches on the cleanup (pruneWatchMu), and waits for a
+	// pooled connection and for SQLite's writer. A restore also reads the rest
+	// of its downtime category from the request under it, which makes it the
+	// one holder that can keep the lock for long (see HoldOutageRecord for
+	// what waits).
+	// No goroutine holding any of those goes on to take outageMu, and clockMu
+	// and pauseRepairMu are never held with it (Prune takes and lets go of
+	// both before its close), so no two goroutines can each wait for the
+	// other. Taking it with nothing open also keeps the in-memory pool, which
+	// has one connection, from waiting on itself: a holder never waits for a
+	// connection it holds.
+	outageMu sync.Mutex
+
+	// liveDownFloor is the earliest 'down' written through InsertEvent on this
+	// handle, math.MaxInt64 until the first. InsertEvent is the live monitor's
+	// door for its transitions, and the daemon opens one handle when it starts
+	// and runs one monitor on it for the life of that handle. The monitor only
+	// ever closes an outage it opened itself, and every 'up' it writes lands
+	// after its own 'down', so a 'down' before this second is not one the
+	// running monitor will close, and one at or past it may be. Clear reads it:
+	// see there, and resolveDanglingDowns, for why a Delete now needs the line
+	// and a cleanup does not.
+	liveDownFloor atomic.Int64
 }
 
 // pragmaConn is the per-connection pragma query appended to every file-backed
@@ -885,6 +942,7 @@ func openAtClock(path string, nowU int64, opened time.Time, existing bool, opts 
 	}
 	st.clockBase, st.clockBaseUp = st.opened.Round(0), 0
 	st.held.init()
+	st.liveDownFloor.Store(math.MaxInt64) // no 'down' from this handle's monitor yet
 	// When the clock could not anchor the future-end pause repair above, arm the
 	// lazy re-judgement: the first write under a plausible clock runs it instead.
 	if nowU < plausibleEpoch {
@@ -3100,6 +3158,20 @@ func (s *Store) InsertEvent(ctx context.Context, ts time.Time, typ string, durat
 			stats.Inc("db.event_duration_dropped")
 		} else {
 			dur = durationS
+		}
+	}
+	// A 'down' moves the line Clear keeps away from (liveDownFloor) before the
+	// row can be on disk, so a Clear that finds the row also finds the line. A
+	// write that fails moves it all the same: the monitor keeps that 'down' and
+	// writes it again, at the same second, from its retry buffer. The line only
+	// ever moves to an earlier second: a backward clock step can date a later
+	// 'down' before an earlier one, and both are the monitor's.
+	if typ == "down" {
+		for at := ts.Unix(); ; {
+			cur := s.liveDownFloor.Load()
+			if at >= cur || s.liveDownFloor.CompareAndSwap(cur, at) {
+				break
+			}
 		}
 	}
 	// The rounds that confirmed the change are stored before the event is, so
@@ -6345,7 +6417,15 @@ func (s *Store) DeleteSpeed(ctx context.Context, ts int64) (int64, error) {
 // and every delete below targets exact rows with its own guard, so the
 // pre-computed list can't touch anything it shouldn't. Returns rows removed;
 // 0 means no such resolved outage, an idempotent no-op.
+//
+// The whole of it runs under outageMu. The close of outages whose end only the
+// samples show (resolveDanglingDowns) is the one writer that adds ends and
+// moves an 'up' back, and it decides both from rows it read first: run in
+// between, it could write an end after this delete took that outage's 'down',
+// or change the rows this sweep was decided on (see outageMu).
 func (s *Store) DeleteOutage(ctx context.Context, ts int64) (int64, error) {
+	s.outageMu.Lock()
+	defer s.outageMu.Unlock()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ts FROM events WHERE type = 'down' AND ts <= ?1
 		  AND ts > COALESCE((SELECT MAX(ts) FROM events WHERE type = 'up' AND ts < ?1), 0)
@@ -7225,7 +7305,57 @@ func currentHorizon(nowU int64) int64 { return nowU + int64(metricsFutureSkew.Se
 // in-memory). So, for each such 'down' whose recovery falls in the window about
 // to be pruned (rec < sampleCutoff), persist a synthetic closing 'up' at that
 // second: the outage becomes a completed event and no longer needs the samples.
-func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int64) error {
+//
+// Clear runs it too, before a Delete now takes every sample, and passes liveFrom,
+// which reads liveDownFloor; Prune passes nil. The difference is the running
+// monitor. It holds an outage open in memory from its own 'down' and closes it
+// by a stricter rule than the scan below: up-after good rounds in a row, dated
+// at the last of them, its length measured on the monotonic clock with paused
+// time taken out. The scan takes the first good second. So while the monitor is
+// still counting, or after one good round between bad ones, the samples already
+// show a recovery the monitor has not accepted - and after a failed write its
+// 'up' can be waiting in its retry buffer, with the 'down' still dangling on
+// disk. A synthetic 'up' for that outage is one closing event too many once the
+// monitor writes its own: the readers book the second 'up' as an outage of its
+// own, anchored at ts minus its duration, and with the samples gone nothing
+// re-derives the truth.
+//
+// A cleanup keeps its distance through its cutoff. It only writes a recovery
+// older than the sample retention, thirty days by default, so an outage the
+// monitor still holds would have to have stayed open, with the monitor running,
+// for that whole window after a good second the monitor never accepted. The
+// retention is the operator's to set, and a shorter one narrows that distance to
+// match. A Delete now has no distance at all: every sample goes, so its cutoff
+// is the present. So every 'down' at or past liveFrom's line is left to the
+// monitor, and an earlier outage's search stops at that line, as it stops at a
+// 'down' on disk. The line is read again after each search, because the monitor
+// can confirm an outage while one runs, and a recovery found past the line as it
+// then stands is the monitor's to judge.
+//
+// Two other ways to draw that line were weighed and left. Reading the monitor's
+// rule back out of the samples cannot be done from here: this package does not
+// know up-after, a live setting, nor which rounds a pause or a suspend cut out of
+// the monitor's streak, and no sample shows an 'up' still waiting to be written.
+// Asking the monitor (the snapshot /api/status reads) says whether the link is
+// down now, not whether an 'up' of the monitor's own is still to be written, and
+// it is read before the delete runs, so a transition in between goes unseen.
+//
+// The whole of it runs under outageMu, whoever calls it. What it writes is
+// decided by what it read first: which outages have no end on disk, and the
+// second the samples prove for each. A second close in between wrote the same
+// end again, and a delete of outages in between left the end it wrote with no
+// outage (see outageMu for who else takes the lock, and why the monitor does
+// not).
+//
+// It counts the failures of its writes on /metrics itself, and of the lookup
+// that goes with them, and returns those wrapped in recordedErr. The rest are
+// its caller's to count.
+func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int64, liveFrom func() int64) error {
+	s.outageMu.Lock()
+	defer s.outageMu.Unlock()
+	if liveFrom == nil {
+		liveFrom = func() int64 { return math.MaxInt64 } // a cleanup reaches every 'down'
+	}
 	// Dangling downs: a 'down' immediately followed by another 'down' (orphan gap)
 	// or the final event being a 'down'. Mirrors UptimeSince's pairing, because
 	// this is the write side of that agreement and a disagreement here is
@@ -7322,9 +7452,44 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	}
 	var synth []synthUp
 	for _, g := range gaps {
+		// Read after the pairing query, never before it: InsertEvent moves the
+		// line before its row lands, so a monitor 'down' the query found is
+		// behind the line by now.
+		live := liveFrom()
+		if g.down >= live {
+			continue // the monitor's own outage, or one after it: the monitor closes those
+		}
+		if g.end > live {
+			// The monitor's first 'down' ends this search, as a 'down' on disk
+			// would: the samples after it belong to the monitor's outage. And
+			// like one on disk it means this gap is not the last, even when
+			// that 'down' is not on disk yet (its write failed and waits in the
+			// monitor's buffer).
+			g.end, g.final = live, false
+			// For the same reason an 'up' past the line is the monitor's to
+			// judge, not this outage's to move. This 'down' pairs with one
+			// only while the monitor's 'down' before it is not on disk yet,
+			// and the monitor dates its own 'up' ahead of the clock on purpose
+			// (the widen in Monitor.transition). Moved back to this outage's
+			// recovery, it closed this outage with the monitor's measurement,
+			// and the monitor's outage had no end once its 'down' landed. This
+			// outage gets an end of its own instead, at a price accepted with
+			// it: an 'up' that an import brought from a clock that ran fast,
+			// which the close now leaves alone here too, can read as an outage
+			// of its own once the monitor's waiting 'down' lands and the clock
+			// passes it.
+			if g.pairUp > live {
+				g.pairUp = 0
+			}
+		}
 		rec, ok, err := s.firstQuorumRecovery(ctx, g.down, g.end)
 		if err != nil {
 			return err
+		}
+		if ok && rec >= liveFrom() {
+			// The monitor confirmed an outage while the search ran, and this
+			// recovery came after that 'down': it is the monitor's to judge.
+			continue
 		}
 		// Only persist when the recovery evidence is itself being pruned; if it
 		// survives this prune, the samples still prove it and no synthetic event is
@@ -7356,6 +7521,9 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			}
 			synth = append(synth, synthUp{ts: rec, dur: dur, down: g.down, final: g.final, pairUp: g.pairUp})
 		}
+	}
+	if closeHook != nil {
+		closeHook()
 	}
 	for _, u := range synth {
 		// An outage gets ONE closing event. A 'down' can look dangling while an
@@ -7397,7 +7565,7 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			if _, err := s.db.ExecContext(ctx,
 				`UPDATE events SET ts = ?, duration_s = ? WHERE type = 'up' AND ts = ?`, u.ts, u.dur, u.pairUp); err != nil {
 				recordDBErr(err)
-				return err
+				return recordedErr{err}
 			}
 			log.Printf("pingularity: an outage recovery was recorded %ds in the future (a clock that ran fast, or an import from one); moved it back to the second the probe history proves the link returned", u.pairUp-u.ts)
 			moved = true
@@ -7414,21 +7582,21 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 				if _, err := s.db.ExecContext(ctx,
 					`UPDATE events SET ts = ?, duration_s = ? WHERE type = 'up' AND ts = ?`, u.ts, u.dur, at); err != nil {
 					recordDBErr(err)
-					return err
+					return recordedErr{err}
 				}
 				log.Printf("pingularity: an outage recovery was recorded %ds in the future (a clock that ran fast, or an import from one); moved it back to the second the probe history proves the link returned", at-u.ts)
 				moved = true
 			case errors.Is(err, sql.ErrNoRows):
 			default:
 				recordDBErr(err)
-				return err
+				return recordedErr{err}
 			}
 		}
 		if moved {
 			continue
 		}
 		if err := s.InsertEvent(ctx, time.Unix(u.ts, 0), "up", int(u.dur), "recovered while unmonitored"); err != nil {
-			return err
+			return recordedErr{err} // InsertEvent counted it
 		}
 	}
 	if len(synth) > 0 {
@@ -7436,6 +7604,13 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	}
 	return nil
 }
+
+// closeHook runs inside resolveDanglingDowns once the close has read which
+// outages have no end and searched the samples for each, before it writes the
+// first end it found. Test seam only (nil in production), like pruneChunkHook:
+// it holds a close at the one point where another change to the outage record
+// would make its writes wrong.
+var closeHook func()
 
 // pruneClock reads the wall clock and the store's uptime (sinceOpen) as one
 // pair. A single seam so a test can make the two disagree, which is the whole
@@ -7742,8 +7917,10 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	cut := func(table string) int64 { return pruneAge[table].on.at(samplesBefore, speedBefore, eventsBefore) }
 	horizon := start.Add(pruneFutureSlack).Unix()
 	// Close any dangling 'down' whose recovery lives only in the samples about to
-	// be deleted, so pruning can't turn it into phantom downtime.
-	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix()); err != nil {
+	// be deleted, so pruning can't turn it into phantom downtime. Every 'down', the
+	// running monitor's too: the retention is what keeps this away from an outage
+	// the monitor still holds (see resolveDanglingDowns; Clear has no such margin).
+	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix(), nil); err != nil {
 		recordDBErr(err)
 		return 0, err
 	}
@@ -7825,19 +8002,33 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 	// the statement is the unchunked one. It reads every row under the cutoff
 	// each time, which is fine for a table this size and would not be for
 	// samples. The rule itself is pruneAge's, with the chunk's bound added.
-	if err := s.pruneChunked(ctx, sw, "events", nil, `
-		WITH b(ts) AS (SELECT COALESCE(
-			(SELECT ts FROM events WHERE type = 'up' AND ts < ?1 ORDER BY ts, rowid LIMIT 1 OFFSET ?2 - 1), ?1))
-		DELETE FROM events
-		WHERE (`+pruneAge["events"].rule+`)
-		  AND ts <= (SELECT ts FROM b)`, cut("events")); err != nil {
-		return fail(err)
+	//
+	// Both arms run under outageMu, like every change to the outage record but
+	// the monitor's. A Delete now's close that read an outage before a chunk
+	// here took it would write that outage's end afterwards, with no outage
+	// left for it, and one about to move an 'up' dated past the horizon back
+	// would find it gone and write no end at all (see outageMu). The close
+	// above has let go of the lock by now. A close that comes during the sweep
+	// waits for it, and the sweep is short: two rows an outage, and a chunk is
+	// rarely full.
+	sweepEvents := func() error {
+		s.outageMu.Lock()
+		defer s.outageMu.Unlock()
+		if err := s.pruneChunked(ctx, sw, "events", nil, `
+			WITH b(ts) AS (SELECT COALESCE(
+				(SELECT ts FROM events WHERE type = 'up' AND ts < ?1 ORDER BY ts, rowid LIMIT 1 OFFSET ?2 - 1), ?1))
+			DELETE FROM events
+			WHERE (`+pruneAge["events"].rule+`)
+			  AND ts <= (SELECT ts FROM b)`, cut("events")); err != nil {
+			return err
+		}
+		// The future arm is cut by rows like every other table's. Nothing that
+		// reads the present looks past currentHorizon, and these rows are further
+		// out than that, so no reader can tell where a chunk of them ended.
+		return s.pruneChunked(ctx, sw, "events", nil, `DELETE FROM events WHERE rowid IN (
+			SELECT rowid FROM events WHERE ts > ? ORDER BY ts, rowid LIMIT ?)`, horizon)
 	}
-	// The future arm is cut by rows like every other table's. Nothing that
-	// reads the present looks past currentHorizon, and these rows are further
-	// out than that, so no reader can tell where a chunk of them ended.
-	if err := s.pruneChunked(ctx, sw, "events", nil, `DELETE FROM events WHERE rowid IN (
-		SELECT rowid FROM events WHERE ts > ? ORDER BY ts, rowid LIMIT ?)`, horizon); err != nil {
+	if err := sweepEvents(); err != nil {
 		return fail(err)
 	}
 	// Pause spans share the outage retention (they are the uptime DENOMINATOR), and
@@ -8404,6 +8595,15 @@ func recordDBErr(err error) {
 	}
 }
 
+// recordedErr is an error recordDBErr has already counted. A function that
+// counts some of the errors it returns and not others returns the counted ones
+// wrapped in it, so a caller that counts the rest can tell them apart
+// (errors.As) and /metrics sees each failure once. It reads and unwraps as the
+// error it holds.
+type recordedErr struct{ error }
+
+func (e recordedErr) Unwrap() error { return e.error }
+
 // invalidateReadCaches drops memoized read results (quorum-recovery scans,
 // cached chart aggregates) after bulk data changes: an import can back-fill
 // samples that change a memoized answer, and a clear must not keep serving
@@ -8424,6 +8624,19 @@ func (s *Store) invalidateReadCaches() {
 // too - otherwise orphaned DNS rows keep feeding the chart after a clear. The
 // speedtest times go with it for the same reason: that chart's hover note is
 // their only reader, and a chart with no data has no point to hover.
+//
+// A latency clear also takes the only record of when some outages ended. A
+// restart in the middle of an outage leaves its 'down' with no 'up': the
+// process that wrote it stopped, and the next one starts out believing the link
+// is up, so it never writes one. The readers bound such an outage at the first
+// good second in the samples (firstQuorumRecovery). With every sample deleted
+// the next one they find is whatever the monitor writes after the clear, so a
+// ten-minute outage three hours back read as three hours long - and once those
+// later rows passed the retention, a cleanup would have written that length
+// down for good. So the clear first closes each such outage at the second the
+// samples prove, as a cleanup does before it prunes them, and leaves alone every
+// outage the running monitor may still close itself (resolveDanglingDowns, with
+// liveDownFloor as its line).
 //
 // The database file keeps its size. The rows' pages go on the free list
 // (ReusableBytes) and new rows fill them. A clear of walTrimRows or more ends
@@ -8458,6 +8671,63 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 		if err := s.SaveBuffered(SaveOrder); err != nil {
 			return 0, err
 		}
+		// The outages whose end only the samples show are closed next: after the
+		// save, because the waiting rounds are evidence too, and before the
+		// delete. Not inside its transaction. The search saves and reads and the
+		// close writes through InsertEvent, and none of that may run while this
+		// call holds a transaction open (the in-memory pool has one connection);
+		// a transaction that read first and wrote after would also fail with
+		// SQLITE_BUSY_SNAPSHOT whenever a probe round committed in between (see
+		// SetSettingsDiff).
+		//
+		// A close that fails deletes nothing, like a save that fails: deleting
+		// the samples with the recovery unwritten is the damage this step exists
+		// to prevent, and the operator can press the button again. A failure or a
+		// crash between the close and the delete leaves closing events and no
+		// delete. Each sits at the second the samples prove, with the observed
+		// length, so every reader books the outage as it did from the samples,
+		// and the next clear or cleanup finds it closed and passes it by. The
+		// read caches drop as a cleanup drops them: in the close when it wrote
+		// anything, and again once the delete commits.
+		//
+		// The cutoff is the present. Every sample goes, so every recovery they
+		// prove is written - except one dated ahead of the clock, which a cleanup
+		// never writes either. An 'up' dated ahead of the clock that closes an
+		// outage the monitor does not hold is moved back to the proven second
+		// rather than joined by a second closing event, as a cleanup does: no
+		// reader counts it until the clock gets there, and a backward step would
+		// let the next cleanup delete it as too far ahead. One the monitor wrote
+		// for its own outage stays where it is; the widen in Monitor.transition
+		// puts it there on purpose. A clock that is not set yet (before
+		// plausibleEpoch: a board with no battery, before time sync) reaches no
+		// outage recorded under a correct one, so none of those is closed and the
+		// delete goes ahead, as it always did.
+		//
+		// A round saved between the close and the delete goes with the rest. If
+		// it was the first good round after an outage the monitor does not hold
+		// (one that ran on into this process and ended just now), that outage
+		// ends at the next good round instead, one probe interval late.
+		//
+		// The close holds outageMu for the whole of its run, so it never meets
+		// another close or a delete of outages half way (see there). The delete
+		// below does without it: it removes no outage.
+		nowU := time.Now().Unix()
+		if err := s.resolveDanglingDowns(ctx, nowU+1, nowU, s.liveDownFloor.Load); err != nil {
+			// A failed write the close has counted already (recordedErr).
+			if !errors.As(err, new(recordedErr)) {
+				recordDBErr(err)
+			}
+			return 0, err
+		}
+	}
+	// The downtime delete takes the whole outage record, under outageMu. A
+	// close that read an outage before this delete would write that outage's
+	// end after it: an end with no outage (see outageMu). Held to the end, the
+	// trim included, which adds half a second at the most, and only after a
+	// delete of walTrimRows rows or more.
+	if kind == "downtime" {
+		s.outageMu.Lock()
+		defer s.outageMu.Unlock()
 	}
 	// One transaction so a multi-table clear ("latency" -> samples + dns) is
 	// all-or-nothing: a cancellation or a failure on the second table must not
@@ -9119,8 +9389,16 @@ var importChunkHook func()
 //
 // The per-timestamp flood cap is scoped to this single call; a streaming
 // importer that splits one logical import across batches must use
-// ImportTableBatch with a shared counter so the cap stays global.
+// ImportTableBatch with a shared counter so the cap stays global, and for the
+// downtime category's tables the ImportTableBatch of a hold on the outage
+// record. ImportTable brings those tables in under a hold of its own, taken
+// for the call and let go when it returns.
 func (s *Store) ImportTable(ctx context.Context, table string, rows []map[string]any) (int, error) {
+	if outageTables[table] {
+		hold := s.HoldOutageRecord()
+		defer hold.Release()
+		return hold.ImportTableBatch(ctx, table, rows, map[int64]int{})
+	}
 	return s.ImportTableBatch(ctx, table, rows, map[int64]int{})
 }
 
@@ -9130,7 +9408,124 @@ func (s *Store) ImportTable(ctx context.Context, table string, rows []map[string
 // across all batches. A per-call counter would reset each batch, letting a
 // crafted file pack maxRowsPerTS rows per batch at one ts and restore the O(N^2)
 // dedup cost the cap exists to bound.
+//
+// It refuses the downtime category's tables (outageTables): the outages, the
+// paused time and the held-aside pauses. Those go in under outageMu, like
+// every change to the outage record but the monitor's (see there), and the
+// lock has to be held across every call that brings a part of them, which is
+// what the hold on the outage record does (HoldOutageRecord). They go in
+// through its ImportTableBatch, or through ImportTable, which takes a hold for
+// its one call.
+//
+// This used to take the lock itself, for the outages alone and for one call
+// at a time. That kept a close away from the rows of that call: one that read
+// an outage as having no end, before the call brought the backup's end for it
+// at the same second, wrote that end again after it, because the merge skips
+// a row only when one with its key is stored already. It left every gap
+// between two calls open, and a caller that streamed an outage history
+// through here in batches would have had the second end back, and the length
+// that counts unwatched time, both of which the hold exists to prevent. A
+// caller that brings them in batches now has to take the hold.
 func (s *Store) ImportTableBatch(ctx context.Context, table string, rows []map[string]any, perTS map[int64]int) (int, error) {
+	if outageTables[table] {
+		return 0, fmt.Errorf("import %s: the outage history goes in only under the hold on the outage record (HoldOutageRecord)", table)
+	}
+	return s.importTableBatch(ctx, table, rows, perTS)
+}
+
+// outageTables are the downtime category's tables, the outages and the time
+// that was not watched, which go in only under the hold on the outage record
+// (HoldOutageRecord): Store.ImportTableBatch refuses them.
+var outageTables = map[string]bool{"events": true, "pauses": true, "pauses_quarantine": true}
+
+// OutageHold is a restore's hold on the outage record: outageMu, from
+// HoldOutageRecord to Release. It belongs to the goroutine that took it, like
+// the lock itself.
+type OutageHold struct {
+	s        *Store
+	released bool
+}
+
+// HoldOutageRecord takes outageMu for the whole of a restore's downtime
+// category, and keeps it until Release: the outages (events), the paused time
+// (pauses) and the held-aside pauses (pauses_quarantine), which our exports
+// write one after the other. The rows go in through the hold's
+// ImportTableBatch.
+//
+// Taken per call, as ImportTableBatch once took it for the outages, the lock
+// left every gap between two batches open, and a restore brings a big history
+// in batches (5,000 rows in the web layer). An outage whose 'down' ended one
+// batch had its 'up' in the next. The latency category comes first in a backup,
+// so its samples already proved the recovery, and a close run in the gap -
+// Delete now, or a cleanup that had reached those samples - read the 'down' as
+// having no end and wrote one at the first good second. The next batch then
+// stored the backup's own 'up' at the second the monitor had dated it, a
+// different second, so the merge kept both: one outage, two ends, and the
+// readers counted the second as an outage of its own.
+//
+// The paused time is held with the outages because the close reads it too: it
+// takes the paused seconds out of the length it writes (pausedOverlap). An
+// outage that a restart left open is usually followed by a pause, the one the
+// next process books for the time it was not running (anything over two
+// minutes), and our exports write the paused time after the outages. A close
+// run between the two wrote that outage an end whose length counted the
+// unwatched stretch as downtime, which the paused time, landing next, then
+// also took out of the watched time: booked twice, for good, as the close's
+// own comments describe. Held across both, a close sees the restore's downtime
+// category whole or not at all. The held-aside pauses ride along, though the
+// close does not read them: they are part of the same category, a hand-built
+// file can put them between the other two, and our exports write them last,
+// and only when there are any.
+//
+// What the hold costs. It is held while the restore reads its downtime rows
+// from the request, so for as long as the client takes to send them, not only
+// while they are stored. Measured on a laptop, with the file already there, a
+// restore took about a quarter of a second over 20,000 outage rows and 1,000
+// pauses, and about two and a half over 200,000 and 10,000. A stalled upload
+// is cut off by the web layer's read deadline, which a batch rearms, and a
+// failed restore lets go at once. What waits meanwhile is what takes
+// outageMu: a Delete now (the latency close and the downtime delete), the
+// delete of one outage, and the hourly cleanup, at its close before its first
+// delete and at its sweep of old outages. None of them holds anything another
+// goroutine needs while it waits (see outageMu), so a cleanup starts late,
+// and a Delete now answers once the restore has moved past its outages. The
+// monitor never waits: its writes do not take the lock.
+//
+// Taken with nothing of this package held and no transaction open, as
+// outageMu always is. The restore may hold the web layer's importMu already (a
+// file that carries its config ahead of its outages); it lets go of this hold
+// before it moves on to any other category, so it never takes importMu with
+// outageMu held.
+func (s *Store) HoldOutageRecord() *OutageHold {
+	s.outageMu.Lock()
+	return &OutageHold{s: s}
+}
+
+// ImportTableBatch is Store.ImportTableBatch for the holder of the outage
+// record, and the way the downtime category's tables go in: the store's own
+// refuses them. It does not take outageMu again: the hold has it, and a
+// sync.Mutex taken twice by one goroutine waits for itself forever. After
+// Release it refuses, rather than write outage rows with nothing held.
+func (h *OutageHold) ImportTableBatch(ctx context.Context, table string, rows []map[string]any, perTS map[int64]int) (int, error) {
+	if h.released {
+		return 0, fmt.Errorf("import %s: the hold on the outage record has been released", table)
+	}
+	return h.s.importTableBatch(ctx, table, rows, perTS)
+}
+
+// Release lets go of the outage record. A second call does nothing, and so
+// does a call on a nil hold, so a restore can release it wherever it stops.
+func (h *OutageHold) Release() {
+	if h == nil || h.released {
+		return
+	}
+	h.released = true
+	h.s.outageMu.Unlock()
+}
+
+// importTableBatch is ImportTableBatch's work, with outageMu held by the
+// caller wherever the rows are outage rows.
+func (s *Store) importTableBatch(ctx context.Context, table string, rows []map[string]any, perTS map[int64]int) (int, error) {
 	t, ok := exportTables[table]
 	if !ok {
 		return 0, fmt.Errorf("import: unknown table %q", table)

@@ -4113,6 +4113,15 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// the DB and silently activate only on the next restart.
 	var importErr error
 	importStatus := http.StatusInternalServerError
+	// The downtime category goes in under the store's hold on the outage
+	// record (store.HoldOutageRecord), taken as the loop reaches its first key
+	// and let go as it reaches a key of any other kind, or leaves the loop, so
+	// that no Delete now or cleanup can close an outage half way through a
+	// restore's outages and the paused time that follows them. Let go on the
+	// way out too, should anything below panic: a hold left behind would stop
+	// every later change to the outage history for good.
+	var outages *store.OutageHold
+	defer func() { outages.Release() }()
 	for importErr == nil && dec.More() {
 		progress() // progress made: rearm before the next (possibly large) value
 		keyTok, err := dec.Token()
@@ -4122,6 +4131,13 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		}
 		key, _ := keyTok.(string)
 		dc, known := keyToCat[key]
+		// Past the downtime category, before this key's value is read or its
+		// category's locks are taken: importMu, taken below for config, must
+		// never be taken with the outage record held.
+		if outages != nil && (!known || dc.cat != "downtime" || r.URL.Query().Get(dc.cat) == "") {
+			outages.Release()
+			outages = nil
+		}
 		if !known || r.URL.Query().Get(dc.cat) == "" {
 			// exported_at, an unselected category, or an unknown key: walk past its
 			// value without materializing it. Every token renews the byte allowance
@@ -4207,7 +4223,14 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		if dc.table == "settings" {
 			onRow = func(row map[string]any) bool { notePairRow(row); return keepRetentionRow(row) }
 		}
-		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, progress, onRow, commitPairRows)
+		importBatch := s.store.ImportTableBatch
+		if dc.cat == "downtime" {
+			if outages == nil {
+				outages = s.store.HoldOutageRecord()
+			}
+			importBatch = outages.ImportTableBatch
+		}
+		n, minTS, sawTS, err := s.importArray(r.Context(), dec, key, dc.table, importBatch, progress, onRow, commitPairRows)
 		result[dc.cat] += n // latency spans two tables (samples + dns); sum them
 		if cur, ok := oldest[dc.cat]; sawTS && (!ok || minTS < cur) {
 			oldest[dc.cat] = minTS // oldest across every table of the category
@@ -4230,6 +4253,10 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Whatever ended the loop, the restore is done with the outage history:
+	// nothing below changes it, and the reconcile takes importMu.
+	outages.Release()
+	outages = nil
 	// The category loop stops as soon as dec.More() reports no next element - which
 	// is ALSO what a truncated body looks like (EOF before the closing '}'). Require
 	// the exact closing token and then EOF, so a backup cut off partway (config
@@ -4595,7 +4622,11 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 // transaction, and if that one fails - a client hanging up at that moment -
 // the store refuses a batch whose rows are all stored, and onCommit does not
 // run for them.
-func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, onProgress func(), onRow func(map[string]any) bool, onCommit func()) (n int, minTS int64, sawTS bool, err error) {
+//
+// importBatch stores each batch: the store's ImportTableBatch, or for the
+// downtime category the ImportTableBatch of the caller's hold on the outage
+// record (store.HoldOutageRecord), which keeps that lock across every batch.
+func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table string, importBatch func(context.Context, string, []map[string]any, map[int64]int) (int, error), onProgress func(), onRow func(map[string]any) bool, onCommit func()) (n int, minTS int64, sawTS bool, err error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("bad %s data: %w", key, err)
@@ -4614,7 +4645,7 @@ func (s *Server) importArray(ctx context.Context, dec *json.Decoder, key, table 
 		if len(batch) == 0 {
 			return nil
 		}
-		applied, ierr := s.store.ImportTableBatch(ctx, table, batch, perTS)
+		applied, ierr := importBatch(ctx, table, batch, perTS)
 		n += applied
 		batch = batch[:0]
 		batchBytes = 0
