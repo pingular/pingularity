@@ -312,6 +312,19 @@ func TestAWatchNotesTheCutoffsTheCleanupDeletedAt(t *testing.T) {
 		t.Errorf("after a pass on an hour and one on thirty days, each deleting a row of every table, the watch "+
 			"holds %v; want the hour's cutoffs %v and two samples", got, later)
 	}
+
+	// The future arm's chunks note no cutoff: what they delete is stamped past
+	// the horizon, not old, and no restored row younger than the cutoff is
+	// among it for being young. A pass on an hour that finds nothing past its
+	// cutoff and a row of every table three days ahead of the clock counts the
+	// rows and notes no cutoff.
+	ahead := s.WatchPrunes()
+	oldRows(-3 * day)
+	prune(ago(time.Hour), ago(time.Hour), ago(time.Hour))
+	if got := ahead.Close(); len(got.Cut) != 0 || got.Rows["samples"] != 1 || got.Rows["events"] != 2 {
+		t.Errorf("a pass that deleted only rows ahead of the clock left the watch holding %v; want a row of each "+
+			"table, both of the outage's, and no cutoff", got)
+	}
 }
 
 // outageRow is one row of a random outage history.

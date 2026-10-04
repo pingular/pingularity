@@ -345,10 +345,12 @@ and persist across restarts.
   length under the box (`= 1d 12h`), so a short window never reads as `0`,
   and a box you leave alone saves exactly the window it showed. A lowered
   window applies at the next hourly cleanup, which works through a large
-  backlog in small steps and can take a few minutes. A shorter window or a
+  backlog in small steps and can take a few minutes. A raised window, or `0`,
+  also stops a cleanup that is already running from deleting what the new
+  window keeps, from its next step on. A shorter window or a
   delete does not make the database file smaller: the freed space stays in
   the file and new data fills it first. Plus
-  per-kind "delete data" buttons, each clearing everything its category exports:
+  per-kind **Delete now** buttons, each clearing everything its category exports:
   **latency** takes the DNS-resolution series with the ping samples, **speed**
   takes the server-selection reports with the runs, and **downtime** takes the
   pause/unobserved spans with the outage events, so clearing downtime also resets
@@ -362,7 +364,8 @@ and persist across restarts.
   hourly cleanup does before it removes old samples. The uptime figures, the
   heatmap and the digest read the same afterwards, and **Recent outages**
   shows the recorded end. An outage still in progress is left to the
-  monitor, which records its end itself. If that end cannot be
+  monitor, which records its end itself; the hourly cleanup leaves it too,
+  however short the latency window. If that end cannot be
   written, nothing is deleted: the page reports an error and the log says
   why. Pressed while an import is bringing in outage history, it waits until
   the import has all of it in. And **Export** / **Import** on the same tab: pick any of
@@ -407,11 +410,11 @@ and persist across restarts.
   may be among them. Where outages are among them, this install's own outage
   records may be as well, and importing again brings those back only if the
   backup holds them. The import speaks for what the cleanup deleted from the
-  start of the import until its reply. A cleanup keeps the windows it started
-  with to its end, so one that began before you raised a window can still
-  delete rows the new window keeps, and what it deletes after the reply is not
-  in it. And a config restore that carried "login on" without a password
-  leaves login off until you set one.
+  start of the import until its reply. A cleanup still running after the reply
+  follows a window you raised from its next step on, so any restored rows it
+  goes on to delete are ones the import already counted as due at the next
+  cleanup, unless you lower a window after the reply. And a config restore that carried "login on" without a
+  password leaves login off until you set one.
 - **Alerts** → *Thresholds* (min download/upload, max ping/jitter/packet-loss, and
   max bufferbloat per direction; each run is marked healthy/unhealthy against the
   values in effect when it ran) with a **Breaches in a row** count (1-10) that

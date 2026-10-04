@@ -176,3 +176,56 @@ func TestPrunerGivesWayToAnotherWriter(t *testing.T) {
 		t.Errorf("giving way to another writer was logged as an error:\n%s", logs.String())
 	}
 }
+
+// A window raised while a big pass runs takes effect at the pass's next
+// chunk, not at the pass after: runPruner hands the pass the controller's
+// windows to read as it goes, not a copy taken as it started. Here the stored
+// latency window is ten days over two hundred thousand readings twenty days
+// old, and it is raised to thirty days on the controller once the pass has
+// deleted some. Every chunk that starts after the raise reads it, so the pass
+// deletes at most the one chunk under way as the raise lands, and the rest,
+// which thirty days keep, stays.
+func TestPrunerFollowsAWindowRaisedMidPass(t *testing.T) {
+	f := openPrunerStore(t)
+	const seeded = 200000 // ten full chunks, a second and a half in waits alone
+	newest := time.Now().Add(-20 * 24 * time.Hour).Unix()
+	if _, err := f.db2.ExecContext(f.ctx, `
+		WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ? - 1)
+		INSERT INTO samples (ts, target, latency_ms, success, family)
+		SELECT ? - i, 'a', 10.0, 1, 'ipv4' FROM n`, seeded, newest); err != nil {
+		t.Fatalf("seed %d samples: %v", seeded, err)
+	}
+	set := tenDayController(t, f)
+
+	passes := prunePasses()
+	var logs bytes.Buffer
+	p := &program{store: f.st, log: slog.New(slog.NewTextHandler(&logs, nil))}
+	stop, _ := runPrunerFor(t, p, set)
+	defer stop()
+	if !waitFor(func() bool { return f.count("samples") < seeded }, 10*time.Second) {
+		t.Fatal("no chunk was deleted within 10s of the grace")
+	}
+	thirty := 30 * 24 * time.Hour
+	if _, err := set.Update(f.ctx, settings.Patch{Retention: &thirty}); err != nil {
+		t.Fatalf("raise the latency window: %v", err)
+	}
+	// Counted once the raise is in force: a chunk that starts from here on
+	// reads it, and one already under way is the only one that does not.
+	const chunk = 20000 // store.pruneChunkRows
+	raisedAt := f.count("samples")
+	if raisedAt <= chunk {
+		t.Fatalf("the pass had deleted all but %d of %d readings by the time the window was raised; %d rows is too "+
+			"small a fixture for this machine", raisedAt, seeded, seeded)
+	}
+	if !waitFor(func() bool { return prunePasses() > passes }, 30*time.Second) {
+		t.Fatalf("the pass did not finish within 30s; %d rows left", f.count("samples"))
+	}
+	stop()
+	if left := f.count("samples"); left < raisedAt-chunk {
+		t.Errorf("%d readings, twenty days old, were left as the window was raised to thirty days and %d after the "+
+			"pass: it went on past the chunk under way, at the ten days it started with", raisedAt, left)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("the pass failed:\n%s", logs.String())
+	}
+}

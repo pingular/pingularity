@@ -236,7 +236,7 @@ func TestEventTypeFilterCoversEveryEventRead(t *testing.T) {
 	// Statements that must NOT restrict the type, each with the reason.
 	exempt := map[string]string{
 		"InsertEvent":                "the writer; it ENFORCES the rule at the door, so there is no row to filter",
-		"Prune":                      "deletes by ts and must reach EVERY row - retention that skipped the types it cannot read would keep them forever",
+		"PruneLive":                  "deletes by ts and must reach EVERY row - retention that skipped the types it cannot read would keep them forever",
 		"reportUnreadableEventTypes": "asks the inverse question - it LOOKS FOR the rows the filtered reads ignore, to tell the operator they are there",
 		"repairInsaneEventDurations": "the duration bound is about what a LENGTH can mean, not what a type means; the import door holds the same rule for every row",
 		"DeleteOutage":               "constrains the type in every statement with an explicit type = 'down' / type = 'up' rather than the IN idiom, because it targets one side of a pair at a time",

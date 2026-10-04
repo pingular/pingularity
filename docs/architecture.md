@@ -249,11 +249,20 @@ flowchart TB
   rows a chunk at a time and leaves the database alone for a moment after each
   full chunk, so probe writes get their turn in between. A large cleanup (after
   lowering retention, a long power-off or a restore of old rows) takes longer
-  this way, up to a few minutes, and cannot block probe writes while it runs.
+  this way, up to a few minutes, but saving new readings waits for it only one
+  chunk at a time, tens of milliseconds on a fast machine, not for the whole
+  cleanup. Emptying the log after a large one can add up to a quarter of a
+  second.
   At the default cadence an hour of rows is less than one chunk, so the usual
   cleanup never waits. Outages are removed whole: a chunk never ends between a
   `down` and its `up`. A cleanup stopped by a shutdown keeps what it has
-  removed, and the next one removes the rest.
+  removed, and the next one removes the rest. A cleanup reads the retention
+  windows again before every chunk it deletes by age, measured from the moment
+  it started, and cuts at the earlier of that cutoff and the one it started
+  with: a window raised while it runs, or set to keep forever, stops it
+  deleting what the new window keeps from its next chunk on, rows a restore
+  brings back meanwhile included. A lowered window waits for the next
+  cleanup, so a cleanup never deletes more than it set out to.
 - **Cleanup waits for a clock it can trust.** Every retention cutoff comes
   from the clock, so a clock set wrong would delete history that should stay.
   Cleanup is skipped while the clock reads earlier than 2023 (a board with no
@@ -268,6 +277,13 @@ flowchart TB
   jump: the virtual machine's clocks stop while the laptop sleeps, the boot
   clock with them, and its time sync sets the clock forward at wake.
   `db.prune_skipped_clock` on `/metrics` counts the skipped passes.
+  A cleanup also deletes rows stamped more than 48 hours ahead of the clock,
+  which only a wrong clock leaves behind. A large cleanup can be caught by the
+  lid closing and go on days later, so it measures those 48 hours from the
+  clock it started on plus the time it has been running, sleep included, and
+  what is recorded after the wake stays. If the clock is set by more than 15
+  minutes while a cleanup runs, that cleanup deletes no more rows as ahead of
+  the clock, and the next one treats the jump like any other.
 - **An outage keeps its end when its samples go.** A restart in the middle of
   an outage leaves its `down` with no `up`: the process that wrote it stopped,
   and the next one starts out assuming the link is up. Only the latency
@@ -275,11 +291,17 @@ flowchart TB
   those samples, and before **Delete now** removes all of them, the outage is
   given an `up` at that second with its observed length. The uptime figures,
   the heatmap and the digest read the same afterwards, and the outage list
-  shows the recorded end. The cleanup only reaches samples older than the
-  retention window, 30 days by default. **Delete now** reaches the present, so
-  it leaves alone every outage the running monitor opened: the monitor may
-  still be counting the `up-after` good rounds it needs, or waiting to write
-  its `up`, and it records the end itself. If the `up` cannot be written, the
+  shows the recorded end. Neither touches an outage the running monitor
+  opened: the monitor may still be counting the `up-after` good rounds it
+  needs, or waiting to write its `up`, and it records the end itself.
+  **Delete now** reaches the present, and the cleanup reaches as close to it
+  as the latency window is short (the window can be minutes), so an end
+  written for such an outage would turn into a second one. The cleanup used
+  to rely on the window alone, 30 days by default, to keep it away from them.
+  What that gives up is an outage whose `up` the monitor could not write and
+  had to drop (`monitor.event_dropped` on `/metrics`): the cleanup no longer
+  ends it from its samples, and once those are past the window it reads as
+  lasting until the next recorded outage. If the `up` cannot be written, the
   delete deletes nothing. Such a close decides what to write from what it read
   first, so it takes turns with every other change to the outages but the
   monitor's: another close, the delete of one outage, the downtime **Delete

@@ -212,6 +212,51 @@ func TestDeleteNowLeavesAnOutageTheMonitorStillHoldsOpen(t *testing.T) {
 	}
 }
 
+// The hourly cleanup has the same hazard once the latency window is short. It
+// used to keep its distance from the monitor's outages by the window alone,
+// thirty days by default, and the window is the operator's: the Data tab takes
+// a fraction of a day, and the API and -retain take any length. Here it is
+// under five minutes, on the history above, so the good round five minutes ago
+// is past the cutoff and the cleanup's close reaches it. It wrote an 'up'
+// there, deleted the round with the rest, and the monitor's own 'up' then made
+// two ends of one outage, for good. The cleanup now leaves every outage of the
+// running monitor to the monitor, as Delete now does.
+func TestACleanupOnAShortWindowLeavesAnOutageTheMonitorStillHoldsOpen(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	st := openFileStore(t)
+	mustInsert(t, st, round(ago(now, 3600), true)) // monitoring anchor
+	if err := st.InsertEvent(ctx, ago(now, 600), "down", -1, ""); err != nil {
+		t.Fatalf("the monitor's down: %v", err)
+	}
+	mustInsert(t, st, round(ago(now, 600), false))
+	mustInsert(t, st, round(ago(now, 300), true))
+	mustInsert(t, st, round(ago(now, 295), false))
+	since := ago(now, 3600)
+
+	far := now.Add(-9999 * time.Hour)
+	if _, err := st.Prune(ctx, ago(now, 259), far, far); err != nil {
+		t.Fatalf("the cleanup: %v", err)
+	}
+	if got := onDisk(t, st, "samples"); got != 0 {
+		t.Fatalf("fixture: the cleanup left %d samples, want none: every round is older than its window", got)
+	}
+	if got := dump(t, st, eventsAsStored); len(got) != 1 {
+		t.Fatalf("after the cleanup the events are %q, want the monitor's 'down' alone: the cleanup closed "+
+			"an outage the running monitor still holds open", got)
+	}
+
+	// The monitor sees the link back and writes its own recovery: one outage.
+	if err := st.InsertEvent(ctx, time.Now(), "up", int(time.Since(ago(now, 600)).Seconds()), ""); err != nil {
+		t.Fatalf("the monitor's up: %v", err)
+	}
+	ups := closingEvents(t, st)
+	if outages, _, err := st.ResolvedOutagesSince(ctx, since.Unix()); err != nil || outages != 1 || len(ups) != 1 {
+		t.Errorf("once the monitor closed its outage the history holds the closing events %q and reads %d "+
+			"outage(s) (err %v), want one of each", ups, outages, err)
+	}
+}
+
 // ranOnAfterARestart is an orphan whose outage went on into this process: the
 // first process confirmed it an hour ago and stopped, and every round since has
 // been bad, up to five minutes ago. No good round separates it from an outage
@@ -521,32 +566,54 @@ func TestOnlyDeletingLatencyClosesOutagesFirst(t *testing.T) {
 }
 
 // A close that fails is one failure on /metrics (db.err), whichever statement
-// failed. The close counts a failed write itself, so Delete now does not count
-// it again. A failed read is left to the caller, so Delete now counts that one.
-func TestDeleteNowCountsAFailedCloseOnce(t *testing.T) {
+// failed and whoever ran the close. The close counts a failed write itself, so
+// Delete now and the cleanup do not count it again. A failed read is left to
+// the caller, so they count that one. The cleanup used to count every failure
+// of its close, and a refused 'up' read as two.
+func TestACloseThatFailsIsCountedOnce(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct{ name, fail, heal string }{
-		{"a write", `CREATE TRIGGER refuse_recoveries BEFORE INSERT ON events WHEN NEW.type = 'up'
-			BEGIN SELECT RAISE(ABORT, 'the recovery is refused'); END`, `DROP TRIGGER refuse_recoveries`},
-		// The pause spans are read for the outage's observed length.
-		{"a read", `ALTER TABLE pauses RENAME TO pauses_gone`, `ALTER TABLE pauses_gone RENAME TO pauses`},
+	for _, by := range []struct {
+		name string
+		run  func(st *Store, now time.Time) error
+	}{
+		{"Delete now", func(st *Store, _ time.Time) error { _, err := st.Clear(ctx, "latency"); return err }},
+		// A window of an hour: the round that shows the orphan's link back is
+		// older, so the cleanup closes the outage before it deletes that round.
+		{"a cleanup", func(st *Store, now time.Time) error {
+			far := now.Add(-9999 * time.Hour)
+			_, err := st.Prune(ctx, ago(now, 3600), far, far)
+			return err
+		}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			st := orphanedByARestart(t, time.Now())
-			if _, err := st.db.Exec(tc.fail); err != nil {
-				t.Fatal(err)
-			}
-			stats.ResetForTest()
-			if _, err := st.Clear(ctx, "latency"); err == nil {
-				t.Fatal("Delete now went through with the close failing")
-			}
-			if got := counter("db.err"); got != 1 {
-				t.Errorf("one failed close counts %d on db.err, want 1", got)
-			}
-			if _, err := st.db.Exec(tc.heal); err != nil {
-				t.Fatal(err)
-			}
-		})
+		for _, tc := range []struct{ name, fail, heal string }{
+			{"a write", `CREATE TRIGGER refuse_recoveries BEFORE INSERT ON events WHEN NEW.type = 'up'
+				BEGIN SELECT RAISE(ABORT, 'the recovery is refused'); END`, `DROP TRIGGER refuse_recoveries`},
+			// The pause spans are read for the outage's observed length.
+			{"a read", `ALTER TABLE pauses RENAME TO pauses_gone`, `ALTER TABLE pauses_gone RENAME TO pauses`},
+		} {
+			t.Run(by.name+"/"+tc.name, func(t *testing.T) {
+				now := time.Now()
+				st := orphanedByARestart(t, now)
+				samples := onDisk(t, st, "samples")
+				if _, err := st.db.Exec(tc.fail); err != nil {
+					t.Fatal(err)
+				}
+				stats.ResetForTest()
+				if err := by.run(st, now); err == nil {
+					t.Fatal("it went through with the close failing")
+				}
+				if got := counter("db.err"); got != 1 {
+					t.Errorf("one failed close counts %d on db.err, want 1", got)
+				}
+				if got := onDisk(t, st, "samples"); got != samples {
+					t.Errorf("with the close failing %d samples are left, want all %d: they are the outage's "+
+						"only record of its end", got, samples)
+				}
+				if _, err := st.db.Exec(tc.heal); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }
 

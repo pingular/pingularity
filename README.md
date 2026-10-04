@@ -503,9 +503,9 @@ sidecar, and the latest readings, which are still in memory - and copy the key
 file with it.
 
 **Disk space.** The database file grows until it holds what your retention
-windows keep, then stops. It does not get smaller. Lowering a window or using
-**Delete now** frees space inside the file, and new data fills it before the
-file grows again. The `-wal` file beside it stays at a few MB. A large cleanup
+windows keep, then stops. It does not get smaller. **Delete now** frees space
+inside the file at once, and lowering a window does at the next hourly
+cleanup. New data fills that space before the file grows again. The `-wal` file beside it stays at a few MB. A large cleanup
 or an export can make it grow for a while, and it is cut back afterwards.
 
 **Forgot the password?** Run `pingularity reset-auth` on the host to clear it

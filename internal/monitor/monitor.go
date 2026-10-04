@@ -1211,8 +1211,10 @@ func (m *Monitor) round(ctx context.Context) {
 	// Retry any transition events whose durable write failed on an earlier round,
 	// before anything else, so a store that has since recovered catches up
 	// promptly. resolveDanglingDowns can't rescue a lost event - it only bounds a
-	// dangling 'down' from sample evidence weeks later at Prune, and can't recreate
-	// a 'down' that was never written - so this retry is the only path back.
+	// dangling 'down' from sample evidence weeks later at Prune, and only one an
+	// earlier process left: a 'down' of this monitor's is left to this monitor
+	// (the store's liveDownFloor). Nor can it recreate a 'down' that was never
+	// written - so this retry is the only path back.
 	m.flushPendingEvents(ctx)
 
 	// The speedtest wire counter, read on both sides of the probe (see during below).

@@ -815,11 +815,11 @@ func storeSources(t *testing.T) map[string]string {
 // here why it does not. Modelled on TestSpeedFilterCoversEveryMeasurementRead,
 // including the staleness half. A function deletes when it holds a DELETE
 // statement or hands one to the chunker, so the guard follows the statements
-// if they ever move out of Prune.
+// if they ever move out of PruneLive.
 func TestEveryDeleteSaysWhetherItTrimsTheLog(t *testing.T) {
 	trims := map[string]string{
-		"Prune": "retention: a lowered window or a long power-off deletes days of rounds at once",
-		"Clear": "the Data tab's Delete now: whole tables",
+		"PruneLive": "retention: a lowered window or a long power-off deletes days of rounds at once",
+		"Clear":     "the Data tab's Delete now: whole tables",
 	}
 	exempt := map[string]string{
 		"repairInsanePausesAt":         "at Open, before the pool serves anything; pause rows are few",

@@ -178,9 +178,10 @@ self-describing):
   RAM, SQLite's included. This is the one to compare with a container or NAS
   memory limit. Absent on other systems
 - `pingularity_db_bytes` - on-disk database size incl. WAL/SHM. Watch it for
-  growth. The main file does not get smaller when data is deleted: lowering
-  retention or clearing data frees space inside the file, new data fills that
-  space first, and the file keeps its size
+  growth. The main file does not get smaller when data is deleted: clearing
+  data frees space inside the file at once, and lowering retention does at the
+  next hourly cleanup. New data fills that space first, and the file keeps its
+  size
 - `pingularity_db_reusable_bytes` - that free space inside the file. Only whole
   free pages are counted, so
   `pingularity_db_bytes - pingularity_db_reusable_bytes` is about what the
@@ -208,7 +209,10 @@ self-describing):
   `pingularity_stat_total{stat="monitor.event_dropped"}` - the outage-persistence
   retry queue's depth (0 = healthy) and a counter of transitions dropped for good
   when the DB stayed unwritable past the buffer cap (each drop leaves a gap in
-  uptime history). `pending_events` is a depth, not a counter, so it is not seeded
+  uptime history; an outage whose end was dropped is not ended by the hourly
+  cleanup either while pingularity keeps running, and once its latency samples
+  are past their window it reads as lasting until the next recorded outage).
+  `pending_events` is a depth, not a counter, so it is not seeded
   at startup: the series appears the first time an event has to be queued
 - `pingularity_metrics_data_valid` - **1 only when every store read on this scrape
   succeeded**; 0 when any failed (so a DB outage that would otherwise be a silent

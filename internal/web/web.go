@@ -4763,12 +4763,14 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // The windows cannot answer that. This used to measure the oldest row against
 // the shorter of the window the restore began with and the one in force at its
 // end, on the reasoning that a pass cuts at its own time less the window in
-// force then. But a pass fixes its cutoffs when it starts (runPruner reads the
-// windows and hands Prune the cutoffs), and a pass over a big backlog runs for
-// minutes. An operator who raised a window while one ran and then restored,
-// which is the advice above, lost the restored rows older than that pass's
-// cutoff, and the reply said nothing: by both windows those rows were young
-// enough to keep.
+// force then. But a pass measures the windows from the moment it started, a
+// pass over a big backlog runs for minutes, and it leaves a window lowered
+// meanwhile to the next pass (store.PruneLive). And a pass used to keep the
+// cutoffs it started with to its end: an operator who raised a window while
+// one ran and then restored, which is the advice above, lost the restored rows
+// older than that pass's cutoff, and the reply said nothing, since by both
+// windows those rows were young enough to keep. The cutoffs the chunks were
+// cut at answer it, whatever the windows did.
 //
 // Nor can a tally kept since the store opened, which is what this read before
 // the watch: the rows each table had lost, as the restore began and again here,
@@ -4790,9 +4792,14 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // holds them.
 //
 // What the reply cannot see is what a pass still running when it is written
-// deletes afterwards. Its later chunks cut at the cutoffs it started with, and
-// can still delete restored rows of a category older than those, including
-// rows of a category whose tables it has not reached yet.
+// deletes afterwards, the rows of a category whose tables it has not reached
+// yet among them. That holds no restored row the windows in force keep. Each
+// of its chunks is cut no later than those windows give the start of the pass,
+// which is earlier than they give now, and a window raised while it runs
+// holds it back from its next chunk on, so whatever restored rows it deletes
+// are past the windows in force and counted above as due at the next cleanup.
+// Only a window lowered after the reply lets it go further, and then no
+// further than the cutoffs it started at.
 func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, windows map[string]time.Duration, landed map[string]int, oldest map[string]int64, pruned *store.PruneWatch) []string {
 	if len(marks) == 0 {
 		return nil

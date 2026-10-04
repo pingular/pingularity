@@ -1599,9 +1599,19 @@ func (p *program) retrySettingsLoad(ctx context.Context, set *settings.Controlle
 // 0 keeps that data forever. A pass is skipped while settings have never
 // loaded, since the windows would then be nobody's choice.
 func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
-	// cutoff returns the prune-before time for a window (epoch = keep forever).
-	// A restore counts what this pass will remove with the same function.
-	cutoff := func(d time.Duration) time.Time { return settings.PruneCutoff(time.Now(), d) }
+	// cutoffs gives a pass the prune-before times of the windows in force,
+	// measured from the pass's start (epoch = keep forever). A restore counts
+	// what the next pass will remove with the same function
+	// (settings.PruneCutoff). The pass asks as it starts and again before every
+	// chunk it deletes by age (store.PruneLive), so it reads the controller
+	// each time rather than a copy taken as the pass began: a window raised
+	// while a big pass runs, or set to keep forever, stops the pass deleting
+	// what the new window keeps at its next chunk, not at the pass after. A
+	// lowered one still waits for the next pass.
+	cutoffs := func(start time.Time) (time.Time, time.Time, time.Time) {
+		return settings.PruneCutoff(start, set.Retention()), settings.PruneCutoff(start, set.SpeedRetention()),
+			settings.PruneCutoff(start, set.DowntimeRetention())
+	}
 	prune := func() {
 		// The windows come from the controller, and one whose boot read failed
 		// answers with the compiled-in defaults, not the operator's stored
@@ -1618,7 +1628,7 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 			p.log.Warn("prune skipped until settings load; the retention windows would be the compiled-in defaults")
 			return
 		}
-		n, err := p.store.Prune(ctx, cutoff(set.Retention()), cutoff(set.SpeedRetention()), cutoff(set.DowntimeRetention()))
+		n, err := p.store.PruneLive(ctx, cutoffs)
 		if err != nil {
 			switch {
 			case ctx.Err() != nil:

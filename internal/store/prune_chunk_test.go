@@ -23,8 +23,9 @@ import (
 //
 // Prune ran one DELETE per table. Over a big backlog (retention lowered, a box
 // that was off for weeks, a restore of old rows) one of those held SQLite's
-// single writer for seconds, and a probe write that waits 5 s for the writer is
-// logged and dropped. The deletes now run in chunks of pruneChunkRows with a
+// single writer for seconds, and a save of probe readings that waits 5 s for
+// the writer fails (before readings were saved in batches, that lost the
+// round). The deletes now run in chunks of pruneChunkRows with a
 // wait after every full one. These tests pin what that must not change (the
 // rows that go, the count returned, whole outages) and what it must add (a
 // bound between waits, a free writer in the gaps, a clean stop).
@@ -54,7 +55,7 @@ func oraclePrune(t *testing.T, s *Store, start, samplesBefore, speedBefore, even
 	ctx := context.Background()
 	s.maybeRepairFuturePauses()
 	horizon := start.Add(pruneFutureSlack).Unix()
-	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix(), nil); err != nil {
+	if err := s.resolveDanglingDowns(ctx, samplesBefore.Unix(), start.Unix(), s.liveDownFloor.Load); err != nil {
 		t.Fatal(err)
 	}
 	var total int64
@@ -1063,34 +1064,35 @@ func TestPruneChunksCoverEveryPrunedTable(t *testing.T) {
 	}
 }
 
-// The chunker is only a bound if every DELETE in Prune goes through it. This
-// reads Prune's body, sliced the way TestEventTypeFilterCoversEveryEventRead
-// slices a function, and refuses a statement run any other way.
+// The chunker is only a bound if every DELETE in a pass goes through it. This
+// reads PruneLive's body, which Prune runs too, sliced the way
+// TestEventTypeFilterCoversEveryEventRead slices a function, and refuses a
+// statement run any other way.
 func TestPruneRunsEveryDeleteThroughTheChunker(t *testing.T) {
 	src, err := os.ReadFile("store.go")
 	if err != nil {
 		t.Fatalf("read store.go: %v", err)
 	}
-	start := regexp.MustCompile(`(?m)^func \(s \*Store\) Prune\(`).FindIndex(src)
+	start := regexp.MustCompile(`(?m)^func \(s \*Store\) PruneLive\(`).FindIndex(src)
 	if start == nil {
-		t.Fatal("the source scan did not find Prune - it is no longer checking anything")
+		t.Fatal("the source scan did not find PruneLive - it is no longer checking anything")
 	}
 	end := regexp.MustCompile(`(?m)^\}$`).FindIndex(src[start[0]:])
 	if end == nil {
-		t.Fatal("the source scan did not find the end of Prune")
+		t.Fatal("the source scan did not find the end of PruneLive")
 	}
 	body := stripLineComments(string(src[start[0] : start[0]+end[1]]))
 	for _, direct := range []string{"ExecContext(", ".Exec(", "BeginTx(", ".Begin("} {
 		if strings.Contains(body, direct) {
-			t.Errorf("Prune calls %s itself: a statement run outside pruneChunked has no row bound and no wait, "+
+			t.Errorf("PruneLive calls %s itself: a statement run outside pruneChunked has no row bound and no wait, "+
 				"and holds the writer for as long as its backlog is big", direct)
 		}
 	}
 	if n := strings.Count(body, "s.pruneChunked("); n < 8 {
-		t.Errorf("Prune calls pruneChunked %d times; the scan is reading the wrong text", n)
+		t.Errorf("PruneLive calls pruneChunked %d times; the scan is reading the wrong text", n)
 	}
 	if n := strings.Count(body, "DELETE FROM"); n < 8 {
-		t.Errorf("Prune holds %d DELETE statements; the scan is reading the wrong text", n)
+		t.Errorf("PruneLive holds %d DELETE statements; the scan is reading the wrong text", n)
 	}
 }
 

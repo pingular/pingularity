@@ -658,11 +658,11 @@ func readerCases() []readerCase {
 			return fmt.Sprint(n, onDisk(t, st, "samples"), onDisk(t, st, "dns"))
 		}},
 		{"Prune", func(t *testing.T, st *Store, now time.Time) {
-			// A link that went down ten days ago, with nothing to say it came back.
+			// A link that went down ten days ago, with nothing to say it came
+			// back: an earlier process wrote the 'down' (eventAt), since a
+			// cleanup leaves the running monitor's own outages to the monitor.
 			mustInsert(t, st, round(now.Add(-11*24*time.Hour), true))
-			if err := st.InsertEvent(ctx, now.Add(-10*24*time.Hour), "down", -1, ""); err != nil {
-				t.Fatalf("insert down: %v", err)
-			}
+			eventAt(t, st, now, 10*24*3600, "down", -1)
 			mustInsert(t, st, round(now.Add(-10*24*time.Hour), false))
 			mustInsert(t, st, round(ago(now, 60), true))
 		}, func(t *testing.T, st *Store, now time.Time) {
@@ -2338,7 +2338,7 @@ func TestEverySamplesStatementSavesFirst(t *testing.T) {
 	}
 	// The scan found the real readers and did not pass on an empty match.
 	for _, must := range []string{"LastObservedTS", "monitoringSince", "HasHistory", "firstQuorumRecovery",
-		"newestSampleAt", "LatestPerTarget", "seriesQuery", "TableCounts", "Prune", "Clear", "importTableBatch"} {
+		"newestSampleAt", "LatestPerTarget", "seriesQuery", "TableCounts", "PruneLive", "Clear", "importTableBatch"} {
 		if !seen[must] {
 			t.Errorf("the source scan did not find %s - it is no longer checking anything", must)
 		}
