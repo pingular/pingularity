@@ -1,0 +1,549 @@
+# Throwaway probe of the Windows install path on a GitHub-hosted Windows machine.
+# It installs NOTHING of Pingularity's and never touches the URLs the install
+# counter watches (install.pingularity.dev/latest.json and /compose*.yaml). It
+# asks both PowerShells the same questions: which interpreter is running and
+# whether the one-shot's relaunch path exists there, what each shell makes of
+# the Docker compose commands on the install page (parsed, not run), what
+# winget says about the pingularity source (lookups only), and what the served
+# winget.ps1 looks like (fetched with a user agent the counter ignores, hashed,
+# parsed, never executed). The only writes are a scratch folder under the
+# runner's temp directory and, if winget is missing or older than 1.11, the
+# one-shot's own App Installer repair. Every step carries on after a failure so
+# one broken check cannot hide the others. Runs only on pushes to the
+# install-check branch, or by hand.
+name: Install check (Windows probe)
+
+on:
+  push:
+    branches: [install-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows probe
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: 'PowerShell 7 (pwsh): which PowerShell this is, and whether $PSHOME\powershell.exe - the path the one-shot relaunches itself with - exists'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== Which PowerShell is running this step"
+          Write-Host "   PSVersion    : $($PSVersionTable.PSVersion)"
+          Write-Host "   PSEdition    : $($PSVersionTable.PSEdition)"
+          Write-Host "   PSHOME       : $PSHOME"
+          Write-Host "   this process : $((Get-Process -Id $PID).Path)"
+          $found = @(Get-Command pwsh, powershell -ErrorAction SilentlyContinue)
+          foreach ($c in $found) { Write-Host "   Get-Command $($c.Name) -> $($c.Source)" }
+          if (-not ($found | Where-Object { $_.Name -like 'pwsh*' })) { Write-Host "   Get-Command pwsh -> not found" }
+          if (-not ($found | Where-Object { $_.Name -like 'powershell*' })) { Write-Host "   Get-Command powershell -> not found" }
+          Write-Host "== The path the one-shot relaunches itself with when it is not admin: `"`$PSHOME\powershell.exe`""
+          Write-Host "   here that is : $PSHOME\powershell.exe"
+          Write-Host "   Test-Path `"`$PSHOME\powershell.exe`" : $(Test-Path "$PSHOME\powershell.exe")"
+          Write-Host "   Test-Path `"`$PSHOME\pwsh.exe`"       : $(Test-Path "$PSHOME\pwsh.exe")"
+          Write-Host "   (for comparison) Windows PowerShell 5.1 is at $env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe : $(Test-Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")"
+          Write-Host "== The machine"
+          Write-Host "   runner image : $env:ImageOS $env:ImageVersion"
+          try { Write-Host "   Windows      : $((Get-CimInstance Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version)" } catch { Write-Host "   Windows      : $([Environment]::OSVersion.VersionString)" }
+          Write-Host "   user         : $env:USERDOMAIN\$env:USERNAME"
+          Write-Host "   exec policy  : $((Get-ExecutionPolicy -List | ForEach-Object { "$($_.Scope)=$($_.ExecutionPolicy)" }) -join ', ')"
+      - name: 'Windows PowerShell 5.1: which PowerShell this is, and whether $PSHOME\powershell.exe - the path the one-shot relaunches itself with - exists'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== Which PowerShell is running this step"
+          Write-Host "   PSVersion    : $($PSVersionTable.PSVersion)"
+          Write-Host "   PSEdition    : $($PSVersionTable.PSEdition)"
+          Write-Host "   PSHOME       : $PSHOME"
+          Write-Host "   this process : $((Get-Process -Id $PID).Path)"
+          $found = @(Get-Command pwsh, powershell -ErrorAction SilentlyContinue)
+          foreach ($c in $found) { Write-Host "   Get-Command $($c.Name) -> $($c.Source)" }
+          if (-not ($found | Where-Object { $_.Name -like 'pwsh*' })) { Write-Host "   Get-Command pwsh -> not found" }
+          if (-not ($found | Where-Object { $_.Name -like 'powershell*' })) { Write-Host "   Get-Command powershell -> not found" }
+          Write-Host "== The path the one-shot relaunches itself with when it is not admin: `"`$PSHOME\powershell.exe`""
+          Write-Host "   here that is : $PSHOME\powershell.exe"
+          Write-Host "   Test-Path `"`$PSHOME\powershell.exe`" : $(Test-Path "$PSHOME\powershell.exe")"
+          Write-Host "   Test-Path `"`$PSHOME\pwsh.exe`"       : $(Test-Path "$PSHOME\pwsh.exe")"
+          Write-Host "   (for comparison) Windows PowerShell 5.1 is at $env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe : $(Test-Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")"
+          Write-Host "== The machine"
+          Write-Host "   runner image : $env:ImageOS $env:ImageVersion"
+          try { Write-Host "   Windows      : $((Get-CimInstance Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version)" } catch { Write-Host "   Windows      : $([Environment]::OSVersion.VersionString)" }
+          Write-Host "   user         : $env:USERDOMAIN\$env:USERNAME"
+          Write-Host "   exec policy  : $((Get-ExecutionPolicy -List | ForEach-Object { "$($_.Scope)=$($_.ExecutionPolicy)" }) -join ', ')"
+      - name: 'PowerShell 7 (pwsh): parse the Docker compose one-shot blocks from the install page (no execution), then run only their harmless parts'
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== What the words in those blocks mean to THIS shell"
+          foreach ($n in 'mkdir', 'cd', 'curl', 'docker') {
+            $c = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $c) { Write-Host "   $n -> not found"; continue }
+            if ($c.CommandType -eq 'Alias') { Write-Host "   $n -> alias for $($c.Definition)" }
+            elseif ($c.CommandType -eq 'Application') { Write-Host "   $n -> program $($c.Source)" }
+            else { Write-Host "   $n -> $($c.CommandType) $($c.Source)" }
+          }
+          # The three Docker one-shot blocks exactly as the install page shows them
+          # (install/public/index.html lines 393, 397, 403; &amp; decoded, comment markup dropped).
+          $blocks = New-Object System.Collections.Specialized.OrderedDictionary
+          $blocks['block 1 - compose, standard image (page line 393)'] = @'
+          # needs Docker's Compose plugin (docker compose ...) - standard image
+          mkdir -p pingularity && cd pingularity && \
+            curl -fsSLO https://install.pingularity.dev/compose.yaml && \
+            docker compose up -d
+          '@
+          $blocks['block 2 - compose, iperf3 image (page line 397)'] = @'
+          # iperf3 image
+          mkdir -p pingularity && cd pingularity && \
+            curl -fsSL https://install.pingularity.dev/compose-iperf.yaml -o compose.yaml && \
+            docker compose up -d
+          '@
+          $blocks['block 3 - compose update (page line 403)'] = @'
+          # re-run the one-shot: the fresh file names the new release and recreates the container
+          cd pingularity && \
+            curl -fsSLO https://install.pingularity.dev/compose.yaml && \
+            docker compose up -d
+          '@
+          Write-Host "== PARSE ONLY - nothing in the blocks is executed"
+          foreach ($name in $blocks.Keys) {
+            Write-Host "-- $name"
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput($blocks[$name], [ref]$tokens, [ref]$errors)
+            Write-Host "   parse errors: $($errors.Count)"
+            foreach ($e in $errors) { Write-Host "   line $($e.Extent.StartLineNumber) col $($e.Extent.StartColumnNumber) [$($e.ErrorId)]: $($e.Message)" }
+            if ($errors.Count -eq 0) {
+              $cmds = @($tokens | Where-Object { $_.TokenFlags -band [System.Management.Automation.Language.TokenFlags]::CommandName } | ForEach-Object { $_.Text })
+              Write-Host "   would run these commands, in order: $($cmds -join ' | ')"
+            }
+          }
+          Write-Host "== RUN the harmless parts in a scratch folder (an uncounted URL stands in for compose.yaml)"
+          $scratch = Join-Path $env:RUNNER_TEMP ("one-shot-" + $PSVersionTable.PSEdition)
+          $null = New-Item -ItemType Directory -Force -Path $scratch
+          Set-Location $scratch
+          Write-Host "   scratch folder: $(Get-Location)"
+          Write-Host "-- 1. the first line of block 1, as written:  mkdir -p pingularity && cd pingularity && \"
+          try { Invoke-Expression 'mkdir -p pingularity && cd pingularity && \' } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   folder now: $(Get-Location)"
+          $second = Join-Path $scratch 'second'
+          $null = New-Item -ItemType Directory -Force -Path $second
+          Set-Location $second
+          Write-Host "-- 2. one command at a time, from $(Get-Location)"
+          Write-Host "   > mkdir -p pingularity"
+          try { mkdir -p pingularity | Out-Null; Write-Host "   ok - folder exists: $(Test-Path .\pingularity)" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > cd pingularity"
+          try { cd pingularity; Write-Host "   ok - now in $(Get-Location)" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > curl -fsSLO https://winget.pingularity.dev/information      (block 1 spelling)"
+          try { curl -fsSLO https://winget.pingularity.dev/information; Write-Host "   native exit code: $LASTEXITCODE" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > curl -fsSL https://winget.pingularity.dev/information -o compose.yaml      (block 2 spelling)"
+          try { curl -fsSL https://winget.pingularity.dev/information -o compose.yaml; Write-Host "   native exit code: $LASTEXITCODE" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   files in $(Get-Location):"
+          $files = @(Get-ChildItem -File)
+          if ($files.Count -eq 0) { Write-Host "   (none)" }
+          foreach ($f in $files) { Write-Host "   $($f.Length) bytes  $($f.Name)  first line: $(Get-Content $f.FullName -First 1)" }
+      - name: 'Windows PowerShell 5.1: parse the Docker compose one-shot blocks from the install page (no execution), then run only their harmless parts'
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== What the words in those blocks mean to THIS shell"
+          foreach ($n in 'mkdir', 'cd', 'curl', 'docker') {
+            $c = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $c) { Write-Host "   $n -> not found"; continue }
+            if ($c.CommandType -eq 'Alias') { Write-Host "   $n -> alias for $($c.Definition)" }
+            elseif ($c.CommandType -eq 'Application') { Write-Host "   $n -> program $($c.Source)" }
+            else { Write-Host "   $n -> $($c.CommandType) $($c.Source)" }
+          }
+          # The three Docker one-shot blocks exactly as the install page shows them
+          # (install/public/index.html lines 393, 397, 403; &amp; decoded, comment markup dropped).
+          $blocks = New-Object System.Collections.Specialized.OrderedDictionary
+          $blocks['block 1 - compose, standard image (page line 393)'] = @'
+          # needs Docker's Compose plugin (docker compose ...) - standard image
+          mkdir -p pingularity && cd pingularity && \
+            curl -fsSLO https://install.pingularity.dev/compose.yaml && \
+            docker compose up -d
+          '@
+          $blocks['block 2 - compose, iperf3 image (page line 397)'] = @'
+          # iperf3 image
+          mkdir -p pingularity && cd pingularity && \
+            curl -fsSL https://install.pingularity.dev/compose-iperf.yaml -o compose.yaml && \
+            docker compose up -d
+          '@
+          $blocks['block 3 - compose update (page line 403)'] = @'
+          # re-run the one-shot: the fresh file names the new release and recreates the container
+          cd pingularity && \
+            curl -fsSLO https://install.pingularity.dev/compose.yaml && \
+            docker compose up -d
+          '@
+          Write-Host "== PARSE ONLY - nothing in the blocks is executed"
+          foreach ($name in $blocks.Keys) {
+            Write-Host "-- $name"
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput($blocks[$name], [ref]$tokens, [ref]$errors)
+            Write-Host "   parse errors: $($errors.Count)"
+            foreach ($e in $errors) { Write-Host "   line $($e.Extent.StartLineNumber) col $($e.Extent.StartColumnNumber) [$($e.ErrorId)]: $($e.Message)" }
+            if ($errors.Count -eq 0) {
+              $cmds = @($tokens | Where-Object { $_.TokenFlags -band [System.Management.Automation.Language.TokenFlags]::CommandName } | ForEach-Object { $_.Text })
+              Write-Host "   would run these commands, in order: $($cmds -join ' | ')"
+            }
+          }
+          Write-Host "== RUN the harmless parts in a scratch folder (an uncounted URL stands in for compose.yaml)"
+          $scratch = Join-Path $env:RUNNER_TEMP ("one-shot-" + $PSVersionTable.PSEdition)
+          $null = New-Item -ItemType Directory -Force -Path $scratch
+          Set-Location $scratch
+          Write-Host "   scratch folder: $(Get-Location)"
+          Write-Host "-- 1. the first line of block 1, as written:  mkdir -p pingularity && cd pingularity && \"
+          try { Invoke-Expression 'mkdir -p pingularity && cd pingularity && \' } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   folder now: $(Get-Location)"
+          $second = Join-Path $scratch 'second'
+          $null = New-Item -ItemType Directory -Force -Path $second
+          Set-Location $second
+          Write-Host "-- 2. one command at a time, from $(Get-Location)"
+          Write-Host "   > mkdir -p pingularity"
+          try { mkdir -p pingularity | Out-Null; Write-Host "   ok - folder exists: $(Test-Path .\pingularity)" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > cd pingularity"
+          try { cd pingularity; Write-Host "   ok - now in $(Get-Location)" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > curl -fsSLO https://winget.pingularity.dev/information      (block 1 spelling)"
+          try { curl -fsSLO https://winget.pingularity.dev/information; Write-Host "   native exit code: $LASTEXITCODE" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   > curl -fsSL https://winget.pingularity.dev/information -o compose.yaml      (block 2 spelling)"
+          try { curl -fsSL https://winget.pingularity.dev/information -o compose.yaml; Write-Host "   native exit code: $LASTEXITCODE" } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+          Write-Host "   files in $(Get-Location):"
+          $files = @(Get-ChildItem -File)
+          if ($files.Count -eq 0) { Write-Host "   (none)" }
+          foreach ($f in $files) { Write-Host "   $($f.Length) bytes  $($f.Name)  first line: $(Get-Content $f.FullName -First 1)" }
+      - name: 'PowerShell 7 (pwsh): winget version, the one-shot''s ''source add'', then search and show (no install, no upgrade)'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== winget, as the one-shot's repair check sees it"
+          $wg = Get-Command winget -ErrorAction SilentlyContinue
+          if ($wg) { Write-Host "   Get-Command winget -> $($wg.Source)" } else { Write-Host "   Get-Command winget -> NOT FOUND on PATH" }
+          Write-Host "   > winget --version"
+          $repair = $false
+          try {
+            $vout = ((winget --version) 2>&1 | Out-String)
+            Write-Host "   output: $($vout.Trim())"
+            $m = [regex]::Match($vout, 'v?(\d+)\.(\d+)')
+            if (-not $m.Success) { $repair = $true }
+            elseif ([int]$m.Groups[1].Value -eq 1 -and [int]$m.Groups[2].Value -lt 11) { $repair = $true }
+          } catch { Write-Host "   threw: $($_.Exception.Message)"; $repair = $true }
+          Write-Host "   the one-shot's verdict: would repair winget = $repair   (missing, unreadable, or 1.x with x < 11)"
+          Write-Host "== The one-shot's source step, exactly as it spells it"
+          Write-Host "   > winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements"
+          winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget source list"
+          winget source list
+          Write-Host "== Read-only lookups against that source (no install, no upgrade)"
+          Write-Host "   > winget search pingularity -s pingularity"
+          winget search pingularity -s pingularity
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget show pingular.pingularity -s pingularity --accept-source-agreements"
+          winget show pingular.pingularity -s pingularity --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+      - name: 'Windows PowerShell 5.1: winget version, the one-shot''s ''source add'', then search and show (no install, no upgrade) - a second ''source add'' shows what a re-run says'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== winget, as the one-shot's repair check sees it"
+          $wg = Get-Command winget -ErrorAction SilentlyContinue
+          if ($wg) { Write-Host "   Get-Command winget -> $($wg.Source)" } else { Write-Host "   Get-Command winget -> NOT FOUND on PATH" }
+          Write-Host "   > winget --version"
+          $repair = $false
+          try {
+            $vout = ((winget --version) 2>&1 | Out-String)
+            Write-Host "   output: $($vout.Trim())"
+            $m = [regex]::Match($vout, 'v?(\d+)\.(\d+)')
+            if (-not $m.Success) { $repair = $true }
+            elseif ([int]$m.Groups[1].Value -eq 1 -and [int]$m.Groups[2].Value -lt 11) { $repair = $true }
+          } catch { Write-Host "   threw: $($_.Exception.Message)"; $repair = $true }
+          Write-Host "   the one-shot's verdict: would repair winget = $repair   (missing, unreadable, or 1.x with x < 11)"
+          Write-Host "== The one-shot's source step, exactly as it spells it"
+          Write-Host "   > winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements"
+          winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget source list"
+          winget source list
+          Write-Host "== Read-only lookups against that source (no install, no upgrade)"
+          Write-Host "   > winget search pingularity -s pingularity"
+          winget search pingularity -s pingularity
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget show pingular.pingularity -s pingularity --accept-source-agreements"
+          winget show pingular.pingularity -s pingularity --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+      - name: 'Windows PowerShell 5.1: the one-shot''s winget repair commands, only if winget is missing or older than 1.11'
+        id: repair
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== Does the one-shot's step 2 (repair winget) apply here?"
+          Write-Host "   > winget --version"
+          $repair = $false
+          try {
+            $vout = ((winget --version) 2>&1 | Out-String)
+            Write-Host "   output: $($vout.Trim())"
+            $m = [regex]::Match($vout, 'v?(\d+)\.(\d+)')
+            if (-not $m.Success) { $repair = $true }
+            elseif ([int]$m.Groups[1].Value -eq 1 -and [int]$m.Groups[2].Value -lt 11) { $repair = $true }
+          } catch { Write-Host "   threw: $($_.Exception.Message)"; $repair = $true }
+          Write-Host "   the one-shot's verdict: would repair winget = $repair   (missing, unreadable, or 1.x with x < 11)"
+          if (-not $repair) {
+            Write-Host "   winget is present and new enough: the one-shot would skip its repair step, so this step does nothing."
+            "repaired=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          } else {
+            Write-Host "   winget is missing or older than 1.11: running the one-shot's repair commands (they update Windows' App Installer, not Pingularity)"
+            "repaired=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            try {
+              Write-Host "   > Install-PackageProvider -Name NuGet -Force -ErrorAction Stop | Out-Null"
+              Install-PackageProvider -Name NuGet -Force -ErrorAction Stop | Out-Null
+              Write-Host "   ok after $([int]$sw.Elapsed.TotalSeconds)s"
+              Write-Host "   > Install-Module Microsoft.WinGet.Client -Force -ErrorAction Stop"
+              Install-Module Microsoft.WinGet.Client -Force -ErrorAction Stop
+              Write-Host "   ok after $([int]$sw.Elapsed.TotalSeconds)s - module version $((Get-Module Microsoft.WinGet.Client -ListAvailable | Select-Object -First 1).Version)"
+              Write-Host "   > Repair-WinGetPackageManager -Latest -AllUsers -ErrorAction Stop"
+              Repair-WinGetPackageManager -Latest -AllUsers -ErrorAction Stop
+              Write-Host "   ok after $([int]$sw.Elapsed.TotalSeconds)s"
+            } catch { Write-Host "   FAILED after $([int]$sw.Elapsed.TotalSeconds)s: $($_.Exception.Message)" }
+            Write-Host "   > winget --version   (again, in this same session, as the one-shot does next)"
+            try { Write-Host "   $(((winget --version) 2>&1 | Out-String).Trim())" } catch { Write-Host "   threw: $($_.Exception.Message)" }
+            Write-Host "   (and via the full path, in case this session's PATH has not caught up)"
+            $exe = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($exe) { Write-Host "   $($exe.FullName) -> $(((& $exe.FullName --version) 2>&1 | Out-String).Trim())" } else { Write-Host "   no winget.exe under Program Files\WindowsApps" }
+          }
+      - name: 'PowerShell 7 (pwsh): winget again after the repair (skipped when the repair did not run)'
+        if: steps.repair.outputs.repaired == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== winget, as the one-shot's repair check sees it"
+          $wg = Get-Command winget -ErrorAction SilentlyContinue
+          if ($wg) { Write-Host "   Get-Command winget -> $($wg.Source)" } else { Write-Host "   Get-Command winget -> NOT FOUND on PATH" }
+          Write-Host "   > winget --version"
+          $repair = $false
+          try {
+            $vout = ((winget --version) 2>&1 | Out-String)
+            Write-Host "   output: $($vout.Trim())"
+            $m = [regex]::Match($vout, 'v?(\d+)\.(\d+)')
+            if (-not $m.Success) { $repair = $true }
+            elseif ([int]$m.Groups[1].Value -eq 1 -and [int]$m.Groups[2].Value -lt 11) { $repair = $true }
+          } catch { Write-Host "   threw: $($_.Exception.Message)"; $repair = $true }
+          Write-Host "   the one-shot's verdict: would repair winget = $repair   (missing, unreadable, or 1.x with x < 11)"
+          Write-Host "== The one-shot's source step, exactly as it spells it"
+          Write-Host "   > winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements"
+          winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget source list"
+          winget source list
+          Write-Host "== Read-only lookups against that source (no install, no upgrade)"
+          Write-Host "   > winget search pingularity -s pingularity"
+          winget search pingularity -s pingularity
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget show pingular.pingularity -s pingularity --accept-source-agreements"
+          winget show pingular.pingularity -s pingularity --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+      - name: 'Windows PowerShell 5.1: winget again after the repair (skipped when the repair did not run)'
+        if: steps.repair.outputs.repaired == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== winget, as the one-shot's repair check sees it"
+          $wg = Get-Command winget -ErrorAction SilentlyContinue
+          if ($wg) { Write-Host "   Get-Command winget -> $($wg.Source)" } else { Write-Host "   Get-Command winget -> NOT FOUND on PATH" }
+          Write-Host "   > winget --version"
+          $repair = $false
+          try {
+            $vout = ((winget --version) 2>&1 | Out-String)
+            Write-Host "   output: $($vout.Trim())"
+            $m = [regex]::Match($vout, 'v?(\d+)\.(\d+)')
+            if (-not $m.Success) { $repair = $true }
+            elseif ([int]$m.Groups[1].Value -eq 1 -and [int]$m.Groups[2].Value -lt 11) { $repair = $true }
+          } catch { Write-Host "   threw: $($_.Exception.Message)"; $repair = $true }
+          Write-Host "   the one-shot's verdict: would repair winget = $repair   (missing, unreadable, or 1.x with x < 11)"
+          Write-Host "== The one-shot's source step, exactly as it spells it"
+          Write-Host "   > winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements"
+          winget source add -n pingularity -a https://winget.pingularity.dev -t Microsoft.Rest --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget source list"
+          winget source list
+          Write-Host "== Read-only lookups against that source (no install, no upgrade)"
+          Write-Host "   > winget search pingularity -s pingularity"
+          winget search pingularity -s pingularity
+          Write-Host "   exit code: $LASTEXITCODE"
+          Write-Host "   > winget show pingular.pingularity -s pingularity --accept-source-agreements"
+          winget show pingular.pingularity -s pingularity --accept-source-agreements
+          Write-Host "   exit code: $LASTEXITCODE"
+      - name: 'PowerShell 7 (pwsh): fetch winget.ps1 with a ''checker'' user agent, print its size and SHA256, parse it, never run it'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          $ua = 'pingularity-install-checker'
+          Write-Host "== Invoke-RestMethod https://install.pingularity.dev/winget.ps1 -UserAgent '$ua'"
+          Write-Host "   (that user agent is filtered out of the install count; the script is never executed here)"
+          try {
+            $script = Invoke-RestMethod -Uri 'https://install.pingularity.dev/winget.ps1' -UserAgent $ua
+            Write-Host "   returned type : $($script.GetType().FullName)"
+            Write-Host "   length (chars): $($script.Length)"
+            $bytes = [Text.Encoding]::UTF8.GetBytes($script)
+            $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '').ToLower()
+            Write-Host "   length (UTF-8 bytes): $($bytes.Length)"
+            Write-Host "   SHA256 (UTF-8 bytes): $sha"
+            Write-Host "   for comparison, curl from the maintainer's Mac on 2026-10-05 16:23 UTC saw 3993 bytes, SHA256 31a4d46f22b062ad2179e2250579c35d4a60ce57d3081bcd690e872534f284e8"
+            $dir = Join-Path $env:RUNNER_TEMP 'fetched'
+            $null = New-Item -ItemType Directory -Force -Path $dir
+            $out = Join-Path $dir ("winget.ps1-" + $PSVersionTable.PSEdition + "-" + $PSVersionTable.PSVersion + ".txt")
+            [IO.File]::WriteAllBytes($out, $bytes)
+            Write-Host "   saved to: $out"
+            $lines = $script -split "`n"
+            Write-Host "   line 2: $($lines[1])"
+            Write-Host "   line 3: $($lines[2])"
+            Write-Host "   the relaunch line: $(($lines | Where-Object { $_ -match 'Start-Process' }) -join ' / ')"
+            Write-Host "   the version check: $(($lines | Where-Object { $_ -match 'winget --version' }) -join ' / ')"
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors)
+            Write-Host "== PARSE ONLY of the fetched script in this shell: errors = $($errors.Count)"
+            foreach ($e in $errors) { Write-Host "   line $($e.Extent.StartLineNumber) col $($e.Extent.StartColumnNumber) [$($e.ErrorId)]: $($e.Message)" }
+          } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+      - name: 'Windows PowerShell 5.1: fetch winget.ps1 with a ''checker'' user agent, print its size and SHA256, parse it, never run it'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          $ua = 'pingularity-install-checker'
+          Write-Host "== Invoke-RestMethod https://install.pingularity.dev/winget.ps1 -UserAgent '$ua'"
+          Write-Host "   (that user agent is filtered out of the install count; the script is never executed here)"
+          try {
+            $script = Invoke-RestMethod -Uri 'https://install.pingularity.dev/winget.ps1' -UserAgent $ua
+            Write-Host "   returned type : $($script.GetType().FullName)"
+            Write-Host "   length (chars): $($script.Length)"
+            $bytes = [Text.Encoding]::UTF8.GetBytes($script)
+            $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '').ToLower()
+            Write-Host "   length (UTF-8 bytes): $($bytes.Length)"
+            Write-Host "   SHA256 (UTF-8 bytes): $sha"
+            Write-Host "   for comparison, curl from the maintainer's Mac on 2026-10-05 16:23 UTC saw 3993 bytes, SHA256 31a4d46f22b062ad2179e2250579c35d4a60ce57d3081bcd690e872534f284e8"
+            $dir = Join-Path $env:RUNNER_TEMP 'fetched'
+            $null = New-Item -ItemType Directory -Force -Path $dir
+            $out = Join-Path $dir ("winget.ps1-" + $PSVersionTable.PSEdition + "-" + $PSVersionTable.PSVersion + ".txt")
+            [IO.File]::WriteAllBytes($out, $bytes)
+            Write-Host "   saved to: $out"
+            $lines = $script -split "`n"
+            Write-Host "   line 2: $($lines[1])"
+            Write-Host "   line 3: $($lines[2])"
+            Write-Host "   the relaunch line: $(($lines | Where-Object { $_ -match 'Start-Process' }) -join ' / ')"
+            Write-Host "   the version check: $(($lines | Where-Object { $_ -match 'winget --version' }) -join ' / ')"
+            $tokens = $null; $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors)
+            Write-Host "== PARSE ONLY of the fetched script in this shell: errors = $($errors.Count)"
+            foreach ($e in $errors) { Write-Host "   line $($e.Extent.StartLineNumber) col $($e.Extent.StartColumnNumber) [$($e.ErrorId)]: $($e.Message)" }
+          } catch { Write-Host "   ERROR: $($_.Exception.Message)" }
+      - name: 'PowerShell 7 (pwsh): Expand-Archive, Unblock-File, Start-Process, and whether this session is already an administrator'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== The commands the raw-zip instructions and the one-shot rely on"
+          foreach ($n in 'Expand-Archive', 'Unblock-File', 'Start-Process') {
+            $c = Get-Command $n -ErrorAction SilentlyContinue
+            if ($c) { Write-Host "   $n -> $($c.CommandType) from $($c.Source) $($c.Version)" } else { Write-Host "   $n -> NOT FOUND" }
+          }
+          Write-Host "== Is this session already an administrator? (the one-shot's IsInRole check)"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]$identity
+          $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "   user: $($identity.Name)"
+          Write-Host "   IsInRole(Administrator): $isAdmin"
+          Write-Host "   token level: $((whoami /groups | Select-String 'Mandatory Level' | ForEach-Object { ($_ -split '\s{2,}')[0] }) -join ', ')"
+          if ($isAdmin) { Write-Host "   => already admin, so the one-shot's self-elevation branch (Start-Process -Verb RunAs `"`$PSHOME\powershell.exe`") did NOT run on this machine" }
+          else { Write-Host "   => not admin, so the one-shot WOULD try to relaunch itself through `"`$PSHOME\powershell.exe`"" }
+          Write-Host "== What happens when Start-Process is pointed at that relaunch path (no elevation; the child just exits with code 7)"
+          $path = "$PSHOME\powershell.exe"
+          Write-Host "   path  : $path"
+          Write-Host "   exists: $(Test-Path $path)"
+          try {
+            $p = Start-Process -FilePath $path -ArgumentList '-NoProfile', '-Command', 'exit 7' -Wait -PassThru -NoNewWindow -ErrorAction Stop
+            Write-Host "   Start-Process ran it; child exit code $($p.ExitCode)"
+          } catch { Write-Host "   Start-Process ERROR: $($_.Exception.Message)" }
+      - name: 'Windows PowerShell 5.1: Expand-Archive, Unblock-File, Start-Process, and whether this session is already an administrator'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'   # the runner sets Stop; a user's console has Continue, like the one-shot sees
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "== PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) at $PSHOME"
+          Write-Host "== The commands the raw-zip instructions and the one-shot rely on"
+          foreach ($n in 'Expand-Archive', 'Unblock-File', 'Start-Process') {
+            $c = Get-Command $n -ErrorAction SilentlyContinue
+            if ($c) { Write-Host "   $n -> $($c.CommandType) from $($c.Source) $($c.Version)" } else { Write-Host "   $n -> NOT FOUND" }
+          }
+          Write-Host "== Is this session already an administrator? (the one-shot's IsInRole check)"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]$identity
+          $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "   user: $($identity.Name)"
+          Write-Host "   IsInRole(Administrator): $isAdmin"
+          Write-Host "   token level: $((whoami /groups | Select-String 'Mandatory Level' | ForEach-Object { ($_ -split '\s{2,}')[0] }) -join ', ')"
+          if ($isAdmin) { Write-Host "   => already admin, so the one-shot's self-elevation branch (Start-Process -Verb RunAs `"`$PSHOME\powershell.exe`") did NOT run on this machine" }
+          else { Write-Host "   => not admin, so the one-shot WOULD try to relaunch itself through `"`$PSHOME\powershell.exe`"" }
+          Write-Host "== What happens when Start-Process is pointed at that relaunch path (no elevation; the child just exits with code 7)"
+          $path = "$PSHOME\powershell.exe"
+          Write-Host "   path  : $path"
+          Write-Host "   exists: $(Test-Path $path)"
+          try {
+            $p = Start-Process -FilePath $path -ArgumentList '-NoProfile', '-Command', 'exit 7' -Wait -PassThru -NoNewWindow -ErrorAction Stop
+            Write-Host "   Start-Process ran it; child exit code $($p.ExitCode)"
+          } catch { Write-Host "   Start-Process ERROR: $($_.Exception.Message)" }
+      - name: Save the fetched winget.ps1 copies as a workflow artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: winget-ps1-fetched
+          path: ${{ runner.temp }}/fetched/
+          if-no-files-found: warn
