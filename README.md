@@ -627,7 +627,7 @@ stateDiagram-v2
 
 Each round records the raw latency samples, and only a confirmed change writes
 an outage event. The samples wait in memory and are written to disk in
-batches, 30 seconds apart by default, and at once whenever the dashboard, the
+batches, 5 minutes apart by default, and at once whenever the dashboard, the
 API or `/metrics` reads them. That wears an SD card or eMMC far less than a write every round. A crash
 or a power cut can lose up to that many seconds of latency readings. Outage
 events are never delayed. **Save to disk every** on the Latency tab sets the

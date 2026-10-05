@@ -260,9 +260,9 @@ func TestSaveEveryZeroWritesEveryRound(t *testing.T) {
 		t.Errorf("with a negative interval the table holds %d samples, want 6", s)
 	}
 	// And one above the maximum is the maximum.
-	st.SetSaveEveryFn(func() time.Duration { return time.Hour })
+	st.SetSaveEveryFn(func() time.Duration { return 24 * time.Hour })
 	if got := st.saveEvery(); got != MaxSaveEvery {
-		t.Errorf("an interval of an hour is taken as %v, want the maximum %v", got, MaxSaveEvery)
+		t.Errorf("an interval of a day is taken as %v, want the maximum %v", got, MaxSaveEvery)
 	}
 }
 

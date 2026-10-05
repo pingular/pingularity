@@ -2014,8 +2014,8 @@
 • A normal stop or restart writes what is waiting. A crash or a power cut can lose up to this many seconds of latency readings.
 • Outage records are never delayed.
 • 0 = write every round at once.
-• Capped at 120 sec.">i</span></span>
-          <span class="ctl"><input type="number" id="setSaveEvery" step="1" min="0" max="120"><span class="unit">sec</span></span></label>
+• 300 (5 minutes) by default, 3600 (an hour) at most. A busy install writes sooner: no more than 8,192 readings wait.">i</span></span>
+          <span class="ctl"><input type="number" id="setSaveEvery" step="1" min="0" max="3600"><span class="unit">sec</span></span></label>
         <label class="srow"><span class="lbl">IPv6
           <span class="info" tabindex="0" data-tip="Probe IPv6 anchors too. Auto probes them whenever this host holds a public IPv6 address - it doesn't check that IPv6 actually reaches the internet.">i</span></span>
           <span class="ctl"><select id="setIPv6"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select><span class="unit"></span></span></label>
@@ -9300,7 +9300,7 @@ const FIELDS=[
   ['setNetinfo','netinfo_enabled','bool'],
   ['setLatency','latency_seconds','int',5],
   ['setTimeout','timeout_seconds','int',3],
-  ['setSaveEvery','save_every_seconds','int',30],
+  ['setSaveEvery','save_every_seconds','int',300],
   ['setDown','down_after','int',2],
   ['setUp','up_after','int',1],
   ['setIPv6','ipv6_mode','val'],

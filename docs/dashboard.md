@@ -224,10 +224,12 @@ and persist across restarts.
   sensitivity (failures→down / successes→up, IPv6 mode auto/on/off; rounds
   taken while a speedtest runs don't count toward failures→down, for at least
   two minutes and at least one round), how often latency readings are saved to
-  disk (**Save to disk every**: 30 seconds by default, 120 at most, 0 = every
+  disk (**Save to disk every**: 300 seconds by default, 3600 at most, 0 = every
   round at once. Readings wait in memory in between, and the dashboard, the
   API, `/metrics` and an export save them before they read them. A crash or a power cut can lose up to the chosen
-  number of seconds of latency readings. Outage records are never delayed. A
+  number of seconds of latency readings, and what it lost past two minutes
+  then counts as time nobody watched. No more than 8,192 readings wait, so a
+  busy install saves sooner than its setting. Outage records are never delayed. A
   value at or below the check interval saves nothing: every round is then
   written by itself), plus the
   **DNS resolution** probe (on by default), the **Connection info** lookups, and

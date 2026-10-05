@@ -2659,7 +2659,7 @@ func defaultSettings(cfg config.Config) settings.Values {
 		Speed:          cfg.SpeedtestInterval, Retention: cfg.Retention,
 		SpeedRetention: cfg.SpeedRetention, DowntimeRetention: cfg.DowntimeRetention,
 		Timeout: cfg.Timeout, DownAfter: cfg.DownAfter, UpAfter: cfg.UpAfter,
-		SaveEvery:            30 * time.Second, // probe readings are written in batches; 0 = every round at once
+		SaveEvery:            5 * time.Minute, // probe readings are written in batches; 0 = every round at once
 		SpeedtestEnabled:     cfg.SpeedtestEnabled,
 		SpeedtestOnReconnect: cfg.SpeedtestOnReconnect, IPv6Mode: cfg.IPv6Mode, Monitoring: true,
 		AccessLocalOnly:    !networkAccess, // loopback-only unless the operator explicitly opted into network access

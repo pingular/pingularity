@@ -193,7 +193,7 @@ and `-d '{…}'` where a body is listed below.
   such windows parks its feature - latency probing stops, no automatic speedtest
   fires - which the daemon says on stdout at every boot. `save_every_seconds`
   is how long latency readings wait in memory before they are written to disk:
-  0 to 120, 30 by default, and 0 writes every round at once. A crash or a power
+  0 to 3600, 300 by default, and 0 writes every round at once. A crash or a power
   cut can lose up to that many seconds of latency readings
 - `GET|POST /api/access` - read / update access controls (local-only, auth, password); once auth is active, any change must carry `current_password`
 - `POST /api/auth/login` / `POST /api/auth/logout` - session login / logout. The

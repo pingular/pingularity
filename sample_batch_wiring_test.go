@@ -24,14 +24,14 @@ func TestMainWiresBatchedSaving(t *testing.T) {
 	}
 	src := string(b)
 	for _, want := range []string{
-		"p.store.SetSaveEveryFn(set.SaveEvery)",  // without it no round is ever held
-		"p.store.SetSaveLogFn(",                  // a failed save has no other way into the log the dashboard shows
-		"p.store.SaveBuffered(store.SaveStop)",   // the save at shutdown that does not wait for the workers
-		"defer p.store.Close()",                  // and the close, which saves what that one could not
-		"SaveEvery:            30 * time.Second", // on by default
-		"2*store.FinalSaveBudget",                // Stop waits for both saves of a shutdown
-		`"save_every", set.SaveEvery()`,          // the startup line says what is in force
-		"range store.SaveReasons()",              // the counters are seeded from the list they are booked from
+		"p.store.SetSaveEveryFn(set.SaveEvery)", // without it no round is ever held
+		"p.store.SetSaveLogFn(",                 // a failed save has no other way into the log the dashboard shows
+		"p.store.SaveBuffered(store.SaveStop)",  // the save at shutdown that does not wait for the workers
+		"defer p.store.Close()",                 // and the close, which saves what that one could not
+		"SaveEvery:            5 * time.Minute", // on by default
+		"2*store.FinalSaveBudget",               // Stop waits for both saves of a shutdown
+		`"save_every", set.SaveEvery()`,         // the startup line says what is in force
+		"range store.SaveReasons()",             // the counters are seeded from the list they are booked from
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("main.go no longer has %q", want)

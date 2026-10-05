@@ -447,13 +447,13 @@ func TestSettingsCarrySaveEveryAndItsBound(t *testing.T) {
 		}
 		return *out.Every, out.Max
 	}
-	if every, max := read(mustGet(t, h, "/api/settings")); every != 30 || max != 120 {
-		t.Errorf("GET settings: save_every_seconds %d, max_save_every_seconds %d; want 30 and 120", every, max)
+	if every, max := read(mustGet(t, h, "/api/settings")); every != 30 || max != 3600 {
+		t.Errorf("GET settings: save_every_seconds %d, max_save_every_seconds %d; want 30 and 3600", every, max)
 	}
 	for _, c := range []struct {
 		post string
 		want int64
-	}{{`{"save_every_seconds":0}`, 0}, {`{"save_every_seconds":45}`, 45}, {`{"save_every_seconds":500}`, 120}, {`{"save_every_seconds":-3}`, 0}} {
+	}{{`{"save_every_seconds":0}`, 0}, {`{"save_every_seconds":45}`, 45}, {`{"save_every_seconds":500}`, 500}, {`{"save_every_seconds":5000}`, 3600}, {`{"save_every_seconds":-3}`, 0}} {
 		w := do(t, h, "POST", "/api/settings", c.post)
 		if w.Code != http.StatusOK {
 			t.Fatalf("POST %s: %d %s", c.post, w.Code, w.Body)

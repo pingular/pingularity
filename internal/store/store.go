@@ -2428,11 +2428,14 @@ func (s *Store) InsertDNS(ctx context.Context, ts time.Time, ms float64, ok bool
 // reset-auth.
 
 // MaxSaveEvery is the longest a reading may be left waiting, whatever the
-// setting says. It is the most history a crash or a power cut can cost. It is
-// also as long as a restart after one may take before the monitor books the
-// stretch it cannot account for as unobserved (startupGapMin in
-// internal/monitor).
-const MaxSaveEvery = 120 * time.Second
+// setting says. It is the most history a crash or a power cut can cost. A
+// crash that costs more than two minutes of readings is booked as time
+// nobody watched when the daemon starts again (startupGapMin in
+// internal/monitor): the newest reading on disk is then that old, and the
+// monitor cannot tell the stretch from one it was not running for. A busy
+// install saves sooner than its setting: no more than maxHeldRows readings
+// wait, whatever the interval.
+const MaxSaveEvery = time.Hour
 
 // FinalSaveBudget is what a save at shutdown may take: one whole wait for the
 // writer (busy_timeout in pragmaConn) and a second to commit. It must stay
@@ -2448,10 +2451,14 @@ const (
 	// dropped. A save that failed within the last saveRetryEvery counts as
 	// that failure, and the round starts none of its own: a store that
 	// cannot be written would be handed every waiting row again by every
-	// round, and the retry is the timer's. It covers the longest wait at the
-	// fastest cadence: 120 s of rounds a second apart, with 64 targets and a
-	// DNS reading each, is 7,800 rows. 64 is where /metrics stops listing
-	// targets. Full, the buffer holds about 0.6 MB.
+	// round, and the retry is the timer's. It is also what bounds one save,
+	// and so how long a save holds the writer, whatever the interval: 8,190
+	// rows took 17 ms on a laptop. An hour at the default cadence, six
+	// targets and a DNS reading every five seconds, is 5,040 rows and fits.
+	// At a round a second those seven rows fill it in about twenty minutes,
+	// and with 64 targets (where /metrics stops listing them) in about two,
+	// and the full buffer is then what starts each save. Full, it holds
+	// about 0.6 MB.
 	maxHeldRows = 8192
 	// saveRetryEvery is how long after a failed save the next one is tried.
 	// It is the default probe interval: a store that could not be written

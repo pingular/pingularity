@@ -807,14 +807,15 @@ func TestNormalizeClampsSaveEvery(t *testing.T) {
 		{-5 * time.Second, 0},
 		{45 * time.Second, 45 * time.Second},
 		{MaxSaveEvery, MaxSaveEvery},
-		{500 * time.Second, MaxSaveEvery},
+		{500 * time.Second, 500 * time.Second},
+		{2 * time.Hour, MaxSaveEvery},
 	} {
 		if got := normalize(Values{SaveEvery: c.in}).SaveEvery; got != c.want {
 			t.Errorf("a save interval of %v is kept as %v, want %v", c.in, got, c.want)
 		}
 	}
-	if MaxSaveEvery != 120*time.Second {
-		t.Errorf("MaxSaveEvery = %v, want 2 minutes: the dashboard's help and the docs name the figure", MaxSaveEvery)
+	if MaxSaveEvery != time.Hour {
+		t.Errorf("MaxSaveEvery = %v, want an hour: the dashboard's help and the docs name the figure", MaxSaveEvery)
 	}
 }
 

@@ -97,8 +97,8 @@ func TestDefaultSettings(t *testing.T) {
 	// Probe readings are written in batches by default, on a new install and
 	// on one that upgrades alike: neither has the key stored. The figure is in
 	// the dashboard's help, its blank-field fallback and the docs.
-	if v.SaveEvery != 30*time.Second {
-		t.Errorf("SaveEvery default = %v, want 30s", v.SaveEvery)
+	if v.SaveEvery != 5*time.Minute {
+		t.Errorf("SaveEvery default = %v, want 5m", v.SaveEvery)
 	}
 
 	// Access is EXPLICIT, not guessed: loopback-only by default everywhere, and

@@ -535,7 +535,7 @@ consequences worth knowing before you need them:
   recent rows live in a sidecar file (`pingularity.db-wal`) that a copy of just
   `pingularity.db` misses - on a young install that can be *everything*. The
   latest latency readings are not in any file yet: they wait in memory for up
-  to the save interval (30 seconds by default). A clean
+  to the save interval (5 minutes by default). A clean
   stop writes them and folds the sidecar back into the main file. (The Data tab's **Export** is
   the safe way to back up a *running* instance - it streams a single consistent
   read-snapshot, so categories can't skew across it. **A full-retention export
