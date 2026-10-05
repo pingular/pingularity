@@ -513,8 +513,12 @@ func TestTrimHoldsTheWriterNoLongerThanItsBound(t *testing.T) {
 	if got != walTrimGaveUp || err != nil {
 		t.Fatalf("trimWAL = %s, %v with a reader on the end of the log; want gave up, nil", trimName(got), err)
 	}
-	if took < walTrimWait {
-		t.Errorf("the trim gave up after %v, want it to wait %v for the reader", took, walTrimWait)
+	// It waited, and did not give up at once. Not for the whole of walTrimWait:
+	// SQLite's busy handler sleeps in steps that grow to 100 ms and gives up
+	// when the next one would take it past the timeout, so the wait ends up to
+	// one step short of it (208 ms was seen against 250).
+	if least := walTrimWait - 100*time.Millisecond; took < least {
+		t.Errorf("the trim gave up after %v, want it to wait at least %v of its %v for the reader", took, least, walTrimWait)
 	}
 	if took > busyTimeout/2 {
 		t.Errorf("the trim took %v, want under %v", took, busyTimeout/2)
@@ -587,17 +591,34 @@ func TestTrimBesideAnotherCheckpointIsBlocked(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		var busy, logFrames, copied int64
-		done <- other.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &copied)
+		// The other checkpoint can itself come second: a trim below that got
+		// there first holds the checkpoint lock while it waits for the
+		// reader, and this one is then told so at once (log -1) and returns
+		// without having held anything. It asks again until it is the one
+		// that holds the lock and waits.
+		for {
+			var busy, logFrames, copied int64
+			err := other.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &copied)
+			if err == nil && busy == 1 && logFrames == -1 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			done <- err
+			return
+		}
 	}()
 	// Until the other checkpoint has the lock, the trim's own TRUNCATE meets
-	// the reader and gives up. Once it has, the trim must see it.
+	// the reader and gives up. Once it has, the trim must see it. The short
+	// sleep between two trims is the other checkpoint's chance at the lock.
 	saw := false
-	for !saw {
+	for deadline := time.Now().Add(30 * time.Second); !saw; {
 		select {
 		case err := <-done:
 			t.Fatalf("the other checkpoint ended (%v) before a trim ever found it running", err)
 		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no trim found the other checkpoint running in 30 s")
 		}
 		switch got, err := st.trimWAL(ctx); {
 		case err != nil:
@@ -606,6 +627,8 @@ func TestTrimBesideAnotherCheckpointIsBlocked(t *testing.T) {
 			saw = true
 		case got != walTrimGaveUp:
 			t.Fatalf("trimWAL = %s beside another checkpoint; want not tried", trimName(got))
+		default:
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	st.trimWALAfter(ctx, walTrimRows, nil)

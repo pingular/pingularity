@@ -704,11 +704,42 @@ func TestPruneLetsProbeWritesInterleave(t *testing.T) {
 	now := time.Now()
 	seedExpiredSamples(t, s, rows, now.Add(-time.Hour))
 	w := secondWriter(t, path)
+	// The writer leaves the log alone. SQLite copies the log back into the
+	// database inside whichever commit takes it past a thousand pages, and on
+	// a slow disk that copy is long: on the Windows test machine it sat inside
+	// one of this writer's commits for 0.8 s, across two chunks that each took
+	// 50 ms and on past the end of the cleanup, and the writer was counted as
+	// kept out of gaps it was never waiting for. With the copy left to the
+	// cleanup's own connections, a write here waits for the writer and nothing
+	// else, which is what this test is about.
+	if _, err := w.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
+		t.Fatalf("turn off the writer's own checkpoints: %v", err)
+	}
 	pruneChunks(t, pruneChunkRows, pruneChunkPause) // the shipped values; this only restores the hook
 
 	var commits atomic.Int64
 	var longest time.Duration
 	var werr error
+	// A timeline for a machine where this fails: when each chunk landed, how
+	// long its statement took and how big the log was, and every write that
+	// took long, with when it began. A slow write that begins as a chunk
+	// lands waited for the cleanup; one that spans chunks which were
+	// themselves quick is more likely the log being copied back inside it.
+	t0 := time.Now()
+	walSize := func() int64 {
+		fi, err := os.Stat(path + "-wal")
+		if err != nil {
+			return -1
+		}
+		return fi.Size()
+	}
+	var tmu sync.Mutex
+	var timeline []string
+	note := func(format string, a ...any) {
+		tmu.Lock()
+		defer tmu.Unlock()
+		timeline = append(timeline, fmt.Sprintf("%7.3fs ", time.Since(t0).Seconds())+fmt.Sprintf(format, a...))
+	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -726,15 +757,24 @@ func TestPruneLetsProbeWritesInterleave(t *testing.T) {
 				werr = err
 				return
 			}
-			if d := time.Since(began); d > longest {
+			d := time.Since(began)
+			if d > longest {
 				longest = d
+			}
+			if d > 50*time.Millisecond {
+				note("write %d took %v (began at %.3fs), log %d bytes after it", commits.Load()+1,
+					d.Round(time.Millisecond), began.Sub(t0).Seconds(), walSize())
 			}
 			commits.Add(1)
 			time.Sleep(time.Millisecond)
 		}
 	}()
 	var marks []int64 // the writer's commits so far, read as each full chunk lands
-	pruneChunkHook = func(_ string, _ int64, _ time.Duration, full bool) {
+	pruneChunkHook = func(_ string, n int64, held time.Duration, full bool) {
+		if n > 0 {
+			note("chunk of %d rows landed, its statement took %v, full %v, log %d bytes, %d writes so far",
+				n, held.Round(time.Millisecond), full, walSize(), commits.Load())
+		}
 		if full {
 			marks = append(marks, commits.Load())
 		}
@@ -742,6 +782,7 @@ func TestPruneLetsProbeWritesInterleave(t *testing.T) {
 	clockAt(t, s, now, now, 0)
 	epoch := time.Unix(0, 0)
 	n, err := s.Prune(context.Background(), now.Add(-10*time.Minute), epoch, epoch)
+	note("the cleanup returned, %d writes so far", commits.Load())
 	marks = append(marks, commits.Load())
 	close(stop)
 	wg.Wait()
@@ -755,6 +796,9 @@ func TestPruneLetsProbeWritesInterleave(t *testing.T) {
 		t.Fatalf("%d full chunks, want %d", len(marks)-1, want)
 	}
 	t.Logf("commits at each full chunk %v, longest write %v", marks, longest.Round(time.Millisecond))
+	tmu.Lock()
+	t.Logf("timeline:\n%s", strings.Join(timeline, "\n"))
+	tmu.Unlock()
 	if raceEnabled {
 		t.Skip("wall-clock budgets are not meaningful under the race detector")
 	}
