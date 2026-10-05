@@ -76,9 +76,22 @@ func outageHistory(t *testing.T, st *store.Store) []string {
 // waits for the reply.
 func pipedRestore(t *testing.T, s *Server) (send func(string), finish func() *httptest.ResponseRecorder) {
 	t.Helper()
+	return pipedImport(t, s, "downtime=1")
+}
+
+// pipedImport is pipedRestore for the categories query names.
+func pipedImport(t *testing.T, s *Server, query string) (send func(string), finish func() *httptest.ResponseRecorder) {
+	t.Helper()
+	return pipedImportCtx(context.Background(), t, s, query)
+}
+
+// pipedImportCtx is pipedImport on a request context the test can cancel, as
+// a shutdown cancels every request's.
+func pipedImportCtx(ctx context.Context, t *testing.T, s *Server, query string) (send func(string), finish func() *httptest.ResponseRecorder) {
+	t.Helper()
 	pr, pw := io.Pipe()
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest("POST", "/api/import?downtime=1", pr)
+	r := httptest.NewRequest("POST", "/api/import?"+query, pr).WithContext(ctx)
 	r.Host = "127.0.0.1:9000"
 	r.RemoteAddr = "127.0.0.1:54321"
 	r.Header.Set("Content-Type", "application/json")
@@ -120,6 +133,18 @@ func historyFrom(history []string, ts int64) []string {
 		}
 	}
 	return out
+}
+
+// storedRows waits until table holds n rows: the restore has stored what the
+// test has sent so far.
+func storedRows(t *testing.T, st *store.Store, table string, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); stored(t, st, table) != n; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s holds %d rows 10 s on, want %d: the restore never stored what it was sent", table,
+				stored(t, st, table), n)
+		}
+	}
 }
 
 // storedEvent waits until the restore has stored the event at ts.

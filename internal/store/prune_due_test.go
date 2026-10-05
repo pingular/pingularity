@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,25 +28,99 @@ func countRows(t *testing.T, s *Store, q string, args ...any) int64 {
 	return n
 }
 
+// rowIDs lists a table's rowids.
+func rowIDs(t *testing.T, s *Store, table string) map[int64]bool {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT rowid FROM ` + table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	ids := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// goneFrom counts the rows of before that the table no longer holds, all of
+// them or only the ones on one side of a mark. Counted by rowid, because a
+// cleanup also writes rows: the ends its close gives outages that had none.
+func goneFrom(t *testing.T, s *Store, table string, before map[int64]bool, keep func(id int64) bool) int64 {
+	t.Helper()
+	now := rowIDs(t, s, table)
+	var n int64
+	for id := range before {
+		if !now[id] && (keep == nil || keep(id)) {
+			n++
+		}
+	}
+	return n
+}
+
 // Over random histories on both sides of every cutoff - straddling outages,
-// open ones, pauses running into the window, rows ahead of the clock - the rows
-// PruneDue counts in each table are the rows the next Prune removes from it,
-// less the ones past the future horizon, which it does not count.
+// open ones, outages whose end only old samples show, pauses running into the
+// window, rows ahead of the clock - the rows PruneDue counts in each table are
+// the rows the next Prune removes from it by age, and the rows PruneDueAhead
+// counts are the ones it removes for being past the future horizon: together,
+// every row the pass removes. The close Prune begins with is part of that
+// Prune: the outages it ends past the cutoff go in the same pass, and PruneDue
+// counts them, and an 'up' past the horizon that it moves back is not deleted
+// for being ahead of the clock, and PruneDueAhead leaves it out.
+//
+// In two trials of three the running monitor holds an outage open, its 'down'
+// written through the monitor's door at some second of the history. The close
+// leaves every outage from that second on to the monitor and stops an earlier
+// one's search there, so the cleanup ends fewer outages and moves fewer ends
+// back, and both counts must leave out the same ones.
 func TestPruneDueCountsWhatPruneRemovesByAge(t *testing.T) {
 	ctx := context.Background()
 	tables := []string{"samples", "dns", "speed", "speed_servers", "speed_spans", "events", "pauses"}
-	var counted int64
+	var counted, closedAndGone, leftToTheMonitor, ahead int64
 	for trial := 0; trial < randomHistories(30); trial++ {
 		now := time.Now()
 		s := open(t)
 		seedPruneHistory(t, s, now, rand.New(rand.NewSource(int64(trial))))
 		sb, pb, eb := now.Add(-30*24*time.Hour), now.Add(-60*24*time.Hour), now.Add(-90*24*time.Hour)
-		// The one repair Prune makes that PruneDue leaves out, closing an outage
-		// from the samples about to go (see PruneDue). Made first, so what follows
-		// compares the rules alone; Prune's own call then finds nothing to close.
-		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix(), nil); err != nil {
-			t.Fatal(err)
+		if trial%3 != 0 {
+			// The ends the close records with no line at all: the ones past the
+			// outage cutoff are the ones the monitor's line can take away.
+			past := func(line func() int64) (downs []int64) {
+				var plan []plannedClose
+				if err := s.closeDanglingDowns(ctx, sb.Unix(), now.Unix(), line, &plan); err != nil {
+					t.Fatal(err)
+				}
+				for _, c := range plan {
+					if c.at < eb.Unix() {
+						downs = append(downs, c.down)
+					}
+				}
+				return downs
+			}
+			without := past(nil)
+			// The monitor's 'down' at any second of the history, from a source of
+			// its own so the histories stay the ones the seed gives. Every other
+			// time it is put just before an outage the close would have ended.
+			at := now.Add(-time.Duration(rand.New(rand.NewSource(int64(1000+trial))).Intn(120*86400)) * time.Second)
+			if trial%3 == 2 && len(without) > 0 {
+				at = time.Unix(slices.Min(without)-1, 0)
+			}
+			if err := s.InsertEvent(ctx, at, "down", -1, ""); err != nil {
+				t.Fatalf("trial %d: the monitor's down: %v", trial, err)
+			}
+			leftToTheMonitor += int64(len(without) - len(past(s.liveDownFloor.Load)))
 		}
+		clockAt(t, s, now, now, 0)
+		// What the rules alone count, before the close is asked: the difference
+		// is what the close adds, and some history must have some.
+		rulesAlone := countRows(t, s, pruneDueCount("events"), eb.Unix(), int64(0))
 		since := map[string]int64{}
 		for _, tbl := range tables {
 			since[tbl] = 0 // every row counts
@@ -54,25 +129,24 @@ func TestPruneDueCountsWhatPruneRemovesByAge(t *testing.T) {
 		if err != nil {
 			t.Fatalf("trial %d: PruneDue: %v", trial, err)
 		}
-		horizon := now.Add(pruneFutureSlack).Unix()
-		before, future := map[string]int64{}, map[string]int64{}
-		for _, tbl := range tables {
-			col := "ts"
-			if tbl == "speed_servers" {
-				col = "run_ts"
-			}
-			before[tbl] = countRows(t, s, `SELECT COUNT(*) FROM `+tbl)
-			future[tbl] = countRows(t, s, `SELECT COUNT(*) FROM `+tbl+` WHERE `+col+` > ?`, horizon)
+		closedAndGone += due["events"] - rulesAlone
+		future, err := s.PruneDueAhead(ctx, sb, since)
+		if err != nil {
+			t.Fatalf("trial %d: PruneDueAhead: %v", trial, err)
 		}
-		clockAt(t, s, now, now, 0)
+		before := map[string]map[int64]bool{}
+		for _, tbl := range tables {
+			before[tbl] = rowIDs(t, s, tbl)
+			ahead += future[tbl]
+		}
 		if _, err := s.Prune(ctx, sb, pb, eb); err != nil {
 			t.Fatalf("trial %d: prune: %v", trial, err)
 		}
 		for _, tbl := range tables {
-			removed := before[tbl] - countRows(t, s, `SELECT COUNT(*) FROM `+tbl)
+			removed := goneFrom(t, s, tbl, before[tbl], nil)
 			if removed != due[tbl]+future[tbl] {
-				t.Errorf("trial %d: %s: prune removed %d rows, %d of them past the future horizon, but PruneDue counted %d",
-					trial, tbl, removed, future[tbl], due[tbl])
+				t.Errorf("trial %d: %s: prune removed %d rows, but PruneDue counted %d by age and PruneDueAhead %d "+
+					"past the future horizon", trial, tbl, removed, due[tbl], future[tbl])
 			}
 			counted += due[tbl]
 		}
@@ -82,6 +156,16 @@ func TestPruneDueCountsWhatPruneRemovesByAge(t *testing.T) {
 	}
 	if counted == 0 {
 		t.Fatal("no trial had a row past a cutoff; the histories no longer test anything")
+	}
+	if closedAndGone == 0 {
+		t.Fatal("no trial had an outage the close ended past the cutoff; the histories no longer test the close")
+	}
+	if leftToTheMonitor <= 0 {
+		t.Fatal("no trial had the monitor's line keep the close from an outage it would have ended past the cutoff; " +
+			"the histories no longer test the line")
+	}
+	if ahead == 0 {
+		t.Fatal("no trial had a row past the future horizon; the histories no longer test the future arms")
 	}
 }
 
@@ -133,7 +217,8 @@ func TestRowMarkIsWhereTheTableStands(t *testing.T) {
 // latency and speed rules go through their table's ts index, which holds only
 // what is past the cutoff; the outage and span rules go through the rowid
 // range after the mark, the outage one with a seek of the events ts index for
-// each row's recovery. The count of this install's own outage records that a
+// each row's recovery. The rows stamped past the future horizon are found the
+// same way, table by table. The count of this install's own outage records that a
 // restored recovery closes reads the rowid range up to the mark - every outage
 // record the install had, two small rows an outage - with the same seeks.
 func TestPruneDueCountsSeek(t *testing.T) {
@@ -151,6 +236,191 @@ func TestPruneDueCountsSeek(t *testing.T) {
 		strings.Count(plan, "INDEX idx_events_ts (ts>?)") != 2 {
 		t.Errorf("%s\nplan %q: want a SEARCH of events, a seek of its ts index for each recovery in both halves, "+
 			"and no SCAN", strings.Join(strings.Fields(q), " "), plan)
+	}
+	for table := range pruneAheadCol {
+		q := pruneDueAheadCount(table)
+		plan := queryPlan(t, s, q, int64(1700000000), int64(5))
+		if strings.Contains(plan, "SCAN") || !strings.Contains(plan, "SEARCH "+table) {
+			t.Errorf("%s\nplan %q: want a SEARCH of %s and no SCAN", strings.Join(strings.Fields(q), " "), plan, table)
+		}
+	}
+	// The outages the cleanup's close ends past the cutoff: the 'down' rows on
+	// one side of the mark that the rule keeps today, in the range of seconds
+	// the ends reach, with the rule's seek for each one's recovery.
+	for _, own := range []bool{false, true} {
+		q := pruneDueKeptDowns(own)
+		plan := queryPlan(t, s, q, int64(1700000000), int64(5), int64(1600000000), int64(1650000000))
+		if strings.Contains(plan, "SCAN") || !strings.Contains(plan, "SEARCH events") ||
+			!strings.Contains(plan, "INDEX idx_events_ts (ts>?)") {
+			t.Errorf("%s\nplan %q: want a SEARCH of events, a seek of its ts index for each recovery, and no SCAN",
+				strings.Join(strings.Fields(q), " "), plan)
+		}
+	}
+}
+
+// A cleanup begins by giving each outage that never got its end the second the
+// old samples show (resolveDanglingDowns), and where that second is past the
+// outage cutoff too, its sweep deletes the outage in the same pass. PruneDue
+// used to count such an outage as the open one it still is, which the cleanup
+// keeps, so a restore was told nothing of an outage the next cleanup deleted.
+// Each case here is an install's own rows, then a restore's, under a latency
+// window of thirty days and an outage window of a year. The restored rows
+// PruneDue counts are the ones the next Prune removes from the rows after the
+// marks, and the own records PruneDueClosedOutages counts are the ones it
+// removes from the rows before them and would not have removed without the
+// restore, which a second store holding the install's rows alone shows.
+func TestPruneDueCountsTheOutagesTheCleanupsCloseEnds(t *testing.T) {
+	ctx := context.Background()
+	const day = int64(86400)
+	now := time.Now()
+	nowU := now.Unix()
+	samplesCut, eventsCut := now.Add(-30*24*time.Hour), now.Add(-365*24*time.Hour)
+	type row struct {
+		q    string
+		args []any
+	}
+	down := func(ago int64) row {
+		return row{`INSERT INTO events (ts, type, duration_s, detail) VALUES (?, 'down', NULL, '')`, []any{nowU - ago}}
+	}
+	up := func(ago int64) row {
+		return row{`INSERT INTO events (ts, type, duration_s, detail) VALUES (?, 'up', 60, '')`, []any{nowU - ago}}
+	}
+	// round is one probe round of three targets, all good or all bad.
+	round := func(ago int64, ok bool) []row {
+		var out []row
+		for _, tg := range []string{"a", "b", "c"} {
+			out = append(out, row{`INSERT INTO samples (ts, target, latency_ms, success, family) VALUES (?, ?, 10, ?, 'ipv4')`,
+				[]any{nowU - ago, tg, ok}})
+		}
+		return out
+	}
+	rows := func(parts ...any) []row {
+		var out []row
+		for _, p := range parts {
+			switch p := p.(type) {
+			case row:
+				out = append(out, p)
+			case []row:
+				out = append(out, p...)
+			}
+		}
+		return out
+	}
+	// An outage that began 400 days ago, and the rounds that show it over ten
+	// minutes later.
+	const began = 400 * day
+	ended := rows(round(began, false), round(began-600, true), round(began-1200, true))
+	for _, tc := range []struct {
+		name           string
+		held           int64 // how long ago the running monitor opened an outage it still holds; 0 for none
+		mine, theirs   []row
+		wantDue        int64 // restored outage rows the next cleanup deletes
+		wantOwn        int64 // own outage rows it deletes only because of the restore
+		wantDueSamples int64
+	}{
+		{"a restored outage with no end, which the restored readings show ended",
+			0, nil, rows(ended, down(began)), 1, 0, 9},
+		{"an outage of the install's own, which the restored readings show ended",
+			0, rows(down(began)), rows(ended), 0, 1, 9},
+		{"a restored outage whose end is inside the outage window",
+			0, nil, rows(round(200*day, false), round(200*day-600, true), down(200*day)), 0, 0, 6},
+		{"a restored outage whose end the readings inside the latency window show",
+			0, nil, rows(round(10*day, false), round(10*day-600, true), down(10*day)), 0, 0, 0},
+		{"an outage and the readings that end it, both the install's own",
+			0, rows(ended, down(began)), rows(down(20*day), up(20*day-60)), 0, 0, 0},
+		{"a restored outage whose own end is dated a day ahead",
+			0, nil, rows(ended, down(began), up(-day)), 2, 0, 9},
+		{"an outage of the install's own with a restored one after it, which the restored readings show ended",
+			0, rows(down(began + 3600)), rows(ended, down(began)), 1, 1, 9},
+		// Past the future horizon the 'up' would go for being ahead of the clock,
+		// but the close moves it back first: it goes by age with its outage...
+		{"a restored outage whose own end is dated three days ahead",
+			0, nil, rows(ended, down(began), up(-3*day)), 2, 0, 9},
+		// ...or stays with it, where the end the readings show is inside the
+		// outage window.
+		{"a restored outage inside the outage window whose own end is dated three days ahead",
+			0, nil, rows(round(200*day, false), round(200*day-600, true), down(200*day), up(-3*day)), 0, 0, 6},
+		// With no readings to show an earlier end it is only a row from the future.
+		{"a restored outage whose only end is dated three days ahead",
+			0, nil, rows(down(began), up(-3*day)), 0, 0, 0},
+		// An outage the running monitor holds open is the monitor's to end. The
+		// cleanup's close leaves it, whatever the restored readings show, so
+		// the count names nothing...
+		{"an outage the running monitor holds open, in which the restored readings show a good round",
+			began, nil, rows(ended), 0, 0, 9},
+		// ...and an end a restore brings for it, dated three days ahead, is
+		// not moved back: it goes as a row ahead of the clock.
+		{"an outage the running monitor holds open, with a restored end dated three days ahead",
+			began, nil, rows(ended, up(-3*day)), 0, 0, 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			with, alone := open(t), open(t)
+			put := func(s *Store, rs []row) {
+				t.Helper()
+				for _, r := range rs {
+					if _, err := s.db.Exec(r.q, r.args...); err != nil {
+						t.Fatalf("%s: %v", r.q, err)
+					}
+				}
+			}
+			put(with, tc.mine)
+			put(alone, tc.mine)
+			if tc.held != 0 {
+				for _, s := range []*Store{with, alone} {
+					if err := s.InsertEvent(ctx, time.Unix(nowU-tc.held, 0), "down", -1, ""); err != nil {
+						t.Fatalf("the monitor's down: %v", err)
+					}
+				}
+			}
+			since := map[string]int64{}
+			for _, tbl := range []string{"samples", "events"} {
+				mark, err := with.RowMark(ctx, tbl)
+				if err != nil {
+					t.Fatal(err)
+				}
+				since[tbl] = mark
+			}
+			put(with, tc.theirs)
+			clockAt(t, with, now, now, 0)
+			due, err := with.PruneDue(ctx, samplesCut, samplesCut, eventsCut, since)
+			if err != nil {
+				t.Fatalf("PruneDue: %v", err)
+			}
+			own, err := with.PruneDueClosedOutages(ctx, samplesCut, eventsCut, since)
+			if err != nil {
+				t.Fatalf("PruneDueClosedOutages: %v", err)
+			}
+			ahead, err := with.PruneDueAhead(ctx, samplesCut, since)
+			if err != nil {
+				t.Fatalf("PruneDueAhead: %v", err)
+			}
+			if got := countRows(t, with, `SELECT COUNT(*) FROM events WHERE type = 'up' AND detail = 'recovered while unmonitored'`); got != 0 {
+				t.Fatalf("the count wrote %d outage ends; it must write nothing", got)
+			}
+			if due["events"] != tc.wantDue || own != tc.wantOwn || due["samples"] != tc.wantDueSamples {
+				t.Errorf("counted %d restored outage rows, %d of the install's own and %d restored readings; want %d, %d and %d",
+					due["events"], own, due["samples"], tc.wantDue, tc.wantOwn, tc.wantDueSamples)
+			}
+			before, aloneBefore := rowIDs(t, with, "events"), rowIDs(t, alone, "events")
+			for _, s := range []*Store{with, alone} {
+				clockAt(t, s, now, now, 0)
+				if _, err := s.Prune(ctx, samplesCut, samplesCut, eventsCut); err != nil {
+					t.Fatalf("prune: %v", err)
+				}
+			}
+			mark := since["events"]
+			theirsGone := goneFrom(t, with, "events", before, func(id int64) bool { return id > mark })
+			mineGone := goneFrom(t, with, "events", before, func(id int64) bool { return id <= mark })
+			aloneGone := goneFrom(t, alone, "events", aloneBefore, nil)
+			if theirsGone != due["events"]+ahead["events"] {
+				t.Errorf("the next cleanup removed %d of the restored outage rows, but PruneDue counted %d and "+
+					"PruneDueAhead %d ahead of the clock", theirsGone, due["events"], ahead["events"])
+			}
+			if mineGone-aloneGone != own {
+				t.Errorf("the next cleanup removed %d of the install's own outage rows, %d of them only because of the "+
+					"restore, but PruneDueClosedOutages counted %d", mineGone, mineGone-aloneGone, own)
+			}
+		})
 	}
 }
 
@@ -327,6 +597,73 @@ func TestAWatchNotesTheCutoffsTheCleanupDeletedAt(t *testing.T) {
 	}
 }
 
+// A watch also notes a Delete now: the tables one has emptied while the watch
+// was open, and the tables one is on as the watch is read. A restore tells its
+// rows from the install's by rowid, and a table emptied under it hands its
+// rowids out again (RowMark). A Delete now that deleted nothing - refused, or
+// stopped before its delete - empties nothing and notes nothing, and neither
+// does one from before the watch opened.
+func TestAWatchNotesADeleteNow(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	now := time.Now()
+	sampleAt(t, s, now, 60, "a", "ipv4", true)
+	if _, err := s.Clear(ctx, "speed"); err != nil { // before the watch
+		t.Fatal(err)
+	}
+	w := s.WatchPrunes()
+	if got := w.Tally(); len(got.Cleared) != 0 || len(got.Clearing) != 0 {
+		t.Fatalf("no Delete now has run since the watch opened, but it holds %v", got)
+	}
+
+	// Read from inside a latency Delete now, between its close of the outages
+	// and its delete: its tables are being emptied, and not emptied yet.
+	var during PruneTally
+	closeHook = func() { during = w.Tally() }
+	t.Cleanup(func() { closeHook = nil })
+	if n, err := s.Clear(ctx, "latency"); err != nil || n != 1 {
+		t.Fatalf("Delete now: %d rows, %v; want the 1 sample", n, err)
+	}
+	closeHook = nil
+	latency := map[string]bool{"samples": true, "dns": true, "speed_spans": true}
+	if !maps.Equal(during.Clearing, latency) || len(during.Cleared) != 0 {
+		t.Errorf("read in the middle of a latency Delete now the watch holds %v; want its three tables as being "+
+			"emptied and none as emptied yet", during)
+	}
+	after := w.Tally()
+	if want := map[string]int64{"samples": 1, "dns": 1, "speed_spans": 1}; !maps.Equal(after.Cleared, want) || len(after.Clearing) != 0 {
+		t.Errorf("after the Delete now the watch holds %v; want each of its tables emptied once and none being emptied", after)
+	}
+
+	// One that deletes nothing notes nothing.
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.Clear(gone, "downtime"); err == nil {
+		t.Fatal("fixture: a Delete now on a cancelled context succeeded")
+	}
+	if _, err := s.Clear(ctx, "everything"); err == nil {
+		t.Fatal("fixture: a Delete now of a kind that does not exist succeeded")
+	}
+	if got := w.Tally(); !maps.Equal(got.Cleared, after.Cleared) || len(got.Clearing) != 0 {
+		t.Errorf("two Delete nows that deleted nothing left the watch holding %v, want %v as before", got, after)
+	}
+
+	// A second one counts again, and a closed watch holds what it held.
+	if _, err := s.Clear(ctx, "latency"); err != nil {
+		t.Fatal(err)
+	}
+	closed := w.Close()
+	if closed.Cleared["samples"] != 2 {
+		t.Errorf("after two latency Delete nows the watch counts %d for samples, want 2", closed.Cleared["samples"])
+	}
+	if _, err := s.Clear(ctx, "latency"); err != nil {
+		t.Fatal(err)
+	}
+	if again := w.Close(); !maps.Equal(again.Cleared, closed.Cleared) || !maps.Equal(w.Tally().Cleared, closed.Cleared) {
+		t.Errorf("a closed watch moved from %v to %v with a later Delete now", closed, again)
+	}
+}
+
 // outageRow is one row of a random outage history.
 type outageRow struct {
 	ts  int64
@@ -385,7 +722,7 @@ func TestPruneDueClosedOutagesCountsWhatARestoreAddsToTheCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatalf("trial %d: PruneDue: %v", trial, err)
 		}
-		closed, err := with.PruneDueClosedOutages(ctx, cut, mark)
+		closed, err := with.PruneDueClosedOutages(ctx, epoch, cut, map[string]int64{"events": mark})
 		if err != nil {
 			t.Fatalf("trial %d: PruneDueClosedOutages: %v", trial, err)
 		}

@@ -1,14 +1,18 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,6 +51,11 @@ import (
 // pass. A cleanup that is running as a window is raised follows the raise at
 // its next chunk, so a restore made after the raise keeps what the raised
 // window keeps.
+//
+// No cleanup starts while a restore is in flight (import_cleanup_hold_test.go),
+// so the cleanup that runs beside one here is always one that was already
+// under way when the restore began (cleanupUnderWay), let go where the test
+// wants its chunks to land.
 //
 // These tests drive the real handler end to end, so they cover the whole chain:
 // where each table stood, what landed, when the settings go live, and what the
@@ -191,25 +200,65 @@ func pruneNow(t *testing.T, s *Server) int64 {
 	return n
 }
 
-// pruneBegunOnTheHour runs a pass that began before its windows were raised:
-// its first ask, as it starts, is answered with an hour for every window, and
-// every later one with the windows in force, the way runPruner's are once the
-// Data tab has saved the raise. It returns the rows removed.
-func pruneBegunOnTheHour(t *testing.T, s *Server) int64 {
-	t.Helper()
+// begunOnTheHour is the cutoffs function of a pass that began before its
+// windows were raised: its first ask, as it starts, is answered with an hour
+// for every window, and every later one with the windows in force, the way
+// runPruner's are once the Data tab has saved the raise.
+func begunOnTheHour(s *Server) func(start time.Time) (time.Time, time.Time, time.Time) {
 	began := true
-	n, err := s.store.PruneLive(context.Background(), func(start time.Time) (time.Time, time.Time, time.Time) {
+	return func(start time.Time) (time.Time, time.Time, time.Time) {
 		if began {
 			began = false
 			c := settings.PruneCutoff(start, time.Hour)
 			return c, c, c
 		}
 		return liveWindows(s)(start)
-	})
-	if err != nil {
-		t.Errorf("prune: %v", err)
 	}
-	return n
+}
+
+// cleanupUnderWay starts a cleanup pass and holds it where it begins, at its
+// first ask for the windows, before it has deleted a row. No pass starts while
+// a restore is in flight (store.HoldCleanup), so the pass that runs beside one
+// is a pass that was already running, and this is that pass. finish lets it
+// go on to its end and returns the rows it removed: a test calls it where the
+// pass's chunks are to land, inside the restore. A test that never calls it
+// has the pass let go as it ends.
+func cleanupUnderWay(t *testing.T, s *Server, cutoffs func(start time.Time) (time.Time, time.Time, time.Time)) (finish func() int64) {
+	t.Helper()
+	type result struct {
+		n   int64
+		err error
+	}
+	begun, goOn, done := make(chan struct{}), make(chan struct{}), make(chan result, 1)
+	first := true
+	go func() {
+		n, err := s.store.PruneLive(context.Background(), func(start time.Time) (time.Time, time.Time, time.Time) {
+			if first {
+				first = false
+				close(begun)
+				<-goOn
+			}
+			return cutoffs(start)
+		})
+		done <- result{n, err}
+	}()
+	select {
+	case <-begun:
+	case r := <-done:
+		t.Fatalf("fixture: the pass ended before it asked for a window (%d rows, %v)", r.n, r.err)
+	}
+	var once sync.Once
+	var got result
+	wait := func() { once.Do(func() { close(goOn); got = <-done }) }
+	t.Cleanup(wait)
+	return func() int64 {
+		t.Helper()
+		wait()
+		if got.err != nil {
+			t.Errorf("prune: %v", got.err)
+		}
+		return got.n
+	}
 }
 
 // The other direction: the destination prunes after an hour, the backup keeps
@@ -502,6 +551,60 @@ func TestAPartialRestoreWarnsAboutTheOldRowsItCommitted(t *testing.T) {
 	}
 }
 
+// A shutdown cancels every request's context while the server still gives the
+// connection three seconds, and the restore's handler is one the shutdown
+// waits for, so the store is open and the client is still reading. The rows
+// after the cancel fail, and the count of the rows already committed ran on
+// the same cancelled context, failed too, and was dropped as "nobody reads
+// this reply": the client was told 5,000 rows were in, with no word that the
+// next cleanup deletes them, and the log said nothing either. The count now
+// runs on a context of its own for a few seconds after the request's is gone,
+// so the reply and the log both carry it. The same goes for a browser that
+// hangs up: nobody reads that reply, but the log has the count.
+func TestARestoreStoppedByAShutdownStillCountsTheOldRowsItCommitted(t *testing.T) {
+	const day = 24 * time.Hour
+	s, st := batchedServer(t, 0)
+	var logs bytes.Buffer
+	s.log = slog.New(slog.NewTextHandler(&logs, nil))
+	setRetention(t, s, day, day, day)
+	old := time.Now().Add(-2 * day).Unix()
+	rows := func(from, to int) string {
+		var out []string
+		for i := from; i < to; i++ {
+			out = append(out, fmt.Sprintf(`{"ts":%d,"target":"restored","family":"ipv4","latency_ms":12.5,"success":1}`, old+int64(i)))
+		}
+		return strings.Join(out, ",")
+	}
+
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	send, finish := pipedImportCtx(ctx, t, s, "latency=1")
+	send(`{"pingularity_export":2,"latency":[` + rows(0, 5000))
+	storedRows(t, st, "samples", 5000) // a full batch is stored as its last row arrives
+	shutdown()
+	send(`,` + rows(5000, 5010) + `]}`)
+	rr := finish()
+
+	var d struct {
+		Partial   bool           `json:"partial"`
+		Committed map[string]int `json:"committed"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &d); err != nil || rr.Code == http.StatusOK || !d.Partial || d.Committed["latency"] != 5000 {
+		t.Fatalf("fixture: want a partial restore with 5000 latency rows committed, got HTTP %d: %s", rr.Code,
+			strings.TrimSpace(rr.Body.String()))
+	}
+	if n, ok := dueWarning(t, rr, "latency"); !ok || n != 5000 {
+		t.Errorf("a restore stopped by a shutdown committed 5000 rows two days old under a one-day window and warned "+
+			"about %d (warned: %v); they go at the next cleanup (warnings: %q)", n, ok, warningsOf(t, rr))
+	}
+	if !strings.Contains(logs.String(), "restored rows are older than the retention window") || !strings.Contains(logs.String(), "rows=5000") {
+		t.Errorf("the log does not say that the 5000 committed rows are past the window:\n%s", logs.String())
+	}
+	if removed := pruneNow(t, s); removed != 5000 {
+		t.Errorf("the next cleanup removed %d rows, want the 5000 the warning named", removed)
+	}
+}
+
 // The count is of the rows the restore brought. The install's own old rows,
 // waiting for the cleanup by its own window, are not the restore's to report -
 // counting them made a restore of recent rows cry wolf, and inflated the number
@@ -602,9 +705,10 @@ func TestWaitingReadingsAreNotCountedAsRestored(t *testing.T) {
 	}
 }
 
-// The hourly cleanup can run in the middle of a restore - between the last row
-// landing and the count, here - and delete restored rows the count then cannot
-// see. Counted afterwards they are simply not there, and a reply that said
+// A cleanup that was under way when the restore began can delete restored rows
+// in the middle of it - between the last row landing and the count, here - and
+// the count then cannot see them. Counted afterwards they are simply not
+// there, and a reply that said
 // nothing would be the silent loss all over again; the old warning, which only
 // looked at the file, would at least have fired. The reply says a cleanup ran
 // and how many rows of that kind it deleted.
@@ -612,7 +716,8 @@ func TestACleanupDuringTheRestoreIsReported(t *testing.T) {
 	s := newTestServer(t)
 	setRetention(t, s, time.Hour, time.Hour, time.Hour)
 	var removed int64
-	importReconcileHook = func() { removed = pruneNow(t, s) } // after the rows, before the count
+	finish := cleanupUnderWay(t, s, liveWindows(s))
+	importReconcileHook = func() { removed = finish() } // after the rows, before the count
 	t.Cleanup(func() { importReconcileHook = nil })
 
 	body := `{"pingularity_export":2,"latency":[` + oldLatencyRow(48*time.Hour) + `,` + oldLatencyRow(47*time.Hour) + `],` +
@@ -627,10 +732,11 @@ func TestACleanupDuringTheRestoreIsReported(t *testing.T) {
 	if prunedWarning(t, rr, "latency") {
 		t.Errorf("warned that rows the cleanup has already deleted will be deleted (warnings: %q)", warningsOf(t, rr))
 	}
-	if w := cleanupRan(t, rr); !strings.HasPrefix(w,
-		"The cleanup ran while this backup was being restored and deleted 2 latency rows.") {
-		t.Errorf("a cleanup deleted two restored rows during the restore and the reply does not say so (warnings: %q)",
-			warningsOf(t, rr))
+	if w := cleanupRan(t, rr); w != "The cleanup ran while this backup was being restored and deleted 2 latency rows. "+
+		"Restored rows that were already older than a retention window may be among them: to keep those, raise that "+
+		"window in the Data tab and import this backup again." {
+		t.Errorf("a cleanup deleted two restored rows during the restore and the reply does not say so, with what to "+
+			"do about it (warnings: %q)", warningsOf(t, rr))
 	}
 
 	// A restore no cleanup ran beside says nothing of the kind.
@@ -662,7 +768,8 @@ func TestACleanupThatTookOutagesDuringTheRestoreSaysWhatComesBack(t *testing.T) 
 			s := newTestServer(t)
 			setRetention(t, s, time.Hour, time.Hour, time.Hour)
 			var removed int64
-			importReconcileHook = func() { removed = pruneNow(t, s) } // after the rows, before the count
+			finish := cleanupUnderWay(t, s, liveWindows(s))
+			importReconcileHook = func() { removed = finish() } // after the rows, before the count
 			t.Cleanup(func() { importReconcileHook = nil })
 
 			rr := importBackup(t, s, tc.query, tc.body)
@@ -715,7 +822,8 @@ func TestACleanupThatCouldNotTakeRestoredRowsIsNotReported(t *testing.T) {
 			setRetention(t, s, time.Hour, time.Hour, time.Hour)
 			ownSample(t, s, 48*time.Hour) // this install's own, past its window
 			var removed int64
-			importReconcileHook = func() { removed = pruneNow(t, s) } // after the rows, before the count
+			finish := cleanupUnderWay(t, s, liveWindows(s))
+			importReconcileHook = func() { removed = finish() } // after the rows, before the count
 			t.Cleanup(func() { importReconcileHook = nil })
 
 			rr := importBackup(t, s, tc.query, tc.body)
@@ -738,16 +846,19 @@ func TestACleanupThatCouldNotTakeRestoredRowsIsNotReported(t *testing.T) {
 }
 
 // A restore itself only ever lengthens a window, but the Data tab can lower
-// one while a restore runs, and a pass after that cuts at the lower window. A
-// restored row's age is measured against the cutoff the passes cut at, so a
-// cleanup that took restored rows on a window lowered mid-restore is still
-// reported. Measured against keep-forever, the window this restore began with,
-// no pass could have taken anything.
+// one while a restore runs, and a pass that reads its windows after that cuts
+// at the lower one: here a pass that began a moment before the restore and
+// asks for its windows a moment after the save. A restored row's age is
+// measured against the cutoff the passes cut at, so a cleanup that took
+// restored rows on a window lowered mid-restore is still reported. Measured
+// against keep-forever, the window this restore began with, no pass could
+// have taken anything.
 func TestACleanupOnAWindowLoweredDuringTheRestoreIsReported(t *testing.T) {
 	s := newTestServer(t) // keeps everything
 	var removed int64
+	finish := cleanupUnderWay(t, s, liveWindows(s))
 	importMidHook = func() { setRetention(t, s, time.Hour, 0, 0) } // lowered as the restore starts
-	importReconcileHook = func() { removed = pruneNow(t, s) }      // after the rows, before the count
+	importReconcileHook = func() { removed = finish() }            // after the rows, before the count
 	t.Cleanup(func() { importMidHook, importReconcileHook = nil, nil })
 
 	body := `{"pingularity_export":2,"latency":[` + oldLatencyRow(48*time.Hour) + `,` + oldLatencyRow(47*time.Hour) + `],` +
@@ -783,7 +894,8 @@ func TestACleanupThatBeganBeforeAWindowWasRaisedKeepsTheRestoredRows(t *testing.
 			setRetention(t, s, time.Hour, time.Hour, time.Hour)
 			setRetention(t, s, raised, time.Hour, time.Hour) // raised on the Data tab while the pass runs
 			var removed int64
-			importReconcileHook = func() { removed = pruneBegunOnTheHour(t, s) } // after the rows, before the count
+			finish := cleanupUnderWay(t, s, begunOnTheHour(s))
+			importReconcileHook = func() { removed = finish() } // after the rows, before the count
 			t.Cleanup(func() { importReconcileHook = nil })
 
 			rr := importBackup(t, s, "latency=1&config=1", `{"pingularity_export":2,"latency":[`+
@@ -973,7 +1085,8 @@ func TestACleanupThatFollowedARaiseIsJudgedByTheCutoffsItCutAt(t *testing.T) {
 	}
 	setRetention(t, s, 7*24*time.Hour, time.Hour, time.Hour) // raised on the Data tab while the pass runs
 	var removed int64
-	importReconcileHook = func() { removed = pruneBegunOnTheHour(t, s) } // after the rows, before the count
+	finish := cleanupUnderWay(t, s, begunOnTheHour(s))
+	importReconcileHook = func() { removed = finish() } // after the rows, before the count
 	t.Cleanup(func() { importReconcileHook = nil })
 
 	rr := importBackup(t, s, "latency=1&config=1", `{"pingularity_export":2,"latency":[`+oldLatencyRow(5*24*time.Hour)+`],`+
@@ -1013,7 +1126,8 @@ func TestAWindowLoweredAndRaisedAgainBeforeARestoreDrawsNoNotice(t *testing.T) {
 		ownSample(t, s, 8*24*time.Hour+time.Duration(i)*time.Second)
 	}
 	var removed int64
-	importReconcileHook = func() { removed = pruneNow(t, s) } // after the rows, before the count
+	finish := cleanupUnderWay(t, s, liveWindows(s))
+	importReconcileHook = func() { removed = finish() } // after the rows, before the count
 	t.Cleanup(func() { importReconcileHook = nil })
 
 	rr := importBackup(t, s, "latency=1&config=1", `{"pingularity_export":2,"latency":[`+oldLatencyRow(5*24*time.Hour)+`],`+
@@ -1037,17 +1151,18 @@ func TestAWindowLoweredAndRaisedAgainBeforeARestoreDrawsNoNotice(t *testing.T) {
 // The count of this install's own outage records is a count of 'down' rows,
 // not of recoveries: a restart in the middle of an outage gives it a second
 // 'down', and one restored recovery then ends both. For any count above one
-// the warning said "restored recoveries now end their outages".
+// the warning said "restored recoveries now end their outages". It says
+// "restored rows", since restored latency readings can end an outage too.
 func TestTheWarningDoesNotCountOwnOutageRecordsAsRecoveries(t *testing.T) {
 	for _, tc := range []struct {
 		n, own int64
 		says   string
 	}{
-		{1, 2, "2 outage records this install already had will be deleted with it: the restored row now ends " +
+		{1, 2, "2 outage records this install already had will be deleted with it: restored rows now end " +
 			"those outages before the window begins."},
-		{3, 2, "2 outage records this install already had will be deleted with them: the restored rows now end " +
+		{3, 2, "2 outage records this install already had will be deleted with them: restored rows now end " +
 			"those outages before the window begins."},
-		{2, 1, "1 outage record this install already had will be deleted with them: a restored recovery now ends " +
+		{2, 1, "1 outage record this install already had will be deleted with them: restored rows now end " +
 			"its outage before the window begins."},
 	} {
 		w := restoredDueWarning("downtime", tc.n, tc.own, time.Hour)
@@ -1108,5 +1223,142 @@ func TestTheWarningCountsTheOutageRecordsARestoredRecoveryCloses(t *testing.T) {
 					removed, n, own)
 			}
 		})
+	}
+}
+
+// A restart in the middle of an outage leaves its 'down' with no 'up', and
+// only the latency readings then show when it ended. An install that keeps its
+// latency forever never writes that end down. Restore its backup onto windows
+// of thirty days and a year, data only, and the next cleanup does: it gives
+// the outage the end the old readings show, and deletes it in the same pass,
+// since the end is past the year too. The reply named the old readings and
+// said nothing of the outage, which the dashboard guide called "still open"
+// and so kept. It now counts the restored 'down', and an outage of this
+// install's own that restored readings end, as an outage record this install
+// already had. On a real file, the daemon's pool of connections.
+func TestTheWarningCountsAnOutageTheCleanupEndsFromOldReadingsAndDeletes(t *testing.T) {
+	const day = 24 * time.Hour
+	began := time.Now().Add(-400 * day)
+	round := func(after time.Duration, ok int) string {
+		var out []string
+		for _, tg := range []string{"a", "b", "c"} {
+			out = append(out, fmt.Sprintf(`{"ts":%d,"target":%q,"family":"ipv4","latency_ms":12.5,"success":%d}`,
+				began.Add(after).Unix(), tg, ok))
+		}
+		return strings.Join(out, ",")
+	}
+	latency := `"latency":[` + round(0, 0) + `,` + round(10*time.Minute, 1) + `,` + round(20*time.Minute, 1) + `]`
+	for _, tc := range []struct {
+		name, query, body string
+		own               bool // the outage is this install's, stored before the restore
+		restored, records int  // the downtime rows and own outage records the reply must name
+		alone             bool // the own records get a line of their own
+	}{
+		{"the backup's own outage", "latency=1&downtime=1",
+			`{"pingularity_export":2,` + latency + fmt.Sprintf(`,"downtime":[{"ts":%d,"type":"down"}]}`, began.Unix()),
+			false, 1, 0, false},
+		{"an outage this install already had", "latency=1&downtime=1",
+			// A complete outage an hour before it, so the reply has restored
+			// downtime rows to name this install's record beside. Before, not
+			// after: a restored recovery after it would end it by itself.
+			`{"pingularity_export":2,` + latency + fmt.Sprintf(`,"downtime":[{"ts":%d,"type":"down"},{"ts":%d,"type":"up","duration_s":60}]}`,
+				began.Add(-time.Hour).Unix(), began.Add(-time.Hour+time.Minute).Unix()),
+			true, 2, 1, false},
+		// Latency readings alone: no downtime row to name the record beside.
+		{"an outage this install already had, and a restore of readings alone", "latency=1",
+			`{"pingularity_export":2,` + latency + `}`, true, 0, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st := batchedServer(t, 0)
+			setRetention(t, s, 30*day, 0, 365*day)
+			if tc.own {
+				// Stored as an earlier run of the daemon left it, not through
+				// the running monitor's door: an outage the monitor holds open
+				// is the monitor's to end, and the cleanup leaves it.
+				if _, err := st.DB().Exec(`INSERT INTO events (ts, type, detail) VALUES (?, 'down', '')`, began.Unix()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rr := importBackup(t, s, tc.query, tc.body)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("import: HTTP %d: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+			}
+			if n, ok := dueWarning(t, rr, "latency"); !ok || n != 9 {
+				t.Fatalf("fixture: warned about %d latency rows (warned: %v), want the 9 restored readings", n, ok)
+			}
+			n, _ := dueWarning(t, rr, "downtime")
+			own, _ := ownRecords(t, rr)
+			if tc.alone {
+				own = 0
+				for _, w := range warningsOf(t, rr) {
+					if strings.HasPrefix(w, "1 outage record this install already had will be deleted at the next cleanup, "+
+						"which runs every hour: the restored latency readings show that the outage ended before") {
+						own = 1
+					}
+				}
+			}
+			if n != tc.restored || own != tc.records {
+				t.Errorf("warned about %d restored downtime rows and %d outage records this install had; want %d and %d: "+
+					"the next cleanup ends the outage from the old readings and deletes it (warnings: %q)",
+					n, own, tc.restored, tc.records, warningsOf(t, rr))
+			}
+			events := stored(t, st, "events")
+			pruneNow(t, s)
+			if left := stored(t, st, "events"); left != 0 {
+				t.Fatalf("fixture: the next cleanup left %d of %d outage rows, want none: it ends the outage and deletes it",
+					left, events)
+			}
+			if events != tc.restored+tc.records {
+				t.Errorf("the next cleanup deleted the %d outage rows there were; the warning named %d restored and %d "+
+					"of this install's", events, tc.restored, tc.records)
+			}
+		})
+	}
+}
+
+// The cleanup also deletes rows stamped more than 48 hours ahead of the clock,
+// whatever the retention windows are: a row from the future would otherwise
+// answer for "now" on every chart until the clock caught up. A backup from a
+// machine whose clock ran fast, or one restored onto a machine whose clock is
+// behind, brings such rows, and the next cleanup deleted them with nothing in
+// the reply. The reply now counts them, in a line of their own, since no
+// window keeps them. A row a day ahead is inside what the cleanup allows, and
+// is not counted.
+func TestTheWarningCountsRestoredRowsStampedAheadOfTheClock(t *testing.T) {
+	s, st := batchedServer(t, 0)
+	const day = 24 * time.Hour
+	setRetention(t, s, 30*day, 30*day, 30*day)
+	at := func(ahead time.Duration) int64 { return time.Now().Add(ahead).Unix() }
+	var latency []string
+	for i := 0; i < 25; i++ {
+		latency = append(latency, fmt.Sprintf(`{"ts":%d,"target":"a","family":"ipv4","latency_ms":12.5,"success":1}`,
+			at(3*day)+int64(i)))
+	}
+	latency = append(latency, fmt.Sprintf(`{"ts":%d,"target":"a","family":"ipv4","latency_ms":12.5,"success":1}`, at(day)))
+	body := `{"pingularity_export":2,"latency":[` + strings.Join(latency, ",") + `],` +
+		fmt.Sprintf(`"speed":[{"ts":%d,"server":"s"}]}`, at(3*day))
+	rr := importBackup(t, s, "latency=1&speed=1", body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("import: HTTP %d: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+	if got := stored(t, st, "samples"); got != 26 {
+		t.Fatalf("fixture: %d latency rows landed, want 26", got)
+	}
+	want := []string{
+		"25 restored latency rows are dated more than 48 hours ahead of this machine's clock and will be deleted at the " +
+			"next cleanup, which runs every hour, whatever the retention window: the clock that recorded them ran fast, " +
+			"or this machine's clock is behind. If it is this machine's, set it and import this backup again.",
+		"1 restored speed row is dated more than 48 hours ahead of this machine's clock and will be deleted at the " +
+			"next cleanup, which runs every hour, whatever the retention window: the clock that recorded it ran fast, " +
+			"or this machine's clock is behind. If it is this machine's, set it and import this backup again.",
+	}
+	if got := warningsOf(t, rr); !slices.Equal(got, want) {
+		t.Errorf("the reply warns\n  %q\nwant\n  %q", got, want)
+	}
+	if removed := pruneNow(t, s); removed != 26 {
+		t.Errorf("the next cleanup removed %d rows; the warnings named 26", removed)
+	}
+	if got := stored(t, st, "samples"); got != 1 {
+		t.Errorf("%d latency rows are left, want the one a day ahead", got)
 	}
 }

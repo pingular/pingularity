@@ -490,7 +490,10 @@ replaced and applied live - except that a restore never shortens how long
 history is kept: where the backup's retention window is shorter, yours stays,
 and the import says so. It also says how many restored rows are older than
 your windows, which the next hourly cleanup deletes; to keep them, raise the
-window and import the file again. A backup never contains passwords, but it
+window and import the file again. If it says outage records this install
+already had will go with them, raise the window before the next cleanup:
+importing again brings those back only if the backup holds them. A backup
+never contains passwords, but it
 does carry your webhook and heartbeat URLs, which are as good as passwords for
 those services, so treat the file as a secret. Restoring onto a machine with
 no password leaves login off and closes network access until you set one;
@@ -624,8 +627,8 @@ stateDiagram-v2
 
 Each round records the raw latency samples, and only a confirmed change writes
 an outage event. The samples wait in memory and are written to disk in
-batches, 30 seconds apart by default, and at once whenever something reads
-them. That wears an SD card or eMMC far less than a write every round. A crash
+batches, 30 seconds apart by default, and at once whenever the dashboard, the
+API or `/metrics` reads them. That wears an SD card or eMMC far less than a write every round. A crash
 or a power cut can lose up to that many seconds of latency readings. Outage
 events are never delayed. **Save to disk every** on the Latency tab sets the
 interval, and 0 writes every round at once. The latency chart reads the

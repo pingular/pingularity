@@ -127,7 +127,9 @@ func prunedTablesDump(t *testing.T, s *Store) string {
 
 // seedPruneHistory fills all seven pruned tables with rows on both sides of
 // every cutoff: old, kept, ahead of the clock inside the slack, and past the
-// future horizon. Spans and outages straddle the cutoffs by chance.
+// future horizon, some of them within the hour on either side of it, so that a
+// horizon worked out differently in two places shows. Spans and outages
+// straddle the cutoffs by chance.
 func seedPruneHistory(t *testing.T, s *Store, now time.Time, rng *rand.Rand) {
 	t.Helper()
 	tx, err := s.db.Begin()
@@ -148,6 +150,14 @@ func seedPruneHistory(t *testing.T, s *Store, now time.Time, rng *rand.Rand) {
 			return nowU + 3*day + int64(rng.Intn(1000)) // past the future horizon
 		case 1:
 			return nowU + int64(rng.Intn(40*3600)) // ahead, inside the slack
+		case 2:
+			// Within the hour on either side of the horizon, and never in
+			// its last minute: the clock moves on between a test's two reads.
+			edge := int64(60 + rng.Intn(3540))
+			if rng.Intn(2) == 0 {
+				edge = -edge
+			}
+			return nowU + int64(pruneFutureSlack/time.Second) + edge
 		}
 		return nowU - int64(rng.Intn(int(120*day)))
 	}

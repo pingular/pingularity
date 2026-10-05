@@ -528,7 +528,7 @@ your **webhook URL** and **heartbeat URL** so that a restore is complete, and fo
 both of those the URL *is* the credential - there is no separate token to
 withhold. Anyone holding an export file can post to your alert channel or tick
 your dead-man's-switch (masking a real outage), so store and share it like a
-secret, and rotate both URLs at their provider if one leaks. Two more
+secret, and rotate both URLs at their provider if one leaks. A few more
 consequences worth knowing before you need them:
 
 - **Copying the database files by hand?** Stop the service first. While it runs,
@@ -642,13 +642,18 @@ consequences worth knowing before you need them:
 - **Restoring a backup with shorter retention?** A backup carries its
   install's retention windows, but a restore never shortens one: where the
   backup keeps a kind of history for less time than this machine does, this
-  machine's window stays, so the next cleanup cannot delete history the
-  machine already had. The import names each window it kept and what the
-  backup asked for; lower it on the Data tab if the backup's was what you
-  wanted. A longer window, or keep forever, is restored as usual. Restored
-  rows that are already older than a window are deleted at the next cleanup,
-  which runs every hour, and the import says how many; raise the window and
-  import the file again to keep them.
+  machine's window stays, so the backup's window cannot make the next cleanup
+  delete history this machine was keeping. The import names each window it
+  kept and what the backup asked for; lower it on the Data tab if the backup's
+  was what you wanted. A longer window, or keep forever, is restored as usual.
+  Restored rows that are already older than a window are deleted at the next
+  cleanup, which runs every hour, and the import says how many; raise the
+  window and import the file again to keep them. One thing a restore can
+  still take from this machine's own history: a restored recovery, or restored
+  latency readings, can end one of this machine's old outages before the
+  window, and the cleanup then deletes that outage whole. The import counts
+  those records too. Importing again brings them back only if the backup
+  holds them, so for those raise the window before the next cleanup.
 - **Restoring on an *older* version?** It will refuse the file rather than
   restore half of it. A backup is stamped with the oldest version that can read
   it, and that stamp is worked out from what the file actually contains - so a

@@ -177,6 +177,56 @@ func TestPrunerGivesWayToAnotherWriter(t *testing.T) {
 	}
 }
 
+// A backup is being restored when the hourly pass comes due. The pass is
+// skipped, not failed: nothing is deleted, the log says why without a warning
+// or an error, the ticker stays, and the pass after the restore has let go
+// removes the rows.
+func TestPrunerSkipsAPassThatComesDueDuringARestore(t *testing.T) {
+	f := openPrunerStore(t)
+	f.seedExpiredSamples(100)
+	set := tenDayController(t, f)
+
+	prevTick := pruneInterval
+	pruneInterval = 100 * time.Millisecond
+	t.Cleanup(func() { pruneInterval = prevTick })
+
+	release := f.st.HoldCleanup() // what a restore takes before its first row
+	defer release()
+	passes := prunePasses()
+	skipped := func() int64 { return stats.Lifetime().Counters["db.prune_skipped_restore"] }
+	before := skipped()
+	var logs bytes.Buffer
+	p := &program{store: f.st, log: slog.New(slog.NewTextHandler(&logs, nil))}
+	stop, running := runPrunerFor(t, p, set)
+	defer stop()
+	if !waitFor(func() bool { return skipped() > before }, 15*time.Second) {
+		t.Fatal("no pass was counted as skipped for the restore within 15s")
+	}
+	if got := f.count("samples"); got != 100 {
+		t.Errorf("%d samples left while the restore held the cleanup off, want all 100", got)
+	}
+	if got := prunePasses(); got != passes {
+		t.Errorf("db.prune_count moved by %d: a skipped pass is not a finished prune", got-passes)
+	}
+	if !running() {
+		t.Fatal("runPruner exited after the skipped pass; nothing would prune once the restore is done")
+	}
+	release()
+	if !waitFor(func() bool { return prunePasses() > passes }, 15*time.Second) {
+		t.Fatal("no pass finished within 15s of the restore letting go")
+	}
+	stop()
+	if got := f.count("samples"); got != 0 {
+		t.Errorf("%d expired rows left after the restore let go, want 0", got)
+	}
+	if !strings.Contains(logs.String(), "prune skipped while a backup is being restored") {
+		t.Errorf("the skipped pass was not reported:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "level=ERROR") || strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("a pass skipped for a restore was logged as a fault:\n%s", logs.String())
+	}
+}
+
 // A window raised while a big pass runs takes effect at the pass's next
 // chunk, not at the pass after: runPruner hands the pass the controller's
 // windows to read as it goes, not a copy taken as it started. Here the stored

@@ -225,8 +225,8 @@ and persist across restarts.
   taken while a speedtest runs don't count toward failures→down, for at least
   two minutes and at least one round), how often latency readings are saved to
   disk (**Save to disk every**: 30 seconds by default, 120 at most, 0 = every
-  round at once. Readings wait in memory in between, and anything that reads
-  them saves them first. A crash or a power cut can lose up to the chosen
+  round at once. Readings wait in memory in between, and the dashboard, the
+  API, `/metrics` and an export save them before they read them. A crash or a power cut can lose up to the chosen
   number of seconds of latency readings. Outage records are never delayed. A
   value at or below the check interval saves nothing: every round is then
   written by itself), plus the
@@ -395,25 +395,42 @@ and persist across restarts.
   runs every hour, so that can be seconds away. It counts only rows the
   cleanup really deletes: an outage whose recovery is inside the window, an
   outage still open, and a pause that runs into the window are kept, and so
-  are not counted. The cleanup deletes an outage whole, though, so a restored
-  recovery that ends one of this install's own old outages before the window
-  takes that outage's record with it, and the import counts those records
-  too. To keep the old rows, raise the window before you restore (the restore
-  will not lower it again), or raise it afterwards and import the file again:
+  are not counted. An outage with no recorded end is only open if the latency
+  readings do not show it ending: where old readings show that it ended
+  before both windows, the cleanup records that end and then deletes the
+  outage, and the import counts it. The cleanup deletes an outage whole, so a
+  restored recovery that ends one of this install's own old outages before the
+  window takes that outage's record with it, as do restored readings that show
+  when one ended, and the import counts those records too. To keep the old
+  rows, raise the window before you restore (the restore will not lower it
+  again), or raise it afterwards and import the file again:
   rows still there are skipped, and any the cleanup already deleted come
   back, except this install's own outage records, which come back only if the
   backup holds them - for those, raise the window before the next cleanup. A
   restore that fails part way gives the same count for the rows it did add.
-  If the hourly cleanup runs beside a restore and could have deleted rows of a
+  No hourly cleanup starts while a backup is being restored. One that comes
+  due is skipped, and the next one runs an hour later at the windows the
+  restore leaves in force, so a backup that keeps history for longer than this
+  install did keeps the rows it brings. A cleanup that was already running
+  when the restore began goes on. If it could have deleted rows of a
   kind the restore brought, older than the window it cut at, the import says
   so, with how many rows of that kind the cleanup deleted, since restored rows
-  may be among them. Where outages are among them, this install's own outage
+  may be among them, and what brings them back: importing the file again where
+  the window now in force keeps them, or raising the window first where it
+  does not. Where outages are among them, this install's own outage
   records may be as well, and importing again brings those back only if the
-  backup holds them. The import speaks for what the cleanup deleted from the
-  start of the import until its reply. A cleanup still running after the reply
+  backup holds them. **Delete now** still works while a restore runs, and
+  removes the rows of that kind restored so far with the rest. The import says
+  so, counts only the rows it brought afterwards, and importing the file again
+  brings the others back. The import speaks for what the cleanup deleted from
+  the start of the import until its reply. A cleanup still running after the reply
   follows a window you raised from its next step on, so any restored rows it
   goes on to delete are ones the import already counted as due at the next
-  cleanup, unless you lower a window after the reply. And a config restore that carried "login on" without a
+  cleanup, unless you lower a window after the reply. The import also counts
+  restored rows dated more than 48 hours ahead of this machine's clock. The
+  cleanup deletes those whatever the windows are, so a backup from a machine
+  whose clock ran fast loses them, and one restored onto a machine whose clock
+  is behind can be imported again once the clock is set. And a config restore that carried "login on" without a
   password leaves login off until you set one.
 - **Alerts** → *Thresholds* (min download/upload, max ping/jitter/packet-loss, and
   max bufferbloat per direction; each run is marked healthy/unhealthy against the

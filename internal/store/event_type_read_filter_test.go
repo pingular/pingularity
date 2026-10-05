@@ -241,6 +241,9 @@ func TestEventTypeFilterCoversEveryEventRead(t *testing.T) {
 		"repairInsaneEventDurations": "the duration bound is about what a LENGTH can mean, not what a type means; the import door holds the same rule for every row",
 		"DeleteOutage":               "constrains the type in every statement with an explicit type = 'down' / type = 'up' rather than the IN idiom, because it targets one side of a pair at a time",
 		"pruneDueClosedCount":        "counts by Prune's own events rule (pruneAge), so it must reach every row Prune does - a count that skipped the types this build cannot read would disagree with the cleanup it counts for",
+		"pruneDueKeptDowns":          "counts the 'down' rows Prune's own events rule (pruneAge) keeps today, with an explicit type = 'down': the rule must read what Prune reads, and the rows counted are one side of a pair",
+		"pruneDueCloses":             "asks which side of the mark one outage's 'down' is on, by its ts, with an explicit type = 'down' rather than the IN idiom",
+		"countUpAt":                  "counts the 'up' rows a close would move back, by their ts, with an explicit type = 'up' rather than the IN idiom - the predicate the close itself moves them by",
 	}
 	src, err := os.ReadFile("store.go")
 	if err != nil {

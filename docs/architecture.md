@@ -224,7 +224,7 @@ flowchart TB
     `/metrics`, an export;
   - before an outage event, a pause or a speedtest result is written, so none
     of them is ever on disk ahead of the readings taken before it;
-  - before a cleanup, a **Delete now** or a restore;
+  - before a cleanup, a latency **Delete now** or a restore;
   - when 8,192 readings are waiting;
   - when the daemon stops.
 
@@ -263,6 +263,19 @@ flowchart TB
   deleting what the new window keeps from its next chunk on, rows a restore
   brings back meanwhile included. A lowered window waits for the next
   cleanup, so a cleanup never deletes more than it set out to.
+- **No cleanup starts during a restore.** A backup's retention windows arrive
+  with its config, which an export writes last, after every row. A cleanup
+  that started in the middle cut at the windows in force at that moment, and
+  a backup that keeps history for longer than the install did lost the rows it
+  had brought so far, just before the window that keeps them arrived. So a
+  restore holds the cleanup off from before its first row until it has
+  replied. A pass that comes due in that time is skipped, and the next one, an
+  hour later, removes what it would have at the windows the restore left.
+  `db.prune_skipped_restore` on `/metrics` counts the skipped passes. The
+  hold is a count that a pass reads as it starts, so nothing waits on it, and
+  it ends with the restore however the restore ends. A cleanup that was
+  already running when the restore began goes on, and the import reports what
+  it deleted.
 - **Cleanup waits for a clock it can trust.** Every retention cutoff comes
   from the clock, so a clock set wrong would delete history that should stay.
   Cleanup is skipped while the clock reads earlier than 2023 (a board with no
@@ -316,14 +329,15 @@ flowchart TB
   the paused time is in. So a close, an outage delete or a cleanup that comes
   while a restore is sending its outage history waits for the rest of it:
   about a quarter of a second for 20,000 outage rows on a laptop, plus the time
-  the upload itself takes. The monitor's own writes never wait for a close or
-  a restore.
+  the upload itself takes. The monitor's own writes never wait for that turn.
+  Like any writer, they can still wait a moment for SQLite's single writer,
+  such as a restore's batch in progress.
 - **Disk space is reused, not given back.** The main file is never compacted:
   deleted rows leave free pages, and new rows fill them before the file grows.
   The write-ahead log beside it stays near 4 MB in ordinary running. A reader
   that holds its place (an export, a wide chart) can make it grow while a big
   cleanup runs. Every connection carries a size limit of 8 MiB, so the log is
   cut back to that once it restarts, inside whichever commit restarts it,
-  which is usually a probe round's. After a cleanup or a delete of 200,000
+  which is usually a save of probe readings. After a cleanup or a delete of 200,000
   rows or more the log is also emptied, when no reader or writer is using it.
   That step never fails the cleanup or the delete.

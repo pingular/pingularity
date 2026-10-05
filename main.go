@@ -1279,6 +1279,9 @@ func seedKnownCounters() {
 		// boot clock among them, stop while the laptop sleeps, and its time
 		// sync sets the clock forward at wake.
 		"db.prune_skipped_clock",
+		// A cleanup skipped because a backup was being restored when it came
+		// due. The next hourly pass removes what it would have.
+		"db.prune_skipped_restore",
 		// The write-ahead log after a large delete: emptied, left because a
 		// reader or a writer was on it, or refused. Read against each other.
 		"db.wal_trim", "db.wal_trim_blocked", "db.wal_trim_failed",
@@ -1631,6 +1634,13 @@ func (p *program) runPruner(ctx context.Context, set *settings.Controller) {
 		n, err := p.store.PruneLive(ctx, cutoffs)
 		if err != nil {
 			switch {
+			case errors.Is(err, store.ErrCleanupHeld):
+				// A backup is being restored, and no pass starts beside one
+				// (store.HoldCleanup): it would cut at the windows in force
+				// now, and the backup's own only arrive as the restore ends.
+				// A skipped pass like the one above, counted on /metrics as
+				// db.prune_skipped_restore.
+				p.log.Info("prune skipped while a backup is being restored; the next pass catches up")
 			case ctx.Err() != nil:
 				// Stopped for shutdown. A big cleanup lasts long enough for
 				// that to land inside it, and it is a stop, not a failure:

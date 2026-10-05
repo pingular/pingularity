@@ -321,11 +321,14 @@ self-describing):
   since every hourly try counts until time sync sets it, or that something
   keeps setting the clock, such as a laptop that sleeps with pingularity in
   one of those virtual machines.
+  `db.prune_skipped_restore` counts cleanups skipped because a backup was
+  being restored when they came due. The next hourly cleanup removes what a
+  skipped one would have.
   Latency readings are saved in batches, and `db.sample_*` follows them:
   `db.sample_saves.<reason>` counts the saves by what started each (`age` the
   save interval, `request` a dashboard, API or `/metrics` request, `read` a
   read inside the daemon, `order` an outage event, pause, speedtest result,
-  cleanup, delete or restore that has to come after the readings, `cap` a
+  cleanup, latency delete or restore that has to come after the readings, `cap` a
   full buffer, `stop` a shutdown), `db.sample_rows_buffered` the readings
   that waited in memory, `db.sample_save_failed` the saves that failed and
   kept their readings for a retry, `db.sample_save_deferred` the saves for a

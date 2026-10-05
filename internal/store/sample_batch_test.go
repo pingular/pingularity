@@ -2299,6 +2299,7 @@ func TestEverySamplesStatementSavesFirst(t *testing.T) {
 		"exportRows":                 "has no store, only a handle or a snapshot: ExportTableRows and BeginReadSnapshot save for it",
 		"seriesSamplesSQL":           "builds the statement and runs nothing: seriesQuery saves",
 		"pruneDueCount":              "builds the statement and runs nothing: PruneDue saves",
+		"pruneDueAheadCount":         "builds the statement and runs nothing: PruneDueAhead saves",
 		"readDNS":                    "reads inside the snapshot seriesQuery opened, where a save would wait for the connection the snapshot holds: its caller saves",
 	}
 	// Functions that name neither table and reach them through a helper.

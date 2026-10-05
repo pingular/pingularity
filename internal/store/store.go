@@ -311,6 +311,14 @@ type Store struct {
 	// (pruneChunked).
 	pruneWatchMu sync.Mutex
 	pruneWatches map[*PruneWatch]struct{}
+	// clearing counts, table by table, the Delete nows that have begun and not
+	// yet ended (Clear), under pruneWatchMu. A watch reads it as it answers
+	// (PruneTally.Clearing).
+	clearing map[string]int
+
+	// cleanupHolds counts the restores that are bringing rows in (HoldCleanup).
+	// While it is above zero no cleanup pass starts.
+	cleanupHolds atomic.Int32
 
 	// rebuilt records that this Open found the database damaged, set it aside
 	// and started over on an empty one. Fixed for the life of the handle - a
@@ -339,7 +347,10 @@ type Store struct {
 	// downtime category, every batch of the outages and the paused time after
 	// them, not batch by batch: a close in a gap between two batches found
 	// half an outage, or an outage without the pauses it reads
-	// (HoldOutageRecord).
+	// (HoldOutageRecord). A restore's count of what the next cleanup deletes
+	// takes it as well, for the dry run of the close it asks for (PruneDue,
+	// closeDanglingDowns): that writes nothing, and reads the record between
+	// two changes to it, never in the middle of one.
 	//
 	// The monitor's own writes never take it: InsertEvent from a probe round
 	// or from the monitor's retry buffer. A probe round must not wait out a
@@ -350,15 +361,18 @@ type Store struct {
 	// It is taken with no other lock of this package held and no transaction
 	// or cursor of the holder's open. (A restore can take it with the web
 	// layer's importMu held, when the file carries its config ahead of its
-	// outages. It lets go before it moves on to another category, and nothing
-	// that holds outageMu takes importMu.) Under it the holder saves the
+	// outages, and again for its count once every row is in. It lets go before
+	// it moves on to another category, the count's dry run lets go as it
+	// returns, and nothing that holds outageMu takes importMu.) Under it the
+	// holder saves the
 	// waiting rows (the save gate, then held.mu, and the daemon's save
 	// interval and save log functions, which lock only their own state), reads
 	// and drops the read caches (recMu, seriesMu), asks a cleanup's cutoffs
 	// function for the windows in force before each chunk of its sweep
 	// (PruneLive: the daemon's reads the settings controller, whose lock is
 	// held only to copy or replace its values), adds what a cleanup's chunk
-	// deleted to the watches on the cleanup (pruneWatchMu), and waits for a
+	// deleted to the watches on the cleanup, or that a downtime Delete now has
+	// emptied its tables (pruneWatchMu), and waits for a
 	// pooled connection and for SQLite's writer. A restore also reads the rest
 	// of its downtime category from the request under it, which makes it the
 	// one holder that can keep the lock for long (see HoldOutageRecord for
@@ -394,8 +408,8 @@ type Store struct {
 // it writes it again from the start after a checkpoint, so a log that grew
 // once kept that size until the daemon stopped (78 to 87 MB after a cleanup of
 // 15 days of rows). With the limit, the first commit after the log restarts
-// cuts the file back to the limit. That commit is usually a probe round's, and
-// the cut is one truncate call inside it. The limit does not keep the log from
+// cuts the file back to the limit. That commit is usually a save of probe
+// readings, and the cut is one truncate call inside it. The limit does not keep the log from
 // growing past it while a reader holds the log. It is a property of the
 // connection, not of the file, which is why it rides the DSN.
 const pragmaConn = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(8388608)&_pragma=synchronous(NORMAL)"
@@ -7380,6 +7394,25 @@ func currentHorizon(nowU int64) int64 { return nowU + int64(metricsFutureSkew.Se
 // that goes with them, and returns those wrapped in recordedErr. The rest are
 // its caller's to count.
 func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int64, liveFrom func() int64) error {
+	return s.closeDanglingDowns(ctx, sampleCutoff, nowU, liveFrom, nil)
+}
+
+// plannedClose is one end a close of the outages would record
+// (closeDanglingDowns), as its dry run reports it.
+type plannedClose struct {
+	down  int64 // the 'down' it ends
+	at    int64 // the second the samples prove the link came back
+	moved int64 // the 'up' it would move back to at, by its ts; 0 when it would write a new one
+}
+
+// closeDanglingDowns is resolveDanglingDowns, with a dry run: when plan is not
+// nil it reads which outages have no end and searches the samples for each, as
+// the close does, fills plan with the ends it would record, and writes
+// nothing. PruneDue asks for one, to count what the close a cleanup begins
+// with puts on that cleanup's list. It is this function and not a second
+// reading of the same rules, so the count cannot come to disagree with the
+// close about which outages get an end, or where.
+func (s *Store) closeDanglingDowns(ctx context.Context, sampleCutoff, nowU int64, liveFrom func() int64, plan *[]plannedClose) error {
 	s.outageMu.Lock()
 	defer s.outageMu.Unlock()
 	if liveFrom == nil {
@@ -7555,6 +7588,29 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 			synth = append(synth, synthUp{ts: rec, dur: dur, down: g.down, final: g.final, pairUp: g.pairUp})
 		}
 	}
+	if plan != nil {
+		// The dry run ends here, before the first write. What the writes below
+		// decide as they go is decided here the same way: an outage's own 'up'
+		// dated ahead of the clock is moved back rather than joined by a second
+		// end, the one the pairing named or, for the last outage, the next
+		// event when that is an 'up'.
+		for _, u := range synth {
+			moved := u.pairUp
+			if moved == 0 && u.final {
+				var at int64
+				var kind string
+				switch err := s.db.QueryRowContext(ctx, closeNextEvent, u.down).Scan(&at, &kind); {
+				case err == nil && kind == "up":
+					moved = at
+				case err == nil, errors.Is(err, sql.ErrNoRows):
+				default:
+					return err
+				}
+			}
+			*plan = append(*plan, plannedClose{down: u.down, at: u.ts, moved: moved})
+		}
+		return nil
+	}
 	if closeHook != nil {
 		closeHook()
 	}
@@ -7606,9 +7662,7 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 		if u.final {
 			var at int64
 			var kind string
-			switch err := s.db.QueryRowContext(ctx,
-				`SELECT ts, type FROM events WHERE type IN ('down','up') AND ts > ?
-				 ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END LIMIT 1`, u.down).Scan(&at, &kind); {
+			switch err := s.db.QueryRowContext(ctx, closeNextEvent, u.down).Scan(&at, &kind); {
 			case err == nil && kind != "up":
 				// A different outage begins first - nothing here to correct.
 			case err == nil:
@@ -7637,6 +7691,14 @@ func (s *Store) resolveDanglingDowns(ctx context.Context, sampleCutoff, nowU int
 	}
 	return nil
 }
+
+// closeNextEvent finds the event that follows a 'down' (?1), a 'down' first
+// where the two share a second. The close asks it of the last outage with no
+// end: an 'up' there is that outage's own, dated past the future horizon, and
+// is moved back instead of joined by a second end. One text for the close and
+// for its dry run.
+const closeNextEvent = `SELECT ts, type FROM events WHERE type IN ('down','up') AND ts > ?
+	ORDER BY ts, CASE type WHEN 'down' THEN 0 ELSE 1 END LIMIT 1`
 
 // closeHook runs inside resolveDanglingDowns once the close has read which
 // outages have no end and searched the samples for each, before it writes the
@@ -7840,6 +7902,16 @@ func (s *Store) repairReading(fallback func() int64) (int64, bool) {
 	return fallback(), true
 }
 
+// futureHorizon is the bound of a cleanup's future arms: pruneFutureSlack ahead
+// of the clock a pass started on, moved on by the time the pass has run (see
+// PruneLive, which says why it is the pass's uptime and not a later reading of
+// the clock). One text for the pass and for the count of what the next pass
+// removes as ahead of the clock (PruneDueAhead), which asks for a pass that
+// has not run yet.
+func futureHorizon(start time.Time, ran time.Duration) int64 {
+	return start.Add(ran + pruneFutureSlack).Unix()
+}
+
 // pruneCut names which of Prune's three cutoffs a table is pruned on.
 type pruneCut int
 
@@ -7871,7 +7943,7 @@ func (c pruneCut) at(samplesBefore, speedBefore, eventsBefore time.Time) int64 {
 // keeps. PruneLive's own comments say why each rule is what it is.
 //
 // The future arms are not here. They are about a clock that ran fast, not
-// about retention, and nothing counts them.
+// about retention, and PruneDueAhead counts them, by pruneAheadCol.
 var pruneAge = map[string]struct {
 	on   pruneCut
 	rule string
@@ -7948,6 +8020,9 @@ func (s *Store) Prune(ctx context.Context, samplesBefore, speedBefore, eventsBef
 //
 // A pass that removed walTrimRows or more ends by emptying the write-ahead
 // log (trimWALAfter). Whatever comes of that, the pass has succeeded.
+//
+// A pass that would start while a restore is bringing rows in does not start:
+// it returns ErrCleanupHeld and deletes nothing (HoldCleanup).
 func (s *Store) PruneLive(ctx context.Context, cutoffs func(start time.Time) (samplesBefore, speedBefore, eventsBefore time.Time)) (int64, error) {
 	start, uptime := pruneClock(s)
 	// Refuse to prune while the wall clock is implausibly early: an RTC-less device
@@ -7976,6 +8051,13 @@ func (s *Store) PruneLive(ctx context.Context, cutoffs func(start time.Time) (sa
 	if s.clockStepped(start, uptime) {
 		stats.Inc("db.prune_skipped_clock")
 		return 0, nil
+	}
+	// A restore is bringing rows in (HoldCleanup), so this pass does not start.
+	// Like the two guards above it costs a delayed cleanup: the next pass
+	// removes what this one would have.
+	if s.cleanupHolds.Load() > 0 {
+		stats.Inc("db.prune_skipped_restore")
+		return 0, ErrCleanupHeld
 	}
 	// The cutoffs the pass starts at: the windows in force, measured from the
 	// clock reading the guards above have just vetted.
@@ -8048,7 +8130,7 @@ func (s *Store) PruneLive(ctx context.Context, cutoffs func(start time.Time) (sa
 		if ran < 0 || drift > pruneClockStepSlack {
 			return 0, false
 		}
-		return start.Add(ran + pruneFutureSlack).Unix(), true
+		return futureHorizon(start, ran), true
 	}
 	// Close any dangling 'down' whose recovery lives only in the samples about to
 	// be deleted, so pruning can't turn it into phantom downtime. Not the running
@@ -8268,14 +8350,27 @@ func (s *Store) PruneLive(ctx context.Context, cutoffs func(start time.Time) (sa
 // and land under the mark - the restore's first batch would write them first
 // anyway, before it merges a row.
 //
-// The one way round it is a rowid handed out again, which needs every row above
-// it deleted first: the table's newest rows, all of them, after the mark. The
-// daemon's own writes keep the newest latency rows current, so that takes a
-// cleanup landing in the middle of a restore and removing the newest rows of a
-// small table that had nothing but old rows at its end, which only an earlier
-// restore of old rows leaves behind. The rows that come in on the old rowids
-// are then left out of PruneDue's count; nothing is ever counted that was not
-// stored after the mark.
+// The way round it is a rowid handed out again, which needs every row above it
+// deleted first: the table's newest rows, all of them, after the mark.
+//
+// Delete now does exactly that (Clear). It empties the table, and the next row
+// stored gets rowid 1. Pressed while a restore was still bringing rows of that
+// kind in, it left every restored row that landed afterwards on a rowid at or
+// below the mark, out of PruneDue's count, and with a mark in the millions
+// that was all of them: the reply said nothing and the next cleanup deleted
+// them. So a Delete now is noted in every watch open on the cleanup
+// (PruneTally.Cleared), and a restore counts a table that was emptied after
+// its watch opened from mark 0: every row then in it was stored after the
+// Delete now, the restore's and the daemon's own new ones, and the new ones
+// are under no window.
+//
+// The other is a cleanup that was running when the restore began and removes
+// the newest rows of a small table that had nothing but old rows at its end,
+// which only an earlier restore of old rows leaves behind (the daemon's own
+// writes keep the newest latency rows current, and no pass starts during a
+// restore: HoldCleanup). The rows that come in on the old rowids are then left
+// out of PruneDue's count; nothing is ever counted that was not stored after
+// the mark.
 func (s *Store) RowMark(ctx context.Context, table string) (int64, error) {
 	if _, ok := exportTables[table]; !ok {
 		return 0, fmt.Errorf("row mark: unknown table %q", table)
@@ -8291,17 +8386,30 @@ func (s *Store) RowMark(ctx context.Context, table string) (int64, error) {
 // since: what a restore is about to lose. It counts by pruneAge, the rules
 // Prune deletes by, so a straddling outage, an open one, and a pause that runs
 // into the window are counted exactly when the cleanup would delete them. The
-// future arms are not counted.
+// future arms are not counted here: PruneDueAhead counts those.
 //
 // Like Prune it first runs any re-judgement of held pauses that is owed. A
 // restore that brought held rows (pauses_quarantine) arms one, the next probe
 // round runs it anyway, and it is what hands a held row whose span is plainly
 // in the past back to pauses, where the pause rule then applies to it. Run
 // here, it happens before the count rather than beside it, and the held rows
-// it leaves are the ones no cleanup removes. What PruneDue leaves out is the
-// other repair Prune makes first: closing an outage that never got its
-// recovery, from the samples about to be deleted, which writes an 'up' where
-// none was. That outage is counted as the open one it still is.
+// it leaves are the ones no cleanup removes.
+//
+// The other repair Prune makes first is counted too: closing an outage that
+// never got its recovery, from the samples about to be deleted
+// (resolveDanglingDowns). PruneDue used to leave it out and count such an
+// outage as the open one it still is, which the cleanup keeps. But the cleanup
+// does not keep it. It gives the outage an end at the second the old samples
+// show, and where that second is past the outage cutoff as well, its sweep
+// then deletes the outage whole, in the same pass. A backup from an install
+// that kept its latency forever and restarted in the middle of an outage,
+// restored onto the default windows, is that case: the reply named the old
+// readings and said nothing of the outage the next cleanup deleted. So
+// PruneDue asks the close for a dry run (closeDanglingDowns), at the latency
+// cutoff it is counting at, and counts the outage rules as they stand once
+// those ends are written (pruneDueAfterCloses). The end the close writes is a
+// row of the daemon's, not the restore's, and is not counted; an 'up' it moves
+// back from ahead of the clock is a row that was there, and is.
 //
 // The rows after a mark can also put rows from before it on the cleanup's
 // list: a restored recovery can end one of this install's own old outages past
@@ -8312,7 +8420,11 @@ func (s *Store) RowMark(ctx context.Context, table string) (int64, error) {
 // A table missing from since is not counted, and neither is one Prune never
 // removes rows from by age (pauses_quarantine). The rows the daemon writes
 // itself after a mark are new, so they are only past a window shorter than the
-// time since the mark. Cheap on a big install, because no count reads a whole
+// time since the mark. The one exception is an end a close wrote after the
+// mark - a latency Delete now in the middle of a restore writes them - which
+// is dated at the second its samples show and counted with the restored rows
+// when that is past the window: the cleanup deletes it like them. Cheap on a
+// big install, because no count reads a whole
 // table (TestPruneDueCountsSeek): the latency and speed rules are ranges on
 // their table's ts index, which holds only the rows past the cutoff - two
 // million of them count in about 150 ms on a laptop - and the outage and span
@@ -8336,12 +8448,226 @@ func (s *Store) PruneDue(ctx context.Context, samplesBefore, speedBefore, events
 		}
 		due[table] = n
 	}
+	if mark, ok := since["events"]; ok {
+		closes, err := s.pruneDueCloses(ctx, samplesBefore, eventsBefore, since)
+		if err != nil {
+			return nil, err
+		}
+		n, err := s.pruneDueAfterCloses(ctx, closes, eventsBefore.Unix(), mark, false)
+		if err != nil {
+			return nil, err
+		}
+		due["events"] += n
+	}
 	return due, nil
 }
 
+// dueClose is an end the close a cleanup begins with would record
+// (plannedClose) at a second that is past the outage cutoff too, so that the
+// same cleanup's sweep then deletes the outage it ends.
+type dueClose struct {
+	plannedClose
+	// restored: this end is the restore's doing. The outage is a restored row,
+	// or a restored sample is among the readings of the second that proves its
+	// end. The rest are ends the cleanup would have written anyway.
+	restored bool
+}
+
+// pruneDueCloses is the dry run of the close the next cleanup at these
+// cutoffs begins with, kept to the ends that land past the outage cutoff:
+// the ones that put rows on that cleanup's list. It passes the close what
+// PruneLive passes it: the latency cutoff, and the line that keeps the close
+// away from the running monitor's outages (liveDownFloor), as it stands now.
+// An outage behind that line gets no end from the cleanup, so none is counted
+// for it. The monitor can move the line before the cleanup runs, and the
+// count is of a cleanup that finds it where it is.
+func (s *Store) pruneDueCloses(ctx context.Context, samplesBefore, eventsBefore time.Time, since map[string]int64) ([]dueClose, error) {
+	// A reader of the samples saves first. The rounds that wait are new, and
+	// prove no end past a cutoff.
+	s.SaveBuffered(SaveRead)
+	// At the clock a pass reads as it starts (pruneClock), which is what bounds
+	// the search for a recovery and says which events are ahead of it.
+	now, _ := pruneClock(s)
+	var plan []plannedClose
+	if err := s.closeDanglingDowns(ctx, samplesBefore.Unix(), now.Unix(), s.liveDownFloor.Load, &plan); err != nil {
+		return nil, err
+	}
+	var out []dueClose
+	for _, c := range plan {
+		if c.at >= eventsBefore.Unix() {
+			continue // the outage it ends straddles the cutoff, and the sweep keeps it
+		}
+		d := dueClose{plannedClose: c}
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM events WHERE type = 'down' AND ts = ?1 AND rowid > ?2)`,
+			c.down, since["events"]).Scan(&d.restored); err != nil {
+			return nil, err
+		}
+		if mark, ok := since["samples"]; ok && !d.restored {
+			if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM samples WHERE ts = ?1 AND rowid > ?2)`,
+				c.at, mark).Scan(&d.restored); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// pruneDueAfterCloses counts the outage rows the next cleanup deletes only
+// because its close first records the ends in closes: the rows after the mark
+// for PruneDue, or, with own set, the rows at or below it that go only because
+// of the ends that are the restore's doing, for PruneDueClosedOutages.
+//
+// An end at a second past the cutoff does to the sweep what a restored
+// recovery there does: every 'down' before it that the rule keeps today, for
+// want of a recovery under the cutoff, has one now. The latest such end
+// reaches them all, so one range is counted, the rows the rule does not
+// delete as the table stands (pruneDueKeptDowns). For the install's own rows
+// the range starts at the latest end the cleanup would have written without
+// the restore, since the rows before that one go either way.
+//
+// And an 'up' the close moves back from ahead of the clock, instead of
+// writing a new one, is a row that was there and is past the cutoff once
+// moved.
+func (s *Store) pruneDueAfterCloses(ctx context.Context, closes []dueClose, cutoff, mark int64, own bool) (int64, error) {
+	var from, to int64 // downs in [from, to) get a recovery under the cutoff
+	for _, c := range closes {
+		switch {
+		case own && !c.restored:
+			from = max(from, c.at)
+		default:
+			to = max(to, c.at)
+		}
+	}
+	var total int64
+	if to > from {
+		if err := s.db.QueryRowContext(ctx, pruneDueKeptDowns(own), cutoff, mark, from, to).Scan(&total); err != nil {
+			return 0, err
+		}
+	}
+	for _, c := range closes {
+		if c.moved == 0 || (own && !c.restored) {
+			continue
+		}
+		n, err := s.countUpAt(ctx, c.moved, mark, own)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// countUpAt counts the 'up' rows at ts on one side of a mark: the rows a
+// close moves when it moves the 'up' at ts back (closeDanglingDowns moves
+// every 'up' at that second, by its type and ts).
+func (s *Store) countUpAt(ctx context.Context, ts, mark int64, own bool) (int64, error) {
+	side := `rowid > ?2`
+	if own {
+		side = `rowid <= ?2`
+	}
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE type = 'up' AND ts = ?1 AND `+side, ts, mark).Scan(&n)
+	return n, err
+}
+
+// pruneAheadCol is, for each table the cleanup deletes from, the column its
+// future arm reads: a row goes when that is past the pass's horizon
+// (pruneFutureSlack ahead of its start), whatever the retention windows say.
+// PruneDueAhead counts by it, and TestPruneDueCountsWhatPruneRemovesByAge
+// holds it to what a pass removes.
+var pruneAheadCol = map[string]string{
+	"samples": "ts", "dns": "ts", "speed_spans": "ts",
+	"speed": "ts", "speed_servers": "run_ts",
+	"events": "ts", "pauses": "ts",
+}
+
+// PruneDueAhead counts, table by table, the rows the next Prune removes for
+// being stamped too far ahead of the clock (pruneFutureSlack), among the rows
+// each table gained after its RowMark in since. PruneDue leaves these out: it
+// counts by retention, and these go whatever the windows are. A restore was
+// told nothing of them, and a backup from a machine whose clock ran fast, or
+// one restored onto a machine whose clock is behind, lost those rows at the
+// next cleanup with a clean reply.
+//
+// Two kinds of row past the horizon are not deleted for it, and are not
+// counted. A pause that far ahead is kept while the re-judgement of held
+// pauses is still owed (see PruneLive), and PruneDue, which a restore calls
+// first, runs that re-judgement when it can. And the last outage's own 'up'
+// is moved back by the close a cleanup begins with, where the samples about to
+// go prove an earlier end (closeDanglingDowns): it then goes by age or stays,
+// and PruneDue has counted it if it goes. samplesBefore is the latency cutoff
+// that close works at.
+//
+// The horizon is the one a pass starting now begins with, by the clock it
+// reads (pruneClock, futureHorizon). A pass moves its own on by the time it
+// runs, and ends its future arms when the clock is set under it (PruneLive):
+// neither can be known before the pass, and the count is of a pass that
+// deletes as it starts. The close is asked with the line that keeps it away
+// from the running monitor's outages, as the cleanup asks it (pruneDueCloses).
+// Each count is a range on the column's index after the mark
+// (TestPruneDueCountsSeek).
+func (s *Store) PruneDueAhead(ctx context.Context, samplesBefore time.Time, since map[string]int64) (map[string]int64, error) {
+	s.SaveBuffered(SaveRead)
+	now, _ := pruneClock(s)
+	horizon := futureHorizon(now, 0)
+	ahead := make(map[string]int64, len(since))
+	for table, mark := range since {
+		if _, ok := pruneAheadCol[table]; !ok {
+			continue
+		}
+		if table == "pauses" && s.pauseRepairArmed() {
+			continue
+		}
+		var n int64
+		if err := s.db.QueryRowContext(ctx, pruneDueAheadCount(table), horizon, mark).Scan(&n); err != nil {
+			return nil, err
+		}
+		ahead[table] = n
+	}
+	if mark, ok := since["events"]; ok && ahead["events"] > 0 {
+		var plan []plannedClose
+		if err := s.closeDanglingDowns(ctx, samplesBefore.Unix(), now.Unix(), s.liveDownFloor.Load, &plan); err != nil {
+			return nil, err
+		}
+		for _, c := range plan {
+			if c.moved <= horizon {
+				continue
+			}
+			n, err := s.countUpAt(ctx, c.moved, mark, false)
+			if err != nil {
+				return nil, err
+			}
+			ahead["events"] -= n
+		}
+	}
+	return ahead, nil
+}
+
+// pruneDueAheadCount is PruneDueAhead's statement for one table of
+// pruneAheadCol: the rows after the mark past the horizon. ?1 is the horizon
+// and ?2 the mark.
+func pruneDueAheadCount(table string) string {
+	return `SELECT COUNT(*) FROM ` + table + ` WHERE rowid > ?2 AND ` + pruneAheadCol[table] + ` > ?1`
+}
+
+// pruneDueKeptDowns is pruneDueAfterCloses' statement: the 'down' rows on one
+// side of the mark, from ?3 up to ?4, that the events rule of pruneAge does
+// not delete as the table stands. ?1 is the cutoff and ?2 the mark. The rule
+// is pruneAge's own text, so what "kept today" means follows it.
+func pruneDueKeptDowns(own bool) string {
+	side := `rowid > ?2`
+	if own {
+		side = `rowid <= ?2`
+	}
+	return `SELECT COUNT(*) FROM events WHERE ` + side + ` AND type = 'down' AND ts >= ?3 AND ts < ?4
+		AND (` + pruneAge["events"].rule + `) IS NOT TRUE`
+}
+
 // PruneDueClosedOutages counts the outage records this install already had -
-// the events rows at or below mark (RowMark) - that the next Prune at
-// eventsBefore deletes only because of the rows stored after the mark. Prune
+// the events rows at or below their mark in since (RowMark) - that the next
+// Prune at these cutoffs deletes only because of the rows stored after the
+// marks. Prune
 // deletes outages whole (pruneAge): a 'down' past the cutoff stays while its
 // recovery is inside the window or has not come. A restored 'up' that lands
 // inside one of this install's own old outages - one still open, or one whose
@@ -8362,21 +8688,86 @@ func (s *Store) PruneDue(ctx context.Context, samplesBefore, speedBefore, events
 // itself, so it is one of the restored rows PruneDue counts, and these only
 // ever come with a count of those.
 //
-// Like PruneDue it leaves out the repair Prune makes first, closing an outage
-// that never got its recovery from the samples about to be deleted
-// (resolveDanglingDowns): that repair writes an 'up' where none was, and a
-// count writes nothing. An outage of this install's that only the samples show
-// recovered is left out, as the open one it still is.
+// Restored latency readings can end one of this install's own outages too.
+// The close a cleanup begins with gives an outage with no end the second the
+// old samples show (resolveDanglingDowns), and where a restored reading is
+// among the ones that prove it, or the outage that gets the end is itself
+// restored, the install's own 'down' rows before that second go with it. Those
+// are counted here as well, from the same dry run PruneDue counts from
+// (pruneDueCloses, pruneDueAfterCloses): samplesBefore is the latency cutoff
+// the close works at, and since holds the marks, the samples table's for
+// telling a restored reading. The ends the cleanup would have written without
+// the restore are left out, with the rows they take.
 //
 // NOT MATERIALIZED keeps SQLite from copying the rows at or below the mark out
 // first, which would take away the ts index the rule finds each recovery by
 // (TestPruneDueCountsSeek). The statement reads this install's own outage
 // records, with a seek for each one's recovery, which is fine for a table that
 // size.
-func (s *Store) PruneDueClosedOutages(ctx context.Context, eventsBefore time.Time, mark int64) (int64, error) {
+func (s *Store) PruneDueClosedOutages(ctx context.Context, samplesBefore, eventsBefore time.Time, since map[string]int64) (int64, error) {
+	mark, ok := since["events"]
+	if !ok {
+		return 0, nil
+	}
 	var n int64
-	err := s.db.QueryRowContext(ctx, pruneDueClosedCount(), eventsBefore.Unix(), mark).Scan(&n)
-	return n, err
+	if err := s.db.QueryRowContext(ctx, pruneDueClosedCount(), eventsBefore.Unix(), mark).Scan(&n); err != nil {
+		return 0, err
+	}
+	closes, err := s.pruneDueCloses(ctx, samplesBefore, eventsBefore, since)
+	if err != nil {
+		return 0, err
+	}
+	more, err := s.pruneDueAfterCloses(ctx, closes, eventsBefore.Unix(), mark, true)
+	return n + more, err
+}
+
+// ErrCleanupHeld is what PruneLive returns for a pass it did not start because
+// a restore was bringing rows in (HoldCleanup). Nothing failed and nothing was
+// deleted: the pass is counted as skipped (db.prune_skipped_restore) and the
+// next one removes what it would have.
+var ErrCleanupHeld = errors.New("cleanup held off while a backup is being restored")
+
+// HoldCleanup keeps the cleanup from starting a pass until the function it
+// returns is called. A restore takes it before its first row lands and lets go
+// once it has replied.
+//
+// A pass that landed in the middle of a restore read the windows in force at
+// that moment, and a backup's own windows only come into force at the reload
+// that ends the restore: our exports write the config last, so that a restore
+// that fails among the rows leaves the settings alone. A backup that keeps
+// history for longer than this install did - a long history moved onto a new
+// install, which is what a restore is mostly for - had the rows it had
+// brought so far deleted at the install's shorter window, a moment before the
+// window that keeps them arrived. The reply could report the loss (WatchPrunes)
+// and no more, and the only way back was to send the whole file again. On a
+// new install the first pass comes ten minutes after the start, which is about
+// when a backup is being restored.
+//
+// So a pass that would start while a restore is in flight does not: PruneLive
+// returns ErrCleanupHeld before it reads a window or deletes a row. The pruner
+// runs every hour and a cleanup removes whatever is past the windows when it
+// runs, so the pass after the restore removes what the skipped one would
+// have, at the windows the restore left in force.
+//
+// A pass already running when the hold is taken goes on. It reads the windows
+// again before every chunk, so it follows a window the restore raises from its
+// next chunk on. Until the restore's config lands it can still delete rows the
+// restore has brought, and the restore's watch on the cleanup says what it
+// deleted (WatchPrunes).
+//
+// Delete now is not held. It is the operator's own, and asked for.
+//
+// The hold is a count, not a lock, so nothing ever waits on it, a pass at
+// shutdown least of all. The function returned lets go once, however often it
+// is called, and the restore calls it on every way out of its handler, a
+// panic included. Safe on a nil store, like WatchPrunes.
+func (s *Store) HoldCleanup() (release func()) {
+	if s == nil {
+		return func() {}
+	}
+	s.cleanupHolds.Add(1)
+	var once sync.Once
+	return func() { once.Do(func() { s.cleanupHolds.Add(-1) }) }
 }
 
 // PruneTally is what the cleanup deleted while a watch on it was open
@@ -8394,12 +8785,24 @@ type PruneTally struct {
 	// by age, or lost them only at the epoch, where a window that keeps
 	// forever cuts, and no row is older than that.
 	Cut map[string]int64
+	// Cleared is, for each table, how many times a Delete now emptied it while
+	// the watch was open (Clear). Not a cleanup's doing, but a watch is how a
+	// restore learns what was deleted beside it, and a table emptied under it
+	// has handed its rowids out again (RowMark). A table missing from it was
+	// not emptied.
+	Cleared map[string]int64
+	// Clearing names the tables a Delete now had begun on and not yet ended
+	// when the tally was taken: waiting for its turn at the outage record, or
+	// in the middle of its delete. It has not emptied them yet, and is about
+	// to.
+	Clearing map[string]bool
 }
 
 // PruneWatch is a watch on the cleanup, from WatchPrunes to Close.
 type PruneWatch struct {
-	s     *Store
-	tally PruneTally // under s.pruneWatchMu
+	s      *Store
+	tally  PruneTally  // under s.pruneWatchMu; Clearing is filled in as it is read
+	closed *PruneTally // what Close returned, once it has
 }
 
 // WatchPrunes opens a watch on the cleanup. Until Close, every chunk of every
@@ -8409,12 +8812,19 @@ type PruneWatch struct {
 // cutoffs it cut at from then on, not at the later one it started at, which
 // would say it could reach rows it no longer could. A restore opens one as it
 // starts and closes it once it has counted what the next cleanup deletes
-// (PruneDue): a pass that ran in between may already have deleted rows the
-// restore brought, which no count taken afterwards can see, and the restore
-// says so rather than let them go unmentioned. It is kept by table because a
+// (PruneDue): a pass that was running as the restore began may already have
+// deleted rows the restore brought, which no count taken afterwards can see,
+// and the restore says so rather than let them go unmentioned. No pass starts
+// while a restore is in flight (HoldCleanup), so that is the one pass there
+// can be. It is kept by table because a
 // pass that deleted rows of one kind says nothing about the rows of another:
 // an install older than its latency window deletes aged samples at every
 // hourly pass, whatever a restore brings.
+//
+// A watch also notes each Delete now that empties a table while it is open
+// (PruneTally.Cleared), and names the tables one is on as it is read
+// (PruneTally.Clearing): the restore tells its rows from the install's by
+// rowid, and a table emptied under it hands its rowids out again (RowMark).
 //
 // A watch holds what was deleted while it was open, and nothing from before.
 // The restore used to read a tally kept since the store opened, as it began
@@ -8426,7 +8836,7 @@ type PruneWatch struct {
 // rows past the raised window. Safe on a nil store, like SaveBuffered: the
 // watch then holds nothing.
 func (s *Store) WatchPrunes() *PruneWatch {
-	w := &PruneWatch{s: s, tally: PruneTally{Rows: map[string]int64{}, Cut: map[string]int64{}}}
+	w := &PruneWatch{s: s, tally: PruneTally{Rows: map[string]int64{}, Cut: map[string]int64{}, Cleared: map[string]int64{}}}
 	if s == nil {
 		return w
 	}
@@ -8447,7 +8857,74 @@ func (w *PruneWatch) Close() PruneTally {
 		defer w.s.pruneWatchMu.Unlock()
 		delete(w.s.pruneWatches, w)
 	}
-	return PruneTally{Rows: maps.Clone(w.tally.Rows), Cut: maps.Clone(w.tally.Cut)}
+	if w.closed == nil {
+		t := w.read()
+		w.closed = &t
+	}
+	return *w.closed
+}
+
+// Tally returns what the watch holds now and leaves it open. A restore reads
+// it before it counts, to know which tables a Delete now has emptied under it
+// (PruneTally.Cleared), and closes the watch after.
+func (w *PruneWatch) Tally() PruneTally {
+	if w.s != nil {
+		w.s.pruneWatchMu.Lock()
+		defer w.s.pruneWatchMu.Unlock()
+	}
+	if w.closed != nil {
+		return *w.closed
+	}
+	return w.read()
+}
+
+// read copies what the watch holds, with the tables a Delete now is on at this
+// moment. The caller holds pruneWatchMu, where there is a store.
+func (w *PruneWatch) read() PruneTally {
+	t := PruneTally{Rows: maps.Clone(w.tally.Rows), Cut: maps.Clone(w.tally.Cut),
+		Cleared: maps.Clone(w.tally.Cleared), Clearing: map[string]bool{}}
+	if w.s != nil {
+		for table, n := range w.s.clearing {
+			if n > 0 {
+				t.Clearing[table] = true
+			}
+		}
+	}
+	return t
+}
+
+// noteClearing records that a Delete now has begun on tables, and returns the
+// function that records its end: once, with whether it emptied them. Every
+// watch open at that end notes the tables as emptied (PruneTally.Cleared), and
+// from the beginning to the end a watch that is read names them as being
+// emptied (PruneTally.Clearing), which covers a Delete now that waits - a
+// downtime one waits for a restore's outage history - and the moment between
+// its commit and its note.
+func (s *Store) noteClearing(tables []string) (ended func(emptied bool)) {
+	s.pruneWatchMu.Lock()
+	if s.clearing == nil {
+		s.clearing = map[string]int{}
+	}
+	for _, table := range tables {
+		s.clearing[table]++
+	}
+	s.pruneWatchMu.Unlock()
+	var once sync.Once
+	return func(emptied bool) {
+		once.Do(func() {
+			s.pruneWatchMu.Lock()
+			defer s.pruneWatchMu.Unlock()
+			for _, table := range tables {
+				s.clearing[table]--
+				if !emptied {
+					continue
+				}
+				for w := range s.pruneWatches {
+					w.tally.Cleared[table]++
+				}
+			}
+		})
+	}
 }
 
 // notePruned adds a chunk that deleted n rows of table to every open watch
@@ -8855,6 +9332,12 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 	default:
 		return 0, fmt.Errorf("unknown data kind %q", kind)
 	}
+	// A restore that is running has to know (noteClearing): a table emptied
+	// under it hands its rowids out again, and the restore tells the rows it
+	// brought from the rows already here by rowid (RowMark). Noted from here,
+	// before any wait, to the commit, or to wherever this gives up.
+	ended := s.noteClearing(tables)
+	defer ended(false)
 	// The readings still waiting belong to what is being cleared. Saved first
 	// they are deleted and counted with the rest. Left waiting they would come
 	// back after the clear. So a clear that cannot save them deletes nothing.
@@ -8944,6 +9427,7 @@ func (s *Store) Clear(ctx context.Context, kind string) (int64, error) {
 		recordDBErr(err)
 		return 0, err
 	}
+	ended(true)
 	s.invalidateReadCaches()
 	// Here by decision more than by need. Emptying a whole table frees its
 	// pages without logging its rows (0.55 bytes of log a row measured,

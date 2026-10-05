@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"mime"
 	"net"
@@ -195,7 +196,10 @@ type Server struct {
 	// (POST /api/access). Without it the reconcile has to GUESS whether a username
 	// it did not expect came from the backup or from the operator, and it guessed
 	// wrong for a password-only rotation - which keeps the username by design, so
-	// the password hash moved while the name did not.
+	// the password hash moved while the name did not. A settings save (POST
+	// /api/settings) takes it for the same kind of reason: the restore weighs
+	// the backup's retention windows against the install's, and a save landing
+	// between the weighing and the write was overwritten (handleSettings).
 	importMu sync.Mutex
 	// reconciling is true from the moment a restore starts landing the backup's
 	// config rows until the safety repair has finished. The guard refuses the
@@ -219,9 +223,10 @@ type Server struct {
 	// importMu above covers: an import takes importMu for the settings
 	// reconcile, from its first config row to the end of the repair, and only
 	// when the backup carries the config category at all (the importedConfig
-	// branch in handleImport). The two other holders, handleAccess and
-	// handleQuickSetup, take it to keep the access and first-run answers from
-	// interleaving with that reconcile; neither one restores rows. So importMu
+	// branch in handleImport). The other holders, handleAccess,
+	// handleQuickSetup and a save in handleSettings, take it to keep the access
+	// and first-run answers and the saved settings from interleaving with that
+	// reconcile; none of them restores rows. So importMu
 	// was never what serialized the row writes where the contention happens.
 	// Lazily built (importGate) so a struct-literal Server still gates.
 	importSemOnce sync.Once
@@ -3243,6 +3248,23 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, msg, http.StatusBadRequest)
 			return
 		}
+		// A save takes its turn with a restore's config, as an access change
+		// and a Quick Setup answer do. A restore weighs each retention row of
+		// the backup against the window this install keeps, some way ahead of
+		// the write that stores the row, and the reload at its end makes what
+		// is stored live. The guard refuses requests once the restore has
+		// reached its config, but not one that was already past it: a save
+		// raising a window to ninety days that committed between those two
+		// steps was overwritten by the backup's sixty, which had been weighed
+		// against the thirty from before the save, with no note in the reply.
+		// Under the lock one of the two goes first, whole. Taken after the body
+		// is read, so a slow client holds nothing, and held to the end of the
+		// save.
+		s.importMu.Lock()
+		defer s.importMu.Unlock()
+		if settingsSaveHook != nil {
+			settingsSaveHook()
+		}
 		prevExit := s.settings.ExitTarget() // detect an exit-path change to re-trace below
 		// Update() is a PATCH: nil (absent) fields keep their current value, so a
 		// partial body can't silently reset settings it didn't mention. Fields the
@@ -3504,10 +3526,45 @@ func (s *Server) RestoreInFlight() bool { return s.reconciling.Load() }
 
 // RestoreDrainBudget is the longest that window can last once the rows are
 // committed: the reconcile's own ceiling plus the fresh one the last-resort
-// restore of the pre-import login keys deliberately gets. Nothing in the
-// handler outlasts it, so a shutdown that has waited this long has waited long
-// enough.
-func RestoreDrainBudget() time.Duration { return importReconcileBudget + importRestoreBudget }
+// restore of the pre-import login keys deliberately gets, and the few seconds
+// the count of restored rows past a window may take after a shutdown has begun
+// (importCountBudget). Nothing in the handler outlasts it, so a shutdown that
+// has waited this long has waited long enough.
+func RestoreDrainBudget() time.Duration {
+	return importReconcileBudget + importRestoreBudget + importCountBudget
+}
+
+// importCountBudget is how long a restore's count of the rows the next cleanup
+// deletes may go on once the request's own context is gone (countContext).
+// Under shutdownWorkerGrace in main, so a restore stopped by a shutdown has
+// its count before the store closes.
+const importCountBudget = 3 * time.Second
+
+// countContext is the context a restore counts on (restoredRowsDue): the
+// request's, kept alive for importCountBudget after the request's is cancelled.
+//
+// The count ran on the request's context. That follows the run context, so a
+// shutdown cancels it, and a client that hangs up cancels it too. Either one
+// stops the restore at its next batch, with the earlier batches committed, and
+// the count of those rows then failed on the cancelled context and was dropped
+// as a reply nobody reads. After a shutdown somebody does: the server gives
+// the connection three more seconds and the handler rides serveWG, so the
+// client got "partially applied" with no word that the rows it had just
+// committed go at the next cleanup, ten minutes after the restart. And after
+// either, nothing reached the log. The reconcile is detached and bounded for
+// the same reason (importReconcileBudget). While the request is alive the
+// count has no deadline of its own, as before.
+func countContext(req context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(req))
+	stop := context.AfterFunc(req, func() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(importCountBudget):
+			cancel()
+		}
+	})
+	return ctx, func() { stop(); cancel() }
+}
 
 // importRestoreBudget bounds the last-resort restore of the pre-import
 // auth/access keys after the reload has failed for good. Deliberately NOT the
@@ -3515,6 +3572,10 @@ func RestoreDrainBudget() time.Duration { return importReconcileBudget + importR
 // reload fails in the first place, and the restore is what stands between that
 // failure and a restart silently adopting the backup's login settings.
 const importRestoreBudget = 10 * time.Second
+
+// settingsSaveHook is called by a settings save (POST /api/settings) once it
+// has its turn, before it writes. Test seam only; nil in production.
+var settingsSaveHook func()
 
 // importReconcileHook is called once the imported settings are live but before the
 // safety repair has run - the window in which the destination is running on
@@ -3992,7 +4053,9 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// still open, and a pause that runs into the window - the cleanup keeps all
 	// three - and it counted rows this install already had as the restore's. And
 	// it reads what the tables hold, so a restore that fails part way is told
-	// about the rows it did commit, as a clean one is.
+	// about the rows it did commit, as a clean one is - one stopped by a
+	// shutdown or by its client included, since the count runs on a context
+	// of its own (countContext).
 	//
 	// Every table of a category is marked the first time any of its keys is
 	// reached, before a row of it lands (latency = samples + dns, speed = speed +
@@ -4003,14 +4066,32 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// with no rows, or none past the window, says nothing, and a row stamped 0 -
 	// the epoch, as old as a row gets - is counted like any other.
 	//
-	// The hourly cleanup can also run in the middle of a restore, and delete
-	// restored rows before they are counted. pruned watches what it deletes
-	// from here until the count (store.WatchPrunes), and oldest is the oldest
-	// timestamp the restore brings in each category (importArray): the reply
-	// says that a cleanup ran where it could have taken rows this restore
+	// No hourly cleanup starts from here until the reply (store.HoldCleanup).
+	// One that did cut at the windows in force at that moment, and a backup's
+	// own windows only come into force at the reload further down: our exports
+	// write the config last. A backup that keeps history for longer than this
+	// install did lost the rows it had brought so far to the install's shorter
+	// window, just before the window that keeps them arrived. The pass that
+	// comes due meanwhile is skipped and the next one catches up. Let go on
+	// every way out, a panic included, so the hold cannot outlast the restore.
+	//
+	// A cleanup that was already running when the restore began goes on, and
+	// can delete restored rows before they are counted. pruned watches what it
+	// deletes from here until the count (store.WatchPrunes), and oldest is the
+	// oldest timestamp the restore brings in each category (importArray): the
+	// reply says that a cleanup ran where it could have taken rows this restore
 	// brought, rather than leave those rows unmentioned, and only there
 	// (restoredRowsDue).
-	marks, oldest := map[string]int64{}, map[string]int64{}
+	//
+	// Delete now can be pressed in the middle of a restore too, and it empties
+	// a table, which starts its rowids again from 1: the rows this restore
+	// brings afterwards land at or below the mark and would not be counted.
+	// The watch notes each Delete now as well, and clearedAt is how many times
+	// each table had been emptied when it was marked, so the count can tell a
+	// table emptied since (restoredRowsDue).
+	marks, oldest, clearedAt := map[string]int64{}, map[string]int64{}, map[string]int64{}
+	resumeCleanup := s.store.HoldCleanup()
+	defer resumeCleanup()
 	pruned := s.store.WatchPrunes()
 	defer pruned.Close()
 	// A restore replaces the rows this daemon may have watched being created, so
@@ -4068,10 +4149,23 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// as long lands as before, and every other setting imports as before.
 	// keptRetention remembers what the backup asked for where its row was left
 	// out, and the reply says so (retentionKeptWarning), so an operator who
-	// wanted the backup's window can lower it in the Data tab, deliberately. A
-	// file carrying one key twice keeps the note of its last row, the one that
-	// stands.
-	keptRetention := map[string]time.Duration{}
+	// wanted the backup's window can lower it in the Data tab, deliberately.
+	//
+	// What a row is weighed against is the longer of two windows: the one this
+	// install kept as the restore reached its config (preRetention, read once,
+	// under importMu, below), and the one an earlier row of this same file has
+	// already put in its place (landedRetention). It used to be the window in
+	// force as the row was read. That does not move while the config streams
+	// in, so a file carrying one key twice - hand-built ones do - had its later
+	// row weighed against the window from before the restore: ninety days and
+	// then one, onto thirty, landed the ninety and left the one out, and then
+	// landed a sixty after them over the ninety. Unless a reload signal came in
+	// between, which made the ninety the window in force and left the sixty
+	// out: which row stood depended on the timing of a signal. Now the longest
+	// row of the file stands either way. keptRetention keeps the note of the
+	// file's last row for a key, when that row was left out.
+	keptRetention, landedRetention := map[string]time.Duration{}, map[string]time.Duration{}
+	var preRetention map[string]time.Duration
 	keepRetentionRow := func(row map[string]any) bool {
 		k, _ := row["key"].(string)
 		cat := settings.RetentionCategory(k)
@@ -4082,8 +4176,13 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return true // the store lands nothing for it either
 		}
-		asked, _, keeps := s.settings.RestoredRetention(k, text)
-		if keeps {
+		asked, _, _ := s.settings.RestoredRetention(k, text)
+		here := preRetention[cat]
+		if landed, ok := landedRetention[cat]; ok && settings.KeepsAtLeast(landed, here) {
+			here = landed
+		}
+		if settings.KeepsAtLeast(asked, here) {
+			landedRetention[cat] = asked
 			delete(keptRetention, cat)
 			return true
 		}
@@ -4191,6 +4290,12 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			// Quick Setup answer waits that long rather than interleaving.
 			s.importMu.Lock()
 			defer s.importMu.Unlock()
+			// The windows this install keeps, which no row of the backup may
+			// shorten (keepRetentionRow). Read here, with the lock held: a
+			// settings save takes it too (handleSettings), so one that was under
+			// way has finished and its window is the one read, and none can
+			// land between this and the reload.
+			preRetention = s.retentionWindows()
 			preAuthActive = s.settings.AuthActive()
 			preAuthEnabled = s.settings.AuthEnabled()
 			preHasPassword = s.settings.HasPassword()
@@ -4205,6 +4310,11 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			if _, seen := marks[t.table]; seen || t.cat != dc.cat || t.cat == "config" {
 				continue
 			}
+			// How often the table had been emptied, read before the mark: a
+			// Delete now that lands between the two then counts as one since
+			// the mark, which starts the count from 0. Read after it, such a
+			// Delete now would pass for one from before a mark it made stale.
+			emptied := pruned.Tally().Cleared[t.table]
 			mark, merr := s.store.RowMark(r.Context(), t.table)
 			if merr != nil {
 				// 0 counts every row of the table the cleanup would delete: the
@@ -4218,6 +4328,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 				mark = 0
 			}
 			marks[t.table] = mark
+			clearedAt[t.table] = emptied
 		}
 		onRow := func(row map[string]any) bool { notePairRow(row); return true }
 		if dc.table == "settings" {
@@ -4559,7 +4670,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// read once, here, and both notes and the count use them.
 	windows := s.retentionWindows()
 	if len(keptRetention) > 0 {
-		warnings = append(warnings, retentionKeptWarning(keptRetention, windows))
+		warnings = append(warnings, retentionKeptWarning(keptRetention, windows, preRetention))
 		kept := map[string]time.Duration{}
 		for cat := range keptRetention {
 			kept[cat] = windows[cat]
@@ -4567,7 +4678,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("restore left the retention windows alone where the backup's would have kept history for less time",
 			"backup", keptRetention, "kept", kept)
 	}
-	warnings = append(warnings, s.restoredRowsDue(r.Context(), marks, windows, result, oldest, pruned)...)
+	warnings = append(warnings, s.restoredRowsDue(r.Context(), marks, clearedAt, windows, result, oldest, pruned)...)
 	if importErr != nil {
 		// A category failed mid-stream, but earlier categories (and any config) were
 		// already committed - the import is intentionally incremental, not atomic. Say
@@ -4745,12 +4856,20 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // cleanup deletes an outage whole, so a restored recovery that ends one of
 // this install's own old outages before the window takes that outage's 'down'
 // with the restored rows: the count of restored rows alone was two where the
-// cleanup deleted three. Importing the file again brings those back only if
+// cleanup deleted three. Restored latency readings can do the same. The
+// cleanup begins by giving an outage with no recorded end the end the old
+// readings show, and where that is past the downtime window too it deletes
+// the outage in the same pass, a restored one or one of this install's. The
+// store counts both from a dry run of that step. Where the restore brought no
+// downtime row past the window to name this install's records beside - a
+// restore of latency readings alone, say - they get a line of their own
+// (ownOutagesDueWarning). Importing the file again brings those back only if
 // the backup holds them, so there the advice is to raise the window before the
 // next cleanup.
 //
-// A pass can also land in the middle of the restore, and delete restored rows
-// before this count can see them. The reply says so for each category where a
+// A pass that was running when the restore began goes on beside it (none
+// starts during one: store.HoldCleanup), and can delete restored rows before
+// this count can see them. The reply says so for each category where a
 // pass could have: the cleanup deleted rows of the category's tables while the
 // restore ran (pruned, the watch the restore opened as it began,
 // store.WatchPrunes), rows of the category landed (landed), and the oldest row
@@ -4782,14 +4901,53 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // restore to this count, and nothing else.
 //
 // Which of the rows a pass deleted were the restore's cannot be told any more,
-// so the reply says they may be among them, with the same advice as above. It
-// is judged by table: an install older than its latency window deletes aged
-// samples at every hourly pass, and a restore of recent rows, or of speed runs
-// alone, is not told a cleanup may have taken them. Where downtime is among
+// so the reply says they may be among them, with the same advice as above -
+// where that advice is true. It is not when the backup itself lengthened the
+// window: our exports write the config last, so the pass cut at the install's
+// shorter window while the rows came in, and by the reply the longer one is in
+// force. The reply used to tell that operator to raise a window that was
+// raised already, to keep rows that were not older than it. So it is worded
+// by the window in force: where that window keeps every row of the category
+// the restore brought (the oldest of them is no older than its cutoff now),
+// importing the backup again is all there is to do, and the reply says that;
+// where it does not, the advice is the one above. It is judged by table: an
+// install older than its latency window deletes aged samples at every hourly
+// pass, and a restore of recent rows, or of speed runs alone, is not told a
+// cleanup may have taken them. Where downtime is among
 // them it adds the caveat of the downtime warning: the cleanup deletes an
 // outage whole, so this install's own outage records may have gone with
 // restored rows, and importing again brings those back only if the backup
 // holds them.
+//
+// Rows stamped too far ahead of the clock are counted as well
+// (store.PruneDueAhead). The cleanup deletes those whatever the windows are,
+// so a backup from a machine whose clock ran fast, or one restored onto a
+// machine whose clock is behind, lost them at the next cleanup with nothing
+// said. They get a line of their own (restoredAheadWarning): raising a window
+// does not keep them.
+//
+// Delete now can land in the middle of the restore as well, and it empties
+// its category's tables, so the next row stored gets rowid 1 and the marks no
+// longer tell the restore's rows from the install's. A latency or speed Delete
+// now pressed while that category was still coming in left every restored row
+// that landed afterwards under the mark: the reply said nothing, and the next
+// cleanup deleted them. A downtime one waits for the restore's outage history
+// and then runs beside this count, which named thousands of rows as due that
+// the operator's own delete had just removed. The watch notes each Delete now
+// (store.PruneTally), and clearedAt is how often each table had been emptied
+// when it was marked. So, for a category the restore brought rows of:
+//
+//   - emptied since its mark, and not being emptied now: it is counted from
+//     mark 0. Every row in it was stored after the Delete now, the rest of the
+//     restore's and the daemon's own new ones, which are under no window. The
+//     reply also says that the rows restored before the Delete now went with
+//     it.
+//   - being emptied as the count was taken - a Delete now that has begun and
+//     not ended, or one that ended between the read of the watch before the
+//     count and its close after it: no count of it means anything, so there is
+//     none, and the reply says the restored rows go with the Delete now.
+//
+// Either way the way back is to import the file again.
 //
 // What the reply cannot see is what a pass still running when it is written
 // deletes afterwards, the rows of a category whose tables it has not reached
@@ -4800,28 +4958,89 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // are past the windows in force and counted above as due at the next cleanup.
 // Only a window lowered after the reply lets it go further, and then no
 // further than the cutoffs it started at.
-func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, windows map[string]time.Duration, landed map[string]int, oldest map[string]int64, pruned *store.PruneWatch) []string {
+func (s *Server) restoredRowsDue(ctx context.Context, marks, clearedAt map[string]int64, windows map[string]time.Duration, landed map[string]int, oldest map[string]int64, pruned *store.PruneWatch) []string {
 	if len(marks) == 0 {
 		return nil
 	}
+	// Counted on a context that outlives the request's by a few seconds, so a
+	// restore stopped by a shutdown, or by its client, still has its count.
+	ctx, counted := countContext(ctx)
+	defer counted()
 	now := time.Now()
-	eventsCut := settings.PruneCutoff(now, windows["downtime"])
-	due, err := s.store.PruneDue(ctx, settings.PruneCutoff(now, windows["latency"]),
-		settings.PruneCutoff(now, windows["speed"]), eventsCut, marks)
-	// Counted after the restored rows: the recovery that closes one of this
-	// install's outages is itself a restored row the cleanup deletes, so these
-	// are only ever reported beside a count of those.
+	samplesCut, eventsCut := settings.PruneCutoff(now, windows["latency"]), settings.PruneCutoff(now, windows["downtime"])
+	// A table a Delete now has emptied since it was marked is counted from
+	// mark 0 (see above).
+	emptied := pruned.Tally().Cleared
+	since := maps.Clone(marks)
+	for table := range since {
+		if emptied[table] > clearedAt[table] {
+			since[table] = 0
+		}
+	}
+	due, err := s.store.PruneDue(ctx, samplesCut, settings.PruneCutoff(now, windows["speed"]), eventsCut, since)
+	// Counted after the restored rows. A restored recovery that closes one of
+	// this install's outages is itself a restored row the cleanup deletes, so
+	// those are reported beside a count of the restored rows. Restored latency
+	// readings that show when one ended are not downtime rows, so an outage
+	// they end can be all there is to report for downtime (below).
 	var closed int64
-	if mark, ok := marks["events"]; ok && err == nil {
-		closed, err = s.store.PruneDueClosedOutages(ctx, eventsCut, mark)
+	if err == nil {
+		// A restore that brought latency readings and no outage history can
+		// still end one of this install's outages: every outage row there is
+		// now is the install's own.
+		ownSince := since
+		if _, marked := since["events"]; !marked {
+			if _, readings := since["samples"]; readings {
+				var all int64
+				if all, err = s.store.RowMark(ctx, "events"); err == nil {
+					ownSince = maps.Clone(since)
+					ownSince["events"] = all
+				}
+			}
+		}
+		if err == nil {
+			closed, err = s.store.PruneDueClosedOutages(ctx, samplesCut, eventsCut, ownSince)
+		}
+	}
+	// And the restored rows the cleanup deletes whatever the windows are: the
+	// ones stamped too far ahead of this machine's clock.
+	var ahead map[string]int64
+	if err == nil {
+		ahead, err = s.store.PruneDueAhead(ctx, samplesCut, since)
 	}
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil // the client has gone, or the daemon is stopping: nobody reads this reply
-		}
 		s.log.Warn("restore: could not count the restored rows the next cleanup deletes", "err", err)
 		return []string{"Could not check whether any restored rows are older than this install's retention windows (" +
 			err.Error() + "). Rows older than a window are deleted at the next cleanup, which runs every hour."}
+	}
+	// Closed after the count, not before it: a row a pass deletes in between
+	// is then in one of the two, and at worst in both - bar the moment between
+	// a chunk's commit and its note, far shorter than the count. And a Delete
+	// now that ran beside the count shows in it.
+	tally := pruned.Close()
+	// deleted names the categories a Delete now emptied after the restore had
+	// brought rows of them, and deleting the ones one was emptying as the
+	// count was taken.
+	var deleted, deleting []string
+	uncounted := map[string]bool{}
+	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
+		if landed[cat] == 0 {
+			continue
+		}
+		was, is := false, false
+		for _, dc := range dataCategories {
+			if _, marked := marks[dc.table]; !marked || dc.cat != cat {
+				continue
+			}
+			was = was || emptied[dc.table] > clearedAt[dc.table]
+			is = is || tally.Clearing[dc.table] || tally.Cleared[dc.table] != emptied[dc.table]
+		}
+		switch {
+		case is:
+			deleting, uncounted[cat] = append(deleting, cat), true
+		case was:
+			deleted = append(deleted, cat)
+		}
 	}
 	var out []string
 	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
@@ -4831,7 +5050,7 @@ func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, wi
 				n += due[dc.table]
 			}
 		}
-		if n == 0 {
+		if n == 0 || uncounted[cat] {
 			continue
 		}
 		var own int64
@@ -4844,12 +5063,43 @@ func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, wi
 		}
 		s.log.Warn("restored rows are older than the retention window; the next cleanup deletes them", attrs...)
 		out = append(out, restoredDueWarning(cat, n, own, windows[cat]))
+		if own > 0 {
+			closed = 0 // named
+		}
 	}
-	// Closed after the count, not before it: a row a pass deletes in between
-	// is then in one of the two, and at worst in both - bar the moment between
-	// a chunk's commit and its note, far shorter than the count.
-	tally := pruned.Close()
-	var gone []string
+	if closed > 0 && !uncounted["downtime"] {
+		s.log.Warn("restored latency readings end outages this install already had before the retention window; the next cleanup deletes them",
+			"own_outage_records", closed, "window", windows["downtime"])
+		out = append(out, ownOutagesDueWarning(closed, windows["downtime"]))
+	}
+	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
+		var n int64
+		for _, dc := range dataCategories {
+			if dc.cat == cat {
+				n += ahead[dc.table]
+			}
+		}
+		if n == 0 || uncounted[cat] {
+			continue
+		}
+		s.log.Warn("restored rows are stamped too far ahead of the clock; the next cleanup deletes them",
+			"category", cat, "rows", n, "ahead_by_more_than", store.FutureSlack)
+		out = append(out, restoredAheadWarning(cat, n))
+	}
+	if len(deleted) > 0 {
+		s.log.Warn("Delete now ran during the restore; the rows restored before it went with it", "categories", deleted)
+		out = append(out, "Delete now removed the "+andList(deleted)+" data while this backup was being restored, and the "+
+			andList(deleted)+" rows restored before that went with it. Import this backup again to bring them back.")
+	}
+	if len(deleting) > 0 {
+		s.log.Warn("Delete now was running as the restore finished; the rows it restored go with it", "categories", deleting)
+		out = append(out, "Delete now was removing the "+andList(deleting)+" data as this restore finished, and the "+
+			andList(deleting)+" rows it restored go with it. Import this backup again to bring them back.")
+	}
+	// gone says how many rows went, category by category. kept names the
+	// categories whose window in force keeps every row the restore brought,
+	// and past the ones where it does not.
+	var gone, kept, past []string
 	goneRows := map[string]int64{}
 	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
 		var n, cut int64
@@ -4872,13 +5122,30 @@ func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, wi
 			rows = "1 " + cat + " row"
 		}
 		gone = append(gone, rows)
+		if ts >= settings.PruneCutoff(now, windows[cat]).Unix() {
+			kept = append(kept, cat)
+		} else {
+			past = append(past, cat)
+		}
 	}
 	if len(gone) > 0 {
 		s.log.Warn("the cleanup ran during the restore; restored rows past a retention window may be among the rows it deleted",
-			"rows", goneRows)
-		ran := "The cleanup ran while this backup was being restored and deleted " + andList(gone) + ". Restored " +
-			"rows that were already older than a retention window may be among them: to keep those, raise that window " +
-			"in the Data tab and import this backup again."
+			"rows", goneRows, "window_now_keeps", kept)
+		ran := "The cleanup ran while this backup was being restored and deleted " + andList(gone) + ". "
+		switch {
+		case len(kept) == 0:
+			ran += "Restored rows that were already older than a retention window may be among them: to keep those, " +
+				"raise that window in the Data tab and import this backup again."
+		case len(past) == 0:
+			ran += "Restored rows may be among them: the cleanup had started on a shorter retention window than the " +
+				"one in force now, which keeps every row of that kind this backup holds. Import this backup again to " +
+				"bring back the ones it deleted."
+		default:
+			ran += "Restored rows that were already older than a retention window may be among them. The " +
+				andList(kept) + " retention now in force keeps every row of that kind this backup holds, so importing " +
+				"this backup again brings those back. To keep the " + andList(past) + " rows, raise that window in " +
+				"the Data tab first."
+		}
 		if goneRows["downtime"] > 0 {
 			ran += " The cleanup deletes an outage whole, so outage records this install already had may be among " +
 				"them too, and importing this backup again brings those back only if the backup holds them."
@@ -4886,6 +5153,39 @@ func (s *Server) restoredRowsDue(ctx context.Context, marks map[string]int64, wi
 		out = append(out, ran)
 	}
 	return out
+}
+
+// restoredAheadWarning says that n restored rows of cat are stamped further
+// ahead of this machine's clock than the cleanup lets a row be
+// (store.FutureSlack) and go at the next cleanup, whatever the retention
+// window. No window keeps them, so the advice is about the clock: nothing
+// brings back a row recorded by a clock that ran fast, and a restore onto a
+// machine whose own clock is behind can be made again once it is set.
+func restoredAheadWarning(cat string, n int64) string {
+	rows, them := strconv.FormatInt(n, 10)+" restored "+cat+" rows are", "them"
+	if n == 1 {
+		rows, them = "1 restored "+cat+" row is", "it"
+	}
+	return rows + " dated more than " + strconv.Itoa(int(store.FutureSlack/time.Hour)) + " hours ahead of this " +
+		"machine's clock and will be deleted at the next cleanup, which runs every hour, whatever the retention " +
+		"window: the clock that recorded " + them + " ran fast, or this machine's clock is behind. If it is this " +
+		"machine's, set it and import this backup again."
+}
+
+// ownOutagesDueWarning says that own outage records this install already had
+// go at the next cleanup because of a restore that brought no downtime row
+// past the window to name them beside: restored latency readings show when
+// those outages ended, which nothing had recorded, and the cleanup records
+// that end before it deletes the readings, and then deletes an outage that
+// ended before the downtime window (store.PruneDueClosedOutages).
+func ownOutagesDueWarning(own int64, window time.Duration) string {
+	records, them := strconv.FormatInt(own, 10)+" outage records this install already had", "them"
+	if own == 1 {
+		records, them = "1 outage record this install already had", "it"
+	}
+	return records + " will be deleted at the next cleanup, which runs every hour: the restored latency readings " +
+		"show that the outage ended before this install's downtime retention window (" + retentionSpan(window) +
+		") begins. To keep " + them + ", raise that window in the Data tab before the next cleanup."
 }
 
 // restoredDueWarning says that n restored rows of cat are past its retention
@@ -4903,36 +5203,51 @@ func restoredDueWarning(cat string, n, own int64, window time.Duration) string {
 			"already here are skipped, and any the cleanup has deleted come back."
 	}
 	// Records, and not recoveries: a restart in the middle of an outage gives
-	// it a second 'down', and one restored recovery can end both.
-	records, ends := strconv.FormatInt(own, 10)+" outage records this install already had", "the restored rows now end those outages"
-	switch {
-	case own == 1:
-		records, ends = "1 outage record this install already had", "a restored recovery now ends its outage"
-	case n == 1:
-		ends = "the restored row now ends those outages"
+	// it a second 'down', and one restored recovery can end both. And "restored
+	// rows", not "restored recoveries": an outage with no end can also get one
+	// from restored latency readings, which the cleanup reads it from.
+	records, ends := strconv.FormatInt(own, 10)+" outage records this install already had", "restored rows now end those outages"
+	if own == 1 {
+		records, ends = "1 outage record this install already had", "restored rows now end its outage"
 	}
 	return due + " " + records + " will be deleted with " + them + ": " + ends + " before the window begins. To keep " +
 		"them all, raise that window in the Data tab before the next cleanup. Importing this backup again afterwards " +
 		"brings back the restored rows the cleanup deleted, but this install's own records only if the backup holds them."
 }
 
-// retentionKeptWarning says which retention windows a restore left as they
-// were because the backup's would have kept history for less time: what the
-// backup keeps, and what this install still keeps (windows, in force now).
-func retentionKeptWarning(kept, windows map[string]time.Duration) string {
-	var asked, still []string
+// retentionKeptWarning says which retention windows a restore left alone
+// because the backup's would have kept history for less time: what the backup
+// keeps, and what this install keeps (windows, in force now). It "still keeps"
+// a window that is as it was before the restore (pre), and "now keeps" one
+// that moved: a file that carries a key twice can lengthen a window with one
+// row and have a shorter, later one left out.
+func retentionKeptWarning(kept, windows, pre map[string]time.Duration) string {
+	var asked, still, now []string
 	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
-		if a, ok := kept[cat]; ok {
-			asked = append(asked, cat+" history "+retentionFor(a))
-			still = append(still, cat+" history "+retentionFor(windows[cat]))
+		a, ok := kept[cat]
+		if !ok {
+			continue
+		}
+		asked = append(asked, cat+" history "+retentionFor(a))
+		if keeps := cat + " history " + retentionFor(windows[cat]); windows[cat] == pre[cat] {
+			still = append(still, keeps)
+		} else {
+			now = append(now, keeps)
 		}
 	}
 	lower := "If you want the backup's window, lower it"
 	if len(asked) > 1 {
 		lower = "If you want the backup's windows, lower them"
 	}
+	var keeps []string
+	if len(still) > 0 {
+		keeps = append(keeps, "still keeps "+andList(still))
+	}
+	if len(now) > 0 {
+		keeps = append(keeps, "now keeps "+andList(now))
+	}
 	return "This backup keeps " + andList(asked) + ", but a restore never shortens how long history is kept, so this " +
-		"install still keeps " + andList(still) + ". " + lower + " in the Data tab."
+		"install " + strings.Join(keeps, " and ") + ". " + lower + " in the Data tab."
 }
 
 // retentionFor says how long a retention window keeps history: "forever" for 0,

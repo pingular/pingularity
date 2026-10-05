@@ -264,15 +264,25 @@ and `-d '{…}'` where a body is listed below.
   settings; a hand-built or third-party file is applied in *its* key order, so put
   `config` last yourself. Config replaces the settings, except that a retention
   window (`retention_s`, `speed_retention_s`, `downtime_retention_s`) is never
-  shortened: a backup's shorter window is left out, and a longer one or `0` lands.
+  shortened: a backup's shorter window is left out, and a longer one or `0` lands
+  (a file that carries a window more than once keeps its longest). A
+  `POST /api/settings` that is being saved as a restore reaches its config
+  finishes first, and the backup's windows are weighed against what it saved.
   The reply's `warnings` (on success and on a partial failure alike) name the
   windows kept, count the restored rows already past a window, which the next
-  cleanup (hourly) deletes, with any outage records the install already had that a
-  restored recovery now ends before the window (the cleanup deletes outages
-  whole), and say so when a cleanup that ran during the restore could have deleted
-  restored rows. The downtime category (`downtime`, `pauses`, `pauses_quarantine`,
-  one after another as the exporter writes them) goes in as one change to the
-  outage history, however many batches it takes: a `latency` or `downtime` data
+  cleanup (hourly) deletes, and the ones dated more than 48 hours ahead of the
+  clock, which it deletes whatever the windows are, with any outage records the install already had that
+  restored rows now end before the window (the cleanup deletes outages whole,
+  and ends an outage that has no recorded end where old latency readings show
+  it), and say so when a cleanup that was already running as the restore
+  began could have deleted restored rows, or when a data delete during the
+  restore removed rows it had brought (the count then covers the rows restored
+  after the delete). No hourly cleanup starts while a
+  restore is in flight: one that comes due is skipped, and the next runs at
+  the windows the restore leaves. The downtime category (`downtime`, `pauses`, `pauses_quarantine`,
+  one after another as the exporter writes them) goes in under one hold on the
+  outage history, however many batches it takes (each batch still commits on
+  its own): a `latency` or `downtime` data
   delete, an outage delete and the hourly cleanup that come while it streams
   wait for the rest of it. A restore that arrives once the daemon has begun
   shutting down is refused with `503` rather than half-applied; one already in

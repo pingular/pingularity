@@ -207,3 +207,161 @@ func TestTheNoteNamesEveryWindowTheRestoreLeftAlone(t *testing.T) {
 		t.Errorf("note:\n got %q\nwant %q", got, want)
 	}
 }
+
+// A file can carry a retention key more than once: hand-built ones do. Each
+// row was weighed against the window in force as it was read, and the window
+// in force does not move while the config streams in, so a later, shorter row
+// was measured against the window from before the restore and not against
+// the longer one the same file had just set. Ninety days and then one day,
+// onto thirty: the ninety landed, the one was left out, and the note said the
+// install "still keeps" ninety days, which it had never kept. With sixty days
+// after those two, the sixty landed over the ninety, unless a reload signal
+// happened to come between them, in which case it did not. A row is now
+// weighed against the longer of the window from before the restore and the
+// one this file has already set, so the longest row of the file stands
+// whatever reloads in between, and the note says "now keeps" where the window
+// moved.
+func TestARetentionKeyRepeatedInOneFileKeepsItsLongestWindow(t *testing.T) {
+	const day = 24 * time.Hour
+	row := func(d time.Duration) string {
+		return fmt.Sprintf(`{"key":"retention_s","value":"%d"}`, int64(d/time.Second))
+	}
+	for _, tc := range []struct {
+		name   string
+		rows   []time.Duration
+		reload bool // a reload signal lands while the config streams in
+		want   time.Duration
+		note   string
+	}{
+		{"a longer window and then a shorter one", []time.Duration{90 * day, day}, false, 90 * day,
+			"This backup keeps latency history for 1 day, but a restore never shortens how long history is kept, so " +
+				"this install now keeps latency history for 90 days. If you want the backup's window, lower it in the Data tab."},
+		{"a longer, a shorter, and one in between", []time.Duration{90 * day, day, 60 * day}, false, 90 * day,
+			"This backup keeps latency history for 60 days, but a restore never shortens how long history is kept, so " +
+				"this install now keeps latency history for 90 days. If you want the backup's window, lower it in the Data tab."},
+		{"the same with a reload signal in between", []time.Duration{90 * day, day, 60 * day}, true, 90 * day,
+			"This backup keeps latency history for 60 days, but a restore never shortens how long history is kept, so " +
+				"this install now keeps latency history for 90 days. If you want the backup's window, lower it in the Data tab."},
+		{"a shorter window and then a longer one", []time.Duration{day, 90 * day}, false, 90 * day, ""},
+		{"two shorter windows", []time.Duration{day, 7 * day}, false, 30 * day,
+			"This backup keeps latency history for 7 days, but a restore never shortens how long history is kept, so " +
+				"this install still keeps latency history for 30 days. If you want the backup's window, lower it in the Data tab."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st := batchedServer(t, 0)
+			setRetention(t, s, 30*day, 30*day, 30*day)
+			send, finish := pipedImport(t, s, "config=1")
+			send(`{"pingularity_export":2,"config":[` + row(tc.rows[0]))
+			for _, d := range tc.rows[1:] {
+				if tc.reload {
+					// The rows so far are in memory, not stored: a batch is stored
+					// when it is full or the category ends. What a reload signal can
+					// publish early is a row an earlier batch stored, so store the
+					// first row the way that batch would have, and reload.
+					if err := st.SetSettings(context.Background(), map[string]string{"retention_s": fmt.Sprint(int64(tc.rows[0] / time.Second))}); err != nil {
+						t.Fatal(err)
+					}
+					if err := s.settings.Reload(context.Background()); err != nil {
+						t.Fatalf("reload: %v", err)
+					}
+				}
+				send(`,` + row(d))
+			}
+			send(`]}`)
+			rr := finish()
+			if rr.Code != http.StatusOK {
+				t.Fatalf("import: HTTP %d: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+			}
+			if got := s.settings.Retention(); got != tc.want {
+				t.Errorf("latency retention is %v after the restore, want %v", got, tc.want)
+			}
+			if got := keptNote(t, rr); got != tc.note {
+				t.Errorf("the reply's note about the windows it kept is\n  %q\nwant\n  %q", got, tc.note)
+			}
+		})
+	}
+}
+
+// A settings save and a restore's config take turns. The restore weighs each
+// retention row of the backup against the window the install keeps, and the
+// row is stored some way after that, so a save that raised the window in
+// between was overwritten by a backup's window shorter than the one just
+// saved, with nothing in the reply: the guard turns requests away once a
+// restore has reached its config, but not a save already past it. Here a save
+// raising latency from thirty days to ninety is under way when a restore whose
+// backup keeps sixty arrives. The restore waits for it, weighs the sixty
+// against the ninety, and leaves it out.
+//
+// Without the turn the restore does not wait: it finishes within milliseconds,
+// on the thirty, and says nothing. restoreHold is how long the test gives it
+// to do that before it lets the save go on, so a slow machine can only make
+// this pass without the turn, never fail with it.
+func TestASettingsSaveUnderWayFinishesBeforeARestoreWeighsItsWindows(t *testing.T) {
+	const day = 24 * time.Hour
+	s, _ := batchedServer(t, 0)
+	setRetention(t, s, 30*day, 30*day, 30*day)
+
+	inSave, goOn := make(chan struct{}), make(chan struct{})
+	heldInSave := false
+	settingsSaveHook = func() {
+		if s.importMu.TryLock() {
+			s.importMu.Unlock()
+		} else {
+			heldInSave = true
+		}
+		close(inSave)
+		<-goOn
+	}
+	t.Cleanup(func() { settingsSaveHook = nil })
+	saved := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/api/settings", strings.NewReader(`{"retention_seconds":7776000}`))
+		r.Host = "127.0.0.1:9000"
+		r.RemoteAddr = "127.0.0.1:54321"
+		r.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(rr, r)
+		saved <- rr
+	}()
+	select {
+	case <-inSave:
+	case rr := <-saved:
+		t.Fatalf("fixture: the save answered HTTP %d before it wrote: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+	if !heldInSave {
+		t.Errorf("a settings save writes without the lock a restore's config holds (importMu)")
+	}
+
+	restored := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		restored <- importBackup(t, s, "config=1", `{"pingularity_export":2,"config":[{"key":"retention_s","value":"5184000"}]}`)
+	}()
+	var rr *httptest.ResponseRecorder
+	select {
+	case rr = <-restored: // only without the turn
+	case <-time.After(restoreHold):
+	}
+	close(goOn)
+	if got := <-saved; got.Code != http.StatusOK {
+		t.Fatalf("save: HTTP %d: %s", got.Code, strings.TrimSpace(got.Body.String()))
+	}
+	if rr == nil {
+		select {
+		case rr = <-restored:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the restore never finished once the save had")
+		}
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("import: HTTP %d: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+	if got := s.settings.Retention(); got != 90*day {
+		t.Errorf("latency retention is %v after the save and the restore, want the 90 days just saved", got)
+	}
+	want := "This backup keeps latency history for 60 days, but a restore never shortens how long history is kept, so " +
+		"this install still keeps latency history for 90 days. If you want the backup's window, lower it in the Data tab."
+	if got := keptNote(t, rr); got != want {
+		t.Errorf("the restore weighed the backup's sixty days against a window from before the save: its note is %q, "+
+			"want %q", got, want)
+	}
+}
