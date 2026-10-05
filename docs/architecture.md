@@ -296,7 +296,9 @@ flowchart TB
   clock it started on plus the time it has been running, sleep included, and
   what is recorded after the wake stays. If the clock is set by more than 15
   minutes while a cleanup runs, that cleanup deletes no more rows as ahead of
-  the clock, and the next one treats the jump like any other.
+  the clock. The next one judges the clock again as it starts: a jump that
+  still leaves the clock more than 15 minutes out is counted and waited out
+  like any other, and a smaller one is trusted.
 - **An outage keeps its end when its samples go.** A restart in the middle of
   an outage leaves its `down` with no `up`: the process that wrote it stopped,
   and the next one starts out assuming the link is up. Only the latency
@@ -304,34 +306,41 @@ flowchart TB
   those samples, and before **Delete now** removes all of them, the outage is
   given an `up` at that second with its observed length. The uptime figures,
   the heatmap and the digest read the same afterwards, and the outage list
-  shows the recorded end. Neither touches an outage the running monitor
-  opened: the monitor may still be counting the `up-after` good rounds it
-  needs, or waiting to write its `up`, and it records the end itself.
-  **Delete now** reaches the present, and the cleanup reaches as close to it
-  as the latency window is short (the window can be minutes), so an end
-  written for such an outage would turn into a second one. The cleanup used
-  to rely on the window alone, 30 days by default, to keep it away from them.
+  shows the recorded end. Neither touches an outage the running monitor opened
+  and is not done with: the monitor may still be counting the `up-after` good
+  rounds it needs, or waiting to write its `up`, and it records the end
+  itself. **Delete now** reaches the present, and the cleanup reaches as close
+  to it as the latency window is short (the window can be minutes), so an end
+  written for such an outage would turn into a second one. The cleanup used to
+  rely on the window alone, 30 days by default, to keep it away from them. An
+  outage dated after one the monitor is not done with waits as well, until the
+  monitor has written both that one's `down` and its `up`. An outage the
+  monitor has finished holds nothing back, so an outage a restore brings from
+  another install, cut short by a restart there, gets its end like any other.
   What that gives up is an outage whose `up` the monitor could not write and
   had to drop (`monitor.event_dropped` on `/metrics`): the cleanup no longer
   ends it from its samples, and once those are past the window it reads as
-  lasting until the next recorded outage. If the `up` cannot be written, the
-  delete deletes nothing. Such a close decides what to write from what it read
-  first, so it takes turns with every other change to the outages but the
+  lasting until the next recorded outage. Until a restart the same goes for
+  any later outage left without an end, such as one a restore brings. If the
+  end of an outage cannot be written, **Delete now** deletes nothing, and
+  neither does the cleanup. Such a close decides what to write from what it
+  read first, so it takes turns with every other change to the outages but the
   monitor's: another close, the delete of one outage, the downtime **Delete
-  now**, the cleanup's sweep of old outages and a restore's outage history. Run
-  in between, one of those could leave an outage with two ends, or an end with
-  no outage. A restore takes one turn for its whole downtime category, the
-  outages and the paused time after them, however many batches of 5,000 rows
-  they come in. Taken batch by batch, a close between two batches gave an
+  now**, the cleanup's sweep of old outages and a restore's outage history.
+  Run in between, one of those could leave an outage with two ends, or an end
+  with no outage. A restore takes one turn for its whole downtime category,
+  the outages and the paused time after them, however many batches of 5,000
+  rows they come in. Taken batch by batch, a close between two batches gave an
   outage whose `up` was still to come a second end, and one between the
   outages and the paused time counted as downtime the time a restarted process
   was not running, which a close takes out of the length it writes only once
-  the paused time is in. So a close, an outage delete or a cleanup that comes
-  while a restore is sending its outage history waits for the rest of it:
-  about a quarter of a second for 20,000 outage rows on a laptop, plus the time
-  the upload itself takes. The monitor's own writes never wait for that turn.
-  Like any writer, they can still wait a moment for SQLite's single writer,
-  such as a restore's batch in progress.
+  the paused time is in. So a close or an outage delete that comes while a
+  restore is sending its outage history waits for the rest of it, and so does
+  a cleanup that was already under way when the restore began (none starts
+  during one): about a quarter of a second for 20,000 outage rows on a laptop,
+  plus the time the upload itself takes. The monitor's own writes never wait
+  for that turn. Like any writer, they can still wait a moment for SQLite's
+  single writer, such as a restore's batch in progress.
 - **Disk space is reused, not given back.** The main file is never compacted:
   deleted rows leave free pages, and new rows fill them before the file grows.
   The write-ahead log beside it stays near 4 MB in ordinary running. A reader

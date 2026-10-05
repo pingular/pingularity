@@ -401,7 +401,9 @@ and persist across restarts.
   outage, and the import counts it. The cleanup deletes an outage whole, so a
   restored recovery that ends one of this install's own old outages before the
   window takes that outage's record with it, as do restored readings that show
-  when one ended, and the import counts those records too. To keep the old
+  when one ended, and the restored start of an outage that falls inside one of
+  this install's, which then ends where the old readings first show the link
+  back. The import counts those records too. To keep the old
   rows, raise the window before you restore (the restore will not lower it
   again), or raise it afterwards and import the file again:
   rows still there are skipped, and any the cleanup already deleted come

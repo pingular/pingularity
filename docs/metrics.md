@@ -211,7 +211,9 @@ self-describing):
   when the DB stayed unwritable past the buffer cap (each drop leaves a gap in
   uptime history; an outage whose end was dropped is not ended by the hourly
   cleanup either while pingularity keeps running, and once its latency samples
-  are past their window it reads as lasting until the next recorded outage).
+  are past their window it reads as lasting until the next recorded outage;
+  the same then goes for a later outage left without an end, such as one a
+  restore brings, until a restart).
   `pending_events` is a depth, not a counter, so it is not seeded
   at startup: the series appears the first time an event has to be queued
 - `pingularity_metrics_data_valid` - **1 only when every store read on this scrape

@@ -277,10 +277,10 @@ func ranOnAfterARestart(t *testing.T, now time.Time) *Store {
 }
 
 // The monitor's 'down' can fail to land and wait in its retry buffer, and the
-// line moves all the same: InsertEvent moves it before the write. The orphan's
-// search must then stop at the monitor's 'down' though no such row is on disk,
-// because the good round after it is the monitor's recovery in progress, not
-// the orphan's.
+// line moves all the same: InsertEvent puts the outage on the monitor's list
+// before the write. The orphan's search must then stop at the monitor's 'down'
+// though no such row is on disk, because the good round after it is the
+// monitor's recovery in progress, not the orphan's.
 func TestDeleteNowStopsAtTheMonitorsDownWhileItWaitsToBeWritten(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -338,7 +338,8 @@ func TestTheCloseRereadsTheMonitorsLineAfterEachSearch(t *testing.T) {
 // clock step the widen in Monitor.transition stamps it where the outage's full
 // width needs it. That row is the monitor's measurement. A cleanup would move an
 // orphan's future-dated 'up' back to the second the samples prove, but this one
-// belongs to an outage the monitor opened, and stays as it was written.
+// belongs to an outage the monitor opened, and stays as it was written: the
+// outage is the monitor's until the clock has reached its 'up'.
 func TestDeleteNowKeepsTheMonitorsOwnRecoveryAheadOfTheClock(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -617,6 +618,364 @@ func TestACloseThatFailsIsCountedOnce(t *testing.T) {
 	}
 }
 
+// THE LINE MOVES ON AS THE MONITOR ENDS ITS OUTAGES.
+//
+// The line a close keeps away from is the earliest outage the monitor is not
+// done with (monitorOutages), not the earliest 'down' this handle has ever
+// written. That one never moves later: on a daemon that had run for a while
+// it would be its first outage since the start, and every outage with no end
+// dated after it would be left to the monitor, the monitor's or not.
+
+// restoredAfterAnOutageOfTheMonitors is the history that showed it. The
+// running monitor recorded an outage whole five hours ago, its 'down' and its
+// 'up' through its own door. Then a restore brought another install's history
+// of the hours since: an outage that began three hours ago and was cut short
+// by a restart there, so its 'down' alone, stored as an import stores it, and
+// that install's rounds, which are good again ten minutes later.
+func restoredAfterAnOutageOfTheMonitors(t *testing.T, now time.Time) *Store {
+	t.Helper()
+	ctx := context.Background()
+	st := openFileStore(t)
+	mustInsert(t, st, round(ago(now, 6*3600), true)) // monitoring anchor
+	if err := st.InsertEvent(ctx, ago(now, 5*3600), "down", -1, ""); err != nil {
+		t.Fatalf("the monitor's down: %v", err)
+	}
+	mustInsert(t, st, round(ago(now, 5*3600), false))
+	if err := st.InsertEvent(ctx, ago(now, 5*3600-600), "up", 600, ""); err != nil {
+		t.Fatalf("the monitor's up: %v", err)
+	}
+	for s := 5*3600 - 600; s > 3*3600; s -= 600 {
+		mustInsert(t, st, round(ago(now, s), true))
+	}
+	if _, err := st.db.Exec(`INSERT INTO events (ts, type, detail) VALUES (?, 'down', '')`, ago(now, 3*3600).Unix()); err != nil {
+		t.Fatalf("the restored down: %v", err)
+	}
+	mustInsert(t, st, round(ago(now, 3*3600), false))
+	for s := 3*3600 - 600; s >= 600; s -= 600 {
+		mustInsert(t, st, round(ago(now, s), true))
+	}
+	return st
+}
+
+// The cleanup deleted the rounds that showed when the restored outage ended
+// and wrote no end for it, because it was dated after the monitor's first
+// 'down'. With those rounds gone the ten-minute outage read as lasting until
+// the next round on disk, and for good once a later cleanup wrote that down.
+// Delete now left it the same way.
+func TestAnOutageDatedAfterOneTheMonitorHasEndedIsClosed(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		delete func(st *Store, now time.Time) error
+	}{
+		{"by the hourly cleanup", func(st *Store, now time.Time) error {
+			far := now.Add(-9999 * time.Hour)
+			_, err := st.Prune(ctx, ago(now, 3600), far, far)
+			return err
+		}},
+		{"by Delete now", func(st *Store, now time.Time) error {
+			_, err := st.Clear(ctx, "latency")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			st := restoredAfterAnOutageOfTheMonitors(t, now)
+			since := ago(now, 6*3600)
+			before := readAll(t, st, since)
+			if before.dgOut != 2 || before.dgDownS != 1200 {
+				t.Fatalf("fixture: the digest reads %d outage(s) / %ds, want 2 / 1200s", before.dgOut, before.dgDownS)
+			}
+			if err := tc.delete(st, now); err != nil {
+				t.Fatal(err)
+			}
+			mustInsert(t, st, round(now, true)) // the monitor goes on probing
+			got, want := closingEvents(t, st), []string{
+				fmt.Sprintf("%d 600", ago(now, 5*3600-600).Unix()),
+				fmt.Sprintf("%d 600", ago(now, 3*3600-600).Unix()),
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("the closing events (ts duration_s) are %q, want the monitor's own and one for the restored "+
+					"outage at the second its rounds proved: %q", got, want)
+			}
+			sameReadings(t, "with the rounds that ended the restored outage deleted,", before, readAll(t, st, since))
+		})
+	}
+}
+
+// The line may move earlier while a close runs and never later. A close reads
+// which outages have no end first and the line afterwards, so an outage the
+// monitor finishes in between must stay behind the line until the close has
+// ended. Here the monitor holds an outage open when the close reads the record,
+// with one good round five minutes back between the bad ones. Then, before the
+// close reads the line, the monitor writes that outage's 'up' and confirms the
+// next outage, which is when it drops the outages it has finished from its
+// list. Dropped under a running close, the first outage read as one nobody
+// holds: the close ended it at the good round, beside the monitor's own 'up'.
+func TestAnOutageTheMonitorEndsDuringACloseStaysTheMonitors(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	st := openFileStore(t)
+	mustInsert(t, st, round(ago(now, 3600), true)) // monitoring anchor
+	if err := st.InsertEvent(ctx, ago(now, 600), "down", -1, ""); err != nil {
+		t.Fatalf("the monitor's down: %v", err)
+	}
+	mustInsert(t, st, round(ago(now, 600), false))
+	mustInsert(t, st, round(ago(now, 300), true))
+	mustInsert(t, st, round(ago(now, 295), false))
+	reads := 0
+	line := func() int64 {
+		if reads++; reads == 1 {
+			if err := st.InsertEvent(ctx, ago(now, 100), "up", 500, ""); err != nil {
+				t.Errorf("the monitor's up: %v", err)
+			}
+			if err := st.InsertEvent(ctx, ago(now, 50), "down", -1, ""); err != nil {
+				t.Errorf("the monitor's next down: %v", err)
+			}
+		}
+		return st.live.line()
+	}
+	if err := st.resolveDanglingDowns(ctx, now.Unix()+1, now.Unix(), line); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if reads == 0 {
+		t.Fatal("fixture: the close never read the line, so it found no outage without an end")
+	}
+	want := []string{fmt.Sprintf("%d 500", ago(now, 100).Unix())}
+	if got := closingEvents(t, st); !slices.Equal(got, want) {
+		t.Errorf("the closing events (ts duration_s) are %q, want the monitor's own alone, %q: the close ended an "+
+			"outage the monitor finished while it ran", got, want)
+	}
+	// The next close begins with that outage off the list, and the line at the
+	// one the monitor still holds.
+	if err := st.resolveDanglingDowns(ctx, now.Unix()+1, now.Unix(), st.live.line); err != nil {
+		t.Fatalf("the next close: %v", err)
+	}
+	if got := st.live.line(); got != ago(now, 50).Unix() {
+		t.Errorf("after the next close the line is at %d, want the monitor's open outage at %d", got, ago(now, 50).Unix())
+	}
+	if got := closingEvents(t, st); !slices.Equal(got, want) {
+		t.Errorf("after the next close the closing events are %q, want %q still", got, want)
+	}
+}
+
+// A close reads its clock and may then wait a long time for its turn: a
+// restore holds the outage record for as long as its client takes to send the
+// outage history. Here a close took its reading five minutes ago and has
+// waited since. Meanwhile the monitor ended the outage it held, with an 'up'
+// dated after that old reading plus the two minutes a close allows, and
+// confirmed its next outage, which is when it drops the ones it has finished.
+// Dropped while the close waited, the first outage read to that close as one
+// nobody holds with an 'up' dated ahead of the clock, and the close moved the
+// monitor's own 'up' back to the good round between the bad ones.
+func TestAnOutageTheMonitorEndsWhileACloseWaitsStaysTheMonitors(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	st := openFileStore(t)
+	mustInsert(t, st, round(ago(now, 3600), true)) // monitoring anchor
+	if err := st.InsertEvent(ctx, ago(now, 900), "down", -1, ""); err != nil {
+		t.Fatalf("the monitor's down: %v", err)
+	}
+	mustInsert(t, st, round(ago(now, 900), false))
+	mustInsert(t, st, round(ago(now, 600), true))
+	mustInsert(t, st, round(ago(now, 595), false))
+	read := ago(now, 300).Unix() // the close's clock, read before its wait
+
+	st.outageMu.Lock() // a restore's turn
+	done := make(chan error, 1)
+	go func() { done <- st.resolveDanglingDowns(ctx, read+1, read, st.live.line) }()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		st.live.mu.Lock()
+		waiting := st.live.waiting
+		st.live.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			st.outageMu.Unlock()
+			t.Fatal("fixture: the close never came to wait for its turn")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := st.InsertEvent(ctx, ago(now, 100), "up", 800, ""); err != nil {
+		t.Errorf("the monitor's up: %v", err)
+	}
+	if err := st.InsertEvent(ctx, ago(now, 50), "down", -1, ""); err != nil {
+		t.Errorf("the monitor's next down: %v", err)
+	}
+	st.outageMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	want := []string{fmt.Sprintf("%d 800", ago(now, 100).Unix())}
+	if got := closingEvents(t, st); !slices.Equal(got, want) {
+		t.Errorf("the closing events (ts duration_s) are %q, want the monitor's own alone, %q: the close changed "+
+			"an outage the monitor ended while it waited for its turn", got, want)
+	}
+	// With nothing waiting, the next close drops the finished outage and finds
+	// the line at the one the monitor still holds.
+	if err := st.resolveDanglingDowns(ctx, now.Unix()+1, now.Unix(), st.live.line); err != nil {
+		t.Fatalf("the next close: %v", err)
+	}
+	if got := st.live.line(); got != ago(now, 50).Unix() {
+		t.Errorf("after the next close the line is at %d, want the monitor's open outage at %d", got, ago(now, 50).Unix())
+	}
+	if got := closingEvents(t, st); !slices.Equal(got, want) {
+		t.Errorf("after the next close the closing events are %q, want %q still", got, want)
+	}
+}
+
+// What is on the monitor's list, event by event. Each case plays the monitor's
+// door (opened before a 'down' is written, landed once an event is on disk)
+// and the start of a close (begin, with the clock it runs at), and wants the
+// line where a close would then find it.
+func TestTheLineIsTheEarliestOutageTheMonitorIsNotDoneWith(t *testing.T) {
+	const none, now = int64(math.MaxInt64), int64(1_800_000_000)
+	closeAt := func(m *monitorOutages, nowU int64) {
+		m.begin(nowU)
+		m.end()
+	}
+	for _, tc := range []struct {
+		name string
+		play func(m *monitorOutages)
+		want int64
+	}{
+		{"nothing written", func(m *monitorOutages) {}, none},
+		{"a down that is still to be written", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			closeAt(m, now)
+		}, now - 600},
+		{"an open outage", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			closeAt(m, now)
+		}, now - 600},
+		{"an outage with both events on disk", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now-300)
+			closeAt(m, now)
+		}, none},
+		{"an outage with both events on disk, before a close has begun", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now-300)
+		}, now - 600},
+		// The monitor writes a later transition straight to the store while an
+		// earlier one waits in its retry buffer.
+		{"an up that landed while its down still waits", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("up", now-300)
+			closeAt(m, now)
+		}, now - 600},
+		{"an up that landed before its down did", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("up", now-300)
+			m.opened(now-600, now) // written again from the retry buffer
+			m.landed("down", now-600)
+			closeAt(m, now)
+		}, none},
+		{"an up dated ahead of the clock", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now+300)
+			closeAt(m, now)
+		}, now - 600},
+		{"an up dated ahead of the clock, once the clock has reached it", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now+300)
+			closeAt(m, now)
+			closeAt(m, now+300)
+		}, none},
+		{"an outage finished while a close runs", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.begin(now)
+			m.landed("up", now-300)
+			m.opened(now-100, now)
+		}, now - 600},
+		{"the monitor's next outage, with no close running", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now-300)
+			m.opened(now-100, now)
+		}, now - 100},
+		// The monitor's door drops a finished outage only once the clock itself
+		// has reached its 'up'. A close allows two minutes more (currentHorizon),
+		// by the clock it runs at, which can be a little behind the door's.
+		{"the monitor's next outage, after one whose up is a minute ahead of the clock", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now+60)
+			m.opened(now-100, now)
+		}, now - 600},
+		{"a close, after an outage whose up is a minute ahead of the clock", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now+60)
+			m.opened(now-100, now)
+			closeAt(m, now)
+		}, now - 100},
+		{"a second outage, the first one finished", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now-500)
+			m.opened(now-300, now)
+			m.landed("down", now-300)
+			closeAt(m, now)
+		}, now - 300},
+		// An 'up' the monitor had to drop never lands. The next outage's 'up'
+		// ends that outage and not the one before it.
+		{"an outage whose up was dropped, and a whole outage after it", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.opened(now-300, now)
+			m.landed("down", now-300)
+			m.landed("up", now-200)
+			closeAt(m, now)
+		}, now - 600},
+		{"an outage whose down was dropped", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("up", now-500)
+			m.opened(now-300, now)
+			m.landed("down", now-300)
+			m.landed("up", now-200)
+			closeAt(m, now)
+		}, now - 600},
+		{"an up with no outage on the list", func(m *monitorOutages) {
+			m.landed("up", now-300)
+			closeAt(m, now)
+		}, none},
+		{"an up dated before the only outage on the list", func(m *monitorOutages) {
+			m.opened(now-600, now)
+			m.landed("down", now-600)
+			m.landed("up", now-700)
+			closeAt(m, now)
+		}, now - 600},
+		// More outages that never finish than the list holds: the oldest leave
+		// it, and the line stays where the earliest of them was.
+		{"more unfinished outages than the list holds", func(m *monitorOutages) {
+			for i := int64(0); i < maxMonitorOutages+5; i++ {
+				m.opened(now-10000+i*10, now)
+				m.landed("down", now-10000+i*10)
+			}
+			closeAt(m, now)
+			if len(m.open) != maxMonitorOutages {
+				t.Errorf("the list holds %d outages, want it kept to %d", len(m.open), maxMonitorOutages)
+			}
+		}, now - 10000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &monitorOutages{floor: none}
+			tc.play(m)
+			if got := m.line(); got != tc.want {
+				t.Errorf("the line is at %d, want %d (now is %d; %d means no line)", got, tc.want, now, none)
+			}
+		})
+	}
+}
+
 // ONE CHANGE TO THE OUTAGE RECORD AT A TIME.
 //
 // The close reads which outages have no end and searches the samples for each,
@@ -696,12 +1055,13 @@ func besideTheClose(t *testing.T, change func() error) (wait func() error) {
 
 // orphanBeforeAnOutageOfItsOwn is the history orphanedByARestart builds, with
 // an outage this process's monitor recorded whole after the orphan: a 'down' two
-// hours back and its 'up' ten minutes later. The orphan's search then ends at
-// that 'down', and the close writes the orphan's end without looking first for
-// an 'up' of its own ahead of the clock. That look is only made for the last
-// outage on record, and one made after another close had written the end would
-// find that end and move it onto itself, which would hide the overlap the tests
-// below are about.
+// hours back and its 'up' ten minutes later. The monitor is done with it, so it
+// draws no line, and it is a whole outage on disk: the orphan's search then
+// ends at that 'down', and the close writes the orphan's end without looking
+// first for an 'up' of its own ahead of the clock. That look is only made for
+// the last outage on record, and one made after another close had written the
+// end would find that end and move it onto itself, which would hide the overlap
+// the tests below are about.
 func orphanBeforeAnOutageOfItsOwn(t *testing.T, now time.Time) *Store {
 	t.Helper()
 	ctx := context.Background()

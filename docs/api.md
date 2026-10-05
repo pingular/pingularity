@@ -251,45 +251,47 @@ and `-d '{…}'` where a body is listed below.
   `downtime` delete sent while a restore is bringing in outage history waits
   until the restore has it all in (see `POST /api/import`). The
   database file keeps its size; the freed space is reused
-- `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import` -
-  export / import config + history. Pick at least one of those four categories (any
-  non-empty value selects one); with none at all the export is a `400`.
-  (JSON; export streams a single consistent snapshot with a small manifest; import
-  streams in bounded batches and is **not atomic** - a mid-file error leaves earlier
-  categories applied and returns `{partial:true, committed:{…}}`. Import puts no
-  cap on the total request (a default install's own export outgrows any fixed one)
-  and bounds the pieces instead: 8 MiB per record, 256 MiB per JSON element
-  (413), 8 MiB per batch held in memory. In a file from Pingularity's own
-  exporter, config is applied last, so a data failure can't half-change your
-  settings; a hand-built or third-party file is applied in *its* key order, so put
-  `config` last yourself. Config replaces the settings, except that a retention
-  window (`retention_s`, `speed_retention_s`, `downtime_retention_s`) is never
-  shortened: a backup's shorter window is left out, and a longer one or `0` lands
-  (a file that carries a window more than once keeps its longest). A
+- `GET /api/export?config=1&latency=1&speed=1&downtime=1` / `POST /api/import`
+  - export / import config + history. Pick at least one of those four
+  categories (any non-empty value selects one); with none at all the export is
+  a `400`. (JSON; export streams a single consistent snapshot with a small
+  manifest; import streams in bounded batches and is **not atomic** - a
+  mid-file error leaves earlier categories applied and returns `{partial:true,
+  committed:{…}}`. Import puts no cap on the total request (a default
+  install's own export outgrows any fixed one) and bounds the pieces instead:
+  8 MiB per record, 256 MiB per JSON element (413), 8 MiB per batch held in
+  memory. In a file from Pingularity's own exporter, config is applied last,
+  so a data failure can't half-change your settings; a hand-built or
+  third-party file is applied in *its* key order, so put `config` last
+  yourself. Config replaces the settings, except that a retention window
+  (`retention_s`, `speed_retention_s`, `downtime_retention_s`) is never
+  shortened: a backup's shorter window is left out, and a longer one or `0`
+  lands (a file that carries a window more than once keeps its longest). A
   `POST /api/settings` that is being saved as a restore reaches its config
   finishes first, and the backup's windows are weighed against what it saved.
   The reply's `warnings` (on success and on a partial failure alike) name the
   windows kept, count the restored rows already past a window, which the next
   cleanup (hourly) deletes, and the ones dated more than 48 hours ahead of the
-  clock, which it deletes whatever the windows are, with any outage records the install already had that
-  restored rows now end before the window (the cleanup deletes outages whole,
-  and ends an outage that has no recorded end where old latency readings show
-  it), and say so when a cleanup that was already running as the restore
-  began could have deleted restored rows, or when a data delete during the
-  restore removed rows it had brought (the count then covers the rows restored
-  after the delete). No hourly cleanup starts while a
-  restore is in flight: one that comes due is skipped, and the next runs at
-  the windows the restore leaves. The downtime category (`downtime`, `pauses`, `pauses_quarantine`,
-  one after another as the exporter writes them) goes in under one hold on the
-  outage history, however many batches it takes (each batch still commits on
-  its own): a `latency` or `downtime` data
-  delete, an outage delete and the hourly cleanup that come while it streams
-  wait for the rest of it. A restore that arrives once the daemon has begun
-  shutting down is refused with `503` rather than half-applied; one already in
-  flight holds the shutdown open until the login/access repairs that follow it
-  have finished). The
+  clock, which it deletes whatever the windows are, with any outage records
+  the install already had that restored rows now end before the window (the
+  cleanup deletes outages whole, and ends an outage that has no recorded end
+  where old latency readings show it), and say so when a cleanup that was
+  already running as the restore began could have deleted restored rows, or
+  when a data delete during the restore removed rows it had brought (the count
+  then covers the rows restored after the delete). No hourly cleanup starts
+  while a restore is in flight: one that comes due is skipped, and the next
+  runs at the windows the restore leaves. The downtime category (`downtime`,
+  `pauses`, `pauses_quarantine`, one after another as the exporter writes
+  them) goes in under one hold on the outage history, however many batches it
+  takes (each batch still commits on its own): a `latency` or `downtime` data
+  delete and an outage delete that come while it streams wait for the rest of
+  it, and so does an hourly cleanup that was already running when it began. A
+  restore that arrives once the daemon has begun shutting down is refused with
+  `503` rather than half-applied; one already in flight holds the shutdown
+  open until the login/access repairs that follow it have finished). The
   speedtest times behind the latency chart's hover note are not exported: they
-  only feed that note, and a restore simply has no notes for the history it brings
+  only feed that note, and a restore simply has no notes for the history it
+  brings
 - `POST /api/notify/test` - `{url}` send a test alert to a webhook
 - `POST /api/notify/heartbeat/test` - `{url}` check in to a heartbeat URL. There is no dry run, so this counts as a real check-in and resets the watchdog's countdown
 

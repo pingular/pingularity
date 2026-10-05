@@ -1212,9 +1212,9 @@ func (m *Monitor) round(ctx context.Context) {
 	// before anything else, so a store that has since recovered catches up
 	// promptly. resolveDanglingDowns can't rescue a lost event - it only bounds a
 	// dangling 'down' from sample evidence weeks later at Prune, and only one an
-	// earlier process left: a 'down' of this monitor's is left to this monitor
-	// (the store's liveDownFloor). Nor can it recreate a 'down' that was never
-	// written - so this retry is the only path back.
+	// earlier process left: an outage this monitor is not done with is left to
+	// this monitor (the store's monitorOutages). Nor can it recreate a 'down'
+	// that was never written - so this retry is the only path back.
 	m.flushPendingEvents(ctx)
 
 	// The speedtest wire counter, read on both sides of the probe (see during below).

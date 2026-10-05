@@ -1316,6 +1316,64 @@ func TestTheWarningCountsAnOutageTheCleanupEndsFromOldReadingsAndDeletes(t *test
 	}
 }
 
+// The restored start of an outage can end one of this install's outages early
+// with no restored reading and no restored recovery. This install recorded an
+// outage that began 400 days ago and ended 200 days ago, inside its year, and
+// still holds the readings of those days, good again ten minutes in. The
+// backup holds one row: the start of an outage an hour into that one. It takes
+// the recovery for its own outage, this install's then has no recorded end,
+// and the next cleanup ends it at the good reading, past the year, and deletes
+// it. The reply said nothing: it took an end written from this install's own
+// readings for one the cleanup would have written anyway.
+func TestTheWarningCountsAnOutageARestoredStartCutsShort(t *testing.T) {
+	const day = 24 * time.Hour
+	began := time.Now().Add(-400 * day)
+	s, st := batchedServer(t, 0)
+	setRetention(t, s, 30*day, 0, 365*day)
+	if _, err := st.DB().Exec(`INSERT INTO events (ts, type, duration_s, detail) VALUES (?, 'down', NULL, ''), (?, 'up', 600, '')`,
+		began.Unix(), began.Add(200*day).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []struct {
+		after time.Duration
+		ok    int
+	}{{0, 0}, {10 * time.Minute, 1}} {
+		for _, tg := range []string{"a", "b", "c"} {
+			if _, err := st.DB().Exec(`INSERT INTO samples (ts, target, latency_ms, success, family) VALUES (?, ?, 12.5, ?, 'ipv4')`,
+				began.Add(r.after).Unix(), tg, r.ok); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rr := importBackup(t, s, "downtime=1",
+		fmt.Sprintf(`{"pingularity_export":2,"downtime":[{"ts":%d,"type":"down"}]}`, began.Add(time.Hour).Unix()))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("import: HTTP %d: %s", rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+	if n, ok := dueWarning(t, rr, "downtime"); ok {
+		t.Errorf("warned about %d restored downtime rows; the restored outage ends inside the window and is kept", n)
+	}
+	named := false
+	for _, w := range warningsOf(t, rr) {
+		if strings.HasPrefix(w, "1 outage record this install already had will be deleted at the next cleanup, "+
+			"which runs every hour: restored rows now end its outage before this install's downtime retention window (") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("the reply does not name the outage record this install is about to lose (warnings: %q)", warningsOf(t, rr))
+	}
+	pruneNow(t, s)
+	var left, mine int
+	if err := st.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(ts = ?), 0) FROM events`, began.Unix()).Scan(&left, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if left != 2 || mine != 0 {
+		t.Fatalf("fixture: the next cleanup left %d outage rows, %d of them this install's 'down'; want the restored "+
+			"'down' and the recovery, and this install's 'down' gone", left, mine)
+	}
+}
+
 // The cleanup also deletes rows stamped more than 48 hours ahead of the clock,
 // whatever the retention windows are: a row from the future would otherwise
 // answer for "now" on every chart until the clock caught up. A backup from a

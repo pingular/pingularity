@@ -115,3 +115,52 @@ func TestDeleteNowLeavesTheMonitorItsOwnOutage(t *testing.T) {
 		theOneRecovery(t, st, sec(5), 5)
 	})
 }
+
+// The store leaves alone the outages the monitor is not done with, and no
+// others. It used to leave alone every outage dated after the first one this
+// monitor had opened, for as long as the daemon ran: an outage a restore then
+// brought from another install, cut short by a restart there, kept no end when
+// its samples were deleted. Here the monitor records an outage whole, and the
+// restored one after it is closed where its samples show.
+func TestDeleteNowClosesAnOutageDatedAfterOneTheMonitorHasEnded(t *testing.T) {
+	t0 := time.Unix(time.Now().Add(-time.Minute).Unix(), 0)
+	sec := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	m, st := newTestMonitor(t, 1, 1)
+	probeRound(t, m, st, sec(0), false) // the monitor's outage opens
+	probeRound(t, m, st, sec(5), true)  // and ends
+	if !m.online || eventCount(t, st, "up") != 1 {
+		t.Fatal("fixture: want the monitor's outage recorded whole")
+	}
+	// The restored outage: its 'down' as an import stores it, and the other
+	// install's rounds, good again ten seconds later.
+	if _, err := st.DB().Exec(`INSERT INTO events (ts, type, detail) VALUES (?, 'down', '')`, sec(20).Unix()); err != nil {
+		t.Fatalf("the restored down: %v", err)
+	}
+	sampleRound(t, st, sec(20), false)
+	sampleRound(t, st, sec(30), true)
+
+	if _, err := st.Clear(context.Background(), "latency"); err != nil {
+		t.Fatalf("Delete now: %v", err)
+	}
+	rows, err := st.DB().Query(`SELECT ts, duration_s FROM events WHERE type = 'up' ORDER BY ts`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got [][2]int64
+	for rows.Next() {
+		var at, dur int64
+		if err := rows.Scan(&at, &dur); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, [2]int64{at, dur})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := [][2]int64{{sec(5).Unix(), 5}, {sec(30).Unix(), 10}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("the closing events (ts, duration_s) are %v, want the monitor's own and one for the restored "+
+			"outage where its samples show the link back: %v", got, want)
+	}
+}

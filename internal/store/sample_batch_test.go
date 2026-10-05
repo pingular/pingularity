@@ -2376,7 +2376,7 @@ func TestEveryOrderedWriterSavesFirst(t *testing.T) {
 			t.Errorf("exempt lists %q, which no longer inserts into one of those tables", name)
 		}
 	}
-	for _, must := range []string{"InsertEvent", "InsertPause", "InsertSpeedSpan", "InsertSpeedTS", "InsertSpeedServers"} {
+	for _, must := range []string{"insertEvent", "InsertPause", "InsertSpeedSpan", "InsertSpeedTS", "InsertSpeedServers"} {
 		if !seen[must] {
 			t.Errorf("the source scan did not find %s - it is no longer checking anything", must)
 		}

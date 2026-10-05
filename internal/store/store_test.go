@@ -34,17 +34,16 @@ func sampleAt(t *testing.T, st *Store, now time.Time, secsAgo int, target, famil
 }
 
 // eventAt writes one event of the history a test reads, secsAgo seconds before
-// now. It is history, not the running monitor: the line a cleanup's close and a
-// Delete now's keep away from (liveDownFloor) stays where it was, as if an
-// earlier process had written the row. A test about an outage the running
-// monitor holds writes its 'down' through InsertEvent itself.
+// now. It is history, not the running monitor: the row goes in by the door
+// that keeps no list of the monitor's outages (insertEvent), so the line a
+// cleanup's close and a Delete now's keep away from (monitorOutages) stays
+// where it was, as if an earlier process had written the row. A test about an
+// outage the running monitor holds writes its 'down' through InsertEvent itself.
 func eventAt(t *testing.T, st *Store, now time.Time, secsAgo int, typ string, durationS int) {
 	t.Helper()
-	line := st.liveDownFloor.Load()
-	if err := st.InsertEvent(context.Background(), now.Add(-time.Duration(secsAgo)*time.Second), typ, durationS, ""); err != nil {
+	if err := st.insertEvent(context.Background(), now.Add(-time.Duration(secsAgo)*time.Second), typ, durationS, ""); err != nil {
 		t.Fatalf("insert event: %v", err)
 	}
-	st.liveDownFloor.Store(line)
 }
 
 func approx(t *testing.T, got, want float64) {

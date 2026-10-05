@@ -115,7 +115,7 @@ func TestPruneDueCountsWhatPruneRemovesByAge(t *testing.T) {
 			if err := s.InsertEvent(ctx, at, "down", -1, ""); err != nil {
 				t.Fatalf("trial %d: the monitor's down: %v", trial, err)
 			}
-			leftToTheMonitor += int64(len(without) - len(past(s.liveDownFloor.Load)))
+			leftToTheMonitor += int64(len(without) - len(past(s.live.line)))
 		}
 		clockAt(t, s, now, now, 0)
 		// What the rules alone count, before the close is asked: the difference
@@ -244,6 +244,16 @@ func TestPruneDueCountsSeek(t *testing.T) {
 			t.Errorf("%s\nplan %q: want a SEARCH of %s and no SCAN", strings.Join(strings.Fields(q), " "), plan, table)
 		}
 	}
+	// The event that followed an own 'down' before the restore: a seek of the ts
+	// index to that second and a walk from there, never the whole table.
+	plan = queryPlan(t, s, pruneDueOwnNext, int64(1700000000), int64(5))
+	if strings.Contains(plan, "SCAN") || !strings.Contains(plan, "SEARCH events USING INDEX idx_events_ts (ts>?)") {
+		t.Errorf("%s\nplan %q: want a SEARCH of events from that second on its ts index, and no SCAN",
+			strings.Join(strings.Fields(pruneDueOwnNext), " "), plan)
+	}
+	if strings.Contains(plan, "TEMP B-TREE") && !strings.Contains(plan, "FOR LAST TERM OF ORDER BY") {
+		t.Errorf("plan %q: want the rows read in ts order, with a sort only among the events of one second", plan)
+	}
 	// The outages the cleanup's close ends past the cutoff: the 'down' rows on
 	// one side of the mark that the rule keeps today, in the range of seconds
 	// the ends reach, with the rule's seek for each one's recovery.
@@ -343,6 +353,18 @@ func TestPruneDueCountsTheOutagesTheCleanupsCloseEnds(t *testing.T) {
 		// With no readings to show an earlier end it is only a row from the future.
 		{"a restored outage whose only end is dated three days ahead",
 			0, nil, rows(down(began), up(-3*day)), 0, 0, 0},
+		// No restored reading here, and no restored end: a restored 'down' an hour
+		// into an outage of the install's own, which straddles the outage cutoff.
+		// It takes that outage's 'up' for its own, the install's outage reads as
+		// having no end, and the close ends it from the install's own readings,
+		// ten minutes in and past the cutoff.
+		{"an outage of the install's own that straddles the cutoff, with a restored down inside it",
+			0, rows(ended, down(began), up(200*day)), rows(down(began - 3600)), 0, 1, 0},
+		// The same restored 'down' after an outage of the install's own that never
+		// had an end, a later outage of the install's following it: the cleanup
+		// would have ended that one anyway.
+		{"an outage of the install's own with no end, with a restored down after it",
+			0, rows(ended, down(began), down(300*day), up(300*day-60)), rows(down(began - 3600)), 0, 0, 0},
 		// An outage the running monitor holds open is the monitor's to end. The
 		// cleanup's close leaves it, whatever the restored readings show, so
 		// the count names nothing...
@@ -443,7 +465,7 @@ func TestAWatchCountsWhatPruneRemovesFromEachTable(t *testing.T) {
 		sb, pb, eb := now.Add(-30*24*time.Hour), now.Add(-60*24*time.Hour), now.Add(-90*24*time.Hour)
 		// The synthetic recoveries Prune can write first, written now, so that
 		// what a table loses is what Prune deleted from it.
-		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix(), nil); err != nil {
+		if err := s.resolveDanglingDowns(ctx, sb.Unix(), now.Unix(), s.live.line); err != nil {
 			t.Fatal(err)
 		}
 		before, watch := map[string]int64{}, s.WatchPrunes()

@@ -254,6 +254,16 @@ func TestARetentionKeyRepeatedInOneFileKeepsItsLongestWindow(t *testing.T) {
 			send(`{"pingularity_export":2,"config":[` + row(tc.rows[0]))
 			for _, d := range tc.rows[1:] {
 				if tc.reload {
+					// The restore reads the windows it must not shorten as it
+					// reaches its config, and raises the reconcile gate just
+					// after. A reload that beat that reading would make the
+					// first row's window the one "from before the restore".
+					for deadline := time.Now().Add(10 * time.Second); !s.reconciling.Load(); {
+						if time.Now().After(deadline) {
+							t.Fatal("fixture: the restore never reached its config")
+						}
+						time.Sleep(time.Millisecond)
+					}
 					// The rows so far are in memory, not stored: a batch is stored
 					// when it is full or the category ends. What a reload signal can
 					// publish early is a row an earlier batch stored, so store the

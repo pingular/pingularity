@@ -3554,6 +3554,13 @@ const importCountBudget = 3 * time.Second
 // either, nothing reached the log. The reconcile is detached and bounded for
 // the same reason (importReconcileBudget). While the request is alive the
 // count has no deadline of its own, as before.
+//
+// The budget bounds the count's queries, not its wait for the outage record.
+// The count asks the store for a dry run of the cleanup's close, which takes
+// its turn at the outage record with a plain lock (store.PruneDue), and no
+// context cuts that wait short. The holders are brief: a latency or downtime
+// Delete now, and a running cleanup's close and its sweep of old outages. The
+// restore's own hold is let go before the count on every way out.
 func countContext(req context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(req))
 	stop := context.AfterFunc(req, func() {
@@ -4859,11 +4866,13 @@ func (s *Server) retentionWindows() map[string]time.Duration {
 // cleanup deleted three. Restored latency readings can do the same. The
 // cleanup begins by giving an outage with no recorded end the end the old
 // readings show, and where that is past the downtime window too it deletes
-// the outage in the same pass, a restored one or one of this install's. The
-// store counts both from a dry run of that step. Where the restore brought no
-// downtime row past the window to name this install's records beside - a
-// restore of latency readings alone, say - they get a line of their own
-// (ownOutagesDueWarning). Importing the file again brings those back only if
+// the outage in the same pass, a restored one or one of this install's. So
+// can the restored start of an outage that lands inside one of this install's
+// and takes its recovery: this install's outage then gets its end from the
+// old readings as well. The store counts all of these from a dry run of that
+// step. Where the restore brought no downtime row past the window to name
+// this install's records beside - a restore of latency readings alone, say -
+// they get a line of their own (ownOutagesDueWarning). Importing the file again brings those back only if
 // the backup holds them, so there the advice is to raise the window before the
 // next cleanup.
 //
@@ -5068,9 +5077,9 @@ func (s *Server) restoredRowsDue(ctx context.Context, marks, clearedAt map[strin
 		}
 	}
 	if closed > 0 && !uncounted["downtime"] {
-		s.log.Warn("restored latency readings end outages this install already had before the retention window; the next cleanup deletes them",
+		s.log.Warn("restored rows end outages this install already had before the retention window; the next cleanup deletes them",
 			"own_outage_records", closed, "window", windows["downtime"])
-		out = append(out, ownOutagesDueWarning(closed, windows["downtime"]))
+		out = append(out, ownOutagesDueWarning(closed, windows["downtime"], landed["downtime"] == 0))
 	}
 	for _, cat := range []string{"latency", "speed", "downtime"} { // stable order
 		var n int64
@@ -5178,13 +5187,22 @@ func restoredAheadWarning(cat string, n int64) string {
 // those outages ended, which nothing had recorded, and the cleanup records
 // that end before it deletes the readings, and then deletes an outage that
 // ended before the downtime window (store.PruneDueClosedOutages).
-func ownOutagesDueWarning(own int64, window time.Duration) string {
-	records, them := strconv.FormatInt(own, 10)+" outage records this install already had", "them"
+//
+// readingsAlone says the restore brought no downtime rows at all, so only its
+// readings can have done it, and the line says so. A restore that did bring
+// some can also have put the start of an outage inside one of this install's,
+// which then ends earlier than it did, by this install's own readings. The
+// line then says what restoredDueWarning says of both: restored rows.
+func ownOutagesDueWarning(own int64, window time.Duration, readingsAlone bool) string {
+	records, them, ends := strconv.FormatInt(own, 10)+" outage records this install already had", "them", "restored rows now end those outages"
 	if own == 1 {
-		records, them = "1 outage record this install already had", "it"
+		records, them, ends = "1 outage record this install already had", "it", "restored rows now end its outage"
 	}
-	return records + " will be deleted at the next cleanup, which runs every hour: the restored latency readings " +
-		"show that the outage ended before this install's downtime retention window (" + retentionSpan(window) +
+	if readingsAlone {
+		ends = "the restored latency readings show that the outage ended"
+	}
+	return records + " will be deleted at the next cleanup, which runs every hour: " + ends +
+		" before this install's downtime retention window (" + retentionSpan(window) +
 		") begins. To keep " + them + ", raise that window in the Data tab before the next cleanup."
 }
 
