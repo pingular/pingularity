@@ -21,7 +21,7 @@
 # workflow already sets up buildx.
 
 # --- stamp CAP_NET_RAW onto the binary (runs natively on the build host) ---
-FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS setcap
+FROM --platform=$BUILDPLATFORM debian:13-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS setcap
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -45,7 +45,7 @@ RUN setcap cap_net_raw+ep /pingularity \
     && chmod 0700 /seed/pingularity
 
 # --- final image: distroless nonroot, carrying the capped binary ---
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 # Static attribution; version/revision are stamped per build by goreleaser
 # (dockers_v2 labels/annotations in .goreleaser.yaml), not hardcoded here.
 LABEL org.opencontainers.image.title="pingularity" \
